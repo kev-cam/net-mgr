@@ -1,0 +1,267 @@
+#!/usr/bin/perl
+# net-fix — assign a fixed IP to a MAC, log it in net-mgr's DB, and
+# append the dhcpd-style host block to /etc/net-mgr/dhcp.extra.
+#
+# Usage:
+#   net-fix --mac MAC --name NAME [--subnet 192.168.223.0/24] [--ip IP]
+#           [--file /etc/net-mgr/dhcp.extra] [--dry-run] [--listen H:P]
+#
+# Without --ip the picker lists free IP ranges in the subnet (skipping
+# dhcpd's dynamic range), shows the immediate neighbours (so you can
+# group cameras / power plugs / etc. near their kin), and prompts for a
+# selection. Default = first IP of the first listed range; you can also
+# type a specific IP.
+#
+# After picking, the tool appends:
+#   host <NAME> { hardware ethernet <MAC>; fixed-address <IP>; }
+# to dhcp.extra, then pushes an OBSERVE so the DB is in sync. Run
+# /usr/local/bin/fix_dhcp afterwards to regenerate dhcpd.conf.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use Sys::Hostname qw(hostname);
+use NetMgr::Producer::DhcpMaster;
+use NetMgr::Client;
+
+my $MASTER = '/etc/net-mgr/dhcp.master';
+my $EXTRA  = '/etc/net-mgr/dhcp.extra';
+
+my ($mac, $name, $subnet, $ip);
+my $file    = $EXTRA;
+my $dry_run = 0;
+my $listen;
+my $assume_yes;
+
+GetOptions(
+    'mac=s'    => \$mac,
+    'name=s'   => \$name,
+    'subnet=s' => \$subnet,
+    'ip=s'     => \$ip,
+    'file=s'   => \$file,
+    'dry-run|n' => \$dry_run,
+    'yes|y'    => \$assume_yes,
+    'listen=s' => \$listen,
+) or die "bad options\n";
+
+$mac && $name or die <<'EOF';
+usage: net-fix --mac MAC --name NAME [--subnet CIDR] [--ip IP]
+               [--file /etc/net-mgr/dhcp.extra] [--dry-run]
+EOF
+
+$mac =~ /^[0-9a-fA-F:]{17}$/ or die "bad MAC '$mac'\n";
+$mac = lc $mac;
+
+my $my_host = (split /\./, hostname())[0];
+
+# ---- gather state ----------------------------------------------------
+my $cli = NetMgr::Client->new(listen => $listen);
+$cli->hello(consumer => "net-fix.$$");
+
+my @records         = -f $MASTER ? NetMgr::Producer::DhcpMaster::parse_file($MASTER) : ();
+my @master_hosts    = NetMgr::Producer::DhcpMaster::hosts_only(@records);
+my @master_subnets  = NetMgr::Producer::DhcpMaster::subnets_only(@records);
+
+# Used IPs from the DB (includes everything any producer has seen)
+my $db_addrs   = $cli->snapshot(1, 'addresses', where => "family = 'v4'");
+my $db_ifaces  = $cli->snapshot(2, 'interfaces');
+my $db_machs   = $cli->snapshot(3, 'machines');
+my %iface_by_mac = map { lc $_->{mac} => $_ } @$db_ifaces;
+my %mach_by_id   = map { $_->{id} => $_ } @$db_machs;
+
+my %used;   # ip → display label
+for my $a (@$db_addrs) {
+    my $iface = $iface_by_mac{ lc $a->{mac} };
+    my $name = $iface && $mach_by_id{ $iface->{machine_id} // '' }
+             ? $mach_by_id{ $iface->{machine_id} }->{primary_name}
+             : $a->{mac};
+    $used{ $a->{addr} } //= $name;
+}
+# And dhcp.master reservations (not all may have made it into the DB)
+for my $h (@master_hosts) {
+    $used{ $h->{ip} } //= $h->{name};
+}
+
+# Reject if MAC already has an entry in dhcp.master
+for my $h (@master_hosts) {
+    if ($h->{mac} eq $mac) {
+        die "MAC $mac already reserved as '$h->{name}' at $h->{ip} in $MASTER\n";
+    }
+}
+
+# If --ip was given, derive subnet from it (no need to prompt).
+if ($ip && !$subnet) {
+    $ip =~ /^(\d+\.\d+\.\d+)\./ or die "bad IP '$ip'\n";
+    $subnet = "$1.0/24";
+}
+
+# ---- pick subnet if still not given ---------------------------------
+unless ($subnet) {
+    if (!@master_subnets) {
+        die "no subnets in $MASTER and --subnet not given\n";
+    }
+    print "available subnets:\n";
+    for my $i (0..$#master_subnets) {
+        my $s = $master_subnets[$i];
+        my @ranges = map { "$_->[0]-$_->[1]" } @{ $s->{ranges} };
+        printf "  %d) %s/%s   dynamic: %s\n",
+            $i+1, $s->{net}, $s->{mask},
+            (@ranges ? join(',', @ranges) : '(none)');
+    }
+    print "subnet number: ";
+    my $r = <STDIN>; defined $r or die "no input\n"; chomp $r;
+    my $idx = ($r =~ /^\d+$/) ? $r - 1 : -1;
+    die "bad subnet selection\n" if $idx < 0 || $idx >= @master_subnets;
+    my $s = $master_subnets[$idx];
+    $subnet = "$s->{net}/24";
+}
+
+my ($net_base) = $subnet =~ /^(\d+\.\d+\.\d+)\.0(?:\/24)?$/
+    or die "subnet must look like 192.168.223.0/24 (got '$subnet')\n";
+
+# ---- find dynamic range for this subnet ------------------------------
+my %dyn;
+my ($sub_rec) = grep { $_->{net} eq "$net_base.0" } @master_subnets;
+if ($sub_rec) {
+    for my $r (@{ $sub_rec->{ranges} }) {
+        my @from = split /\./, $r->[0];
+        my @to   = split /\./, $r->[1];
+        for my $oct ($from[3]..$to[3]) {
+            $dyn{"$net_base.$oct"} = 1;
+        }
+    }
+}
+
+# ---- explicit --ip path ----------------------------------------------
+if ($ip) {
+    $ip =~ /^\d+\.\d+\.\d+\.\d+$/ or die "bad IP '$ip'\n";
+    $ip =~ /^\Q$net_base\E\./ or die "$ip is outside $subnet\n";
+    die "$ip is in the dynamic DHCP range\n" if $dyn{$ip};
+    if (my $owner = $used{$ip}) { die "$ip already in use by '$owner'\n" }
+    write_block($file, $ip);
+    push_observation($cli, $ip);
+    finish();
+    exit 0;
+}
+
+# ---- compute free ranges --------------------------------------------
+my @cells;   # one per .1..254 octet: { oct, ip, status, label }
+for my $oct (1..254) {
+    my $a = "$net_base.$oct";
+    my $status = $dyn{$a}    ? 'dyn'
+               : $used{$a}   ? 'used'
+               :               'free';
+    push @cells, { oct => $oct, ip => $a, status => $status,
+                   label => $used{$a} // '' };
+}
+
+my @free_ranges;
+{
+    my $cur;
+    for my $c (@cells) {
+        if ($c->{status} eq 'free') {
+            if ($cur) { $cur->[1] = $c->{oct} }
+            else      { $cur = [ $c->{oct}, $c->{oct} ]; push @free_ranges, $cur }
+        } else { $cur = undef }
+    }
+}
+
+unless (@free_ranges) {
+    die "no free IPs in $subnet — all .1–.254 are dynamic or assigned\n";
+}
+
+# Show ranges with their neighbours (one before, one after)
+print "free IP ranges in $subnet (excluding dynamic):\n";
+for my $i (0..$#free_ranges) {
+    my ($lo, $hi) = @{ $free_ranges[$i] };
+    my $count = $hi - $lo + 1;
+    my $before = $cells[$lo - 2]; # -1 in array
+    my $after  = $cells[$hi];     # +1 in array (oct=hi+1)
+    my @ctx;
+    push @ctx, sprintf("after %s.%d (%s)",
+                       $net_base, $before->{oct}, $before->{label} || $before->{status})
+        if $before && $before->{status} ne 'free';
+    push @ctx, sprintf("before %s.%d (%s)",
+                       $net_base, $after->{oct}, $after->{label} || $after->{status})
+        if $after && $after->{status} ne 'free';
+    my $ctx = @ctx ? '   ' . join('; ', @ctx) : '';
+    printf "  %2d) %-15s - %-15s  (%3d IP%s)%s\n",
+        $i+1, "$net_base.$lo", "$net_base.$hi", $count,
+        ($count == 1 ? ' ' : 's'), $ctx;
+}
+
+# ---- prompt ---------------------------------------------------------
+print "\nselect range number, type a specific IP, or 'q' to quit\n";
+print "[default: 1] > ";
+my $sel = <STDIN>; defined $sel or die "no input\n"; chomp $sel;
+$sel = '1' if $sel eq '';
+exit 0 if $sel =~ /^q/i;
+
+my $chosen;
+if ($sel =~ /^\d+$/) {
+    my $idx = $sel - 1;
+    die "out of range\n" if $idx < 0 || $idx >= @free_ranges;
+    my ($lo, $hi) = @{ $free_ranges[$idx] };
+    if ($lo == $hi) {
+        $chosen = "$net_base.$lo";
+    } else {
+        printf "  range %s.%d-%s.%d — pick offset [default $lo]: ",
+            $net_base, $lo, $net_base, $hi;
+        my $off = <STDIN>; defined $off or die "no input\n"; chomp $off;
+        $off = $lo if $off eq '';
+        die "out of range\n" if $off !~ /^\d+$/ || $off < $lo || $off > $hi;
+        $chosen = "$net_base.$off";
+    }
+} elsif ($sel =~ /^\d+\.\d+\.\d+\.\d+$/) {
+    $chosen = $sel;
+    $chosen =~ /^\Q$net_base\E\./ or die "$chosen is outside $subnet\n";
+    die "$chosen is in the dynamic range\n" if $dyn{$chosen};
+    die "$chosen already in use by '$used{$chosen}'\n" if $used{$chosen};
+} else {
+    die "bad selection '$sel'\n";
+}
+
+# ---- write & push ---------------------------------------------------
+write_block($file, $chosen);
+push_observation($cli, $chosen);
+finish();
+
+# ----------------------------------------------------------------------
+
+sub write_block {
+    my ($path, $addr) = @_;
+    my $block = sprintf "host %-12s { hardware ethernet %s; fixed-address %s; }\n",
+        $name, $mac, $addr;
+    if ($dry_run) {
+        print "[dry-run] would append to $path:\n  $block";
+        return;
+    }
+    open my $fh, '>>', $path or die "open $path: $!";
+    print {$fh} $block;
+    close $fh;
+    print "appended to $path:\n  $block";
+}
+
+sub push_observation {
+    my ($cli, $addr) = @_;
+    return if $dry_run;
+    my $r = $cli->observe(
+        kind        => 'host',
+        mac         => $mac,
+        ip          => $addr,
+        family      => 'v4',
+        name        => $name,
+        name_source => 'dhcp.extra',
+        source      => "$my_host:dhcp.extra",
+    );
+    if ($r && $r =~ /^ERR/) { warn "observe rejected: $r\n" }
+    else                    { print "logged in net-mgr DB.\n" }
+}
+
+sub finish {
+    $cli->bye;
+    return if $dry_run;
+    print "\nrun /usr/local/bin/fix_dhcp to regenerate dhcpd.conf.\n";
+}
