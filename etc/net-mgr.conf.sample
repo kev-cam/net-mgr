@@ -11,8 +11,8 @@ defaults = /root/.my.cnf
 section  = net-mgr
 
 [scanner]
-# 'auto' = walk UP ethernet interfaces (eth*, enp*) and include any
-# 192.168.x.0/24 they sit on. Or comma-separated CIDRs.
+# 'auto' = walk UP wired/wifi interfaces (eth*, en*, wl*) and include
+# any 192.168.x.0/24 they sit on. Or comma-separated CIDRs.
 networks          = auto
 
 # fping/ip-neigh sweep of known IPs:

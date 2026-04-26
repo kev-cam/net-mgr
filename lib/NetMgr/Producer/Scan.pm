@@ -11,8 +11,10 @@ use Carp qw(croak);
 our @DEFAULT_PORTS = qw(22 23 25 53 80 443 515 554 2222 3389
                         5001 5900-5910 6000-6010 8899 9999 12345);
 
-# Walk UP IPv4 ethernet-ish interfaces (eth*, enp*, en*), return list of
-# { iface, cidr, my_ip } for any 192.168.x.0/24 they sit on.
+# Walk UP IPv4 LAN-side interfaces (eth*, en*, wl*) and return list of
+# { iface, cidr, my_ip } for any 192.168.x.0/24 they sit on. Skips lo,
+# bridges, virtual interfaces (vmnet*, docker*, virbr*, etc.) — those
+# get caught by the `^(eth|en|wl)` prefix gate.
 sub detect_networks {
     open my $fh, '-|', 'ip', '-o', '-4', 'addr', 'show'
         or croak "ip: $!";
@@ -20,7 +22,7 @@ sub detect_networks {
     while (my $line = <$fh>) {
         next unless $line =~ /^\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)\/(\d+)/;
         my ($iface, $ip, $bits) = ($1, $2, $3);
-        next unless $iface =~ /^(eth|enp|en)/;
+        next unless $iface =~ /^(eth|en|wl)/;
         next unless $ip    =~ /^192\.168\./;
         my @oct = split /\./, $ip;
         my $cidr = "$oct[0].$oct[1].$oct[2].0/24";
