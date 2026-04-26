@@ -56,9 +56,14 @@ CREATE TABLE IF NOT EXISTS addresses (
     mac          CHAR(17)     NOT NULL,
     family       ENUM('v4','v6') NOT NULL,
     addr         VARCHAR(45)  NOT NULL,
+    source       VARCHAR(64),                -- e.g. '192.168.15.151:DHCP',
+                                             --      'kestrel:dhcp.master',
+                                             --      'kestrel:dhcp.extra',
+                                             --      '<host>:nmap'
     last_seen    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (mac, family, addr),
     KEY idx_addr (addr),
+    KEY idx_source (source),
     CONSTRAINT fk_addresses_iface
         FOREIGN KEY (mac) REFERENCES interfaces(mac) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -125,3 +130,4 @@ CREATE TABLE IF NOT EXISTS events (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 INSERT IGNORE INTO schema_version (version) VALUES (1);
+INSERT IGNORE INTO schema_version (version) VALUES (2);

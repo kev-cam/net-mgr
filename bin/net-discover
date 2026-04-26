@@ -18,6 +18,9 @@ use Getopt::Long qw(:config no_ignore_case bundling);
 use NetMgr::Producer::Scan;
 use NetMgr::Client;
 use NetMgr::Protocol qw(format_kv);
+use Sys::Hostname qw(hostname);
+
+my $MY_HOST = (split /\./, hostname())[0];
 
 my $print_only = 0;
 my $listen;
@@ -53,6 +56,9 @@ sub emit {
     if (defined(my $ik = delete $kv{kind_})) {
         $kv{iface_kind} = $ik;
     }
+    # Tag with our identity so downstream knows where the observation
+    # came from (and how authoritative it is — nmap is bottom of pile).
+    $kv{source} //= "$MY_HOST:nmap" if $kv{kind} eq 'host';
     %kv = map { $_ => $kv{$_} } grep { defined $kv{$_} } keys %kv;
     if ($print_only) {
         print "OBSERVE ", format_kv(%kv), "\n";

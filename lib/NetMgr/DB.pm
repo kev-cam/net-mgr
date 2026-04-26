@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 1;
+our $SCHEMA_VERSION = 2;
 
 sub new {
     my ($class, %args) = @_;
@@ -68,19 +68,48 @@ sub bootstrap_schema {
     my $cur = $self->current_schema_version;
     return $cur if $cur >= $SCHEMA_VERSION;
 
-    my $path = "$self->{schema_dir}/schema.sql";
-    open my $fh, '<', $path or croak "open $path: $!";
-    my $sql = do { local $/; <$fh> };
-    close $fh;
+    if ($cur == 0) {
+        # Fresh install — load schema.sql wholesale.
+        my $path = "$self->{schema_dir}/schema.sql";
+        open my $fh, '<', $path or croak "open $path: $!";
+        my $sql = do { local $/; <$fh> };
+        close $fh;
+        my @stmts = split /;\s*\n/, $sql;
+        for my $s (@stmts) {
+            $s =~ s/^\s+|\s+$//g;
+            next if $s eq '' || $s =~ /^--/;
+            $self->{dbh}->do($s);
+        }
+        return $self->current_schema_version;
+    }
 
-    # Split on `;` at end-of-line. The v1 schema has no `;` inside strings.
-    my @stmts = split /;\s*\n/, $sql;
-    for my $s (@stmts) {
-        $s =~ s/^\s+|\s+$//g;
-        next if $s eq '' || $s =~ /^--/;
-        $self->{dbh}->do($s);
+    # Incremental migrations from $cur to $SCHEMA_VERSION.
+    while ($cur < $SCHEMA_VERSION) {
+        my $next = $cur + 1;
+        $self->_apply_migration($next);
+        $self->{dbh}->do("INSERT IGNORE INTO schema_version (version) VALUES (?)",
+                         undef, $next);
+        $cur = $next;
     }
     return $self->current_schema_version;
+}
+
+# Per-version DDL migrations. Inline rather than separate files for now —
+# add a sql/migrations/ tree if/when the count justifies it.
+sub _apply_migration {
+    my ($self, $v) = @_;
+    if ($v == 2) {
+        # Add addresses.source so we can track where each (mac, addr)
+        # assignment came from (DHCP server, dhcp.master, dhcp.extra, nmap).
+        $self->{dbh}->do(
+            "ALTER TABLE addresses ADD COLUMN source VARCHAR(64) AFTER addr"
+        );
+        $self->{dbh}->do(
+            "ALTER TABLE addresses ADD KEY idx_source (source)"
+        );
+        return;
+    }
+    croak "no migration for schema v$v";
 }
 
 # ---- UPSERT helpers ----------------------------------------------------
@@ -145,27 +174,57 @@ sub upsert_address {
         undef, $f{mac}, $f{family}, $f{addr}
     );
     if ($was) {
-        $self->{dbh}->do(
-            "UPDATE addresses SET last_seen = CURRENT_TIMESTAMP
-              WHERE mac = ? AND family = ? AND addr = ?",
-            undef, $f{mac}, $f{family}, $f{addr}
-        );
+        my @changed;
+        # Only overwrite source when the new authority is >= the existing one.
+        # That way a casual nmap observation can't downgrade a dhcp.master entry.
+        my $new_src = $f{source};
+        if (defined $new_src
+            && _source_priority($new_src) >= _source_priority($was->{source})
+            && (($was->{source} // '') ne $new_src))
+        {
+            push @changed, 'source';
+            $self->{dbh}->do(
+                "UPDATE addresses SET source = ?, last_seen = CURRENT_TIMESTAMP
+                  WHERE mac = ? AND family = ? AND addr = ?",
+                undef, $new_src, $f{mac}, $f{family}, $f{addr}
+            );
+        } else {
+            $self->{dbh}->do(
+                "UPDATE addresses SET last_seen = CURRENT_TIMESTAMP
+                  WHERE mac = ? AND family = ? AND addr = ?",
+                undef, $f{mac}, $f{family}, $f{addr}
+            );
+        }
         my $now = $self->{dbh}->selectrow_hashref(
             "SELECT * FROM addresses WHERE mac = ? AND family = ? AND addr = ?",
             undef, $f{mac}, $f{family}, $f{addr}
         );
-        return { op => 'noop', changed_fields => [], was => $was, now => $now };
+        return { op => @changed ? 'update' : 'noop',
+                 changed_fields => \@changed, was => $was, now => $now };
     }
     $self->{dbh}->do(
-        "INSERT INTO addresses (mac, family, addr) VALUES (?, ?, ?)",
-        undef, $f{mac}, $f{family}, $f{addr}
+        "INSERT INTO addresses (mac, family, addr, source) VALUES (?, ?, ?, ?)",
+        undef, $f{mac}, $f{family}, $f{addr}, $f{source}
     );
     my $now = $self->{dbh}->selectrow_hashref(
         "SELECT * FROM addresses WHERE mac = ? AND family = ? AND addr = ?",
         undef, $f{mac}, $f{family}, $f{addr}
     );
-    return { op => 'insert', changed_fields => [qw(mac family addr)],
+    return { op => 'insert', changed_fields => [qw(mac family addr source)],
              was => undef, now => $now };
+}
+
+# Higher = more authoritative. The exact strings are convention; the suffix
+# after the colon classifies the source.
+sub _source_priority {
+    my ($s) = @_;
+    return 0 unless defined $s;
+    return 5 if $s =~ /:dhcp\.master$/;
+    return 4 if $s =~ /:dhcp\.extra$/;
+    return 3 if $s =~ /:DHCP$/i;       # leased from a DHCP server
+    return 3 if $s =~ /:ssh$/i;        # direct probe of host (e.g. AP self-report)
+    return 1 if $s =~ /:(arp|nmap)$/i; # passive observation
+    return 1;
 }
 
 sub upsert_machine {

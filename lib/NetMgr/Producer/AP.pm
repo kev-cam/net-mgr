@@ -181,14 +181,15 @@ sub to_observations {
     my $ap_mac = $br0 ? $br0->{mac} : undef;
 
     push @obs, {
-        kind  => 'ap_self',
-        via   => $via,
-        mac   => $ap_mac,
-        ip    => $ap_ip,
-        name  => $ap_name,
-        board => $r->{ap}{board},
-        model => $r->{ap}{model},
-        ssid  => join(',', map { $r->{ssids}{$_} } sort keys %{ $r->{ssids} }),
+        kind   => 'ap_self',
+        via    => $via,
+        mac    => $ap_mac,
+        ip     => $ap_ip,
+        name   => $ap_name,
+        board  => $r->{ap}{board},
+        model  => $r->{ap}{model},
+        ssid   => join(',', map { $r->{ssids}{$_} } sort keys %{ $r->{ssids} }),
+        source => "$ap_ip:ssh",
     };
 
     # Associations: each client MAC seen by this AP
@@ -205,15 +206,19 @@ sub to_observations {
     # ARP entries from the AP — MAC↔IP for everything it sees on br0
     for my $a (@{ $r->{arp} }) {
         push @obs, {
-            kind => 'arp',
-            via  => $via,
-            mac  => $a->{mac},
-            ip   => $a->{ip},
-            dev  => $a->{dev},
+            kind   => 'arp',
+            via    => $via,
+            mac    => $a->{mac},
+            ip     => $a->{ip},
+            dev    => $a->{dev},
+            source => "$ap_ip:arp",
         };
     }
 
-    # DHCP leases — only present when this AP is the DHCP server
+    # DHCP leases — only present when this AP is the DHCP server.
+    # An entry here means the AP's dnsmasq handed out the lease (whether
+    # static reservation or random) — we tag it as :DHCP and let
+    # higher-authority sources (dhcp.master / dhcp.extra) override.
     for my $l (@{ $r->{leases} }) {
         push @obs, {
             kind     => 'lease',
@@ -222,6 +227,7 @@ sub to_observations {
             ip       => $l->{ip},
             hostname => $l->{hostname},
             expires  => $l->{expires},
+            source   => "$ap_ip:DHCP",
         };
     }
 
