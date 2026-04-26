@@ -120,6 +120,17 @@ exit 1;                     # only reached if all workers die
 
 sub handler {
     my ($qname, $qclass, $qtype, $peerhost, $query, $conn) = @_;
+    my @result = eval { _handle($qname, $qclass, $qtype, $peerhost) };
+    if ($@) {
+        my $err = $@; chomp $err;
+        warn "[net-dns] handler error for $qname/$qtype from $peerhost: $err\n";
+        return ('SERVFAIL', [], [], [], {});
+    }
+    return @result;
+}
+
+sub _handle {
+    my ($qname, $qclass, $qtype, $peerhost) = @_;
     return ('NOTIMP', [], [], [], {}) if $qclass ne 'IN';
 
     # Strip configured domain suffix to get bare name (case-insensitive).
