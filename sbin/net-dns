@@ -99,7 +99,12 @@ unless ($foreground) {
     open STDIN,  '<',  '/dev/null';
     open STDOUT, '>>', '/dev/null';
 }
-$ns->main_loop;
+
+# In libnet-dns-perl 1.44+, main_loop is gone; start_server forks per
+# listen address and returns. Parent keeps the workers parented.
+$ns->start_server;
+while (wait() != -1) { }    # reap any exited workers; loop forever otherwise
+exit 1;                     # only reached if all workers die
 
 # ---- handlers -------------------------------------------------------
 
