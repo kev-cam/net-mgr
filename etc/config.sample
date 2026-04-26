@@ -1,5 +1,7 @@
 # net-mgr sample configuration
-# Install to /etc/net-mgr.conf (or set NET_MGR_CONF env var).
+# Install to /etc/net-mgr/config (or set NET_MGR_CONF env var).
+# Other files in /etc/net-mgr/ are loaded by their own components
+# (e.g. /etc/net-mgr/dhcp for the dhcp/dnsmasq integration).
 
 [manager]
 listen = 127.0.0.1:7531

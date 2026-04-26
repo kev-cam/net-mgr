@@ -78,7 +78,8 @@ list:
 	@echo
 	@echo "sql + sample config:"
 	@echo "  $(DESTDIR)$(SHAREDIR)/sql/schema.sql"
-	@echo "  $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf  (only if not already present)"
+	@echo "  $(DESTDIR)$(SYSCONFDIR)/net-mgr/config  (only if not already present)"
+	@echo "  (legacy $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf gets moved automatically)"
 	@echo
 	@echo "scripts will have their 'use lib' rewritten to:"
 	@echo "  $(PERL5DIR)"
@@ -98,7 +99,7 @@ install: deps
 	$(INSTALL) -d $(DESTDIR)$(SBINDIR)
 	$(INSTALL) -d $(DESTDIR)$(PERL5DIR)/NetMgr/Producer
 	$(INSTALL) -d $(DESTDIR)$(SHAREDIR)/sql
-	$(INSTALL) -d $(DESTDIR)$(SYSCONFDIR)
+	$(INSTALL) -d $(DESTDIR)$(SYSCONFDIR)/net-mgr
 	@for f in $(BINS); do \
 	  echo "  bin/$$f → $(DESTDIR)$(BINDIR)/$$f"; \
 	  sed -e 's|use lib .*FindBin.*|use lib "$(PERL5DIR)";|' \
@@ -120,12 +121,17 @@ install: deps
 	done
 	@echo "  sql/schema.sql → $(DESTDIR)$(SHAREDIR)/sql/schema.sql"
 	@$(INSTALL) -m 644 sql/schema.sql $(DESTDIR)$(SHAREDIR)/sql/schema.sql
-	@if [ ! -f $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf ]; then \
-	  echo "  etc/net-mgr.conf.sample → $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf"; \
-	  $(INSTALL) -m 644 etc/net-mgr.conf.sample \
-	             $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf; \
+	@if [ -f $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf ] \
+	     && [ ! -e $(DESTDIR)$(SYSCONFDIR)/net-mgr/config ]; then \
+	  echo "  migrating $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf → $(DESTDIR)$(SYSCONFDIR)/net-mgr/config"; \
+	  mv $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf $(DESTDIR)$(SYSCONFDIR)/net-mgr/config; \
+	fi
+	@if [ ! -f $(DESTDIR)$(SYSCONFDIR)/net-mgr/config ]; then \
+	  echo "  etc/config.sample → $(DESTDIR)$(SYSCONFDIR)/net-mgr/config"; \
+	  $(INSTALL) -m 644 etc/config.sample \
+	             $(DESTDIR)$(SYSCONFDIR)/net-mgr/config; \
 	else \
-	  echo "  skip $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf (already exists)"; \
+	  echo "  skip $(DESTDIR)$(SYSCONFDIR)/net-mgr/config (already exists)"; \
 	fi
 	@echo
 	@echo "Files installed."
@@ -152,7 +158,7 @@ setup:
 	fi
 	$(DESTDIR)$(SBINDIR)/net-mgr-setup
 
-# --- uninstall (does not remove /etc/net-mgr.conf or /root/.my.cnf) ---
+# --- uninstall (does not remove /etc/net-mgr/ or /root/.my.cnf) ---
 uninstall:
 	@for f in $(BINS);  do rm -fv $(DESTDIR)$(BINDIR)/$$f;  done
 	@for f in $(SBINS); do rm -fv $(DESTDIR)$(SBINDIR)/$$f; done
@@ -163,7 +169,7 @@ uninstall:
 	-@rmdir $(DESTDIR)$(SHAREDIR)/sql             2>/dev/null || true
 	-@rmdir $(DESTDIR)$(SHAREDIR)                 2>/dev/null || true
 	@echo
-	@echo "Kept: $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf (remove manually if desired)"
+	@echo "Kept: $(DESTDIR)$(SYSCONFDIR)/net-mgr/ (remove manually if desired)"
 
 # --- tests / lint ----------------------------------------------------
 test:

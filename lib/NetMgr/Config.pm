@@ -1,5 +1,5 @@
 package NetMgr::Config;
-# Loads /etc/net-mgr.conf (INI-style) into a nested hashref.
+# Loads /etc/net-mgr/config (INI-style) into a nested hashref.
 #
 # Sections:
 #   [manager]   listen, log
@@ -61,7 +61,7 @@ my %DURATION_KEYS = (
 
 sub load {
     my ($class, $path) = @_;
-    $path //= $ENV{NET_MGR_CONF} // '/etc/net-mgr.conf';
+    $path //= $ENV{NET_MGR_CONF} // '/etc/net-mgr/config';
     my $cfg = _deep_copy(\%DEFAULTS);
 
     if (-e $path) {

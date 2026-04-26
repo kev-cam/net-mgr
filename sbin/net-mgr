@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-# net-mgr — daemon. Reads /etc/net-mgr.conf, connects to MySQL,
+# net-mgr — daemon. Reads /etc/net-mgr/config, connects to MySQL,
 # bootstraps schema if needed, then runs the main loop.
 
 use strict;
@@ -12,7 +12,7 @@ use NetMgr::Config;
 use NetMgr::DB;
 use NetMgr::Manager;
 
-my $conf_path  = $ENV{NET_MGR_CONF} // '/etc/net-mgr.conf';
+my $conf_path  = $ENV{NET_MGR_CONF} // '/etc/net-mgr/config';
 my $foreground = 0;
 GetOptions(
     'config=s'    => \$conf_path,
