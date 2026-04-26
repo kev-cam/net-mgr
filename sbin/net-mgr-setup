@@ -1,0 +1,191 @@
+#!/usr/bin/perl
+# net-mgr-setup — interactive first-time DB setup.
+#
+# Must be run as root (needs to talk to mysql via unix_socket and
+# write /root/.my.cnf).
+#
+# Asks whether to use the existing root account (unix_socket auth, no
+# password) or create a dedicated MySQL user, then creates the database,
+# the user (if needed), writes /root/.my.cnf with a [net-mgr] section,
+# and verifies the connection.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+my $MYCNF    = '/root/.my.cnf';
+my $SECTION  = 'net-mgr';
+my $DBNAME   = 'netmgr';
+
+die "must run as root\n" if $> != 0;
+
+# ---- helpers ----------------------------------------------------------
+sub prompt {
+    my ($q, $default) = @_;
+    local $| = 1;
+    my $hint = defined $default && length $default ? " [$default]" : '';
+    print "$q$hint: ";
+    my $ans = <STDIN>;
+    chomp $ans if defined $ans;
+    return defined $ans && length $ans ? $ans : $default;
+}
+
+sub prompt_yn {
+    my ($q, $default) = @_;
+    while (1) {
+        my $a = prompt($q . ' (y/n)', $default);
+        return 1 if $a =~ /^y/i;
+        return 0 if $a =~ /^n/i;
+    }
+}
+
+sub prompt_pass {
+    my ($q) = @_;
+    local $| = 1;
+    print "$q: ";
+    system('stty', '-echo');
+    my $p = <STDIN>;
+    system('stty', 'echo');
+    print "\n";
+    chomp $p;
+    return $p;
+}
+
+sub mysql_root {
+    my (@sql) = @_;
+    open my $fh, '|-', 'mysql', '-N', '-B' or die "mysql: $!";
+    print {$fh} join(";\n", @sql), ";\n";
+    close $fh;
+    return $? == 0;
+}
+
+sub mysql_root_query {
+    my ($sql) = @_;
+    open my $fh, '-|', 'mysql', '-N', '-B', '-e', $sql or die "mysql: $!";
+    my @rows = <$fh>;
+    close $fh;
+    chomp for @rows;
+    return @rows;
+}
+
+sub user_exists {
+    my ($user, $host) = @_;
+    my @r = mysql_root_query(
+        "SELECT 1 FROM mysql.user WHERE User='$user' AND Host='$host'");
+    return scalar @r > 0;
+}
+
+sub db_exists {
+    my ($name) = @_;
+    my @r = mysql_root_query(
+        "SELECT 1 FROM information_schema.schemata WHERE schema_name='$name'");
+    return scalar @r > 0;
+}
+
+# ---- 1. probe mysql ---------------------------------------------------
+print "Checking mysql connectivity (as unix_socket root)...\n";
+unless (mysql_root_query("SELECT 1")) {
+    die "Cannot connect to mysql as root via unix socket. Is mariadb-server running?\n";
+}
+print "  ok\n";
+
+# ---- 2. existing /root/.my.cnf ---------------------------------------
+if (-d $MYCNF) {
+    die "$MYCNF exists but is a directory — fix that first:\n"
+      . "  rmdir $MYCNF   # or rm -rf if it has content\n";
+}
+if (-e $MYCNF) {
+    print "$MYCNF already exists.\n";
+    if (!prompt_yn("Overwrite (or merge [$SECTION] section)?", 'y')) {
+        print "Aborted; nothing changed.\n";
+        exit 1;
+    }
+}
+
+# ---- 3. choose auth strategy -----------------------------------------
+my $use_root = prompt_yn(
+    "Use mysql 'root' account via unix_socket (no password)?\n"
+    . "  (Pick 'n' to create a dedicated 'net-mgr' user instead)", 'y');
+
+my ($user, $pass);
+if ($use_root) {
+    $user = 'root';
+    $pass = undef;
+} else {
+    $user = prompt("MySQL username for net-mgr", 'net-mgr');
+    if (user_exists($user, 'localhost')) {
+        print "User '$user'\@'localhost' already exists; will reuse.\n";
+        $pass = prompt_pass("Existing password for '$user' (leave blank to reset)");
+        if (!length $pass) {
+            $pass = prompt_pass("New password for '$user'");
+            my $repeat = prompt_pass("Repeat new password");
+            die "passwords do not match\n" unless $pass eq $repeat;
+            mysql_root("ALTER USER '$user'\@'localhost' IDENTIFIED BY '$pass'")
+                or die "ALTER USER failed\n";
+            print "  password reset\n";
+        }
+    } else {
+        $pass = prompt_pass("New password for '$user'");
+        my $repeat = prompt_pass("Repeat password");
+        die "passwords do not match\n" unless $pass eq $repeat;
+        mysql_root("CREATE USER '$user'\@'localhost' IDENTIFIED BY '$pass'")
+            or die "CREATE USER failed\n";
+        print "  user created\n";
+    }
+}
+
+# ---- 4. database -----------------------------------------------------
+if (db_exists($DBNAME)) {
+    print "Database '$DBNAME' already exists.\n";
+} else {
+    mysql_root("CREATE DATABASE $DBNAME") or die "CREATE DATABASE failed\n";
+    print "Database '$DBNAME' created.\n";
+}
+
+# ---- 5. grants -------------------------------------------------------
+mysql_root("GRANT ALL ON $DBNAME.* TO '$user'\@'localhost'")
+    or die "GRANT failed\n";
+print "Privileges granted on $DBNAME.* to '$user'\@'localhost'.\n";
+
+# ---- 6. write /root/.my.cnf -----------------------------------------
+my @existing;
+if (-e $MYCNF) {
+    open my $fh, '<', $MYCNF or die "read $MYCNF: $!";
+    my $cur;
+    my $skip = 0;
+    while (my $line = <$fh>) {
+        if ($line =~ /^\[([^\]]+)\]/) {
+            $cur = $1;
+            $skip = ($cur eq $SECTION) ? 1 : 0;
+            next if $skip;
+        }
+        next if $skip;
+        push @existing, $line;
+    }
+    close $fh;
+}
+
+my $section = "[$SECTION]\nuser=$user\n";
+$section .= "password=$pass\n" if defined $pass;
+$section .= "host=localhost\ndatabase=$DBNAME\n";
+
+open my $out, '>', $MYCNF or die "write $MYCNF: $!";
+print {$out} @existing;
+print {$out} "\n" if @existing && $existing[-1] !~ /\n\z/;
+print {$out} $section;
+close $out;
+chmod 0600, $MYCNF;
+print "Wrote [$SECTION] to $MYCNF (mode 0600).\n";
+
+# ---- 7. verify -------------------------------------------------------
+print "Verifying connection through DBI...\n";
+require NetMgr::DB;
+my $db = NetMgr::DB->new(defaults_file => $MYCNF, section => $SECTION,
+                        db => $DBNAME);
+$db->connect;
+my $v = $db->bootstrap_schema;
+print "Schema bootstrapped to v$v.\n";
+$db->disconnect;
+
+print "\nDone. You can now run:  prove -Ilib t/db.t\n";

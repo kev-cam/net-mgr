@@ -1,0 +1,77 @@
+#!/usr/bin/perl
+# net-scan — list known hosts (interfaces + addresses + ports + names).
+# (Replaces the legacy /usr/local/bin/scan-network. The active scanning
+# producer that nmap-sweeps the network is bin/net-discover.)
+#
+#   net-scan               # snapshot known hosts from the daemon
+#   net-scan -quick        # same (alias)
+#   net-scan --discover    # TRIGGER discover, then snapshot
+#   net-scan --listen H:P  # override manager address
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling pass_through);
+use NetMgr::Client;
+
+my $listen;
+my $quick;
+my $discover;
+GetOptions(
+    'listen=s' => \$listen,
+    'quick'    => \$quick,
+    'discover' => \$discover,
+) or die "bad options\n";
+
+my $cli = NetMgr::Client->new(listen => $listen);
+$cli->hello(consumer => "net-scan.$$");
+
+if ($discover) {
+    my $r = $cli->trigger("discover", wait => 1);
+    print STDERR "TRIGGER discover: $r\n" if $r;
+}
+
+# Pull interfaces, addresses, ports, hostnames; build a per-host view.
+my $ifaces = $cli->snapshot(1, 'interfaces');
+my $addrs  = $cli->snapshot(2, 'addresses', where => "family = 'v4'");
+my $ports  = $cli->snapshot(3, 'ports');
+my $hosts  = $cli->snapshot(4, 'hostnames');
+
+my %iface_by_mac = map { $_->{mac} => $_ } @$ifaces;
+my %ips_by_mac;   push @{ $ips_by_mac{$_->{mac}} }, $_->{addr} for @$addrs;
+my %ports_by_mac; push @{ $ports_by_mac{$_->{mac}} }, $_       for @$ports;
+my %hosts_by_mid; push @{ $hosts_by_mid{$_->{machine_id}} }, $_->{name}
+                                                            for @$hosts;
+
+# Print one line per (interface, ip) pair.
+my @rows;
+for my $mac (sort keys %iface_by_mac) {
+    my $iface = $iface_by_mac{$mac};
+    my @ips   = @{ $ips_by_mac{$mac} || ['?'] };
+    my @hns   = ($iface->{machine_id}
+                 ? @{ $hosts_by_mid{$iface->{machine_id}} || [] } : ());
+    my $hn    = $hns[0] // '';
+    my @ps    = sort { $a->{port} <=> $b->{port} } @{ $ports_by_mac{$mac} || [] };
+    my $ports = join(',', map { $_->{port} } @ps);
+    for my $ip (sort @ips) {
+        push @rows, [ $ip, $mac, $hn, $iface->{vendor} // '', $ports,
+                      ($iface->{online} ? 'up' : 'off') ];
+    }
+}
+
+# IPv4 sort by numeric octets
+@rows = sort { _ip_key($a->[0]) cmp _ip_key($b->[0]) } @rows;
+my $fmt = "%-15s %-17s %-22s %-20s %s\n";
+printf $fmt, qw(IP MAC HOST VENDOR PORTS);
+for my $r (@rows) {
+    printf $fmt, @{$r}[0..4];
+}
+
+$cli->bye;
+
+sub _ip_key {
+    my $ip = shift;
+    return '999.999.999.999' if $ip !~ /^\d+\.\d+\.\d+\.\d+$/;
+    return sprintf "%03d.%03d.%03d.%03d", split /\./, $ip;
+}

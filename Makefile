@@ -1,0 +1,117 @@
+# net-mgr install layout.
+#
+# Default target ('list') prints the file list — no changes made.
+# Run 'make install' to actually copy.
+# Override paths on the command line, e.g.  make install PREFIX=/opt
+#
+# Path-substitution at install time rewrites each script's
+#   use lib "$FindBin::Bin/../lib";
+# (and the daemon's schema_dir = "$FindBin::Bin/../sql") to the absolute
+# install paths so the binaries don't depend on FindBin resolving back
+# to a source tree.
+
+PREFIX     ?= /usr/local
+BINDIR     ?= $(PREFIX)/bin
+SBINDIR    ?= $(PREFIX)/sbin
+PERL5DIR   ?= $(PREFIX)/share/perl5
+SHAREDIR   ?= $(PREFIX)/share/net-mgr
+SYSCONFDIR ?= /etc
+DESTDIR    ?=
+
+BINS  = net-poll-ap net-discover net-scan net-report net-show
+SBINS = net-mgr net-mgr-setup
+LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \
+        NetMgr/Manager.pm NetMgr/Client.pm \
+        NetMgr/Producer/AP.pm NetMgr/Producer/Scan.pm
+
+INSTALL ?= install
+
+.PHONY: list install uninstall test check clean help
+
+# --- default: dry-run listing ----------------------------------------
+list:
+	@echo "net-mgr install plan (no changes — run 'make install' to do it)"
+	@echo
+	@echo "binaries → $(DESTDIR)$(BINDIR):"
+	@for f in $(BINS); do echo "  $$f"; done
+	@echo
+	@echo "daemon → $(DESTDIR)$(SBINDIR):"
+	@for f in $(SBINS); do echo "  $$f"; done
+	@echo
+	@echo "perl modules → $(DESTDIR)$(PERL5DIR):"
+	@for f in $(LIBS); do echo "  $$f"; done
+	@echo
+	@echo "sql + sample config:"
+	@echo "  $(DESTDIR)$(SHAREDIR)/sql/schema.sql"
+	@echo "  $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf  (only if not already present)"
+	@echo
+	@echo "scripts will have their 'use lib' rewritten to:"
+	@echo "  $(PERL5DIR)"
+	@echo
+	@echo "vars: PREFIX=$(PREFIX)  DESTDIR=$(DESTDIR)  SYSCONFDIR=$(SYSCONFDIR)"
+
+# --- install ----------------------------------------------------------
+install:
+	$(INSTALL) -d $(DESTDIR)$(BINDIR)
+	$(INSTALL) -d $(DESTDIR)$(SBINDIR)
+	$(INSTALL) -d $(DESTDIR)$(PERL5DIR)/NetMgr/Producer
+	$(INSTALL) -d $(DESTDIR)$(SHAREDIR)/sql
+	$(INSTALL) -d $(DESTDIR)$(SYSCONFDIR)
+	@for f in $(BINS); do \
+	  echo "  bin/$$f → $(DESTDIR)$(BINDIR)/$$f"; \
+	  sed -e 's|use lib .*FindBin.*|use lib "$(PERL5DIR)";|' \
+	      bin/$$f > $(DESTDIR)$(BINDIR)/$$f.tmp && \
+	  mv $(DESTDIR)$(BINDIR)/$$f.tmp $(DESTDIR)$(BINDIR)/$$f && \
+	  chmod 755 $(DESTDIR)$(BINDIR)/$$f; \
+	done
+	@for f in $(SBINS); do \
+	  echo "  sbin/$$f → $(DESTDIR)$(SBINDIR)/$$f"; \
+	  sed -e 's|use lib .*FindBin.*|use lib "$(PERL5DIR)";|' \
+	      -e 's|"\$$FindBin::Bin/../sql"|"$(SHAREDIR)/sql"|' \
+	      sbin/$$f > $(DESTDIR)$(SBINDIR)/$$f.tmp && \
+	  mv $(DESTDIR)$(SBINDIR)/$$f.tmp $(DESTDIR)$(SBINDIR)/$$f && \
+	  chmod 755 $(DESTDIR)$(SBINDIR)/$$f; \
+	done
+	@for f in $(LIBS); do \
+	  echo "  lib/$$f → $(DESTDIR)$(PERL5DIR)/$$f"; \
+	  $(INSTALL) -m 644 lib/$$f $(DESTDIR)$(PERL5DIR)/$$f; \
+	done
+	@echo "  sql/schema.sql → $(DESTDIR)$(SHAREDIR)/sql/schema.sql"
+	@$(INSTALL) -m 644 sql/schema.sql $(DESTDIR)$(SHAREDIR)/sql/schema.sql
+	@if [ ! -f $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf ]; then \
+	  echo "  etc/net-mgr.conf.sample → $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf"; \
+	  $(INSTALL) -m 644 etc/net-mgr.conf.sample \
+	             $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf; \
+	else \
+	  echo "  skip $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf (already exists)"; \
+	fi
+	@echo
+	@echo "Done. To start the daemon: $(SBINDIR)/net-mgr --foreground"
+
+# --- uninstall (does not remove /etc/net-mgr.conf) -------------------
+uninstall:
+	@for f in $(BINS);  do rm -fv $(DESTDIR)$(BINDIR)/$$f;  done
+	@for f in $(SBINS); do rm -fv $(DESTDIR)$(SBINDIR)/$$f; done
+	@for f in $(LIBS);  do rm -fv $(DESTDIR)$(PERL5DIR)/$$f; done
+	@rm -fv $(DESTDIR)$(SHAREDIR)/sql/schema.sql
+	-@rmdir $(DESTDIR)$(PERL5DIR)/NetMgr/Producer 2>/dev/null || true
+	-@rmdir $(DESTDIR)$(PERL5DIR)/NetMgr          2>/dev/null || true
+	-@rmdir $(DESTDIR)$(SHAREDIR)/sql             2>/dev/null || true
+	-@rmdir $(DESTDIR)$(SHAREDIR)                 2>/dev/null || true
+	@echo
+	@echo "Kept: $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf (remove manually if desired)"
+
+# --- tests / lint ----------------------------------------------------
+test:
+	prove -Ilib t/
+
+check:
+	@for f in $(LIBS); do perl -Ilib -c lib/$$f || exit 1; done
+	@for f in $(BINS);  do perl -Ilib -c bin/$$f  || exit 1; done
+	@for f in $(SBINS); do perl -Ilib -c sbin/$$f || exit 1; done
+	@echo "compile: ok"
+
+clean:
+	@true
+
+help: list

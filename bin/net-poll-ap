@@ -1,0 +1,95 @@
+#!/usr/bin/perl
+# net-poll-ap — SSH each given AP, parse output, push observations to net-mgr.
+#
+# Usage:
+#   net-poll-ap [--print] [--ssh-user USER] [--ssh-timeout N]
+#               [--listen HOST:PORT] IP [IP ...]
+#
+# Without --print, connects to the manager (default 127.0.0.1:7531 or
+# $NET_MGR_LISTEN) and sends OBSERVE messages. With --print, dumps to
+# stdout for debugging.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use NetMgr::Producer::AP;
+use NetMgr::Protocol qw(format_kv);
+use NetMgr::Client;
+
+my $print_only  = 0;
+my $ssh_user    = 'root';
+my $ssh_timeout = 10;
+my $listen;
+
+GetOptions(
+    'print'         => \$print_only,
+    'ssh-user=s'    => \$ssh_user,
+    'ssh-timeout=i' => \$ssh_timeout,
+    'listen=s'      => \$listen,
+) or die "bad options\n";
+
+@ARGV or die "usage: $0 [--print] [--listen HOST:PORT] IP [IP ...]\n";
+
+# Fork-per-AP for concurrent SSH.
+my @children;
+for my $ip (@ARGV) {
+    pipe(my $rd, my $wr) or die "pipe: $!";
+    my $pid = fork();
+    die "fork: $!" unless defined $pid;
+    if ($pid == 0) {
+        close $rd;
+        my $r = NetMgr::Producer::AP::poll_ap(
+            ip          => $ip,
+            ssh_user    => $ssh_user,
+            ssh_timeout => $ssh_timeout,
+        );
+        require Data::Dumper;
+        Data::Dumper->import;
+        no warnings 'once';
+        local ($Data::Dumper::Sortkeys, $Data::Dumper::Indent, $Data::Dumper::Terse)
+            = (1, 0, 1);
+        print {$wr} Data::Dumper::Dumper($r), "\n";
+        close $wr;
+        exit 0;
+    }
+    close $wr;
+    push @children, { pid => $pid, ip => $ip, fh => $rd };
+}
+
+# Optional client (only when not --print).
+my $cli;
+unless ($print_only) {
+    $cli = NetMgr::Client->new(listen => $listen);
+    $cli->hello(source => "net-poll-ap", pid => $$);
+}
+
+for my $c (@children) {
+    my $data = do { local $/; readline $c->{fh} };
+    close $c->{fh};
+    waitpid($c->{pid}, 0);
+    my $r = eval $data;
+    if (!$r || !$r->{ok}) {
+        warn "poll $c->{ip}: " . ($r->{error} // 'no result') . "\n";
+        next;
+    }
+    if ($print_only) {
+        print "# === $c->{ip} ===\n";
+    }
+    for my $o (NetMgr::Producer::AP::to_observations($r)) {
+        my $kind = delete $o->{kind};
+        my %kv = (kind => $kind, map { $_ => $o->{$_} }
+                                 grep { defined $o->{$_} } keys %$o);
+        if ($print_only) {
+            print "OBSERVE ", format_kv(%kv), "\n";
+        } else {
+            my $reply = $cli->observe(%kv);
+            warn "observe rejected: $reply\n" if $reply && $reply =~ /^ERR/;
+        }
+    }
+}
+
+if ($cli) {
+    $cli->bye;
+}

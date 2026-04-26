@@ -1,0 +1,57 @@
+#!/usr/bin/perl
+# net-mgr — daemon. Reads /etc/net-mgr.conf, connects to MySQL,
+# bootstraps schema if needed, then runs the main loop.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+use NetMgr::Config;
+use NetMgr::DB;
+use NetMgr::Manager;
+
+my $conf_path  = $ENV{NET_MGR_CONF} // '/etc/net-mgr.conf';
+my $foreground = 0;
+GetOptions(
+    'config=s'    => \$conf_path,
+    'foreground|f'=> \$foreground,
+) or die "bad options\n";
+
+my $cfg = NetMgr::Config->load($conf_path);
+
+die "must run as root (need to read $cfg->{mysql}{defaults})\n"
+    if $> != 0 && $cfg->{mysql}{defaults} =~ m{^/root/};
+
+my $db = NetMgr::DB->new(
+    defaults_file => $cfg->{mysql}{defaults},
+    section       => $cfg->{mysql}{section},
+    db            => $cfg->{mysql}{db},
+    schema_dir    => "$FindBin::Bin/../sql",
+);
+$db->connect;
+my $v = $db->bootstrap_schema;
+warn "[net-mgr] schema v$v\n";
+
+my $log_fh = \*STDERR;
+if (!$foreground && $cfg->{manager}{log}) {
+    open $log_fh, '>>', $cfg->{manager}{log}
+        or die "open log $cfg->{manager}{log}: $!";
+    $log_fh->autoflush(1);
+}
+
+my $mgr = NetMgr::Manager->new(config => $cfg, db => $db, log_fh => $log_fh);
+$mgr->start_listener;
+
+unless ($foreground) {
+    # simple daemonize
+    my $pid = fork; die "fork: $!" unless defined $pid;
+    exit 0 if $pid;
+    require POSIX; POSIX::setsid();
+    open STDIN,  '<', '/dev/null';
+    open STDOUT, '>>', '/dev/null';
+    open STDERR, '>>&', $log_fh;
+}
+
+$mgr->run;

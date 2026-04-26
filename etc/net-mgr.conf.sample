@@ -1,0 +1,46 @@
+# net-mgr sample configuration
+# Install to /etc/net-mgr.conf (or set NET_MGR_CONF env var).
+
+[manager]
+listen = 127.0.0.1:7531
+log    = /var/log/net-mgr.log
+
+[mysql]
+db       = netmgr
+defaults = /root/.my.cnf
+section  = net-mgr
+
+[scanner]
+# 'auto' = walk UP ethernet interfaces (eth*, enp*) and include any
+# 192.168.x.0/24 they sit on. Or comma-separated CIDRs.
+networks          = auto
+
+# fping/ip-neigh sweep of known IPs:
+presence_interval = 90s
+# Full nmap discovery sweep (once we know things are there, infrequent):
+discover_interval = 24h
+# Re-probe ports of known hosts to catch newly opened services:
+reprobe_ports     = 7d
+
+[ap_poll]
+interval    = 60s
+ssh_timeout = 10s
+
+[timeouts]
+# How long since the last observation from a given source before the
+# manager considers the device offline w.r.t. that source.
+ap    = 120s
+fping = 180s
+nmap  = 24h
+dhcp  = lease     # special: use the lease's own expiry
+
+[paths]
+dnsmasq_conf_glob = /usr/local/sgy/conf.d/dnsmasq-*
+oui_csv           = /var/lib/ieee-data/oui.csv
+
+# Manual machine groupings — interfaces auto-correlate when they share
+# an SSH hostname or appear together in dnsmasq config; everything else
+# goes here. Reloaded on SIGHUP.
+[bindings]
+# machine "kestrel"   = aa:bb:cc:dd:ee:01, aa:bb:cc:dd:ee:02
+# machine "router-up" = 11:22:33:44:55:66

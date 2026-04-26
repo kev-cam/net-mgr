@@ -1,0 +1,110 @@
+#!/usr/bin/perl
+# net-report — query the net-mgr database via the manager socket.
+#
+# Usage:
+#   net-report <table> [WHERE ...]      Snapshot a table (any of:
+#                                       machines, hostnames, interfaces,
+#                                       addresses, ports, aps, associations,
+#                                       dhcp_leases, events).
+#   net-report events --tail [WHERE ...] Stream events as they happen.
+#   net-report --listen HOST:PORT       Override manager address.
+#   net-report --columns COL,COL,...    Limit output columns.
+#
+# Examples:
+#   net-report aps
+#   net-report interfaces "online = 1"
+#   net-report addresses "addr LIKE '192.168.15.%'"
+#   net-report events --tail "type IN ('device_new','interface_offline')"
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling pass_through);
+use NetMgr::Client;
+use NetMgr::Protocol qw(parse_line);
+
+my $listen;
+my $tail;
+my $columns;
+GetOptions(
+    'listen=s'  => \$listen,
+    'tail|f'    => \$tail,
+    'columns=s' => \$columns,
+) or die "bad options\n";
+
+my $table = shift @ARGV or die usage();
+my $where = @ARGV ? join(' ', @ARGV) : undef;
+my @cols  = $columns ? split(/,/, $columns) : ();
+
+sub usage {
+    return "usage:\n"
+         . "  net-report <table> [WHERE ...]\n"
+         . "  net-report events --tail [WHERE ...]\n";
+}
+
+my $cli = NetMgr::Client->new(listen => $listen);
+$cli->hello(consumer => "net-report.$$");
+
+if ($tail) {
+    # Stream subscribe — print rows as they arrive.
+    my $line = "SUBSCRIBE sub=1 mode=stream FROM $table";
+    $line .= " WHERE $where" if defined $where;
+    $cli->send_line($line);
+    $| = 1;
+    while (defined(my $reply = $cli->recv_line)) {
+        my $cmd = parse_line($reply);
+        next unless $cmd;
+        if ($cmd->{verb} eq 'ROW') { print_row($cmd->{kv}, \@cols) }
+        elsif ($cmd->{verb} eq 'ERR') { warn "ERR $cmd->{msg}\n"; last }
+        # ignore OK
+    }
+} else {
+    my $rows = $cli->snapshot(1, $table, defined $where ? (where => $where) : ());
+    print_table($rows, \@cols);
+}
+
+$cli->bye;
+
+sub print_table {
+    my ($rows, $cols) = @_;
+    return unless @$rows;
+
+    # Column set: explicit, else union of keys (minus protocol noise)
+    my @keys;
+    if (@$cols) {
+        @keys = @$cols;
+    } else {
+        my %seen;
+        for my $r (@$rows) {
+            for my $k (sort keys %$r) {
+                next if $k eq 'sub' || $k eq 'table' || $k eq 'op';
+                $seen{$k} = 1;
+            }
+        }
+        @keys = sort keys %seen;
+    }
+
+    # Compute widths
+    my %w = map { $_ => length $_ } @keys;
+    for my $r (@$rows) {
+        for my $k (@keys) {
+            my $v = $r->{$k} // '';
+            $w{$k} = length $v if length $v > $w{$k};
+        }
+    }
+    my $fmt = join('  ', map { "%-$w{$_}s" } @keys) . "\n";
+    printf $fmt, @keys;
+    printf $fmt, map { '-' x $w{$_} } @keys;
+    for my $r (@$rows) {
+        printf $fmt, map { $r->{$_} // '' } @keys;
+    }
+}
+
+sub print_row {
+    my ($r, $cols) = @_;
+    my @keys = @$cols ? @$cols
+                      : grep { $_ ne 'sub' && $_ ne 'table' && $_ ne 'op' }
+                        sort keys %$r;
+    print join(' ', map { defined $r->{$_} ? "$_=$r->{$_}" : "$_=" } @keys), "\n";
+}

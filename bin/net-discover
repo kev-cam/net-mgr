@@ -1,0 +1,112 @@
+#!/usr/bin/perl
+# net-discover — nmap/fping-based active-scan producer. Pushes
+# observations to net-mgr; spawned by the daemon for TRIGGER discover.
+#
+# Usage:
+#   net-discover --discover [--network CIDR]...  Full nmap sweep
+#   net-discover --presence                      fping known IPs (mark dead ones GONE)
+#   net-discover --print                         dump observations to stdout
+#   net-discover --listen HOST:PORT              override manager
+#
+# With no mode flag, defaults to --discover.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use NetMgr::Producer::Scan;
+use NetMgr::Client;
+use NetMgr::Protocol qw(format_kv);
+
+my $print_only = 0;
+my $listen;
+my $do_discover;
+my $do_presence;
+my @networks;
+my $ports;
+my $host_timeout = 20;
+
+GetOptions(
+    'print'        => \$print_only,
+    'listen=s'     => \$listen,
+    'discover'     => \$do_discover,
+    'presence'     => \$do_presence,
+    'network=s@'   => \@networks,
+    'ports=s'      => \$ports,
+    'host-timeout=i' => \$host_timeout,
+) or die "bad options\n";
+
+# Default mode = discover
+$do_discover = 1 unless $do_discover || $do_presence;
+
+my $cli;
+unless ($print_only) {
+    $cli = NetMgr::Client->new(listen => $listen);
+    $cli->hello(source => "net-discover", pid => $$);
+}
+
+sub emit {
+    my (%kv) = @_;
+    # Producer::Scan uses kind_ to carry the interface kind separately
+    # from the OBSERVE-dispatch kind. Promote it to iface_kind here.
+    if (defined(my $ik = delete $kv{kind_})) {
+        $kv{iface_kind} = $ik;
+    }
+    %kv = map { $_ => $kv{$_} } grep { defined $kv{$_} } keys %kv;
+    if ($print_only) {
+        print "OBSERVE ", format_kv(%kv), "\n";
+    } else {
+        my $r = $cli->observe(%kv);
+        warn "observe rejected: $r\n" if $r && $r =~ /^ERR/;
+    }
+}
+
+if ($do_discover) {
+    my @nets;
+    if (@networks) {
+        # Each --network CIDR; pick interface heuristically (none → blank).
+        for my $cidr (@networks) {
+            push @nets, { iface => 'auto', cidr => $cidr };
+        }
+    } else {
+        @nets = NetMgr::Producer::Scan::detect_networks();
+    }
+
+    for my $net (@nets) {
+        warn "discovering $net->{cidr} via $net->{iface}\n";
+        my ($obs, $err) = NetMgr::Producer::Scan::discover_network(
+            iface => $net->{iface},
+            cidr  => $net->{cidr},
+            (defined $ports ? (ports => $ports) : ()),
+            host_timeout => $host_timeout,
+        );
+        warn "discover $net->{cidr}: $err\n" if $err;
+        emit(%$_) for @$obs;
+    }
+}
+
+if ($do_presence) {
+    # Snapshot known v4 addresses, fping them, mark dead ones GONE.
+    die "--presence requires --listen / daemon (no --print mode)\n" if $print_only;
+    my $rows = $cli->snapshot(99, 'addresses', where => "family = 'v4'");
+    my %ips;
+    for my $r (@$rows) {
+        push @{ $ips{$r->{addr}} }, $r->{mac};
+    }
+    my @ips = sort keys %ips;
+    warn "presence-checking " . scalar(@ips) . " ips\n";
+    my $res = NetMgr::Producer::Scan::fping_presence(@ips);
+    for my $ip (@{ $res->{alive} }) {
+        for my $mac (@{ $ips{$ip} }) {
+            $cli->observe(kind => 'arp', mac => $mac, ip => $ip);
+        }
+    }
+    for my $ip (@{ $res->{dead} }) {
+        for my $mac (@{ $ips{$ip} }) {
+            $cli->send_recv("GONE mac=$mac");
+        }
+    }
+}
+
+$cli->bye if $cli;

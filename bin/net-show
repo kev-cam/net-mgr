@@ -1,0 +1,76 @@
+#!/usr/bin/perl
+# net-show — list access points and look up which AP saw a given IP.
+# (Replaces the legacy /usr/local/bin/show-ap.)
+#
+# Bare:           list APs and their SSIDs
+# -find=<ip>:     show which AP/lease saw the given IP
+# --listen H:P:   override manager address
+# --no-scan:      skip the TRIGGER scan-ap (use cached DB only)
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case no_bundling);   # support old `-find=ip`
+use NetMgr::Client;
+
+my $listen;
+my $find;
+my $no_scan;
+GetOptions(
+    'listen=s' => \$listen,
+    'find=s'   => \$find,
+    'no-scan'  => \$no_scan,
+) or die "bad options\n";
+
+my $cli = NetMgr::Client->new(listen => $listen);
+$cli->hello(consumer => "net-show.$$");
+
+unless ($no_scan) {
+    my $r = $cli->trigger("scan-ap", wait => 1);
+    if (defined $r && $r =~ /^ERR/) {
+        warn "TRIGGER scan-ap: $r\n";
+    }
+}
+
+if (defined $find) {
+    # Find which AP saw a given IP. Two paths: dhcp_leases (the AP that
+    # leased it) and addresses+associations (the AP that has the MAC associated).
+    my $leases = $cli->snapshot(1, 'dhcp_leases', where => "ip = '$find'");
+    if (@$leases) {
+        for my $l (@$leases) {
+            printf "lease: %s mac=%s hostname=%s ap_mac=%s\n",
+                $l->{ip}, $l->{mac}, ($l->{hostname}//'?'),
+                ($l->{ap_mac}//'?');
+        }
+    }
+
+    my $addrs = $cli->snapshot(2, 'addresses', where => "addr = '$find'");
+    for my $a (@$addrs) {
+        my $assoc = $cli->snapshot(3, 'associations',
+                                   where => "client_mac = '$a->{mac}'");
+        for my $as (@$assoc) {
+            printf "associated: client_mac=%s on ap_mac=%s iface=%s\n",
+                $as->{client_mac}, $as->{ap_mac}, ($as->{iface}//'?');
+        }
+    }
+
+    if (!@$leases && !@$addrs) {
+        print "no record of $find\n";
+    }
+} else {
+    # Bare: list APs with their addresses and SSIDs.
+    my $aps  = $cli->snapshot(1, 'aps');
+    my $addrs = $cli->snapshot(2, 'addresses');
+    my %ip_for;
+    for my $a (@$addrs) {
+        next unless $a->{family} eq 'v4';
+        push @{ $ip_for{$a->{mac}} }, $a->{addr};
+    }
+    for my $ap (sort { ($a->{ssid}//'') cmp ($b->{ssid}//'') } @$aps) {
+        my $ip = (sort @{ $ip_for{$ap->{mac}} || [] })[0] // '?';
+        printf "%-15s %-17s %s\n", $ip, $ap->{mac}, $ap->{ssid} // '';
+    }
+}
+
+$cli->bye;

@@ -1,0 +1,671 @@
+package NetMgr::Manager;
+# Main net-mgr daemon. Listens on a TCP socket, accepts producer
+# observations + subscriber connections, applies UPSERTs to MySQL,
+# detects state transitions, and (in stage-2) streams matching rows
+# to subscribers.
+#
+# Stage 1 (this module): producer side only.
+#   - HELLO/OBSERVE/GONE/BYE handling
+#   - DB upsert + event-logging based on change-info
+#   - ERR/OK replies
+#
+# Stage 2 will add SUBSCRIBE/UNSUB/TRIGGER and streaming.
+
+use strict;
+use warnings;
+use Carp qw(croak);
+use IO::Socket::INET;
+use IO::Select;
+use Time::HiRes qw(time);
+use FindBin ();
+use POSIX ();
+use NetMgr::Protocol qw(parse_line format_ok format_err format_row format_eos format_ready);
+use NetMgr::Where    qw(parse eval_ast);
+
+# Logical tables a SUBSCRIBE may target.
+my %SUBSCRIBABLE = map { $_ => 1 } qw(
+    machines hostnames interfaces addresses ports aps
+    associations dhcp_leases events
+);
+
+sub new {
+    my ($class, %args) = @_;
+    croak "config required" unless $args{config};
+    croak "db required"     unless $args{db};
+    my $log_fh = $args{log_fh};
+    $log_fh = \*STDERR unless defined $log_fh;
+    my $self = bless {
+        config    => $args{config},
+        db        => $args{db},
+        log_fh    => $log_fh,
+        listen    => undef,
+        select    => undef,
+        clients   => {},      # fd → { sock, source/consumer, buffer, peer }
+        triggers  => {},      # pid → { cli_fd, name, started_at } pending TRIGGER WAITs
+        stop      => 0,
+    }, $class;
+    return $self;
+}
+
+# ---- logging ----------------------------------------------------------
+# Method named _log to avoid any collision with the `log` builtin.
+
+sub _log {
+    my ($self, $msg) = @_;
+    my $fh = $self->{log_fh};
+    return unless defined $fh;
+    my $ts = _ts();
+    print {$fh} "$ts $msg\n";
+}
+
+sub _ts {
+    my @t = localtime;
+    return sprintf "%04d-%02d-%02d %02d:%02d:%02d",
+        $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0];
+}
+
+# ---- listener / loop --------------------------------------------------
+
+sub start_listener {
+    my ($self) = @_;
+    my $listen = $self->{config}{manager}{listen} || '127.0.0.1:7531';
+    my ($host, $port) = split /:/, $listen, 2;
+    my $sock = IO::Socket::INET->new(
+        LocalAddr => $host,
+        LocalPort => $port,
+        Listen    => 16,
+        ReuseAddr => 1,
+        Proto     => 'tcp',
+    ) or croak "bind $listen: $!";
+    $self->{listen} = $sock;
+    $self->{select} = IO::Select->new($sock);
+    $self->_log("listening on $listen");
+    return $sock;
+}
+
+sub stop  { $_[0]->{stop} = 1 }
+
+sub run {
+    my ($self) = @_;
+    $self->start_listener unless $self->{listen};
+
+    local $SIG{INT}  = sub { $self->stop };
+    local $SIG{TERM} = sub { $self->stop };
+    local $SIG{PIPE} = 'IGNORE';
+
+    while (!$self->{stop}) {
+        my @ready = $self->{select}->can_read(1.0);
+        for my $fh (@ready) {
+            if ($fh == $self->{listen}) {
+                $self->_accept;
+            } else {
+                $self->_handle_readable($fh);
+            }
+        }
+        $self->_reap_triggers if %{ $self->{triggers} };
+    }
+    $self->_log("shutting down");
+    for my $c (values %{ $self->{clients} }) {
+        eval { $c->{sock}->close };
+    }
+    eval { $self->{listen}->close };
+}
+
+sub _accept {
+    my ($self) = @_;
+    my $cli = $self->{listen}->accept or return;
+    $cli->blocking(0);
+    my $peer = sprintf "%s:%d", $cli->peerhost // '?', $cli->peerport // 0;
+    my $fd   = fileno($cli);
+    $self->{clients}{$fd} = {
+        sock   => $cli,
+        peer   => $peer,
+        buffer => '',
+        kind   => undef,    # 'producer' | 'consumer'
+        ident  => undef,    # source=... or consumer=...
+        subs   => {},       # id → { table, mode, where_ast }
+    };
+    $self->{select}->add($cli);
+    $self->_log("connect $peer fd=$fd");
+}
+
+sub _handle_readable {
+    my ($self, $fh) = @_;
+    my $fd  = fileno($fh);
+    my $cli = $self->{clients}{$fd} or return;
+    my $n   = sysread($fh, my $buf, 8192);
+    if (!defined $n) {
+        return if $!{EAGAIN} || $!{EWOULDBLOCK};
+        $self->_drop_client($fd, "read error: $!");
+        return;
+    }
+    if ($n == 0) {
+        $self->_drop_client($fd, 'eof');
+        return;
+    }
+    $cli->{buffer} .= $buf;
+    while ($cli->{buffer} =~ s/^([^\n]*)\n//) {
+        my $line = $1;
+        $self->_handle_line($cli, $line);
+    }
+}
+
+sub _drop_client {
+    my ($self, $fd, $why) = @_;
+    my $cli = delete $self->{clients}{$fd} or return;
+    $self->{select}->remove($cli->{sock});
+    eval { $cli->{sock}->close };
+    $self->_log("disconnect $cli->{peer} fd=$fd ($why)");
+}
+
+sub _send {
+    my ($self, $cli, $line) = @_;
+    return unless $cli && $cli->{sock};
+    my $data = "$line\n";
+    my $left = length $data;
+    my $off  = 0;
+    while ($left > 0) {
+        my $n = syswrite($cli->{sock}, $data, $left, $off);
+        if (!defined $n) {
+            return if $!{EAGAIN} || $!{EWOULDBLOCK};
+            $self->_drop_client(fileno($cli->{sock}), "write error: $!");
+            return;
+        }
+        $left -= $n; $off += $n;
+    }
+}
+
+sub _handle_line {
+    my ($self, $cli, $line) = @_;
+    my $cmd = eval { parse_line($line) };
+    if ($@) {
+        $self->_send($cli, format_err("parse: $@"));
+        $self->_log("err parse from $cli->{peer}: $@");
+        return;
+    }
+    return unless $cmd;
+
+    my $verb = $cmd->{verb};
+    if    ($verb eq 'HELLO')     { $self->_handle_hello($cli, $cmd) }
+    elsif ($verb eq 'OBSERVE')   { $self->_handle_observe($cli, $cmd) }
+    elsif ($verb eq 'GONE')      { $self->_handle_gone($cli, $cmd) }
+    elsif ($verb eq 'SUBSCRIBE') { $self->_handle_subscribe($cli, $cmd) }
+    elsif ($verb eq 'UNSUB')     { $self->_handle_unsub($cli, $cmd) }
+    elsif ($verb eq 'TRIGGER')   { $self->_handle_trigger($cli, $cmd) }
+    elsif ($verb eq 'BYE')       { $self->_drop_client(fileno($cli->{sock}), 'bye') }
+    else {
+        $self->_send($cli, format_err("verb $verb not handled"));
+    }
+}
+
+sub _handle_hello {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    if ($kv->{source}) {
+        $cli->{kind} = 'producer'; $cli->{ident} = $kv->{source};
+    } elsif ($kv->{consumer}) {
+        $cli->{kind} = 'consumer'; $cli->{ident} = $kv->{consumer};
+    } else {
+        return $self->_send($cli, format_err("HELLO needs source= or consumer="));
+    }
+    $self->_log("hello $cli->{peer} $cli->{kind}=$cli->{ident}");
+    $self->_send($cli, format_ok());
+}
+
+# ---- SUBSCRIBE / UNSUB ------------------------------------------------
+
+sub _handle_subscribe {
+    my ($self, $cli, $cmd) = @_;
+    my $sub   = $cmd->{sub};
+    my $mode  = $cmd->{mode};
+    my $table = $cmd->{table};
+    my $where = $cmd->{where};
+    return $self->_send($cli, format_err("unknown table '$table'"))
+        unless $SUBSCRIBABLE{$table};
+
+    my $where_ast = eval { NetMgr::Where::parse($where) };
+    if ($@) {
+        my $err = $@; chomp $err;
+        return $self->_send($cli, format_err("WHERE: $err"));
+    }
+
+    $cli->{subs}{$sub} = {
+        table     => $table,
+        mode      => $mode,
+        where_ast => $where_ast,
+    };
+    $self->_log("subscribe $cli->{ident} sub=$sub mode=$mode FROM $table"
+              . (defined $where ? " WHERE $where" : ''));
+
+    # Snapshot phase
+    if ($mode eq 'snapshot' || $mode eq 'snapshot+stream') {
+        my $rows = $self->{db}->query_table($table);
+        for my $row (@$rows) {
+            next if $where_ast && !eval_ast($where_ast, _row_for_match($row));
+            $self->_send($cli, format_row($sub, $table, 'snapshot', %$row));
+        }
+        $self->_send($cli, format_eos($sub));
+    }
+
+    # If snapshot-only, drop the subscription so we don't stream.
+    if ($mode eq 'snapshot') {
+        delete $cli->{subs}{$sub};
+    }
+
+    $self->_send($cli, format_ok(sub => $sub));
+}
+
+sub _handle_unsub {
+    my ($self, $cli, $cmd) = @_;
+    my $sub = $cmd->{sub};
+    if (delete $cli->{subs}{$sub}) {
+        $self->_log("unsub $cli->{ident} sub=$sub");
+        $self->_send($cli, format_ok(sub => $sub));
+    } else {
+        $self->_send($cli, format_err("no such subscription sub=$sub"));
+    }
+}
+
+# Walks every consumer's subscriptions; for each that matches table+WHERE,
+# pushes a ROW line. Called after every UPSERT/insert/event.
+sub _emit_change {
+    my ($self, %args) = @_;
+    my $table = $args{table};
+    my $op    = $args{op};
+    my $row   = $args{row} or return;
+    my $match_row = _row_for_match($row);
+
+    for my $cli (values %{ $self->{clients} }) {
+        my $subs = $cli->{subs} or next;
+        for my $sub_id (keys %$subs) {
+            my $sub = $subs->{$sub_id};
+            next unless $sub->{table} eq $table;
+            next unless $sub->{mode} eq 'stream' || $sub->{mode} eq 'snapshot+stream';
+            if ($sub->{where_ast}) {
+                next unless eval_ast($sub->{where_ast}, $match_row);
+            }
+            $self->_send($cli, format_row($sub_id, $table, $op, %$row));
+        }
+    }
+}
+
+# Convert a DB row (DATETIME strings) to a hash with epoch seconds for
+# date-shaped values, so WHERE-eval's now()/interval comparisons work.
+sub _row_for_match {
+    my ($row) = @_;
+    my %out;
+    for my $k (keys %$row) {
+        my $v = $row->{$k};
+        if (defined $v && $v =~ /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)/) {
+            require Time::Local;
+            $out{$k} = eval { Time::Local::timelocal($6, $5, $4, $3, $2-1, $1) }
+                       // $v;
+        } else {
+            $out{$k} = $v;
+        }
+    }
+    return \%out;
+}
+
+# ---- TRIGGER ---------------------------------------------------------
+
+sub _handle_trigger {
+    my ($self, $cli, $cmd) = @_;
+    my $name = $cmd->{name};
+    my $wait = $cmd->{wait};
+
+    if ($name eq 'scan-ap') {
+        my @ips = $self->_known_ap_ips;
+        return $self->_send($cli, format_err("no APs known"))
+            unless @ips;
+        my $bin = $self->_producer_path('net-poll-ap');
+        return $self->_send($cli, format_err("net-poll-ap not found at $bin"))
+            unless -x $bin;
+
+        my $pid = fork();
+        return $self->_send($cli, format_err("fork: $!"))
+            unless defined $pid;
+        if ($pid == 0) {
+            # Child: close inherited sockets, exec the producer.
+            for my $c (values %{ $self->{clients} }) {
+                close $c->{sock} if $c->{sock};
+            }
+            close $self->{listen} if $self->{listen};
+            $ENV{NET_MGR_LISTEN} = $self->{config}{manager}{listen}
+                                // '127.0.0.1:7531';
+            exec $bin, @ips;
+            exit 127;
+        }
+        $self->_log("trigger scan-ap pid=$pid ips=" . scalar(@ips)
+                  . ($wait ? ' (WAIT)' : ''));
+
+        # Don't block in waitpid — the child needs to connect back here
+        # to push observations, which we can't accept while blocked.
+        # Record the pending trigger; the main loop reaps it.
+        $self->{triggers}{$pid} = {
+            cli_fd     => ($wait ? fileno($cli->{sock}) : undef),
+            name       => $name,
+            started_at => time(),
+        };
+        $self->_send($cli, format_ok(name => $name, pid => $pid))
+            unless $wait;
+        return;
+    }
+
+    if ($name eq 'discover') {
+        my $bin = $self->_producer_path('net-discover');
+        return $self->_send($cli, format_err("net-discover not found at $bin"))
+            unless -x $bin;
+        my @args = ('--discover');
+        if ($cmd->{kv}{network}) {
+            push @args, '--network', $cmd->{kv}{network};
+        }
+        my $pid = fork();
+        return $self->_send($cli, format_err("fork: $!"))
+            unless defined $pid;
+        if ($pid == 0) {
+            for my $c (values %{ $self->{clients} }) {
+                close $c->{sock} if $c->{sock};
+            }
+            close $self->{listen} if $self->{listen};
+            $ENV{NET_MGR_LISTEN} = $self->{config}{manager}{listen}
+                                // '127.0.0.1:7531';
+            exec $bin, @args;
+            exit 127;
+        }
+        $self->_log("trigger discover pid=$pid args=@args"
+                  . ($wait ? ' (WAIT)' : ''));
+        $self->{triggers}{$pid} = {
+            cli_fd     => ($wait ? fileno($cli->{sock}) : undef),
+            name       => $name,
+            started_at => time(),
+        };
+        $self->_send($cli, format_ok(name => $name, pid => $pid))
+            unless $wait;
+        return;
+    }
+
+    if ($name eq 'probe-host') {
+        return $self->_send($cli, format_err("trigger '$name' not yet implemented"));
+    }
+
+    $self->_send($cli, format_err("unknown trigger '$name'"));
+}
+
+# Non-blocking reap of any TRIGGER children that have exited.
+# For WAIT triggers, sends READY to the waiting client (if still connected).
+sub _reap_triggers {
+    my ($self) = @_;
+    while ((my $pid = waitpid(-1, POSIX::WNOHANG())) > 0) {
+        my $exit = $? >> 8;
+        my $t = delete $self->{triggers}{$pid};
+        next unless $t;
+        $self->_log("trigger $t->{name} pid=$pid done exit=$exit"
+                  . " elapsed=" . (time() - $t->{started_at}) . "s");
+        next unless defined $t->{cli_fd};
+        my $cli = $self->{clients}{ $t->{cli_fd} };
+        next unless $cli;
+        $self->_send($cli, format_ready(name => $t->{name}, pid => $pid,
+                                        exit => $exit));
+    }
+}
+
+# Returns sorted unique v4 addresses for known APs.
+sub _known_ap_ips {
+    my ($self) = @_;
+    my $rows = $self->{db}->dbh->selectall_arrayref(
+        "SELECT DISTINCT ad.addr
+           FROM aps a JOIN addresses ad ON ad.mac = a.mac
+          WHERE ad.family = 'v4'
+          ORDER BY ad.addr",
+        { Slice => {} }
+    );
+    return map { $_->{addr} } @$rows;
+}
+
+# Locate a sibling producer binary. Looks at config[paths] first, then
+# alongside the daemon under sbin/../bin/.
+sub _producer_path {
+    my ($self, $name) = @_;
+    my $cfg_path = $self->{config}{paths}{$name};
+    return $cfg_path if $cfg_path;
+    # Source-tree layout: lib/NetMgr/Manager.pm → ../../bin/<name>
+    require File::Basename;
+    my $here = File::Basename::dirname(__FILE__);
+    for my $cand ("$here/../../bin/$name",
+                  "$FindBin::Bin/../bin/$name",
+                  "/usr/local/bin/$name") {
+        return $cand if -x $cand;
+    }
+    return "$here/../../bin/$name";   # report this in the error
+}
+
+# ---- upsert + emit wrappers ------------------------------------------
+# Keeps the OBSERVE handlers tidy and ensures every change reaches
+# subscribers. $table is the logical table name; $method is the DB
+# method (e.g. 'upsert_interface').
+
+sub _upsert {
+    my ($self, $table, $method, %args) = @_;
+    my $r = $self->{db}->$method(%args);
+    if ($r->{op} && $r->{op} ne 'noop' && $r->{now}) {
+        $self->_emit_change(table => $table, op => $r->{op}, row => $r->{now});
+    }
+    return $r;
+}
+
+sub _log_event {
+    my ($self, %ev) = @_;
+    my $id = $self->{db}->log_event(%ev);
+    $self->_log("event $ev{type} mac=" . ($ev{mac} // '-')
+                                . " addr=" . ($ev{addr} // '-'));
+    # Re-fetch the row so subscribers see exactly what's persisted.
+    my $row = $self->{db}->dbh->selectrow_hashref(
+        "SELECT * FROM events WHERE id = ?", undef, $id);
+    $self->_emit_change(table => 'events', op => 'insert', row => $row) if $row;
+    return $id;
+}
+
+# ---- OBSERVE dispatch ------------------------------------------------
+
+sub _handle_observe {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my $kind = $kv->{kind} // '';
+    my @events;
+    eval {
+        if    ($kind eq 'ap_self')     { @events = $self->_obs_ap_self($cli, $kv) }
+        elsif ($kind eq 'association') { @events = $self->_obs_association($cli, $kv) }
+        elsif ($kind eq 'arp')         { @events = $self->_obs_arp($cli, $kv) }
+        elsif ($kind eq 'lease')       { @events = $self->_obs_lease($cli, $kv) }
+        elsif ($kind eq 'host')        { @events = $self->_obs_host($cli, $kv) }
+        elsif ($kind eq 'port')        { @events = $self->_obs_port($cli, $kv) }
+        else {
+            die "unknown observation kind '$kind'\n";
+        }
+    };
+    if ($@) {
+        my $err = $@; chomp $err;
+        $self->_send($cli, format_err($err));
+        $self->_log("err observe from $cli->{ident}: $err");
+        return;
+    }
+    for my $e (@events) {
+        $self->_log_event(%$e);
+    }
+    $self->_send($cli, format_ok());
+}
+
+sub _handle_gone {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my $mac = $kv->{mac};
+    return $self->_send($cli, format_err("GONE needs mac=")) unless $mac;
+    my $r = $self->_upsert('interfaces', 'upsert_interface',
+                           mac => $mac, online => 0);
+    if ($r->{op} eq 'update' && grep { $_ eq 'online' } @{ $r->{changed_fields} }) {
+        $self->_log_event(type => 'interface_offline', mac => $mac);
+    }
+    $self->_send($cli, format_ok());
+}
+
+# ---- per-kind observation handlers -----------------------------------
+
+# Returns: list of event hashrefs to log.
+sub _events_from_iface_change {
+    my ($r, $extra_addr) = @_;
+    my @ev;
+    if ($r->{op} eq 'insert') {
+        push @ev, { type => 'interface_new', mac => $r->{now}{mac},
+                    addr => $extra_addr };
+        if ($r->{now}{online}) {
+            push @ev, { type => 'interface_online', mac => $r->{now}{mac},
+                        addr => $extra_addr };
+        }
+    } elsif ($r->{op} eq 'update'
+             && grep { $_ eq 'online' } @{ $r->{changed_fields} }) {
+        push @ev, {
+            type => $r->{now}{online} ? 'interface_online' : 'interface_offline',
+            mac  => $r->{now}{mac},
+            addr => $extra_addr,
+        };
+    }
+    return @ev;
+}
+
+sub _obs_ap_self {
+    my ($self, $cli, $kv) = @_;
+    my $mac = $kv->{mac} or die "ap_self: mac required (br0 not parsed?)\n";
+    my @ev;
+    my $iface = $self->_upsert('interfaces', 'upsert_interface',
+        mac => $mac, kind => 'wifi', online => 1);
+    push @ev, _events_from_iface_change($iface, $kv->{ip});
+
+    if ($kv->{ip}) {
+        my $a = $self->_upsert('addresses', 'upsert_address',
+            mac => $mac, family => 'v4', addr => $kv->{ip});
+        if ($a->{op} eq 'insert') {
+            push @ev, { type => 'address_added', mac => $mac, addr => $kv->{ip} };
+        }
+    }
+    $self->_upsert('aps', 'upsert_ap',
+        mac => $mac, ssid => $kv->{ssid},
+        model => $kv->{model}, board => $kv->{board});
+    return @ev;
+}
+
+sub _obs_association {
+    my ($self, $cli, $kv) = @_;
+    my $client_mac = $kv->{client_mac} or die "association: client_mac required\n";
+    my $ap_ip      = $kv->{ap_ip};
+    my @ev;
+
+    my $iface = $self->_upsert('interfaces', 'upsert_interface',
+        mac => $client_mac, kind => 'wifi', online => 1);
+    push @ev, _events_from_iface_change($iface);
+
+    # Resolve ap_ip → ap_mac via aps/addresses join.
+    my $ap_mac;
+    if ($ap_ip) {
+        my $row = $self->{db}->dbh->selectrow_array(
+            "SELECT a.mac FROM aps a
+               JOIN addresses ad ON ad.mac = a.mac
+              WHERE ad.addr = ? LIMIT 1", undef, $ap_ip);
+        $ap_mac = $row;
+    }
+    if ($ap_mac) {
+        my $r = $self->_upsert('associations', 'upsert_association',
+            ap_mac     => $ap_mac,
+            client_mac => $client_mac,
+            iface      => $kv->{iface},
+            signal     => $kv->{signal},
+        );
+        if ($r->{op} eq 'insert') {
+            push @ev, { type => 'ap_associated', mac => $client_mac,
+                        details => qq({"ap_mac":"$ap_mac"}) };
+        }
+    }
+    return @ev;
+}
+
+sub _obs_arp {
+    my ($self, $cli, $kv) = @_;
+    my $mac = $kv->{mac} or die "arp: mac required\n";
+    my $ip  = $kv->{ip}  or die "arp: ip required\n";
+    my @ev;
+    my $iface = $self->_upsert('interfaces', 'upsert_interface',
+        mac => $mac, kind => 'ethernet', online => 1);
+    push @ev, _events_from_iface_change($iface, $ip);
+    my $a = $self->_upsert('addresses', 'upsert_address',
+        mac => $mac, family => 'v4', addr => $ip);
+    if ($a->{op} eq 'insert') {
+        push @ev, { type => 'address_added', mac => $mac, addr => $ip };
+    }
+    return @ev;
+}
+
+sub _obs_lease {
+    my ($self, $cli, $kv) = @_;
+    my $mac = $kv->{mac} or die "lease: mac required\n";
+    my $ip  = $kv->{ip}  or die "lease: ip required\n";
+    my @ev;
+    my $iface = $self->_upsert('interfaces', 'upsert_interface',
+        mac => $mac, online => 1);
+    push @ev, _events_from_iface_change($iface, $ip);
+    my $a = $self->_upsert('addresses', 'upsert_address',
+        mac => $mac, family => 'v4', addr => $ip);
+    if ($a->{op} eq 'insert') {
+        push @ev, { type => 'address_added', mac => $mac, addr => $ip };
+    }
+    $self->_upsert('dhcp_leases', 'upsert_lease',
+        mac      => $mac,
+        ip       => $ip,
+        hostname => $kv->{hostname},
+        expires  => $kv->{expires},
+    );
+    return @ev;
+}
+
+sub _obs_host {
+    my ($self, $cli, $kv) = @_;
+    # generic host observation (e.g. from net-discover)
+    my $mac = $kv->{mac};
+    my $ip  = $kv->{ip};
+    my @ev;
+    if ($mac) {
+        my $iface = $self->_upsert('interfaces', 'upsert_interface',
+            mac    => $mac,
+            kind   => $kv->{iface_kind} // 'ethernet',
+            vendor => $kv->{vendor},
+            online => 1,
+        );
+        push @ev, _events_from_iface_change($iface, $ip);
+        if ($ip) {
+            my $a = $self->_upsert('addresses', 'upsert_address',
+                mac => $mac, family => $kv->{family} // 'v4', addr => $ip);
+            if ($a->{op} eq 'insert') {
+                push @ev, { type => 'address_added', mac => $mac, addr => $ip };
+            }
+        }
+    }
+    return @ev;
+}
+
+sub _obs_port {
+    my ($self, $cli, $kv) = @_;
+    my $mac  = $kv->{mac}  or die "port: mac required\n";
+    my $port = $kv->{port}; defined $port or die "port: port required\n";
+    my @ev;
+    my $r = $self->_upsert('ports', 'upsert_port',
+        mac => $mac, port => $port,
+        proto => $kv->{proto} // 'tcp',
+        service => $kv->{service},
+    );
+    if ($r->{op} eq 'insert') {
+        push @ev, { type => 'port_opened', mac => $mac,
+                    details => qq({"port":$port}) };
+    }
+    return @ev;
+}
+
+1;
