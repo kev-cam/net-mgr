@@ -6,6 +6,7 @@ package NetMgr::Producer::Scan;
 use strict;
 use warnings;
 use Carp qw(croak);
+use NetMgr::Vendor qw(shorten);
 
 # Default port list — same shape as the legacy scan-network's set.
 our @DEFAULT_PORTS = qw(22 23 25 53 80 443 515 554 2222 3389
@@ -71,7 +72,7 @@ sub discover_network {
         }
         elsif ($cur_ip && $line =~ /^MAC Address:\s+(\S+)\s+\((.*)\)/) {
             $hosts{$cur_ip}{mac}    = lc $1;
-            $hosts{$cur_ip}{vendor} = $2 eq 'Unknown' ? undef : $2;
+            $hosts{$cur_ip}{vendor} = $2 eq 'Unknown' ? undef : shorten($2);
         }
         elsif ($cur_ip && $line =~ m{^(\d+)/(tcp|udp)\s+open\s*(.*)}) {
             push @{ $hosts{$cur_ip}{ports} },

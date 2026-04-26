@@ -24,6 +24,7 @@ use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
 use Sys::Hostname qw(hostname);
 use NetMgr::Producer::DhcpMaster;
+use NetMgr::Subnets;
 use NetMgr::Client;
 
 my $MASTER = '/etc/net-mgr/dhcp.master';
@@ -103,11 +104,16 @@ unless ($subnet) {
         die "no subnets in $MASTER and --subnet not given\n";
     }
     print "available subnets:\n";
+    NetMgr::Subnets::load();
     for my $i (0..$#master_subnets) {
         my $s = $master_subnets[$i];
         my @ranges = map { "$_->[0]-$_->[1]" } @{ $s->{ranges} };
-        printf "  %d) %s/%s   dynamic: %s\n",
-            $i+1, $s->{net}, $s->{mask},
+        my $name = '';
+        if (my $sn = NetMgr::Subnets::lookup("$s->{net}/24")) {
+            $name = "  ($sn->{name})";
+        }
+        printf "  %d) %s/%s%s   dynamic: %s\n",
+            $i+1, $s->{net}, $s->{mask}, $name,
             (@ranges ? join(',', @ranges) : '(none)');
     }
     print "subnet number: ";

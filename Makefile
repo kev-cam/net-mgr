@@ -22,6 +22,7 @@ BINS  = net-poll-ap net-discover net-import-dhcp net-fix net-scan net-report net
 SBINS = net-mgr net-mgr-setup
 LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \
         NetMgr/Manager.pm NetMgr/Client.pm \
+        NetMgr/Vendor.pm NetMgr/Subnets.pm \
         NetMgr/Producer/AP.pm NetMgr/Producer/Scan.pm \
         NetMgr/Producer/DhcpMaster.pm
 
