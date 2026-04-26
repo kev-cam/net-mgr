@@ -18,11 +18,12 @@ SHAREDIR   ?= $(PREFIX)/share/net-mgr
 SYSCONFDIR ?= /etc
 DESTDIR    ?=
 
-BINS  = net-poll-ap net-discover net-scan net-report net-show
+BINS  = net-poll-ap net-discover net-import-dhcp net-scan net-report net-show
 SBINS = net-mgr net-mgr-setup
 LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \
         NetMgr/Manager.pm NetMgr/Client.pm \
-        NetMgr/Producer/AP.pm NetMgr/Producer/Scan.pm
+        NetMgr/Producer/AP.pm NetMgr/Producer/Scan.pm \
+        NetMgr/Producer/DhcpMaster.pm
 
 INSTALL ?= install
 

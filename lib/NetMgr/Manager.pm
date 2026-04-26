@@ -670,7 +670,7 @@ sub _obs_lease {
 
 sub _obs_host {
     my ($self, $cli, $kv) = @_;
-    # generic host observation (e.g. from net-discover)
+    # generic host observation (e.g. from net-discover or net-import-dhcp)
     my $mac = $kv->{mac};
     my $ip  = $kv->{ip};
     my @ev;
@@ -689,6 +689,13 @@ sub _obs_host {
             if ($a->{op} eq 'insert') {
                 push @ev, { type => 'address_added', mac => $mac, addr => $ip };
             }
+        }
+        # Producer supplied a hostname (e.g. dhcp.master importer) →
+        # promote to a machine identity. name_source classifies the
+        # hostnames row ('dhcp.master', 'dhcp.extra', 'config', ...).
+        if ($kv->{name}) {
+            $self->_associate_machine(
+                $mac, $kv->{name}, $kv->{name_source} // 'config');
         }
     }
     return @ev;

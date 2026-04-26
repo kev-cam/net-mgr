@@ -1,0 +1,90 @@
+#!/usr/bin/perl
+# net-import-dhcp — read /etc/net-mgr/dhcp.master (and dhcp.extra) and push
+# each host reservation into net-mgr as a `kind=host` observation.
+#
+# Usage:
+#   net-import-dhcp                          # both files (master + extra)
+#   net-import-dhcp --file FILE              # just one file
+#   net-import-dhcp --print                  # dump observations to stdout
+#   net-import-dhcp --listen HOST:PORT       # override manager address
+#
+# Address source string is `<this_host>:<basename of file>` so that a
+# subsequent AP-lease observation can't downgrade the file-curated entry.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use File::Basename qw(basename);
+use Sys::Hostname qw(hostname);
+use NetMgr::Producer::DhcpMaster;
+use NetMgr::Client;
+use NetMgr::Protocol qw(format_kv);
+
+my @files;
+my $print_only;
+my $listen;
+GetOptions(
+    'file=s@'   => \@files,
+    'print'     => \$print_only,
+    'listen=s'  => \$listen,
+) or die "bad options\n";
+
+unless (@files) {
+    @files = grep { -f $_ } qw(/etc/net-mgr/dhcp.master /etc/net-mgr/dhcp.extra);
+    die "no input files (looked for dhcp.master and dhcp.extra under /etc/net-mgr/)\n"
+        unless @files;
+}
+
+my $my_host = (split /\./, hostname())[0];
+
+my $cli;
+unless ($print_only) {
+    $cli = NetMgr::Client->new(listen => $listen);
+    $cli->hello(source => "net-import-dhcp", pid => $$);
+}
+
+my $imported = 0;
+my $skipped  = 0;
+for my $file (@files) {
+    my $bname = basename($file);   # 'dhcp.master' or 'dhcp.extra'
+    my $src   = "$my_host:$bname";
+    my @hosts = NetMgr::Producer::DhcpMaster::hosts_only(
+                   NetMgr::Producer::DhcpMaster::parse_file($file));
+    print STDERR "$file: ", scalar(@hosts), " host blocks\n";
+
+    for my $h (@hosts) {
+        # Skip the `deadend` sentinel — it's a black-hole MAC used to
+        # null-route traffic between subnets, not a real device.
+        if ($h->{name} eq 'deadend' || $h->{mac} eq '12:34:56:78:90:ab') {
+            $skipped++;
+            next;
+        }
+        my %kv = (
+            kind        => 'host',
+            mac         => $h->{mac},
+            ip          => $h->{ip},
+            family      => 'v4',
+            name        => $h->{name},
+            name_source => $bname,
+            source      => $src,
+        );
+        if ($print_only) {
+            print "OBSERVE ", format_kv(%kv), "\n";
+        } else {
+            my $r = $cli->observe(%kv);
+            if ($r && $r =~ /^ERR/) {
+                warn "observe rejected for $h->{name}: $r\n";
+                $skipped++;
+            } else {
+                $imported++;
+            }
+        }
+    }
+}
+
+if ($cli) {
+    $cli->bye;
+    print STDERR "imported=$imported skipped=$skipped\n";
+}
