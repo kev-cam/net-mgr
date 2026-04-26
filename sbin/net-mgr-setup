@@ -182,7 +182,8 @@ print "Wrote [$SECTION] to $MYCNF (mode 0600).\n";
 print "Verifying connection through DBI...\n";
 require NetMgr::DB;
 my $db = NetMgr::DB->new(defaults_file => $MYCNF, section => $SECTION,
-                        db => $DBNAME);
+                        db => $DBNAME,
+                        schema_dir => "$FindBin::Bin/../sql");
 $db->connect;
 my $v = $db->bootstrap_schema;
 print "Schema bootstrapped to v$v.\n";
