@@ -26,7 +26,42 @@ LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \
 
 INSTALL ?= install
 
-.PHONY: list install setup uninstall test check clean help
+.PHONY: list install setup deps uninstall test check clean help
+
+# --- dependency check (Debian/Ubuntu apt names) ----------------------
+# Each check_X writes its apt package name to $$miss if its probe fails.
+# `make deps` exits 1 with an apt install command when anything is missing.
+
+deps:
+	@miss=""; \
+	check() { \
+	  if /bin/sh -c "$$1" >/dev/null 2>&1; then \
+	    printf "  ok      %-20s %s\n" "$$2" "$$3"; \
+	  else \
+	    printf "  MISSING %-20s %s\n" "$$2" "$$3"; \
+	    miss="$$miss $$2"; \
+	  fi; \
+	}; \
+	check 'command -v nmap'           nmap              'nmap (discovery sweep)'; \
+	check 'command -v fping'          fping             'fping (presence check)'; \
+	check 'command -v ssh'            openssh-client    'ssh client (AP polling)'; \
+	check 'command -v ip'             iproute2          'ip command (auto-detect networks)'; \
+	check 'command -v mysql'          mariadb-client    'mysql client (setup script)'; \
+	check 'perl -MDBI -e 1'           libdbi-perl       'Perl DBI'; \
+	check 'perl -MDBD::mysql -e 1'    libdbd-mysql-perl 'Perl DBD::mysql'; \
+	check 'dpkg -l mariadb-server 2>/dev/null | grep -q "^ii " || dpkg -l mysql-server 2>/dev/null | grep -q "^ii "' \
+	                                  mariadb-server    'MySQL/MariaDB server'; \
+	miss=$$(echo $$miss | tr ' ' '\n' | sort -u | tr '\n' ' '); \
+	miss=$${miss% }; miss=$${miss# }; \
+	if [ -n "$$miss" ]; then \
+	  echo; \
+	  echo "install missing packages with:"; \
+	  echo "  sudo apt install -y $$miss"; \
+	  exit 1; \
+	else \
+	  echo; \
+	  echo "all dependencies present"; \
+	fi
 
 # --- default: dry-run listing ----------------------------------------
 list:
@@ -53,9 +88,12 @@ list:
 	@echo "  (run 'make setup' standalone to do just this step)"
 	@echo
 	@echo "vars: PREFIX=$(PREFIX)  DESTDIR=$(DESTDIR)  SYSCONFDIR=$(SYSCONFDIR)"
+	@echo
+	@echo "--- dependency check ---"
+	@$(MAKE) -s deps || true
 
 # --- install ----------------------------------------------------------
-install:
+install: deps
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(SBINDIR)
 	$(INSTALL) -d $(DESTDIR)$(PERL5DIR)/NetMgr/Producer
