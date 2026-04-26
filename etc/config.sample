@@ -44,7 +44,8 @@ oui_csv           = /var/lib/ieee-data/oui.csv
 # Primary listen address. Default UDP/53 needs root or CAP_NET_BIND_SERVICE.
 listen   = 0.0.0.0:53
 # Fallback port if the primary bind fails (e.g. dnsmasq already on :53).
-fallback = 5353
+# 5353 collides with mDNS/avahi-daemon — using 5333 by default.
+fallback = 5333
 # Upstream forwarders for queries we can't answer locally.
 # 'auto' parses /etc/resolv.conf (skipping 127.0.0.0/8).
 upstream = auto

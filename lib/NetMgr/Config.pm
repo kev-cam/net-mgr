@@ -51,8 +51,9 @@ my %DEFAULTS = (
         machines => {},
     },
     dns => {
-        listen   => '0.0.0.0:53',  # primary bind
-        fallback => 5353,           # tried if primary fails (perms or busy)
+        listen   => '0.0.0.0:53',   # primary bind
+        fallback => 5333,           # tried if primary fails (perms or busy);
+                                    # 5353 collides with mDNS/avahi
         upstream => 'auto',         # 'auto' = parse /etc/resolv.conf
         ttl      => 60,             # seconds for replies we generate
         domain   => '',             # e.g. 'grfx.com' for FQDN handling
