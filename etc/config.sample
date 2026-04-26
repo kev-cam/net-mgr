@@ -40,6 +40,19 @@ dhcp  = lease     # special: use the lease's own expiry
 dnsmasq_conf_glob = /usr/local/sgy/conf.d/dnsmasq-*
 oui_csv           = /var/lib/ieee-data/oui.csv
 
+[dns]
+# Primary listen address. Default UDP/53 needs root or CAP_NET_BIND_SERVICE.
+listen   = 0.0.0.0:53
+# Fallback port if the primary bind fails (e.g. dnsmasq already on :53).
+fallback = 5353
+# Upstream forwarders for queries we can't answer locally.
+# 'auto' parses /etc/resolv.conf (skipping 127.0.0.0/8).
+upstream = auto
+# TTL (seconds) we attach to records we synthesize from the DB.
+ttl      = 60
+# Domain suffix to strip from FQDNs before lookup; empty means none.
+domain   = grfx.com
+
 # Manual machine groupings — interfaces auto-correlate when they share
 # an SSH hostname or appear together in dnsmasq config; everything else
 # goes here. Reloaded on SIGHUP.

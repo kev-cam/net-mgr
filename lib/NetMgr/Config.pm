@@ -50,6 +50,13 @@ my %DEFAULTS = (
     bindings => {
         machines => {},
     },
+    dns => {
+        listen   => '0.0.0.0:53',  # primary bind
+        fallback => 5353,           # tried if primary fails (perms or busy)
+        upstream => 'auto',         # 'auto' = parse /etc/resolv.conf
+        ttl      => 60,             # seconds for replies we generate
+        domain   => '',             # e.g. 'grfx.com' for FQDN handling
+    },
 );
 
 # Per-section, which keys should be coerced to integer seconds.
@@ -57,6 +64,7 @@ my %DURATION_KEYS = (
     scanner  => { presence_interval => 1, discover_interval => 1, reprobe_ports => 1 },
     ap_poll  => { interval => 1, ssh_timeout => 1 },
     timeouts => { ap => 1, fping => 1, nmap => 1, dhcp => 1 },
+    dns      => { ttl => 1 },
 );
 
 sub load {

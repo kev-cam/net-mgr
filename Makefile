@@ -19,7 +19,7 @@ SYSCONFDIR ?= /etc
 DESTDIR    ?=
 
 BINS  = net-alias net-poll-ap net-discover net-import-dhcp net-fix net-scan net-report net-show
-SBINS = net-mgr net-mgr-setup
+SBINS = net-mgr net-mgr-setup net-dns
 LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \
         NetMgr/Manager.pm NetMgr/Client.pm NetMgr/Resolver.pm \
         NetMgr/Vendor.pm NetMgr/Subnets.pm \
@@ -51,6 +51,7 @@ deps:
 	check 'command -v mysql'          mariadb-client    'mysql client (setup script)'; \
 	check 'perl -MDBI -e 1'           libdbi-perl       'Perl DBI'; \
 	check 'perl -MDBD::mysql -e 1'    libdbd-mysql-perl 'Perl DBD::mysql'; \
+	check 'perl -MNet::DNS -e 1'      libnet-dns-perl   'Net::DNS (for sbin/net-dns)'; \
 	check 'dpkg -l mariadb-server 2>/dev/null | grep -q "^ii " || dpkg -l mysql-server 2>/dev/null | grep -q "^ii "' \
 	                                  mariadb-server    'MySQL/MariaDB server'; \
 	miss=$$(echo $$miss | tr ' ' '\n' | sort -u | tr '\n' ' '); \

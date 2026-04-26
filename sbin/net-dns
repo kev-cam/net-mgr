@@ -1,0 +1,177 @@
+#!/usr/bin/perl
+# net-dns — DNS server backed by net-mgr's DB.
+#
+# Reads /etc/net-mgr/config for the [dns] section. Tries to bind the
+# configured primary port; if that fails (permissions or port busy),
+# falls back to the configured fallback port. Forwards anything we
+# can't answer locally to the upstream resolvers.
+#
+# Resolution order (NetMgr::Resolver):
+#   1. exact alias hit
+#   2. <name>-* hostnames whose address is in caller's subnet
+#   3. exact <name> hostname/primary_name (preferring caller's subnet)
+#   4. forward to upstream
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use IO::Socket::INET;
+
+eval { require Net::DNS::Nameserver; require Net::DNS::Resolver;
+       require Net::DNS::RR; 1 }
+    or die "net-dns needs Net::DNS — install libnet-dns-perl\n";
+
+use NetMgr::Config;
+use NetMgr::DB;
+use NetMgr::Resolver;
+
+my $conf_path  = $ENV{NET_MGR_CONF} // '/etc/net-mgr/config';
+my $foreground = 0;
+GetOptions(
+    'config=s'      => \$conf_path,
+    'foreground|f'  => \$foreground,
+) or die "bad options\n";
+
+my $cfg = NetMgr::Config->load($conf_path);
+my $dns = $cfg->{dns} // {};
+my $listen   = $dns->{listen}   // '0.0.0.0:53';
+my $fallback = $dns->{fallback} // 5353;
+my $upstream = $dns->{upstream} // 'auto';
+my $ttl      = $dns->{ttl}      // 60;
+my $domain   = $dns->{domain}   // '';
+my ($lhost, $lport) = split /:/, $listen, 2;
+$lhost //= '0.0.0.0';
+$lport //= 53;
+
+# ---- DB connection --------------------------------------------------
+my $mycnf = $cfg->{mysql}{defaults} // '/root/.my.cnf';
+unless (-r $mycnf) {
+    $mycnf = "$ENV{HOME}/.my.cnf" if -r "$ENV{HOME}/.my.cnf";
+}
+die "no readable .my.cnf for [net-mgr]\n" unless -r $mycnf;
+
+my $db = NetMgr::DB->new(
+    defaults_file => $mycnf,
+    section       => $cfg->{mysql}{section} // 'net-mgr',
+    db            => $cfg->{mysql}{db}      // 'netmgr',
+);
+$db->connect;
+
+# ---- upstream resolver ---------------------------------------------
+my @upstreams;
+if ($upstream eq 'auto') {
+    @upstreams = parse_resolv_conf();
+} else {
+    @upstreams = grep { length } split /[,\s]+/, $upstream;
+}
+my $forwarder;
+if (@upstreams) {
+    $forwarder = Net::DNS::Resolver->new(
+        nameservers => \@upstreams, recurse => 1, retry => 1,
+    );
+}
+
+# ---- choose port (primary, then fallback) --------------------------
+my $bind_port = $lport;
+unless (port_bindable_udp($lhost, $lport)) {
+    warn "[net-dns] cannot bind UDP $lhost:$lport — trying fallback $fallback\n";
+    port_bindable_udp($lhost, $fallback)
+        or die "[net-dns] fallback UDP $lhost:$fallback also unavailable\n";
+    $bind_port = $fallback;
+}
+
+my $ns = Net::DNS::Nameserver->new(
+    LocalAddr    => $lhost,
+    LocalPort    => $bind_port,
+    ReplyHandler => \&handler,
+    Verbose      => 0,
+) or die "[net-dns] Net::DNS::Nameserver setup failed\n";
+
+print STDERR "[net-dns] listening on $lhost:$bind_port; "
+           . "upstream=" . (@upstreams ? join(',', @upstreams) : 'none') . "\n";
+
+unless ($foreground) {
+    my $pid = fork; die "fork: $!" unless defined $pid;
+    exit 0 if $pid;
+    require POSIX; POSIX::setsid();
+    open STDIN,  '<',  '/dev/null';
+    open STDOUT, '>>', '/dev/null';
+}
+$ns->main_loop;
+
+# ---- handlers -------------------------------------------------------
+
+sub handler {
+    my ($qname, $qclass, $qtype, $peerhost, $query, $conn) = @_;
+    return ('NOTIMP', [], [], [], {}) if $qclass ne 'IN';
+
+    # Strip configured domain suffix to get bare name (case-insensitive).
+    my $name = $qname;
+    if ($domain) {
+        if ($name =~ /^(.+)\.\Q$domain\E\.?$/i) { $name = $1 }
+    }
+
+    if ($qtype eq 'A' || $qtype eq 'AAAA') {
+        my $family = $qtype eq 'A' ? 'v4' : 'v6';
+        my @ips = NetMgr::Resolver::resolve($db, $name,
+            from_ip => $peerhost, family => $family);
+        if (@ips) {
+            my @rr = map { Net::DNS::RR->new("$qname. $ttl IN $qtype $_") } @ips;
+            return ('NOERROR', \@rr, [], [], { aa => 1 });
+        }
+    }
+    elsif ($qtype eq 'PTR'
+        && $qname =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)\.in-addr\.arpa\.?$/i)
+    {
+        my $ip = "$4.$3.$2.$1";
+        my @names = NetMgr::Resolver::reverse_lookup($db, $ip);
+        if (@names) {
+            my $fqn = $domain ? "$names[0].$domain" : $names[0];
+            my @rr = (Net::DNS::RR->new("$qname. $ttl IN PTR $fqn."));
+            return ('NOERROR', \@rr, [], [], { aa => 1 });
+        }
+    }
+
+    # Forward upstream if we have forwarders configured.
+    if ($forwarder) {
+        my $reply = eval { $forwarder->send($qname, $qtype, $qclass) };
+        if ($reply) {
+            return (
+                $reply->header->rcode,
+                [ $reply->answer ],
+                [ $reply->authority ],
+                [ $reply->additional ],
+                { aa => 0, ra => 1 },
+            );
+        }
+    }
+    return ('NXDOMAIN', [], [], [], {});
+}
+
+# ---- helpers --------------------------------------------------------
+
+sub port_bindable_udp {
+    my ($h, $p) = @_;
+    my $s = IO::Socket::INET->new(
+        LocalAddr => $h, LocalPort => $p,
+        Proto => 'udp', ReuseAddr => 1,
+    );
+    return 0 unless $s;
+    close $s;
+    return 1;
+}
+
+sub parse_resolv_conf {
+    my @s;
+    open my $fh, '<', '/etc/resolv.conf' or return ();
+    while (my $line = <$fh>) {
+        next unless $line =~ /^\s*nameserver\s+(\S+)/;
+        my $ns = $1;
+        next if $ns =~ /^127\./;
+        push @s, $ns;
+    }
+    close $fh;
+    return @s;
+}
