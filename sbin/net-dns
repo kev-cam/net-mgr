@@ -82,16 +82,12 @@ unless (port_bindable_udp($lhost, $lport)) {
     $bind_port = $fallback;
 }
 
-my $ns = Net::DNS::Nameserver->new(
-    LocalAddr    => $lhost,
-    LocalPort    => $bind_port,
-    ReplyHandler => \&handler,
-    Verbose      => 0,
-) or die "[net-dns] Net::DNS::Nameserver setup failed\n";
-
-print STDERR "[net-dns] listening on $lhost:$bind_port; "
+print STDERR "[net-dns] starting on $lhost:$bind_port; "
            . "upstream=" . (@upstreams ? join(',', @upstreams) : 'none') . "\n";
 
+# Daemonize FIRST: Net::DNS::Nameserver caches $$ in its constructor and
+# start_server refuses to run in a subprocess. So fork (if requested)
+# before creating the nameserver object.
 unless ($foreground) {
     my $pid = fork; die "fork: $!" unless defined $pid;
     exit 0 if $pid;
@@ -99,6 +95,13 @@ unless ($foreground) {
     open STDIN,  '<',  '/dev/null';
     open STDOUT, '>>', '/dev/null';
 }
+
+my $ns = Net::DNS::Nameserver->new(
+    LocalAddr    => $lhost,
+    LocalPort    => $bind_port,
+    ReplyHandler => \&handler,
+    Verbose      => 0,
+) or die "[net-dns] Net::DNS::Nameserver setup failed\n";
 
 # In libnet-dns-perl 1.44+, main_loop is gone; start_server forks per
 # listen address and returns. Parent keeps the workers parented.
