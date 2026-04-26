@@ -33,14 +33,31 @@ GetOptions(
     'columns=s' => \$columns,
 ) or die "bad options\n";
 
+my @TABLES = qw(machines hostnames interfaces addresses ports aps
+                associations dhcp_leases events);
+
 my $table = shift @ARGV or die usage();
+unless (grep { $_ eq $table } @TABLES) {
+    die "unknown table '$table'\n\n" . usage();
+}
 my $where = @ARGV ? join(' ', @ARGV) : undef;
 my @cols  = $columns ? split(/,/, $columns) : ();
 
 sub usage {
     return "usage:\n"
          . "  net-report <table> [WHERE ...]\n"
-         . "  net-report events --tail [WHERE ...]\n";
+         . "  net-report events --tail [WHERE ...]\n"
+         . "  net-report <table> --columns COL,COL,...\n"
+         . "  net-report --listen HOST:PORT <table>\n"
+         . "\n"
+         . "tables:\n"
+         . "  " . join(', ', @TABLES) . "\n"
+         . "\n"
+         . "examples:\n"
+         . "  net-report aps\n"
+         . "  net-report interfaces \"online = 1\"\n"
+         . "  net-report addresses \"addr LIKE '192.168.15.%'\"\n"
+         . "  net-report events --tail \"type IN ('device_new','interface_offline')\"\n";
 }
 
 my $cli = NetMgr::Client->new(listen => $listen);
