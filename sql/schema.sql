@@ -129,5 +129,18 @@ CREATE TABLE IF NOT EXISTS events (
     KEY idx_machine   (machine_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS aliases (
+    name               VARCHAR(255) NOT NULL PRIMARY KEY,
+    machine_id         INT          NOT NULL,
+    prefer_subnet_cidr VARCHAR(45),                -- NULL = any address of the machine
+    source             VARCHAR(64),                -- 'manual', 'dhcp.master', etc.
+    notes              TEXT,
+    created_at         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_alias_machine (machine_id),
+    CONSTRAINT fk_alias_machine
+        FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 INSERT IGNORE INTO schema_version (version) VALUES (1);
 INSERT IGNORE INTO schema_version (version) VALUES (2);
+INSERT IGNORE INTO schema_version (version) VALUES (3);

@@ -12,7 +12,7 @@ use warnings;
 use Exporter 'import';
 use NetMgr::Producer::DhcpMaster;
 
-our @EXPORT_OK = qw(load lookup name_for);
+our @EXPORT_OK = qw(load lookup name_for cidr_for all);
 
 my %ZONE_TO_NAME = (
     dmz      => 'DMZ',
@@ -83,11 +83,29 @@ sub lookup {
 # name_for($ip) — find the matching /24 (or wider) entry and return its name.
 sub name_for {
     my ($ip) = @_;
+    my $r = lookup_for_ip($ip);
+    return $r ? $r->{name} : undef;
+}
+
+# cidr_for($ip) — return the matching subnet's CIDR string (or undef).
+sub cidr_for {
+    my ($ip) = @_;
+    my $r = lookup_for_ip($ip);
+    return $r ? $r->{cidr} : undef;
+}
+
+sub lookup_for_ip {
+    my ($ip) = @_;
     load() unless $loaded;
     return undef unless $ip =~ /^(\d+)\.(\d+)\.(\d+)\.\d+$/;
     my $base24 = "$1.$2.$3.0/24";
-    my $r = $BY_CIDR{$base24};
-    return $r ? $r->{name} : undef;
+    return $BY_CIDR{$base24};
+}
+
+# all() — return all known subnets as a list of { cidr, net, mask, name, ... }
+sub all {
+    load() unless $loaded;
+    return values %BY_CIDR;
 }
 
 sub _cidr {

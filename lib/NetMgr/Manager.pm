@@ -25,7 +25,7 @@ use NetMgr::Where    qw(parse eval_ast);
 # Logical tables a SUBSCRIBE may target.
 my %SUBSCRIBABLE = map { $_ => 1 } qw(
     machines hostnames interfaces addresses ports aps
-    associations dhcp_leases events
+    associations dhcp_leases events aliases
 );
 
 sub new {

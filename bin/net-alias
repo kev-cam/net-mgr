@@ -1,0 +1,129 @@
+#!/usr/bin/perl
+# net-alias — add/list/remove DNS aliases in net-mgr's DB.
+#
+# Usage:
+#   net-alias add NAME MACHINE [--subnet CIDR] [--notes 'text']
+#   net-alias list [PATTERN]
+#   net-alias remove NAME
+#   net-alias resolve NAME [--from-ip IP]
+#
+# 'MACHINE' may be a primary_name, machine id, or a hostname string;
+# the tool finds the matching machine.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling pass_through);
+use NetMgr::Client;
+use NetMgr::Resolver;
+use NetMgr::Config;
+use NetMgr::DB;
+
+my $listen;
+my $subnet;
+my $notes;
+my $from_ip;
+
+GetOptions(
+    'listen=s'  => \$listen,
+    'subnet=s'  => \$subnet,
+    'notes=s'   => \$notes,
+    'from-ip=s' => \$from_ip,
+) or die "bad options\n";
+
+my $cmd = shift @ARGV or die "usage: net-alias add|list|remove|resolve\n";
+
+# `add` and `remove` go through the daemon (TRIGGER alias-add / alias-remove)
+# … but those triggers don't exist. Easier: open a direct DB connection.
+# That requires being on the host with /root/.my.cnf or ~/.my.cnf.
+
+my $cfg = NetMgr::Config->load(
+    $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
+my $mycnf = (-r "$ENV{HOME}/.my.cnf") ? "$ENV{HOME}/.my.cnf"
+          : (-r '/root/.my.cnf')      ? '/root/.my.cnf'
+          : die "no readable .my.cnf for the [net-mgr] section\n";
+my $db = NetMgr::DB->new(
+    defaults_file => $mycnf,
+    section       => $cfg->{mysql}{section},
+    db            => $cfg->{mysql}{db},
+);
+$db->connect;
+
+sub find_machine_id {
+    my ($spec) = @_;
+    if ($spec =~ /^\d+$/) {
+        my ($id) = $db->dbh->selectrow_array(
+            "SELECT id FROM machines WHERE id = ?", undef, $spec);
+        return $id if $id;
+    }
+    my ($id) = $db->dbh->selectrow_array(
+        "SELECT id FROM machines WHERE primary_name = ?", undef, $spec);
+    return $id if $id;
+    ($id) = $db->dbh->selectrow_array(
+        "SELECT machine_id FROM hostnames WHERE name = ? LIMIT 1",
+        undef, $spec);
+    return $id;
+}
+
+if ($cmd eq 'add') {
+    my $name    = shift @ARGV or die "missing alias NAME\n";
+    my $machine = shift @ARGV or die "missing MACHINE (name or id)\n";
+    my $mid = find_machine_id($machine)
+        or die "no machine matches '$machine'\n";
+    my $r = $db->upsert_alias(
+        name => $name,
+        machine_id => $mid,
+        prefer_subnet_cidr => $subnet,
+        source => 'manual',
+        notes  => $notes,
+    );
+    print "$r->{op}: alias '$name' → machine_id=$mid"
+        . ($subnet ? " (prefer $subnet)" : '') . "\n";
+}
+elsif ($cmd eq 'remove' || $cmd eq 'rm') {
+    my $name = shift @ARGV or die "missing alias NAME\n";
+    my $n = $db->delete_alias($name);
+    print "removed $n alias", ($n == 1 ? '' : 'es'), " named '$name'\n";
+}
+elsif ($cmd eq 'list' || $cmd eq 'ls') {
+    my $pat  = shift @ARGV;
+    my $sql  = "SELECT a.name, a.prefer_subnet_cidr, a.source, m.primary_name AS machine
+                  FROM aliases a JOIN machines m ON m.id = a.machine_id";
+    my @bind;
+    if (defined $pat) {
+        $sql .= " WHERE a.name LIKE ?";
+        my $like = $pat;
+        $like =~ tr/*/%/;
+        $like = "%$like%" unless $like =~ /[%_]/;
+        push @bind, $like;
+    }
+    $sql .= " ORDER BY a.name";
+    my $rows = $db->dbh->selectall_arrayref($sql, { Slice => {} }, @bind);
+    if (!@$rows) { print "(no aliases)\n"; exit }
+    my $fmt = "%-30s  %-15s  %-20s  %s\n";
+    printf $fmt, qw(name machine prefer_subnet source);
+    printf $fmt, '-' x 30, '-' x 15, '-' x 20, '-' x 6;
+    for my $r (@$rows) {
+        printf $fmt,
+            $r->{name}, $r->{machine},
+            $r->{prefer_subnet_cidr} // '',
+            $r->{source} // '';
+    }
+}
+elsif ($cmd eq 'resolve') {
+    my $name = shift @ARGV or die "missing NAME\n";
+    my @ips = NetMgr::Resolver::resolve($db, $name,
+        $from_ip ? (from_ip => $from_ip) : ());
+    if (@ips) {
+        print join("\n", @ips), "\n";
+    } else {
+        print STDERR "no match (would forward to upstream DNS)\n";
+        exit 1;
+    }
+}
+else {
+    die "unknown command '$cmd' (use: add, list, remove, resolve)\n";
+}
+
+$db->disconnect;

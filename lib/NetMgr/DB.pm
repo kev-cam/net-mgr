@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 2;
+our $SCHEMA_VERSION = 3;
 
 sub new {
     my ($class, %args) = @_;
@@ -107,6 +107,24 @@ sub _apply_migration {
         $self->{dbh}->do(
             "ALTER TABLE addresses ADD KEY idx_source (source)"
         );
+        return;
+    }
+    if ($v == 3) {
+        # Add aliases for explicit name → (machine, preferred-subnet) overrides
+        # used by the DNS resolver. machine_id FK with cascade delete.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS aliases (
+    name               VARCHAR(255) NOT NULL PRIMARY KEY,
+    machine_id         INT          NOT NULL,
+    prefer_subnet_cidr VARCHAR(45),
+    source             VARCHAR(64),
+    notes              TEXT,
+    created_at         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_alias_machine (machine_id),
+    CONSTRAINT fk_alias_machine
+        FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
         return;
     }
     croak "no migration for schema v$v";
@@ -514,11 +532,55 @@ sub get_interface_by_mac {
     );
 }
 
+sub upsert_alias {
+    my ($self, %f) = @_;
+    croak "name and machine_id required"
+        unless defined $f{name} && defined $f{machine_id};
+    my $was = $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM aliases WHERE name = ?", undef, $f{name});
+    if ($was) {
+        my @set; my @bind; my @changed;
+        for my $k (qw(machine_id prefer_subnet_cidr source notes)) {
+            next unless exists $f{$k};
+            my $old = $was->{$k}; my $new = $f{$k};
+            next if (!defined $old && !defined $new);
+            next if (defined $old && defined $new && $old eq $new);
+            push @changed, $k;
+            push @set, "$k = ?";
+            push @bind, $new;
+        }
+        return { op => 'noop', changed_fields => [], was => $was, now => $was }
+            unless @changed;
+        $self->{dbh}->do(
+            "UPDATE aliases SET " . join(', ', @set) . " WHERE name = ?",
+            undef, @bind, $f{name});
+        my $now = $self->{dbh}->selectrow_hashref(
+            "SELECT * FROM aliases WHERE name = ?", undef, $f{name});
+        return { op => 'update', changed_fields => \@changed,
+                 was => $was, now => $now };
+    }
+    $self->{dbh}->do(
+        "INSERT INTO aliases (name, machine_id, prefer_subnet_cidr, source, notes)
+         VALUES (?, ?, ?, ?, ?)", undef,
+        $f{name}, $f{machine_id}, $f{prefer_subnet_cidr},
+        $f{source}, $f{notes});
+    my $now = $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM aliases WHERE name = ?", undef, $f{name});
+    return { op => 'insert',
+             changed_fields => [qw(name machine_id prefer_subnet_cidr source notes)],
+             was => undef, now => $now };
+}
+
+sub delete_alias {
+    my ($self, $name) = @_;
+    return $self->{dbh}->do("DELETE FROM aliases WHERE name = ?", undef, $name);
+}
+
 sub query_table {
     my ($self, $table, $cols) = @_;
     my %allowed = map { $_ => 1 } qw(
         machines hostnames interfaces addresses ports aps
-        associations dhcp_leases events
+        associations dhcp_leases events aliases
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $sql = $cols ? "SELECT " . join(', ', @$cols) . " FROM $table"
