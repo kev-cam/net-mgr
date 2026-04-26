@@ -31,10 +31,11 @@ sub connect {
             . ";mysql_read_default_file=$self->{defaults_file}"
             . ";mysql_read_default_group=$self->{section}";
     my $dbh = DBI->connect($dsn, undef, undef, {
-        RaiseError       => 1,
-        PrintError       => 0,
-        AutoCommit       => 1,
+        RaiseError           => 1,
+        PrintError           => 0,
+        AutoCommit           => 1,
         mysql_enable_utf8mb4 => 1,
+        mysql_auto_reconnect => 1,   # idle-drop survivability for the daemon
     });
     $self->{dbh} = $dbh;
     return $self;
