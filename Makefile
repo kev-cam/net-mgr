@@ -26,7 +26,7 @@ LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \
 
 INSTALL ?= install
 
-.PHONY: list install uninstall test check clean help
+.PHONY: list install setup uninstall test check clean help
 
 # --- default: dry-run listing ----------------------------------------
 list:
@@ -47,6 +47,10 @@ list:
 	@echo
 	@echo "scripts will have their 'use lib' rewritten to:"
 	@echo "  $(PERL5DIR)"
+	@echo
+	@echo "first-time DB bootstrap (auto-invoked from 'install' when root):"
+	@echo "  creates MySQL database 'netmgr' and writes /root/.my.cnf [net-mgr] section"
+	@echo "  (run 'make setup' standalone to do just this step)"
 	@echo
 	@echo "vars: PREFIX=$(PREFIX)  DESTDIR=$(DESTDIR)  SYSCONFDIR=$(SYSCONFDIR)"
 
@@ -86,9 +90,31 @@ install:
 	  echo "  skip $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf (already exists)"; \
 	fi
 	@echo
-	@echo "Done. To start the daemon: $(SBINDIR)/net-mgr --foreground"
+	@echo "Files installed."
+	@if [ -z "$(DESTDIR)" ] && [ "$$(id -u)" = "0" ]; then \
+	  if [ ! -f /root/.my.cnf ] || ! grep -q '^\[net-mgr\]' /root/.my.cnf 2>/dev/null; then \
+	    echo; \
+	    echo "Running first-time DB setup..."; \
+	    $(DESTDIR)$(SBINDIR)/net-mgr-setup; \
+	  else \
+	    echo "(/root/.my.cnf already has [net-mgr] section — skipping setup)"; \
+	  fi; \
+	  echo; \
+	  echo "Start the daemon: $(SBINDIR)/net-mgr"; \
+	else \
+	  echo; \
+	  echo "Next: sudo make setup           (or: sudo $(SBINDIR)/net-mgr-setup)"; \
+	  echo "Then: sudo $(SBINDIR)/net-mgr"; \
+	fi
 
-# --- uninstall (does not remove /etc/net-mgr.conf) -------------------
+# --- setup (interactive DB + creds bootstrap) ------------------------
+setup:
+	@if [ "$$(id -u)" != "0" ]; then \
+	  echo "setup must run as root (it writes /root/.my.cnf)"; exit 1; \
+	fi
+	$(DESTDIR)$(SBINDIR)/net-mgr-setup
+
+# --- uninstall (does not remove /etc/net-mgr.conf or /root/.my.cnf) ---
 uninstall:
 	@for f in $(BINS);  do rm -fv $(DESTDIR)$(BINDIR)/$$f;  done
 	@for f in $(SBINS); do rm -fv $(DESTDIR)$(SBINDIR)/$$f; done
