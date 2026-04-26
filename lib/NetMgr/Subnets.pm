@@ -87,11 +87,16 @@ sub name_for {
     return $r ? $r->{name} : undef;
 }
 
-# cidr_for($ip) — return the matching subnet's CIDR string (or undef).
+# cidr_for($ip) — return the matching subnet's CIDR string. Falls back to
+# the trivial /24 derivation of the IP itself if no explicit subnet
+# record exists (so the resolver still works on hosts without
+# dhcp.master).
 sub cidr_for {
     my ($ip) = @_;
     my $r = lookup_for_ip($ip);
-    return $r ? $r->{cidr} : undef;
+    return $r->{cidr} if $r;
+    if ($ip && $ip =~ /^(\d+\.\d+\.\d+)\.\d+$/) { return "$1.0/24" }
+    return undef;
 }
 
 sub lookup_for_ip {
