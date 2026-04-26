@@ -169,12 +169,15 @@ sub handler {
 
 sub port_bindable_udp {
     my ($h, $p) = @_;
-    my $s = IO::Socket::INET->new(
-        LocalAddr => $h, LocalPort => $p,
-        Proto => 'udp', ReuseAddr => 1,
-    );
-    return 0 unless $s;
-    close $s;
+    # Match Net::DNS::Nameserver bind semantics — no SO_REUSEADDR, and
+    # both TCP and UDP must be available since the server uses both.
+    for my $proto ('udp', 'tcp') {
+        my $s = IO::Socket::INET->new(
+            LocalAddr => $h, LocalPort => $p, Proto => $proto,
+        );
+        return 0 unless $s;
+        close $s;
+    }
     return 1;
 }
 
