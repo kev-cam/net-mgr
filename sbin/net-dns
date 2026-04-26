@@ -19,8 +19,11 @@ use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
 use IO::Socket::INET;
 
-eval { require Net::DNS::Nameserver; require Net::DNS::Resolver;
-       require Net::DNS::RR; 1 }
+# Note: Net::DNS::Nameserver caches $$ at module-load time (file-scope
+# `my $pid = $$`) and start_server croaks if $$ has changed since then,
+# so we must `require` it AFTER the daemonize fork. Resolver/RR are fine
+# at the top.
+eval { require Net::DNS::Resolver; require Net::DNS::RR; 1 }
     or die "net-dns needs Net::DNS — install libnet-dns-perl\n";
 
 use NetMgr::Config;
@@ -95,6 +98,10 @@ unless ($foreground) {
     open STDIN,  '<',  '/dev/null';
     open STDOUT, '>>', '/dev/null';
 }
+
+# Now that we're in our final process, load Nameserver — it records
+# $$ at module-load time and refuses to run in a different PID.
+require Net::DNS::Nameserver;
 
 my $ns = Net::DNS::Nameserver->new(
     LocalAddr    => $lhost,
