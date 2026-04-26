@@ -78,10 +78,35 @@ if ($tail) {
     }
 } else {
     my $rows = $cli->snapshot(1, $table, defined $where ? (where => $where) : ());
+    enrich_with_machine_names($cli, $rows) if rows_have_mac($rows);
     print_table($rows, \@cols);
 }
 
 $cli->bye;
+
+# True if every row has a 'mac' column — then we can join to a machine name.
+sub rows_have_mac {
+    my ($rows) = @_;
+    return 0 unless @$rows;
+    return defined $rows->[0]{mac};
+}
+
+# Mutates $rows in place: adds 'machine' column with the linked machine's
+# primary_name (looked up via interfaces.machine_id → machines.primary_name).
+# Two extra snapshots — fine at our scale (small LAN, no streaming).
+sub enrich_with_machine_names {
+    my ($cli, $rows) = @_;
+    my $ifaces = $cli->snapshot(101, 'interfaces');
+    my $machs  = $cli->snapshot(102, 'machines');
+    my %iface_by_mac = map { lc $_->{mac} => $_ } @$ifaces;
+    my %name_by_id   = map { $_->{id} => $_->{primary_name} } @$machs;
+    for my $r (@$rows) {
+        my $mac = lc($r->{mac} // '');
+        my $iface = $iface_by_mac{$mac} or next;
+        my $name  = $name_by_id{ $iface->{machine_id} // '' };
+        $r->{machine} = $name if defined $name && length $name;
+    }
+}
 
 sub print_table {
     my ($rows, $cols) = @_;

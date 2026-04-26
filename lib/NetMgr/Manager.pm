@@ -509,6 +509,40 @@ sub _handle_gone {
     $self->_send($cli, format_ok());
 }
 
+# Look up or create a machine identified by name and link an interface
+# to it. Adds the (machine_id, name, source) tuple to hostnames. Used
+# whenever a producer reports a hostname for a MAC (DHCP lease,
+# AP self-name, future SSH-fingerprint).
+#
+# Auto-correlation rule 1 from the design memo: two interfaces that
+# report the same name → same machine.
+sub _associate_machine {
+    my ($self, $mac, $name, $source) = @_;
+    return unless defined $mac && defined $name && length $name && $name ne '*';
+    $mac = lc $mac;
+    my $iface = $self->{db}->get_interface_by_mac($mac);
+    return unless $iface;
+
+    my $mid = $iface->{machine_id};
+    if (!$mid) {
+        my ($existing) = $self->{db}->dbh->selectrow_array(
+            "SELECT id FROM machines WHERE primary_name = ? LIMIT 1",
+            undef, $name);
+        if ($existing) {
+            $mid = $existing;
+        } else {
+            my $r = $self->_upsert('machines', 'upsert_machine',
+                primary_name => $name, online => 1);
+            $mid = $r->{now}{id};
+        }
+        $self->_upsert('interfaces', 'upsert_interface',
+            mac => $mac, machine_id => $mid);
+    }
+    $self->_upsert('hostnames', 'upsert_hostname',
+        machine_id => $mid, name => $name, source => $source);
+    return $mid;
+}
+
 # ---- per-kind observation handlers -----------------------------------
 
 # Returns: list of event hashrefs to log.
@@ -551,6 +585,8 @@ sub _obs_ap_self {
     $self->_upsert('aps', 'upsert_ap',
         mac => $mac, ssid => $kv->{ssid},
         model => $kv->{model}, board => $kv->{board});
+    # Promote the AP's router_name to a machine identity.
+    $self->_associate_machine($mac, $kv->{name}, 'ap') if $kv->{name};
     return @ev;
 }
 
@@ -623,6 +659,9 @@ sub _obs_lease {
         hostname => $kv->{hostname},
         expires  => $kv->{expires},
     );
+    # DHCP-supplied hostname → machine identity.
+    $self->_associate_machine($mac, $kv->{hostname}, 'dhcp')
+        if $kv->{hostname};
     return @ev;
 }
 
