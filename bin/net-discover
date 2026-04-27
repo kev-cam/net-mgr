@@ -1,10 +1,15 @@
 #!/usr/bin/perl
-# net-discover — nmap/fping-based active-scan producer. Pushes
+# net-discover — nmap/fping/ssh-fingerprint active-scan producer. Pushes
 # observations to net-mgr; spawned by the daemon for TRIGGER discover.
 #
 # Usage:
 #   net-discover --discover [--network CIDR]...  Full nmap sweep
 #   net-discover --presence                      fping known IPs (mark dead ones GONE)
+#   net-discover --fingerprint                   SSH-probe ssh-open hosts
+#                                                 (DD-WRT/OpenWRT/Linux),
+#                                                 cached so reruns are cheap.
+#                                                 Findings printed; not pushed
+#                                                 as observations (yet).
 #   net-discover --print                         dump observations to stdout
 #   net-discover --listen HOST:PORT              override manager
 #
@@ -16,6 +21,7 @@ use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
 use NetMgr::Producer::Scan;
+use NetMgr::Producer::Fingerprint;
 use NetMgr::Client;
 use NetMgr::Protocol qw(format_kv);
 use Sys::Hostname qw(hostname);
@@ -26,22 +32,34 @@ my $print_only = 0;
 my $listen;
 my $do_discover;
 my $do_presence;
+my $do_fingerprint;
 my @networks;
 my $ports;
 my $host_timeout = 20;
+my $ssh_user    = 'root';
+my $ssh_timeout = 3;
+my $cache_path  = '/var/cache/net-mgr/fingerprints.tsv';
+my $cache_ttl_days = 7;
+my $force_fingerprint;
 
 GetOptions(
-    'print'        => \$print_only,
-    'listen=s'     => \$listen,
-    'discover'     => \$do_discover,
-    'presence'     => \$do_presence,
-    'network=s@'   => \@networks,
-    'ports=s'      => \$ports,
+    'print'          => \$print_only,
+    'listen=s'       => \$listen,
+    'discover'       => \$do_discover,
+    'presence'       => \$do_presence,
+    'fingerprint'    => \$do_fingerprint,
+    'network=s@'     => \@networks,
+    'ports=s'        => \$ports,
     'host-timeout=i' => \$host_timeout,
+    'ssh-user=s'     => \$ssh_user,
+    'ssh-timeout=i'  => \$ssh_timeout,
+    'cache=s'        => \$cache_path,
+    'ttl=i'          => \$cache_ttl_days,
+    'force'          => \$force_fingerprint,
 ) or die "bad options\n";
 
 # Default mode = discover
-$do_discover = 1 unless $do_discover || $do_presence;
+$do_discover = 1 unless $do_discover || $do_presence || $do_fingerprint;
 
 my $cli;
 unless ($print_only) {
@@ -90,6 +108,80 @@ if ($do_discover) {
         warn "discover $net->{cidr}: $err\n" if $err;
         emit(%$_) for @$obs;
     }
+}
+
+if ($do_fingerprint) {
+    # Walk the DB for IPs to probe. Skip those whose port-22 we never saw
+    # open — pointless to SSH-probe — and those still fresh in the cache.
+    die "--fingerprint requires --listen / daemon (no --print mode)\n"
+        if $print_only;
+
+    my $cache = NetMgr::Producer::Fingerprint::load_cache($cache_path);
+    my $ttl_seconds = $cache_ttl_days * 86400;
+
+    # Pull (mac, ip) for hosts with TCP/22 open
+    my $rows = $cli->snapshot(99, 'ports', where => "port = 22 AND proto = 'tcp'");
+    my %mac_seen = map { $_->{mac} => 1 } @$rows;
+
+    my $addrs = $cli->snapshot(98, 'addresses', where => "family = 'v4'");
+    my @targets;
+    for my $a (@$addrs) {
+        next unless $mac_seen{ $a->{mac} };
+        push @targets, { ip => $a->{addr}, mac => $a->{mac} };
+    }
+
+    # Dedup by ip
+    my %by_ip;
+    $by_ip{ $_->{ip} } //= $_ for @targets;
+    @targets = values %by_ip;
+
+    warn scalar(@targets), " hosts have TCP/22 open\n";
+
+    my $printed_header = 0;
+    my $hits = 0; my $cached = 0;
+    for my $t (sort { _ip_key($a->{ip}) cmp _ip_key($b->{ip}) } @targets) {
+        my $entry = $cache->{ $t->{ip} };
+        if (!$force_fingerprint
+            && NetMgr::Producer::Fingerprint::is_fresh($entry, $ttl_seconds))
+        {
+            $cached++;
+            _print_fingerprint($entry, \$printed_header, '(cached)');
+            next;
+        }
+        my $r = NetMgr::Producer::Fingerprint::probe_host(
+            ip          => $t->{ip},
+            ssh_user    => $ssh_user,
+            ssh_timeout => $ssh_timeout,
+        );
+        $r->{last_probed} = time();
+        $cache->{ $t->{ip} } = $r;
+        $hits++;
+        _print_fingerprint($r, \$printed_header, '');
+    }
+    NetMgr::Producer::Fingerprint::save_cache($cache_path, $cache);
+    warn "fingerprint: $hits probed, $cached cached, total ", scalar(@targets), "\n";
+}
+
+sub _ip_key {
+    my $ip = shift;
+    return '999.999.999.999' if $ip !~ /^\d+\.\d+\.\d+\.\d+$/;
+    return sprintf "%03d.%03d.%03d.%03d", split /\./, $ip;
+}
+
+sub _print_fingerprint {
+    my ($r, $hdr_ref, $tag) = @_;
+    unless ($$hdr_ref) {
+        printf "%-15s  %-13s  %-22s  %s\n",
+            'IP', 'KIND', 'NAME / NOTES', 'BOARD/UNAME';
+        printf "%-15s  %-13s  %-22s  %s\n",
+            '-' x 15, '-' x 13, '-' x 22, '-' x 30;
+        $$hdr_ref = 1;
+    }
+    my $detail = $r->{board} || $r->{uname} || $r->{notes} || '';
+    my $name   = $r->{name}  || ($r->{notes} ? "($r->{notes})" : '');
+    printf "%-15s  %-13s  %-22s  %s%s\n",
+        $r->{ip}, $r->{kind}, $name, $detail,
+        ($tag ? "  $tag" : '');
 }
 
 if ($do_presence) {

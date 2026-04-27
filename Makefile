@@ -26,7 +26,7 @@ LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \
         NetMgr/Manager.pm NetMgr/Client.pm NetMgr/Resolver.pm \
         NetMgr/Vendor.pm NetMgr/Subnets.pm \
         NetMgr/Producer/AP.pm NetMgr/Producer/Scan.pm \
-        NetMgr/Producer/DhcpMaster.pm
+        NetMgr/Producer/DhcpMaster.pm NetMgr/Producer/Fingerprint.pm
 
 INSTALL ?= install
 
