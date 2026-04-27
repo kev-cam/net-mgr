@@ -27,14 +27,27 @@ use NetMgr::Protocol qw(parse_line);
 my $listen;
 my $tail;
 my $columns;
+my $absolute_time;
 GetOptions(
-    'listen=s'  => \$listen,
-    'tail|f'    => \$tail,
-    'columns=s' => \$columns,
+    'listen=s'    => \$listen,
+    'tail|f'      => \$tail,
+    'columns=s'   => \$columns,
+    'absolute|a'  => \$absolute_time,
 ) or die "bad options\n";
 
 my @TABLES = qw(machines hostnames interfaces addresses ports aps
                 associations dhcp_leases events);
+
+# Column names hidden from the default-columns set (still selectable
+# via --columns). Declared here, BEFORE the main flow calls print_table —
+# `my %X = (...)` is runtime-initialized, so subs that close over it would
+# see an empty hash if the assignment hadn't executed yet.
+my %SKIP_BY_DEFAULT = (sub => 1, table => 1, op => 1, family => 1);
+
+# Datetime-shaped column names — formatted as relative time unless
+# --absolute was given.
+my %TIME_COL = map { $_ => 1 }
+    qw(last_seen first_seen ts expires created_at applied_at);
 
 my $table = shift @ARGV or die usage();
 unless (grep { $_ eq $table } @TABLES) {
@@ -48,10 +61,16 @@ sub usage {
          . "  net-report <table> [WHERE ...]\n"
          . "  net-report events --tail [WHERE ...]\n"
          . "  net-report <table> --columns COL,COL,...\n"
+         . "  net-report --absolute <table>      # show absolute timestamps\n"
          . "  net-report --listen HOST:PORT <table>\n"
          . "\n"
          . "tables:\n"
          . "  " . join(', ', @TABLES) . "\n"
+         . "\n"
+         . "Default columns hide `family` (rows are almost always v4); pass it\n"
+         . "explicitly via --columns to include it. Datetime columns (last_seen,\n"
+         . "first_seen, ts, expires, created_at) are shown as relative ages\n"
+         . "(`5m`, `2h`, `3d`); use --absolute to see the raw timestamp.\n"
          . "\n"
          . "examples:\n"
          . "  net-report aps\n"
@@ -112,7 +131,7 @@ sub print_table {
     my ($rows, $cols) = @_;
     return unless @$rows;
 
-    # Column set: explicit, else union of keys (minus protocol noise)
+    # Column set: explicit, else union of keys (minus protocol noise + family)
     my @keys;
     if (@$cols) {
         @keys = @$cols;
@@ -120,11 +139,21 @@ sub print_table {
         my %seen;
         for my $r (@$rows) {
             for my $k (sort keys %$r) {
-                next if $k eq 'sub' || $k eq 'table' || $k eq 'op';
+                next if $SKIP_BY_DEFAULT{$k};
                 $seen{$k} = 1;
             }
         }
         @keys = sort keys %seen;
+    }
+
+    # In-place: format datetime columns as relative ages
+    unless ($absolute_time) {
+        for my $r (@$rows) {
+            for my $k (@keys) {
+                next unless $TIME_COL{$k};
+                $r->{$k} = relative_time($r->{$k});
+            }
+        }
     }
 
     # Compute widths
@@ -143,10 +172,38 @@ sub print_table {
     }
 }
 
+# "2026-04-26 22:43:20" → "5m" (or whatever fits). Returns the original
+# string if it doesn't look like a DATETIME, and undef-or-empty pass through.
+sub relative_time {
+    my ($v) = @_;
+    return '' unless defined $v && length $v;
+    return $v unless $v =~ /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)/;
+    require Time::Local;
+    my $epoch = eval { Time::Local::timelocal($6, $5, $4, $3, $2-1, $1) };
+    return $v unless defined $epoch;
+    my $age = time() - $epoch;
+    return age_str($age);
+}
+
+sub age_str {
+    my $s = shift;
+    if ($s < 0)         { return sprintf "in %s", age_str(-$s) }
+    if ($s <  60)       { return "${s}s" }
+    if ($s <  60*60)    { return sprintf "%dm", int($s/60) }
+    if ($s <  24*3600)  { return sprintf "%dh", int($s/3600) }
+    if ($s < 365*86400) { return sprintf "%dd", int($s/86400) }
+    return sprintf "%dy", int($s/(365*86400));
+}
+
 sub print_row {
     my ($r, $cols) = @_;
     my @keys = @$cols ? @$cols
-                      : grep { $_ ne 'sub' && $_ ne 'table' && $_ ne 'op' }
-                        sort keys %$r;
-    print join(' ', map { defined $r->{$_} ? "$_=$r->{$_}" : "$_=" } @keys), "\n";
+                      : grep { !$SKIP_BY_DEFAULT{$_} } sort keys %$r;
+    my @out;
+    for my $k (@keys) {
+        my $v = $r->{$k};
+        $v = relative_time($v) if !$absolute_time && $TIME_COL{$k};
+        push @out, defined $v ? "$k=$v" : "$k=";
+    }
+    print join(' ', @out), "\n";
 }
