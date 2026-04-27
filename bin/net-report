@@ -68,6 +68,25 @@ my %ALWAYS_SHOW = (
     addresses  => [qw(last_observed)],
 );
 
+# Per-table per-column display cleanup. Applied just before width
+# computation, so the raw value stays in the DB. Currently used to
+# tidy up the ssid list on aps rows: APs commonly broadcast both 2.4
+# and 5GHz with the convention <ssid> + <ssid>5, which produces
+# noisy duplicates like "pegasus,phoenix,pegasus,phoenix5".
+my %CLEAN = (
+    aps => { ssid => \&clean_ssid_list },
+);
+
+sub clean_ssid_list {
+    my ($v) = @_;
+    return $v unless defined $v && length $v;
+    my @parts = split /,/, $v;
+    s/5$// for @parts;
+    my %seen;
+    @parts = grep { length && !$seen{$_}++ } @parts;
+    return join ',', @parts;
+}
+
 my $table = shift @ARGV or die usage();
 unless (grep { $_ eq $table } @TABLES) {
     die "unknown table '$table'\n\n" . usage();
@@ -199,6 +218,17 @@ sub print_table {
             for my $k (@keys) {
                 next unless $TIME_COL{$k};
                 $r->{$k} = relative_time($r->{$k}, $k);
+            }
+        }
+    }
+
+    # In-place: per-table column cleanup (ssid dedup, etc.).
+    if ($table && $CLEAN{$table}) {
+        my $hooks = $CLEAN{$table};
+        for my $r (@$rows) {
+            for my $k (@keys) {
+                my $h = $hooks->{$k} or next;
+                $r->{$k} = $h->($r->{$k});
             }
         }
     }
