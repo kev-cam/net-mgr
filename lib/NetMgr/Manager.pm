@@ -881,6 +881,16 @@ sub _obs_ping {
     );
     return unless $r->{found};   # row missing — silent no-op (producer bug)
 
+    # update_rtt writes directly (not via _upsert) so it doesn't auto-
+    # broadcast to subscribers. Emit explicitly so net-watch and other
+    # streaming consumers see the new last_rtt_ms / min_rtt_ms.
+    my $row = $self->{db}->dbh->selectrow_hashref(
+        "SELECT * FROM addresses WHERE mac = ? AND family = 'v4' AND addr = ?",
+        undef, lc $mac, $addr
+    );
+    $self->_emit_change(table => 'addresses', op => 'update', row => $row)
+        if $row;
+
     # Emit ping_slow only on the OK→slow transition so a sustained
     # slowness doesn't generate one event per probe. The transition
     # check uses prev_last (the rtt from the previous ping cycle) —

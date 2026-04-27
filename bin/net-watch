@@ -1,0 +1,196 @@
+#!/usr/bin/perl
+# net-watch — live flake detector. Pure consumer: subscribes to the
+# manager's addresses stream and watches the regular periodic pings
+# (kind=ping observations from net-discover --presence and friends).
+# No producers, no DB writes — just aggregates samples per (mac, addr)
+# and surfaces hosts with packet loss or RTT jitter.
+#
+# Usage:
+#   net-watch                    Watch every known v4 address.
+#   net-watch IP [IP ...]        Filter to specific addresses.
+#   net-watch --listen H:P       Override manager address.
+#   net-watch --window 1800      Sliding window in seconds (default 1800 = 30m).
+#   net-watch --refresh 5        Display refresh in seconds (default 5).
+#   net-watch --once             Print one snapshot and exit (cron-friendly).
+#
+# Loss detection assumes pings arrive on a roughly-fixed cycle (default
+# scanner.presence_interval = 90s); a gap > 1.5× cycle counts the
+# missing intervals as dropped probes. So loss% is approximate but
+# stable across a busy network.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use Time::HiRes qw(time);
+use NetMgr::Client;
+use NetMgr::Config;
+use NetMgr::Protocol qw(parse_line);
+
+my $listen;
+my $window  = 1800;
+my $refresh = 5;
+my $once;
+GetOptions(
+    'listen=s'  => \$listen,
+    'window=i'  => \$window,
+    'refresh=i' => \$refresh,
+    'once'      => \$once,
+) or die "bad options\n";
+
+my %ip_filter = map { $_ => 1 } @ARGV;
+
+# Cycle from config so the gap heuristic matches reality. Falls back
+# to 90s (the default presence_interval) if config can't be read.
+my $cfg   = eval { NetMgr::Config::load() } || {};
+my $cycle = parse_seconds($cfg->{scanner}{presence_interval} // '90s') || 90;
+
+my $cli = NetMgr::Client->new(listen => $listen);
+$cli->hello(consumer => "net-watch.$$");
+
+# Snapshot interfaces+machines for nicer host names; do these BEFORE
+# the streaming subscribe so the snapshot replies don't mingle with
+# stream rows.
+my $iface_rows = $cli->snapshot(2, 'interfaces');
+my $mach_rows  = $cli->snapshot(3, 'machines');
+my %iface_by_mac = map { lc $_->{mac} => $_ } @$iface_rows;
+my %name_by_id   = map { $_->{id} => $_->{primary_name} } @$mach_rows;
+
+# Subscribe to addresses (snapshot + stream). The snapshot half lets
+# us see existing min/last_rtt_ms values immediately; the stream half
+# delivers ROWs as the manager processes new kind=ping observations.
+$cli->send_line("SUBSCRIBE sub=1 mode=snapshot+stream FROM addresses"
+              . " WHERE family = 'v4'");
+
+# state{mac}{addr} = arrayref of [timestamp, rtt_ms]
+my %state;
+my %flagged;   # mac:addr → 1 once we've reported it as flaky (de-dupe)
+
+$| = 1;
+my $start = time();
+my $last_refresh = 0;
+
+while (1) {
+    my $line = $cli->recv_line(1);
+    if (defined $line) {
+        my $cmd = parse_line($line);
+        if ($cmd && $cmd->{verb} eq 'ROW' && $cmd->{kv}{table} eq 'addresses') {
+            record_sample($cmd->{kv});
+        }
+    }
+    my $now = time();
+    if ($now - $last_refresh >= $refresh) {
+        prune_old($now);
+        render($now);
+        $last_refresh = $now;
+        last if $once;
+    }
+}
+
+$cli->bye;
+
+# ---- helpers ----------------------------------------------------------
+
+sub record_sample {
+    my ($kv) = @_;
+    my $mac  = lc($kv->{mac}  // '') or return;
+    my $addr = $kv->{addr} or return;
+    return if %ip_filter && !$ip_filter{$addr};
+    my $rtt = $kv->{last_rtt_ms};
+    return unless defined $rtt && $rtt =~ /^[\d.]+$/;
+    push @{ $state{$mac}{$addr} }, [ time(), $rtt + 0 ];
+}
+
+sub prune_old {
+    my ($now) = @_;
+    my $cutoff = $now - $window;
+    for my $mac (keys %state) {
+        for my $addr (keys %{ $state{$mac} }) {
+            my $arr = $state{$mac}{$addr};
+            @$arr = grep { $_->[0] >= $cutoff } @$arr;
+            delete $state{$mac}{$addr} unless @$arr;
+        }
+        delete $state{$mac} unless keys %{ $state{$mac} };
+    }
+}
+
+sub render {
+    my ($now) = @_;
+    print "\e[H\e[2J" unless $once;   # clear screen unless --once
+    printf "net-watch  cycle=%ds  window=%ds  refresh=%ds  uptime=%ds  hosts=%d\n",
+           $cycle, $window, $refresh, int($now - $start),
+           scalar map { keys %{ $state{$_} } } keys %state;
+    print "\n";
+    printf "%-15s  %-22s  %5s  %7s  %7s  %7s  %7s  %5s  %s\n",
+           qw(IP HOST loss% min/ms med/ms max/ms last/ms n status);
+    print "-" x 95, "\n";
+
+    my @rows;
+    for my $mac (keys %state) {
+        for my $addr (keys %{ $state{$mac} }) {
+            my $samples = $state{$mac}{$addr};
+            next unless @$samples;
+            push @rows, build_row($mac, $addr, $samples);
+        }
+    }
+    @rows = sort { ip_sort_key($a->[0]) cmp ip_sort_key($b->[0]) } @rows;
+    print join('', map { $_->[-1] } @rows);
+}
+
+sub build_row {
+    my ($mac, $addr, $samples) = @_;
+    my @rtts   = map { $_->[1] } @$samples;
+    my @sorted = sort { $a <=> $b } @rtts;
+    my $min    = $sorted[0];
+    my $max    = $sorted[-1];
+    my $med    = $sorted[int(@sorted / 2)];
+    my $last   = $rtts[-1];
+    my $loss   = compute_loss($samples);
+    my $name   = host_name($mac);
+
+    my @flags;
+    push @flags, 'LOSS'   if $loss > 10;
+    push @flags, 'JITTER' if $med > 0 && $max > 5 * $med && ($max - $med) > 50;
+    my $status = @flags ? join(',', @flags) : 'ok';
+
+    my $line = sprintf
+        "%-15s  %-22.22s  %4.0f%%  %7.2f  %7.2f  %7.2f  %7.2f  %5d  %s\n",
+        $addr, ($name || '-'), $loss, $min, $med, $max, $last,
+        scalar @$samples, $status;
+    return [ $addr, $line ];
+}
+
+sub compute_loss {
+    my ($samples) = @_;
+    return 0 unless @$samples >= 2;
+    my $missed = 0;
+    for my $i (1 .. $#$samples) {
+        my $gap = $samples->[$i][0] - $samples->[$i-1][0];
+        if ($gap > 1.5 * $cycle) {
+            $missed += int($gap / $cycle) - 1;
+        }
+    }
+    return $missed * 100 / (scalar(@$samples) + $missed);
+}
+
+sub host_name {
+    my ($mac) = @_;
+    my $iface = $iface_by_mac{$mac} or return '';
+    return $name_by_id{ $iface->{machine_id} // '' } // '';
+}
+
+sub ip_sort_key {
+    my $ip = shift // '';
+    return '999.999.999.999' unless $ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+    return sprintf "%03d.%03d.%03d.%03d", $1, $2, $3, $4;
+}
+
+sub parse_seconds {
+    my $s = shift // '';
+    return $1 * 86400 if $s =~ /^(\d+)d$/;
+    return $1 * 3600  if $s =~ /^(\d+)h$/;
+    return $1 * 60    if $s =~ /^(\d+)m$/;
+    return $1         if $s =~ /^(\d+)s?$/;
+    return 0;
+}

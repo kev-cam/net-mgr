@@ -19,7 +19,7 @@ SYSCONFDIR ?= /etc
 UNITDIR    ?= $(SYSCONFDIR)/systemd/system
 DESTDIR    ?=
 
-BINS  = net-alias net-poll-ap net-discover net-import-dhcp net-fix net-ping net-scan net-report net-show
+BINS  = net-alias net-poll-ap net-discover net-import-dhcp net-fix net-ping net-scan net-report net-show net-watch
 SBINS = net-mgr net-mgr-setup net-dns net-mgr-relay
 UNITS = net-mgr.service net-dns.service net-mgr-relay.service
 LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \
