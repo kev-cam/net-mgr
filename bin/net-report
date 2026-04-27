@@ -50,6 +50,12 @@ my @TABLES = qw(machines hostnames interfaces addresses ports aps
 my %SKIP_BY_DEFAULT = (sub => 1, table => 1, op => 1, family => 1,
                        last_seen => 1);
 
+# Per-table column hides on top of the global set. Use for columns
+# that are useful elsewhere but redundant for one specific table.
+my %SKIP_BY_TABLE = (
+    aps => { mac => 1 },          # mac is implicit; show ip instead
+);
+
 # Datetime-shaped column names — formatted as relative time unless
 # --absolute was given. last_observed renders "never" when NULL —
 # the column means "last live signal", so a paper-only entry has
@@ -66,6 +72,7 @@ my %TIME_COL_NEVER = (last_observed => 1);
 my %ALWAYS_SHOW = (
     interfaces => [qw(last_observed)],
     addresses  => [qw(last_observed)],
+    aps        => [qw(ip)],
 );
 
 # Per-table per-column display cleanup. Applied just before width
@@ -136,6 +143,7 @@ if ($tail) {
 } else {
     my $rows = $cli->snapshot(1, $table, defined $where ? (where => $where) : ());
     enrich_with_machine_names($cli, $rows) if rows_have_mac($rows);
+    enrich_with_ip($cli, $rows) if $table eq 'aps';
     sort_rows_by_ip($rows);
     print_table($rows, \@cols, $table);
 }
@@ -163,6 +171,25 @@ sub enrich_with_machine_names {
         my $iface = $iface_by_mac{$mac} or next;
         my $name  = $name_by_id{ $iface->{machine_id} // '' };
         $r->{machine} = $name if defined $name && length $name;
+    }
+}
+
+# Mutates $rows: adds an 'ip' column from the first matching v4 address.
+# Used for tables (like aps) keyed by mac where the user reading the
+# report cares about the IP, not the hex.
+sub enrich_with_ip {
+    my ($cli, $rows) = @_;
+    return unless @$rows;
+    my $addrs = $cli->snapshot(103, 'addresses', where => "family = 'v4'");
+    my %ip_by_mac;
+    for my $a (@$addrs) {
+        next unless $a->{mac} && $a->{addr};
+        $ip_by_mac{ lc $a->{mac} } //= $a->{addr};
+    }
+    for my $r (@$rows) {
+        my $mac = lc($r->{mac} // '') or next;
+        my $ip  = $ip_by_mac{$mac} or next;
+        $r->{ip} = $ip;
     }
 }
 
@@ -202,9 +229,11 @@ sub print_table {
         if ($table && $ALWAYS_SHOW{$table}) {
             $seen{$_} = 1 for @{ $ALWAYS_SHOW{$table} };
         }
+        my $tbl_skip = ($table && $SKIP_BY_TABLE{$table}) || {};
         for my $r (@$rows) {
             for my $k (sort keys %$r) {
                 next if $SKIP_BY_DEFAULT{$k};
+                next if $tbl_skip->{$k};
                 $seen{$k} = 1;
             }
         }
