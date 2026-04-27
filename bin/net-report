@@ -42,7 +42,13 @@ my @TABLES = qw(machines hostnames interfaces addresses ports aps
 # via --columns). Declared here, BEFORE the main flow calls print_table —
 # `my %X = (...)` is runtime-initialized, so subs that close over it would
 # see an empty hash if the assignment hadn't executed yet.
-my %SKIP_BY_DEFAULT = (sub => 1, table => 1, op => 1, family => 1);
+#
+# last_seen is hidden because it's bumped on any DB touch (including
+# replication and paper imports), so it's a misleading "is this device
+# here?" answer. last_observed is the honest column — use --columns
+# last_seen to see the raw row-touch timestamp.
+my %SKIP_BY_DEFAULT = (sub => 1, table => 1, op => 1, family => 1,
+                       last_seen => 1);
 
 # Datetime-shaped column names — formatted as relative time unless
 # --absolute was given. last_observed renders "never" when NULL —
@@ -51,6 +57,16 @@ my %SKIP_BY_DEFAULT = (sub => 1, table => 1, op => 1, family => 1);
 my %TIME_COL = map { $_ => 1 }
     qw(last_seen first_seen last_observed ts expires created_at applied_at);
 my %TIME_COL_NEVER = (last_observed => 1);
+
+# Columns that must always appear in the default column set for a given
+# table, even when every row's value is NULL (the protocol drops nulls,
+# so a union-of-keys would otherwise hide the column entirely). The
+# whole point of last_observed for paper-only entries is to render as
+# "never" — it has to be visible to do that.
+my %ALWAYS_SHOW = (
+    interfaces => [qw(last_observed)],
+    addresses  => [qw(last_observed)],
+);
 
 my $table = shift @ARGV or die usage();
 unless (grep { $_ eq $table } @TABLES) {
@@ -102,7 +118,7 @@ if ($tail) {
     my $rows = $cli->snapshot(1, $table, defined $where ? (where => $where) : ());
     enrich_with_machine_names($cli, $rows) if rows_have_mac($rows);
     sort_rows_by_ip($rows);
-    print_table($rows, \@cols);
+    print_table($rows, \@cols, $table);
 }
 
 $cli->bye;
@@ -153,15 +169,20 @@ sub ip_sort_key {
 }
 
 sub print_table {
-    my ($rows, $cols) = @_;
+    my ($rows, $cols, $table) = @_;
     return unless @$rows;
 
-    # Column set: explicit, else union of keys (minus protocol noise + family)
+    # Column set: explicit, else union of keys (minus protocol noise +
+    # last_seen + family), seeded with ALWAYS_SHOW for the table so
+    # all-NULL columns like last_observed still render (as "never").
     my @keys;
     if (@$cols) {
         @keys = @$cols;
     } else {
         my %seen;
+        if ($table && $ALWAYS_SHOW{$table}) {
+            $seen{$_} = 1 for @{ $ALWAYS_SHOW{$table} };
+        }
         for my $r (@$rows) {
             for my $k (sort keys %$r) {
                 next if $SKIP_BY_DEFAULT{$k};
