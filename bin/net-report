@@ -174,23 +174,64 @@ sub enrich_with_machine_names {
     }
 }
 
-# Mutates $rows: adds an 'ip' column from the first matching v4 address.
-# Used for tables (like aps) keyed by mac where the user reading the
-# report cares about the IP, not the hex.
+# Mutates $rows: adds an 'ip' column with the AP's address on the
+# subnet that its WiFi clients are on. APs routinely have several
+# reachable IPs (LAN-side, WAN-side, mgmt VLAN); the user-relevant
+# one is the WiFi-side address. Pick it by tallying which /24 contains
+# the most associated client IPs and matching the AP's address in
+# that /24. Fall back to listing every v4 if we can't infer the
+# WiFi subnet (no associations recorded yet, AP-only setup, etc.).
 sub enrich_with_ip {
     my ($cli, $rows) = @_;
     return unless @$rows;
-    my $addrs = $cli->snapshot(103, 'addresses', where => "family = 'v4'");
-    my %ip_by_mac;
+    my $addrs  = $cli->snapshot(103, 'addresses', where => "family = 'v4'");
+    my $assocs = $cli->snapshot(104, 'associations');
+
+    my %ips_by_mac;
     for my $a (@$addrs) {
         next unless $a->{mac} && $a->{addr};
-        $ip_by_mac{ lc $a->{mac} } //= $a->{addr};
+        push @{ $ips_by_mac{ lc $a->{mac} } }, $a->{addr};
     }
+    my %clients_by_ap;
+    for my $a (@$assocs) {
+        next unless $a->{ap_mac} && $a->{client_mac};
+        push @{ $clients_by_ap{ lc $a->{ap_mac} } }, lc $a->{client_mac};
+    }
+
     for my $r (@$rows) {
         my $mac = lc($r->{mac} // '') or next;
-        my $ip  = $ip_by_mac{$mac} or next;
-        $r->{ip} = $ip;
+        my $ips = $ips_by_mac{$mac} or next;
+        my @sorted = sort { ip_sort_key($a) cmp ip_sort_key($b) } @$ips;
+
+        my $wifi_24 = ap_wifi_subnet_24($clients_by_ap{$mac}, \%ips_by_mac);
+        my ($wifi_ip) = $wifi_24 ? grep { ip_24($_) eq $wifi_24 } @sorted : ();
+        $r->{ip} = $wifi_ip // join(',', @sorted);
     }
+}
+
+# Most-common /24 across the supplied clients' v4 addresses; one vote
+# per client to keep a multi-homed laptop from skewing the tally.
+sub ap_wifi_subnet_24 {
+    my ($clients, $ips_by_mac) = @_;
+    return unless $clients && @$clients;
+    my %count;
+    for my $cm (@$clients) {
+        my $cips = $ips_by_mac->{$cm} or next;
+        my %voted;
+        for my $ip (@$cips) {
+            my $s = ip_24($ip) or next;
+            next if $voted{$s}++;
+            $count{$s}++;
+        }
+    }
+    return unless %count;
+    my ($top) = sort { $count{$b} <=> $count{$a} } keys %count;
+    return $top;
+}
+
+sub ip_24 {
+    my $ip = shift // '';
+    return $ip =~ /^(\d+\.\d+\.\d+)\.\d+$/ ? $1 : '';
 }
 
 # If rows have an addr (or ip) column, sort them numerically by it.
