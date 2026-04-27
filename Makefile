@@ -52,8 +52,11 @@ deps:
 	check '/usr/bin/perl -MDBI -e 1'        libdbi-perl       'Perl DBI'; \
 	check '/usr/bin/perl -MDBD::mysql -e 1' libdbd-mysql-perl 'Perl DBD::mysql'; \
 	check '/usr/bin/perl -MNet::DNS -e 1'   libnet-dns-perl   'Net::DNS (for sbin/net-dns)'; \
-	check 'dpkg -l mariadb-server 2>/dev/null | grep -q "^ii " || dpkg -l mysql-server 2>/dev/null | grep -q "^ii "' \
-	                                  mariadb-server    'MySQL/MariaDB server'; \
+	check '{ dpkg -l mariadb-server 2>/dev/null | grep -q "^ii "; } \
+	    || { dpkg -l mysql-server 2>/dev/null | grep -q "^ii "; } \
+	    || { dpkg -l mysql-server-8.0 2>/dev/null | grep -q "^ii "; } \
+	    || { dpkg -l mysql-server-8.4 2>/dev/null | grep -q "^ii "; }' \
+	                                  mariadb-server    'MariaDB or MySQL server (either is fine)'; \
 	miss=$$(echo $$miss | tr ' ' '\n' | sort -u | tr '\n' ' '); \
 	miss=$${miss% }; miss=$${miss# }; \
 	if [ -n "$$miss" ]; then \

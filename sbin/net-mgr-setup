@@ -13,10 +13,14 @@ use strict;
 use warnings;
 use FindBin;
 use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
 
 my $MYCNF    = '/root/.my.cnf';
 my $SECTION  = 'net-mgr';
 my $DBNAME   = 'netmgr';
+
+my $allow_existing;
+GetOptions('allow-existing' => \$allow_existing) or die "bad options\n";
 
 die "must run as root\n" if $> != 0;
 
@@ -86,9 +90,24 @@ sub db_exists {
 # ---- 1. probe mysql ---------------------------------------------------
 print "Checking mysql connectivity (as unix_socket root)...\n";
 unless (mysql_root_query("SELECT 1")) {
-    die "Cannot connect to mysql as root via unix socket. Is mariadb-server running?\n";
+    die "Cannot connect to mysql as root via unix socket. Is the DB server running?\n";
 }
 print "  ok\n";
+
+# Don't blow away someone else's databases (ZoneMinder, mediawiki, …).
+# Only the system schemas are allowed unless --allow-existing was passed.
+{
+    my %sys = map { $_ => 1 } qw(information_schema mysql performance_schema sys);
+    my @all = mysql_root_query("SHOW DATABASES");
+    my @user_dbs = grep { !$sys{$_} && $_ ne $DBNAME } @all;
+    if (@user_dbs && !$allow_existing) {
+        die "Refusing to proceed: existing user database(s) detected:\n"
+          . "  @user_dbs\n\n"
+          . "net-mgr-setup will not run on a machine with other application data\n"
+          . "without explicit consent — re-run with --allow-existing if you have\n"
+          . "a recent mysqldump backup of the listed databases and want to proceed.\n";
+    }
+}
 
 # ---- 2. existing /root/.my.cnf ---------------------------------------
 if (-d $MYCNF) {
@@ -114,6 +133,10 @@ if ($use_root) {
     $pass = undef;
 } else {
     $user = prompt("MySQL username for net-mgr", 'net-mgr');
+    # Pin to the legacy auth plugin so the same connection string works
+    # on MariaDB and on MySQL 8 (whose default `caching_sha2_password`
+    # may not be supported by older DBD::mysql).
+    my $WITH = "IDENTIFIED WITH mysql_native_password";
     if (user_exists($user, 'localhost')) {
         print "User '$user'\@'localhost' already exists; will reuse.\n";
         $pass = prompt_pass("Existing password for '$user' (leave blank to reset)");
@@ -121,7 +144,7 @@ if ($use_root) {
             $pass = prompt_pass("New password for '$user'");
             my $repeat = prompt_pass("Repeat new password");
             die "passwords do not match\n" unless $pass eq $repeat;
-            mysql_root("ALTER USER '$user'\@'localhost' IDENTIFIED BY '$pass'")
+            mysql_root("ALTER USER '$user'\@'localhost' $WITH BY '$pass'")
                 or die "ALTER USER failed\n";
             print "  password reset\n";
         }
@@ -129,7 +152,7 @@ if ($use_root) {
         $pass = prompt_pass("New password for '$user'");
         my $repeat = prompt_pass("Repeat password");
         die "passwords do not match\n" unless $pass eq $repeat;
-        mysql_root("CREATE USER '$user'\@'localhost' IDENTIFIED BY '$pass'")
+        mysql_root("CREATE USER '$user'\@'localhost' $WITH BY '$pass'")
             or die "CREATE USER failed\n";
         print "  user created\n";
     }
