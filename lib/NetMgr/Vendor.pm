@@ -70,6 +70,7 @@ my @DEFAULTS = (
     ['Wistron InfoComm.Kunshan.Co.',              'Wistron'],
     ['Wistron InfoComm(Kunshan)Co.',              'Wistron'],
     ['Wistron Infocomm .Zhongshan.',              'Wistron'],
+    ['Wistron Infocomm (Zhongshan)',              'Wistron'],
     ['Liteon Technology Corporation',             'Liteon'],
     ['Liteon Technology',                         'Liteon'],
     ['SHARP Corporation',                         'Sharp'],
