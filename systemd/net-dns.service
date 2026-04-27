@@ -1,0 +1,20 @@
+[Unit]
+Description=net-dns — DNS server backed by net-mgr DB
+Documentation=https://github.com/kev-cam/net-mgr
+After=network-online.target mariadb.service mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/net-dns --foreground
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=net-dns
+# net-dns wants UDP/53; cap is implicit while running as root. If you
+# ever move it to a non-root user, also add:
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

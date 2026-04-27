@@ -1,0 +1,17 @@
+[Unit]
+Description=net-mgr — network observation broker
+Documentation=https://github.com/kev-cam/net-mgr
+After=network-online.target mariadb.service mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/net-mgr --foreground
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=net-mgr
+
+[Install]
+WantedBy=multi-user.target

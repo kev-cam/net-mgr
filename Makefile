@@ -16,10 +16,12 @@ SBINDIR    ?= $(PREFIX)/sbin
 PERL5DIR   ?= $(PREFIX)/share/perl5
 SHAREDIR   ?= $(PREFIX)/share/net-mgr
 SYSCONFDIR ?= /etc
+UNITDIR    ?= $(SYSCONFDIR)/systemd/system
 DESTDIR    ?=
 
 BINS  = net-alias net-poll-ap net-discover net-import-dhcp net-fix net-scan net-report net-show
 SBINS = net-mgr net-mgr-setup net-dns
+UNITS = net-mgr.service net-dns.service
 LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \
         NetMgr/Manager.pm NetMgr/Client.pm NetMgr/Resolver.pm \
         NetMgr/Vendor.pm NetMgr/Subnets.pm \
@@ -31,17 +33,25 @@ INSTALL ?= install
 .PHONY: list install setup deps uninstall test check clean help
 
 # --- dependency check (Debian/Ubuntu apt names) ----------------------
-# Each check_X writes its apt package name to $$miss if its probe fails.
-# `make deps` exits 1 with an apt install command when anything is missing.
+# Required deps must be present; optional deps print a hint but don't
+# fail the install (e.g. Net::DNS only matters for sbin/net-dns).
 
 deps:
-	@miss=""; \
+	@miss=""; opt_miss=""; \
 	check() { \
 	  if /bin/sh -c "$$1" >/dev/null 2>&1; then \
-	    printf "  ok      %-20s %s\n" "$$2" "$$3"; \
+	    printf "  ok       %-20s %s\n" "$$2" "$$3"; \
 	  else \
-	    printf "  MISSING %-20s %s\n" "$$2" "$$3"; \
+	    printf "  MISSING  %-20s %s\n" "$$2" "$$3"; \
 	    miss="$$miss $$2"; \
+	  fi; \
+	}; \
+	check_opt() { \
+	  if /bin/sh -c "$$1" >/dev/null 2>&1; then \
+	    printf "  ok       %-20s %s (optional)\n" "$$2" "$$3"; \
+	  else \
+	    printf "  optional %-20s %s\n" "$$2" "$$3"; \
+	    opt_miss="$$opt_miss $$2"; \
 	  fi; \
 	}; \
 	check 'command -v nmap'           nmap              'nmap (discovery sweep)'; \
@@ -51,22 +61,27 @@ deps:
 	check 'command -v mysql'          mariadb-client    'mysql client (setup script)'; \
 	check '/usr/bin/perl -MDBI -e 1'        libdbi-perl       'Perl DBI'; \
 	check '/usr/bin/perl -MDBD::mysql -e 1' libdbd-mysql-perl 'Perl DBD::mysql'; \
-	check '/usr/bin/perl -MNet::DNS -e 1'   libnet-dns-perl   'Net::DNS (for sbin/net-dns)'; \
 	check '{ dpkg -l mariadb-server 2>/dev/null | grep -q "^ii "; } \
 	    || { dpkg -l mysql-server 2>/dev/null | grep -q "^ii "; } \
 	    || { dpkg -l mysql-server-8.0 2>/dev/null | grep -q "^ii "; } \
 	    || { dpkg -l mysql-server-8.4 2>/dev/null | grep -q "^ii "; }' \
 	                                  mariadb-server    'MariaDB or MySQL server (either is fine)'; \
+	check_opt '/usr/bin/perl -MNet::DNS -e 1' libnet-dns-perl 'Net::DNS — only needed if you run sbin/net-dns'; \
 	miss=$$(echo $$miss | tr ' ' '\n' | sort -u | tr '\n' ' '); \
 	miss=$${miss% }; miss=$${miss# }; \
+	opt_miss=$$(echo $$opt_miss | tr ' ' '\n' | sort -u | tr '\n' ' '); \
+	opt_miss=$${opt_miss% }; opt_miss=$${opt_miss# }; \
 	if [ -n "$$miss" ]; then \
 	  echo; \
-	  echo "install missing packages with:"; \
+	  echo "install missing required packages with:"; \
 	  echo "  sudo apt install -y $$miss"; \
 	  exit 1; \
-	else \
-	  echo; \
-	  echo "all dependencies present"; \
+	fi; \
+	echo; \
+	echo "all required dependencies present"; \
+	if [ -n "$$opt_miss" ]; then \
+	  echo "(optional, install if you want net-dns):"; \
+	  echo "  sudo apt install -y $$opt_miss"; \
 	fi
 
 # --- default: dry-run listing ----------------------------------------
@@ -87,6 +102,9 @@ list:
 	@echo "  $(DESTDIR)$(SYSCONFDIR)/net-mgr/config  (only if not already present)"
 	@echo "  (legacy $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf gets moved automatically)"
 	@echo
+	@echo "systemd units → $(DESTDIR)$(UNITDIR):"
+	@for f in $(UNITS); do echo "  $$f"; done
+	@echo
 	@echo "scripts will have their 'use lib' rewritten to:"
 	@echo "  $(PERL5DIR)"
 	@echo
@@ -106,6 +124,7 @@ install: deps
 	$(INSTALL) -d $(DESTDIR)$(PERL5DIR)/NetMgr/Producer
 	$(INSTALL) -d $(DESTDIR)$(SHAREDIR)/sql
 	$(INSTALL) -d $(DESTDIR)$(SYSCONFDIR)/net-mgr
+	$(INSTALL) -d $(DESTDIR)$(UNITDIR)
 	@for f in $(BINS); do \
 	  echo "  bin/$$f → $(DESTDIR)$(BINDIR)/$$f"; \
 	  sed -e 's|use lib .*FindBin.*|use lib "$(PERL5DIR)";|' \
@@ -127,6 +146,13 @@ install: deps
 	done
 	@echo "  sql/schema.sql → $(DESTDIR)$(SHAREDIR)/sql/schema.sql"
 	@$(INSTALL) -m 644 sql/schema.sql $(DESTDIR)$(SHAREDIR)/sql/schema.sql
+	@for f in $(UNITS); do \
+	  echo "  systemd/$$f → $(DESTDIR)$(UNITDIR)/$$f"; \
+	  $(INSTALL) -m 644 systemd/$$f $(DESTDIR)$(UNITDIR)/$$f; \
+	done
+	@if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then \
+	  systemctl daemon-reload; \
+	fi
 	@if [ -f $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf ] \
 	     && [ ! -e $(DESTDIR)$(SYSCONFDIR)/net-mgr/config ]; then \
 	  echo "  migrating $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf → $(DESTDIR)$(SYSCONFDIR)/net-mgr/config"; \
@@ -150,11 +176,13 @@ install: deps
 	    echo "(/root/.my.cnf already has [net-mgr] section — skipping setup)"; \
 	  fi; \
 	  echo; \
-	  echo "Start the daemon: $(SBINDIR)/net-mgr"; \
+	  echo "Enable + start the services:"; \
+	  echo "  systemctl enable --now net-mgr.service"; \
+	  echo "  systemctl enable --now net-dns.service     # optional: DNS frontend"; \
 	else \
 	  echo; \
 	  echo "Next: sudo make setup           (or: sudo $(SBINDIR)/net-mgr-setup)"; \
-	  echo "Then: sudo $(SBINDIR)/net-mgr"; \
+	  echo "Then: sudo systemctl enable --now net-mgr.service"; \
 	fi
 
 # --- setup (interactive DB + creds bootstrap) ------------------------
@@ -166,14 +194,23 @@ setup:
 
 # --- uninstall (does not remove /etc/net-mgr/ or /root/.my.cnf) ---
 uninstall:
+	@if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then \
+	  for u in $(UNITS); do \
+	    systemctl disable --now "$$u" 2>/dev/null || true; \
+	  done; \
+	fi
 	@for f in $(BINS);  do rm -fv $(DESTDIR)$(BINDIR)/$$f;  done
 	@for f in $(SBINS); do rm -fv $(DESTDIR)$(SBINDIR)/$$f; done
 	@for f in $(LIBS);  do rm -fv $(DESTDIR)$(PERL5DIR)/$$f; done
+	@for f in $(UNITS); do rm -fv $(DESTDIR)$(UNITDIR)/$$f; done
 	@rm -fv $(DESTDIR)$(SHAREDIR)/sql/schema.sql
 	-@rmdir $(DESTDIR)$(PERL5DIR)/NetMgr/Producer 2>/dev/null || true
 	-@rmdir $(DESTDIR)$(PERL5DIR)/NetMgr          2>/dev/null || true
 	-@rmdir $(DESTDIR)$(SHAREDIR)/sql             2>/dev/null || true
 	-@rmdir $(DESTDIR)$(SHAREDIR)                 2>/dev/null || true
+	@if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then \
+	  systemctl daemon-reload; \
+	fi
 	@echo
 	@echo "Kept: $(DESTDIR)$(SYSCONFDIR)/net-mgr/ (remove manually if desired)"
 
