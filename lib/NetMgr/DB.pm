@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 3;
+our $SCHEMA_VERSION = 4;
 
 sub new {
     my ($class, %args) = @_;
@@ -109,6 +109,24 @@ sub _apply_migration {
         );
         return;
     }
+    if ($v == 4) {
+        # Add last_observed to track *live* observations, separate from
+        # last_seen (any DB touch). NULL = never observed live (paper-only
+        # entries from dhcp.master). interfaces and addresses both get it.
+        $self->{dbh}->do(
+            "ALTER TABLE interfaces ADD COLUMN last_observed DATETIME NULL"
+        );
+        $self->{dbh}->do(
+            "ALTER TABLE interfaces ADD KEY idx_last_observed (last_observed)"
+        );
+        $self->{dbh}->do(
+            "ALTER TABLE addresses ADD COLUMN last_observed DATETIME NULL"
+        );
+        $self->{dbh}->do(
+            "ALTER TABLE addresses ADD KEY idx_last_observed (last_observed)"
+        );
+        return;
+    }
     if ($v == 3) {
         # Add aliases for explicit name → (machine, preferred-subnet) overrides
         # used by the DNS resolver. machine_id FK with cascade delete.
@@ -139,6 +157,12 @@ sub upsert_interface {
     croak "mac required" unless $f{mac};
     $f{mac} = lc $f{mac};
 
+    # `live => 1` (callers passing live observations) bumps last_observed
+    # to NOW. Relay can override by passing an explicit
+    # `last_observed => $datetime` (preserves the source's value).
+    my $live = delete $f{live};
+    my $last_observed_explicit = delete $f{last_observed};
+
     my $was = $self->{dbh}->selectrow_hashref(
         "SELECT * FROM interfaces WHERE mac = ?", undef, $f{mac}
     );
@@ -157,6 +181,12 @@ sub upsert_interface {
             push @bind, $new;
         }
         push @set,  "last_seen = CURRENT_TIMESTAMP";
+        if (defined $last_observed_explicit) {
+            push @set, "last_observed = ?";
+            push @bind, $last_observed_explicit;
+        } elsif ($live) {
+            push @set, "last_observed = CURRENT_TIMESTAMP";
+        }
         my $sql = "UPDATE interfaces SET " . join(', ', @set) . " WHERE mac = ?";
         $self->{dbh}->do($sql, undef, @bind, $f{mac});
         my $now = $self->{dbh}->selectrow_hashref(
@@ -169,11 +199,18 @@ sub upsert_interface {
         };
     }
 
+    # Insert: if live (or explicit), set last_observed; otherwise leave NULL
+    my $insert_last_observed;
+    if (defined $last_observed_explicit) {
+        $insert_last_observed = $last_observed_explicit;
+    } elsif ($live) {
+        $insert_last_observed = $self->{dbh}->selectrow_array("SELECT NOW()");
+    }
     $self->{dbh}->do(
-        "INSERT INTO interfaces (mac, machine_id, vendor, kind, online)
-         VALUES (?, ?, ?, ?, ?)", undef,
+        "INSERT INTO interfaces (mac, machine_id, vendor, kind, online, last_observed)
+         VALUES (?, ?, ?, ?, ?, ?)", undef,
         $f{mac}, $f{machine_id}, $f{vendor}, ($f{kind} // 'unknown'),
-        ($f{online} // 0)
+        ($f{online} // 0), $insert_last_observed
     );
     my $now = $self->{dbh}->selectrow_hashref(
         "SELECT * FROM interfaces WHERE mac = ?", undef, $f{mac});
@@ -187,32 +224,36 @@ sub upsert_address {
     croak "family required" unless $f{family};
     $f{mac} = lc $f{mac};
 
+    # Same `live` / explicit `last_observed` semantics as upsert_interface
+    my $live = delete $f{live};
+    my $last_observed_explicit = delete $f{last_observed};
+
     my $was = $self->{dbh}->selectrow_hashref(
         "SELECT * FROM addresses WHERE mac = ? AND family = ? AND addr = ?",
         undef, $f{mac}, $f{family}, $f{addr}
     );
     if ($was) {
         my @changed;
-        # Only overwrite source when the new authority is >= the existing one.
-        # That way a casual nmap observation can't downgrade a dhcp.master entry.
+        my @set; my @bind;
+        push @set,  "last_seen = CURRENT_TIMESTAMP";
         my $new_src = $f{source};
         if (defined $new_src
             && _source_priority($new_src) >= _source_priority($was->{source})
             && (($was->{source} // '') ne $new_src))
         {
             push @changed, 'source';
-            $self->{dbh}->do(
-                "UPDATE addresses SET source = ?, last_seen = CURRENT_TIMESTAMP
-                  WHERE mac = ? AND family = ? AND addr = ?",
-                undef, $new_src, $f{mac}, $f{family}, $f{addr}
-            );
-        } else {
-            $self->{dbh}->do(
-                "UPDATE addresses SET last_seen = CURRENT_TIMESTAMP
-                  WHERE mac = ? AND family = ? AND addr = ?",
-                undef, $f{mac}, $f{family}, $f{addr}
-            );
+            push @set,  "source = ?";
+            push @bind, $new_src;
         }
+        if (defined $last_observed_explicit) {
+            push @set, "last_observed = ?";
+            push @bind, $last_observed_explicit;
+        } elsif ($live) {
+            push @set, "last_observed = CURRENT_TIMESTAMP";
+        }
+        my $sql = "UPDATE addresses SET " . join(', ', @set)
+                . " WHERE mac = ? AND family = ? AND addr = ?";
+        $self->{dbh}->do($sql, undef, @bind, $f{mac}, $f{family}, $f{addr});
         my $now = $self->{dbh}->selectrow_hashref(
             "SELECT * FROM addresses WHERE mac = ? AND family = ? AND addr = ?",
             undef, $f{mac}, $f{family}, $f{addr}
@@ -220,9 +261,13 @@ sub upsert_address {
         return { op => @changed ? 'update' : 'noop',
                  changed_fields => \@changed, was => $was, now => $now };
     }
+    my $insert_last_observed;
+    if    (defined $last_observed_explicit) { $insert_last_observed = $last_observed_explicit }
+    elsif ($live) { $insert_last_observed = $self->{dbh}->selectrow_array("SELECT NOW()") }
     $self->{dbh}->do(
-        "INSERT INTO addresses (mac, family, addr, source) VALUES (?, ?, ?, ?)",
-        undef, $f{mac}, $f{family}, $f{addr}, $f{source}
+        "INSERT INTO addresses (mac, family, addr, source, last_observed)
+         VALUES (?, ?, ?, ?, ?)",
+        undef, $f{mac}, $f{family}, $f{addr}, $f{source}, $insert_last_observed
     );
     my $now = $self->{dbh}->selectrow_hashref(
         "SELECT * FROM addresses WHERE mac = ? AND family = ? AND addr = ?",

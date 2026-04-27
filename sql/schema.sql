@@ -38,32 +38,35 @@ CREATE TABLE IF NOT EXISTS hostnames (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS interfaces (
-    mac          CHAR(17)     NOT NULL PRIMARY KEY,
-    machine_id   INT          NULL,         -- NULL until correlated to a machine
-    vendor       VARCHAR(128),              -- OUI lookup result
-    kind         VARCHAR(16)  NOT NULL DEFAULT 'unknown',  -- ethernet/wifi/virtual
-    first_seen   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_seen    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    online       TINYINT      NOT NULL DEFAULT 0,
-    KEY idx_machine     (machine_id),
-    KEY idx_online      (online),
-    KEY idx_last_seen   (last_seen),
+    mac           CHAR(17)    NOT NULL PRIMARY KEY,
+    machine_id    INT         NULL,         -- NULL until correlated to a machine
+    vendor        VARCHAR(128),              -- OUI lookup result
+    kind          VARCHAR(16) NOT NULL DEFAULT 'unknown',  -- ethernet/wifi/virtual
+    first_seen    DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen     DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_observed DATETIME    NULL,           -- last live signal (DHCP/SSH/ARP/nmap/fping);
+                                              -- NULL = never observed live (paper-only)
+    online        TINYINT     NOT NULL DEFAULT 0,
+    KEY idx_machine        (machine_id),
+    KEY idx_online         (online),
+    KEY idx_last_seen      (last_seen),
+    KEY idx_last_observed  (last_observed),
     CONSTRAINT fk_interfaces_machine
         FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS addresses (
-    mac          CHAR(17)     NOT NULL,
-    family       ENUM('v4','v6') NOT NULL,
-    addr         VARCHAR(45)  NOT NULL,
-    source       VARCHAR(64),                -- e.g. '192.168.15.151:DHCP',
-                                             --      'kestrel:dhcp.master',
-                                             --      'kestrel:dhcp.extra',
-                                             --      '<host>:nmap'
-    last_seen    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    mac           CHAR(17)    NOT NULL,
+    family        ENUM('v4','v6') NOT NULL,
+    addr          VARCHAR(45) NOT NULL,
+    source        VARCHAR(64),                 -- e.g. '192.168.15.151:DHCP',
+                                               --      'kestrel:dhcp.master', etc.
+    last_seen     DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_observed DATETIME    NULL,            -- last live signal here; NULL = never seen
     PRIMARY KEY (mac, family, addr),
     KEY idx_addr (addr),
     KEY idx_source (source),
+    KEY idx_last_observed (last_observed),
     CONSTRAINT fk_addresses_iface
         FOREIGN KEY (mac) REFERENCES interfaces(mac) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -144,3 +147,4 @@ CREATE TABLE IF NOT EXISTS aliases (
 INSERT IGNORE INTO schema_version (version) VALUES (1);
 INSERT IGNORE INTO schema_version (version) VALUES (2);
 INSERT IGNORE INTO schema_version (version) VALUES (3);
+INSERT IGNORE INTO schema_version (version) VALUES (4);

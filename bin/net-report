@@ -45,9 +45,12 @@ my @TABLES = qw(machines hostnames interfaces addresses ports aps
 my %SKIP_BY_DEFAULT = (sub => 1, table => 1, op => 1, family => 1);
 
 # Datetime-shaped column names — formatted as relative time unless
-# --absolute was given.
+# --absolute was given. last_observed renders "never" when NULL —
+# the column means "last live signal", so a paper-only entry has
+# never been observed at all.
 my %TIME_COL = map { $_ => 1 }
-    qw(last_seen first_seen ts expires created_at applied_at);
+    qw(last_seen first_seen last_observed ts expires created_at applied_at);
+my %TIME_COL_NEVER = (last_observed => 1);
 
 my $table = shift @ARGV or die usage();
 unless (grep { $_ eq $table } @TABLES) {
@@ -168,12 +171,13 @@ sub print_table {
         @keys = sort keys %seen;
     }
 
-    # In-place: format datetime columns as relative ages
+    # In-place: format datetime columns as relative ages (with "never"
+    # for last_observed when null)
     unless ($absolute_time) {
         for my $r (@$rows) {
             for my $k (@keys) {
                 next unless $TIME_COL{$k};
-                $r->{$k} = relative_time($r->{$k});
+                $r->{$k} = relative_time($r->{$k}, $k);
             }
         }
     }
@@ -197,8 +201,11 @@ sub print_table {
 # "2026-04-26 22:43:20" → "5m" (or whatever fits). Returns the original
 # string if it doesn't look like a DATETIME, and undef-or-empty pass through.
 sub relative_time {
-    my ($v) = @_;
-    return '' unless defined $v && length $v;
+    my ($v, $col) = @_;
+    if (!defined $v || $v eq '') {
+        return 'never' if $col && $TIME_COL_NEVER{$col};
+        return '';
+    }
     return $v unless $v =~ /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)/;
     require Time::Local;
     my $epoch = eval { Time::Local::timelocal($6, $5, $4, $3, $2-1, $1) };
@@ -224,7 +231,7 @@ sub print_row {
     my @out;
     for my $k (@keys) {
         my $v = $r->{$k};
-        $v = relative_time($v) if !$absolute_time && $TIME_COL{$k};
+        $v = relative_time($v, $k) if !$absolute_time && $TIME_COL{$k};
         push @out, defined $v ? "$k=$v" : "$k=";
     }
     print join(' ', @out), "\n";

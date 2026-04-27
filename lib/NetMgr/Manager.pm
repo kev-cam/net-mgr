@@ -688,12 +688,12 @@ sub _obs_ap_self {
     my $mac = $kv->{mac} or die "ap_self: mac required (br0 not parsed?)\n";
     my @ev;
     my $iface = $self->_upsert('interfaces', 'upsert_interface',
-        mac => $mac, kind => 'wifi', online => 1);
+        mac => $mac, kind => 'wifi', online => 1, live => 1);
     push @ev, _events_from_iface_change($iface, $kv->{ip});
 
     if ($kv->{ip}) {
         my $a = $self->_upsert('addresses', 'upsert_address',
-            mac => $mac, family => 'v4', addr => $kv->{ip},
+            mac => $mac, family => 'v4', addr => $kv->{ip}, live => 1,
             defined $kv->{source} ? (source => $kv->{source}) : ());
         if ($a->{op} eq 'insert') {
             push @ev, { type => 'address_added', mac => $mac, addr => $kv->{ip} };
@@ -714,7 +714,7 @@ sub _obs_association {
     my @ev;
 
     my $iface = $self->_upsert('interfaces', 'upsert_interface',
-        mac => $client_mac, kind => 'wifi', online => 1);
+        mac => $client_mac, kind => 'wifi', online => 1, live => 1);
     push @ev, _events_from_iface_change($iface);
 
     # Resolve ap_ip → ap_mac via aps/addresses join.
@@ -747,10 +747,10 @@ sub _obs_arp {
     my $ip  = $kv->{ip}  or die "arp: ip required\n";
     my @ev;
     my $iface = $self->_upsert('interfaces', 'upsert_interface',
-        mac => $mac, kind => 'ethernet', online => 1);
+        mac => $mac, kind => 'ethernet', online => 1, live => 1);
     push @ev, _events_from_iface_change($iface, $ip);
     my $a = $self->_upsert('addresses', 'upsert_address',
-        mac => $mac, family => 'v4', addr => $ip,
+        mac => $mac, family => 'v4', addr => $ip, live => 1,
         defined $kv->{source} ? (source => $kv->{source}) : ());
     if ($a->{op} eq 'insert') {
         push @ev, { type => 'address_added', mac => $mac, addr => $ip };
@@ -764,10 +764,10 @@ sub _obs_lease {
     my $ip  = $kv->{ip}  or die "lease: ip required\n";
     my @ev;
     my $iface = $self->_upsert('interfaces', 'upsert_interface',
-        mac => $mac, online => 1);
+        mac => $mac, online => 1, live => 1);
     push @ev, _events_from_iface_change($iface, $ip);
     my $a = $self->_upsert('addresses', 'upsert_address',
-        mac => $mac, family => 'v4', addr => $ip,
+        mac => $mac, family => 'v4', addr => $ip, live => 1,
         defined $kv->{source} ? (source => $kv->{source}) : ());
     if ($a->{op} eq 'insert') {
         push @ev, { type => 'address_added', mac => $mac, addr => $ip };
@@ -801,12 +801,13 @@ sub _obs_host {
             kind   => $kv->{iface_kind} // 'ethernet',
             vendor => $kv->{vendor},
         );
-        $iface_args{online} = 1 if $is_live;
+        if ($is_live) { $iface_args{online} = 1; $iface_args{live} = 1 }
         my $iface = $self->_upsert('interfaces', 'upsert_interface', %iface_args);
         push @ev, _events_from_iface_change($iface, $ip);
         if ($ip) {
             my $a = $self->_upsert('addresses', 'upsert_address',
                 mac => $mac, family => $kv->{family} // 'v4', addr => $ip,
+                ($is_live ? (live => 1) : ()),
                 defined $kv->{source} ? (source => $kv->{source}) : ());
             if ($a->{op} eq 'insert') {
                 push @ev, { type => 'address_added', mac => $mac, addr => $ip };

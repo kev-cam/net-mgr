@@ -128,6 +128,9 @@ sub _apply_interfaces {
     $args{kind}    = $row->{kind}    if defined $row->{kind};
     $args{vendor}  = $row->{vendor}  if defined $row->{vendor};
     $args{online}  = $row->{online}  if defined $row->{online};
+    # Preserve peer's last_observed exactly (don't auto-bump on receiver)
+    $args{last_observed} = $row->{last_observed}
+        if defined $row->{last_observed} && length $row->{last_observed};
     if (defined $row->{machine_id} && $row->{machine_id} ne '') {
         my $lmid = $idmap->{ $row->{machine_id} };
         $args{machine_id} = $lmid if $lmid;
@@ -143,6 +146,8 @@ sub _apply_addresses {
         family => $row->{family},
         addr   => $row->{addr},
         (defined $row->{source} ? (source => $row->{source}) : ()),
+        (defined $row->{last_observed} && length $row->{last_observed}
+            ? (last_observed => $row->{last_observed}) : ()),
     );
 }
 
