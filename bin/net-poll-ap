@@ -3,11 +3,17 @@
 #
 # Usage:
 #   net-poll-ap [--print] [--ssh-user USER] [--ssh-timeout N]
-#               [--listen HOST:PORT] [--cache PATH] [--no-cache] IP [IP ...]
+#               [--listen HOST:PORT] [--cache PATH] [--no-cache]
+#               [--auto] [IP ...]
 #
 # Without --print, connects to the manager (default 127.0.0.1:7531 or
 # $NET_MGR_LISTEN) and sends OBSERVE messages. With --print, dumps to
 # stdout for debugging.
+#
+# --auto asks the manager for everything with port 22 known open (plus
+# rows already in the aps table) and tries each. Failed attempts go
+# into the per-AP backoff cache, so a non-AP that happens to run sshd
+# only costs one round of poll attempts before being mostly skipped.
 #
 # Per-AP backoff: APs that fail to poll get exponentially longer retry
 # windows so this can run frequently from periodic scheduling without
@@ -33,6 +39,7 @@ my $ssh_timeout = 10;
 my $listen;
 my $cache_path  = '/var/cache/net-mgr/ap-poll.tsv';
 my $no_cache;
+my $auto;
 
 GetOptions(
     'print'         => \$print_only,
@@ -41,15 +48,21 @@ GetOptions(
     'listen=s'      => \$listen,
     'cache=s'       => \$cache_path,
     'no-cache'      => \$no_cache,
+    'auto'          => \$auto,
 ) or die "bad options\n";
 
-@ARGV or die "usage: $0 [--print] [--listen HOST:PORT] IP [IP ...]\n";
+my @candidates = @ARGV;
+push @candidates, discover_auto_ips($listen) if $auto;
+@candidates = do { my %seen; grep { !$seen{$_}++ } @candidates };
+
+@candidates
+    or die "usage: $0 [--auto] [--print] [--listen HOST:PORT] [IP ...]\n";
 
 my %cache = $no_cache ? () : load_cache($cache_path);
 
 # Filter out APs that are still in their backoff window
 my @ips_to_poll;
-for my $ip (@ARGV) {
+for my $ip (@candidates) {
     if (in_backoff(\%cache, $ip)) {
         my $entry = $cache{$ip};
         my $remain = $entry->{next_attempt} - time();
@@ -124,6 +137,35 @@ save_cache($cache_path, \%cache) unless $no_cache;
 
 if ($cli) {
     $cli->bye;
+}
+
+# ---- --auto discovery -------------------------------------------------
+# Ask the manager for any mac with port 22 known open OR already in
+# the aps table, then resolve to a v4 address. Already-known APs are
+# included so a periodic --auto run still re-polls them even if their
+# port-22 row hasn't been (re)scanned recently.
+sub discover_auto_ips {
+    my ($listen) = @_;
+    my $cli = NetMgr::Client->new(listen => $listen);
+    $cli->hello(consumer => "net-poll-ap-auto.$$");
+    my %macs;
+    my $ports = $cli->snapshot(1, 'ports', where => 'port = 22');
+    $macs{ lc $_->{mac} } = 1 for grep { $_->{mac} } @$ports;
+    my $aps = $cli->snapshot(2, 'aps');
+    $macs{ lc $_->{mac} } = 1 for grep { $_->{mac} } @$aps;
+    my $addrs = $cli->snapshot(3, 'addresses', where => "family = 'v4'");
+    my %ip_by_mac;
+    for my $a (@$addrs) {
+        next unless $a->{mac} && $a->{addr};
+        $ip_by_mac{ lc $a->{mac} } //= $a->{addr};
+    }
+    $cli->bye;
+    my @ips;
+    for my $mac (sort keys %macs) {
+        my $ip = $ip_by_mac{$mac} or next;
+        push @ips, $ip;
+    }
+    return @ips;
 }
 
 # ---- per-AP backoff cache --------------------------------------------
