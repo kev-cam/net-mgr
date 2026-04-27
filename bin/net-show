@@ -14,14 +14,35 @@ use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case no_bundling);   # support old `-find=ip`
 use NetMgr::Client;
 
+sub usage {
+    return <<'EOF';
+usage:
+  net-show                       # list access points and their SSIDs
+  net-show --no-scan             # same, but skip the TRIGGER scan-ap
+  net-show -find=<ip>            # show which AP saw the given IP
+  net-show --listen HOST:PORT    # override manager address (else 127.0.0.1:7531
+                                 # or $NET_MGR_LISTEN)
+  net-show -h | --help           # this message
+
+examples:
+  net-show
+  net-show -find=192.168.15.81
+  net-show --no-scan -find=192.168.15.81
+EOF
+}
+
 my $listen;
 my $find;
 my $no_scan;
+my $help;
 GetOptions(
     'listen=s' => \$listen,
     'find=s'   => \$find,
     'no-scan'  => \$no_scan,
-) or die "bad options\n";
+    'h|help'   => \$help,
+) or die usage();
+
+if ($help) { print usage(); exit 0 }
 
 my $cli = NetMgr::Client->new(listen => $listen);
 $cli->hello(consumer => "net-show.$$");
