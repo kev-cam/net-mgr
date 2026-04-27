@@ -11,15 +11,19 @@ use NetMgr::Protocol qw(parse_line format_kv);
 sub new {
     my ($class, %args) = @_;
     my $listen = $args{listen} // $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
+    # Default port to 7531 so '--listen zmc1' / '--listen zmc1.grfx.com'
+    # both work without spelling out the port every time.
     my ($host, $port) = split /:/, $listen, 2;
+    $port //= 7531;
+    $port  =  7531 if $port eq '';
     my $timeout = $args{timeout} // 10;
     my $sock = IO::Socket::INET->new(
         PeerAddr => $host,
         PeerPort => $port,
         Proto    => 'tcp',
         Timeout  => $timeout,
-    ) or croak "connect $listen: $!";
-    return bless { sock => $sock, buf => '', listen => $listen }, $class;
+    ) or croak "connect $host:$port: $!";
+    return bless { sock => $sock, buf => '', listen => "$host:$port" }, $class;
 }
 
 sub send_line {
