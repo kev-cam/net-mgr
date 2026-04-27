@@ -104,6 +104,7 @@ sub run {
         }
         $self->_reap_triggers          if %{ $self->{triggers} };
         $self->_check_periodic_triggers;
+        $self->_age_out_offline;
     }
     $self->_log("shutting down");
     for my $c (values %{ $self->{clients} }) {
@@ -416,6 +417,34 @@ sub _handle_trigger {
     }
 
     $self->_send($cli, format_err("unknown trigger '$name'"));
+}
+
+# Flip currently-online interfaces back to offline if their last_seen
+# is older than the grace period. Cheap query; runs at most every 30s.
+sub _age_out_offline {
+    my ($self) = @_;
+    my $grace = $self->{config}{manager}{offline_after} // 300;
+    return unless $grace && $grace > 0;
+    my $now = time();
+    return if ($now - ($self->{_last_age_check} // 0)) < 30;
+    $self->{_last_age_check} = $now;
+
+    my $rows = $self->{db}->dbh->selectall_arrayref(
+        "SELECT mac FROM interfaces
+          WHERE online = 1
+            AND last_seen < DATE_SUB(NOW(), INTERVAL ? SECOND)",
+        { Slice => {} }, $grace
+    );
+    return unless @$rows;
+    for my $r (@$rows) {
+        my $upd = $self->_upsert('interfaces', 'upsert_interface',
+            mac => $r->{mac}, online => 0);
+        if ($upd->{op} eq 'update'
+            && grep { $_ eq 'online' } @{ $upd->{changed_fields} })
+        {
+            $self->_log_event(type => 'interface_offline', mac => $r->{mac});
+        }
+    }
 }
 
 # Periodic, daemon-initiated TRIGGERs. Reads intervals from
@@ -762,12 +791,18 @@ sub _obs_host {
     my $ip  = $kv->{ip};
     my @ev;
     if ($mac) {
-        my $iface = $self->_upsert('interfaces', 'upsert_interface',
+        # Only mark online for *live* observations. Imports from
+        # dhcp.master / dhcp.extra are paper records — they don't
+        # prove the device is currently reachable.
+        my $src = $kv->{source} // '';
+        my $is_live = $src !~ /:dhcp\.(master|extra)$/;
+        my %iface_args = (
             mac    => $mac,
             kind   => $kv->{iface_kind} // 'ethernet',
             vendor => $kv->{vendor},
-            online => 1,
         );
+        $iface_args{online} = 1 if $is_live;
+        my $iface = $self->_upsert('interfaces', 'upsert_interface', %iface_args);
         push @ev, _events_from_iface_change($iface, $ip);
         if ($ip) {
             my $a = $self->_upsert('addresses', 'upsert_address',

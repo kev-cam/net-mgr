@@ -6,6 +6,9 @@
 [manager]
 listen = 127.0.0.1:7531
 log    = /var/log/net-mgr.log
+# Mark an interface offline if last_seen is older than this. Combine
+# with [scheduling] presence / scan-ap to keep `online` honest.
+offline_after = 300s
 
 [mysql]
 db       = netmgr

@@ -19,8 +19,12 @@ use Carp qw(croak);
 
 my %DEFAULTS = (
     manager => {
-        listen => '127.0.0.1:7531',
-        log    => '/var/log/net-mgr.log',
+        listen        => '127.0.0.1:7531',
+        log           => '/var/log/net-mgr.log',
+        # Flip interfaces.online back to 0 when last_seen is older than
+        # this many seconds. Combined with the periodic scan-ap /
+        # presence triggers (in [scheduling]), keeps online accurate.
+        offline_after => 300,
     },
     mysql => {
         db       => 'netmgr',
@@ -69,6 +73,7 @@ my %DEFAULTS = (
 
 # Per-section, which keys should be coerced to integer seconds.
 my %DURATION_KEYS = (
+    manager    => { offline_after => 1 },
     scanner    => { presence_interval => 1, discover_interval => 1, reprobe_ports => 1 },
     ap_poll    => { interval => 1, ssh_timeout => 1 },
     timeouts   => { ap => 1, fping => 1, nmap => 1, dhcp => 1 },

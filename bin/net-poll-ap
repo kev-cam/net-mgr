@@ -3,17 +3,26 @@
 #
 # Usage:
 #   net-poll-ap [--print] [--ssh-user USER] [--ssh-timeout N]
-#               [--listen HOST:PORT] IP [IP ...]
+#               [--listen HOST:PORT] [--cache PATH] [--no-cache] IP [IP ...]
 #
 # Without --print, connects to the manager (default 127.0.0.1:7531 or
 # $NET_MGR_LISTEN) and sends OBSERVE messages. With --print, dumps to
 # stdout for debugging.
+#
+# Per-AP backoff: APs that fail to poll get exponentially longer retry
+# windows so this can run frequently from periodic scheduling without
+# wasting SSH attempts on hosts that don't have keys / networks that
+# don't have a particular AP visible. Cache lives at
+# /var/cache/net-mgr/ap-poll.tsv (override with --cache, disable
+# entirely with --no-cache).
 
 use strict;
 use warnings;
 use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
+use Fcntl qw(:flock);
+use File::Basename qw(dirname);
 use NetMgr::Producer::AP;
 use NetMgr::Protocol qw(format_kv);
 use NetMgr::Client;
@@ -22,19 +31,38 @@ my $print_only  = 0;
 my $ssh_user    = 'root';
 my $ssh_timeout = 10;
 my $listen;
+my $cache_path  = '/var/cache/net-mgr/ap-poll.tsv';
+my $no_cache;
 
 GetOptions(
     'print'         => \$print_only,
     'ssh-user=s'    => \$ssh_user,
     'ssh-timeout=i' => \$ssh_timeout,
     'listen=s'      => \$listen,
+    'cache=s'       => \$cache_path,
+    'no-cache'      => \$no_cache,
 ) or die "bad options\n";
 
 @ARGV or die "usage: $0 [--print] [--listen HOST:PORT] IP [IP ...]\n";
 
+my %cache = $no_cache ? () : load_cache($cache_path);
+
+# Filter out APs that are still in their backoff window
+my @ips_to_poll;
+for my $ip (@ARGV) {
+    if (in_backoff(\%cache, $ip)) {
+        my $entry = $cache{$ip};
+        my $remain = $entry->{next_attempt} - time();
+        warn "skip $ip (backed off, "
+           . "$entry->{failures} failure(s), retry in ${remain}s)\n";
+        next;
+    }
+    push @ips_to_poll, $ip;
+}
+
 # Fork-per-AP for concurrent SSH.
 my @children;
-for my $ip (@ARGV) {
+for my $ip (@ips_to_poll) {
     pipe(my $rd, my $wr) or die "pipe: $!";
     my $pid = fork();
     die "fork: $!" unless defined $pid;
@@ -72,8 +100,10 @@ for my $c (@children) {
     my $r = eval $data;
     if (!$r || !$r->{ok}) {
         warn "poll $c->{ip}: " . ($r->{error} // 'no result') . "\n";
+        record_failure(\%cache, $c->{ip});
         next;
     }
+    record_success(\%cache, $c->{ip});
     if ($print_only) {
         print "# === $c->{ip} ===\n";
     }
@@ -90,6 +120,83 @@ for my $c (@children) {
     }
 }
 
+save_cache($cache_path, \%cache) unless $no_cache;
+
 if ($cli) {
     $cli->bye;
+}
+
+# ---- per-AP backoff cache --------------------------------------------
+# TSV: ip\tlast_attempt\tlast_success\tfailures\tnext_attempt
+#
+# After a failure, next_attempt = now + base * 2^(failures-1), capped.
+# After a success, failures resets to 0 and the AP polls every cycle.
+
+use constant BACKOFF_BASE_SECONDS => 300;     #  5 min after first failure
+use constant BACKOFF_CAP_SECONDS  => 3600;    #  1 hour cap
+
+sub in_backoff {
+    my ($cache, $ip) = @_;
+    my $e = $cache->{$ip} or return 0;
+    return 0 unless $e->{failures} > 0;
+    return time() < ($e->{next_attempt} // 0);
+}
+
+sub record_failure {
+    my ($cache, $ip) = @_;
+    my $e = $cache->{$ip} //= { failures => 0 };
+    $e->{failures}++;
+    $e->{last_attempt} = time();
+    my $delay = BACKOFF_BASE_SECONDS * (2 ** ($e->{failures} - 1));
+    $delay    = BACKOFF_CAP_SECONDS if $delay > BACKOFF_CAP_SECONDS;
+    $e->{next_attempt} = time() + $delay;
+}
+
+sub record_success {
+    my ($cache, $ip) = @_;
+    my $e = $cache->{$ip} //= {};
+    $e->{failures}     = 0;
+    $e->{last_attempt} = time();
+    $e->{last_success} = time();
+    $e->{next_attempt} = 0;
+}
+
+sub load_cache {
+    my ($path) = @_;
+    my %c;
+    return %c unless -f $path;
+    open my $fh, '<', $path or return %c;
+    while (my $line = <$fh>) {
+        chomp $line;
+        next if $line =~ /^\s*(?:#|$)/;
+        my @f = split /\t/, $line, 5;
+        next unless $f[0];
+        $c{ $f[0] } = {
+            last_attempt => $f[1] // 0,
+            last_success => $f[2] // 0,
+            failures     => $f[3] // 0,
+            next_attempt => $f[4] // 0,
+        };
+    }
+    close $fh;
+    return %c;
+}
+
+sub save_cache {
+    my ($path, $cache) = @_;
+    my $dir = dirname($path);
+    -d $dir or eval { require File::Path; File::Path::make_path($dir) };
+    open my $fh, '>', "$path.tmp" or do {
+        warn "save_cache: open $path.tmp: $!"; return;
+    };
+    flock $fh, LOCK_EX;
+    for my $ip (sort keys %$cache) {
+        my $e = $cache->{$ip};
+        print {$fh} join("\t",
+            $ip, $e->{last_attempt} // 0, $e->{last_success} // 0,
+            $e->{failures} // 0, $e->{next_attempt} // 0), "\n";
+    }
+    flock $fh, LOCK_UN;
+    close $fh;
+    rename "$path.tmp", $path or warn "save_cache: rename $path: $!";
 }
