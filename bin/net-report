@@ -174,13 +174,17 @@ sub enrich_with_machine_names {
     }
 }
 
-# Mutates $rows: adds an 'ip' column with the AP's address on the
-# subnet that its WiFi clients are on. APs routinely have several
-# reachable IPs (LAN-side, WAN-side, mgmt VLAN); the user-relevant
-# one is the WiFi-side address. Pick it by tallying which /24 contains
-# the most associated client IPs and matching the AP's address in
-# that /24. Fall back to listing every v4 if we can't infer the
-# WiFi subnet (no associations recorded yet, AP-only setup, etc.).
+# Mutates $rows: adds an 'ip' column with the single IP for the subnet
+# the AP serves WiFi on. APs commonly have several reachable IPs
+# (LAN-side, WAN-side, mgmt VLAN); the user-relevant one is the
+# WiFi-side address.
+#
+# Signals (combined into per-/24 vote counts per AP):
+#   1. associations — explicit "client X is on AP Y" records
+#   2. addresses.source = "<ap-ip>:DHCP|arp" — clients the AP itself
+#      reported via lease/arp tables; works when associations aren't
+#      collected (e.g. AP poll didn't capture them, AP only runs DHCP)
+# Final fallback: lowest-numbered IP (deterministic, single value).
 sub enrich_with_ip {
     my ($cli, $rows) = @_;
     return unless @$rows;
@@ -192,10 +196,33 @@ sub enrich_with_ip {
         next unless $a->{mac} && $a->{addr};
         push @{ $ips_by_mac{ lc $a->{mac} } }, $a->{addr};
     }
-    my %clients_by_ap;
+
+    # ap_ip → ap_mac, so we can map addresses.source back to its AP
+    my %ap_by_ip;
+    for my $r (@$rows) {
+        my $am = lc($r->{mac} // '') or next;
+        $ap_by_ip{$_} = $am for @{ $ips_by_mac{$am} || [] };
+    }
+
+    my %vote;   # ap_mac → { /24 => count }
+
+    # Signal 1: associations
     for my $a (@$assocs) {
-        next unless $a->{ap_mac} && $a->{client_mac};
-        push @{ $clients_by_ap{ lc $a->{ap_mac} } }, lc $a->{client_mac};
+        my $ap = lc($a->{ap_mac}     // '') or next;
+        my $cm = lc($a->{client_mac} // '') or next;
+        my $cips = $ips_by_mac{$cm} or next;
+        my %seen24;
+        $seen24{ ip_24($_) }++ for grep { ip_24($_) } @$cips;
+        $vote{$ap}{$_}++ for keys %seen24;
+    }
+
+    # Signal 2: addresses observed-by-AP via source field
+    for my $a (@$addrs) {
+        my ($src_ip) = ($a->{source} // '') =~ /^(\d+\.\d+\.\d+\.\d+):/
+            or next;
+        my $ap = $ap_by_ip{$src_ip} or next;
+        my $sub = ip_24($a->{addr}) or next;
+        $vote{$ap}{$sub}++;
     }
 
     for my $r (@$rows) {
@@ -203,30 +230,13 @@ sub enrich_with_ip {
         my $ips = $ips_by_mac{$mac} or next;
         my @sorted = sort { ip_sort_key($a) cmp ip_sort_key($b) } @$ips;
 
-        my $wifi_24 = ap_wifi_subnet_24($clients_by_ap{$mac}, \%ips_by_mac);
-        my ($wifi_ip) = $wifi_24 ? grep { ip_24($_) eq $wifi_24 } @sorted : ();
-        $r->{ip} = $wifi_ip // join(',', @sorted);
+        my $tally = $vote{$mac};
+        my ($top) = $tally
+                  ? sort { $tally->{$b} <=> $tally->{$a} } keys %$tally
+                  : ();
+        my ($wifi_ip) = $top ? grep { ip_24($_) eq $top } @sorted : ();
+        $r->{ip} = $wifi_ip // $sorted[0];
     }
-}
-
-# Most-common /24 across the supplied clients' v4 addresses; one vote
-# per client to keep a multi-homed laptop from skewing the tally.
-sub ap_wifi_subnet_24 {
-    my ($clients, $ips_by_mac) = @_;
-    return unless $clients && @$clients;
-    my %count;
-    for my $cm (@$clients) {
-        my $cips = $ips_by_mac->{$cm} or next;
-        my %voted;
-        for my $ip (@$cips) {
-            my $s = ip_24($ip) or next;
-            next if $voted{$s}++;
-            $count{$s}++;
-        }
-    }
-    return unless %count;
-    my ($top) = sort { $count{$b} <=> $count{$a} } keys %count;
-    return $top;
 }
 
 sub ip_24 {
