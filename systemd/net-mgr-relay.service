@@ -1,0 +1,18 @@
+[Unit]
+Description=net-mgr-relay — replicate from peer net-mgr instances
+Documentation=https://github.com/kev-cam/net-mgr
+After=network-online.target net-mgr.service mariadb.service mysql.service
+Wants=network-online.target
+PartOf=net-mgr.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/net-mgr-relay --foreground
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=net-mgr-relay
+
+[Install]
+WantedBy=multi-user.target

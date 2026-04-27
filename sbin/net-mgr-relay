@@ -1,0 +1,106 @@
+#!/usr/bin/perl
+# net-mgr-relay — replicate from peer net-mgr instances into local DB.
+#
+# Reads /etc/net-mgr/config for the [peers] section:
+#   [peers]
+#   sources = kc-qernel, nas3
+#
+# Forks one child per peer; each child opens a SUBSCRIBE+stream
+# connection and replays received ROWs into the local DB. The local
+# net-mgr daemon doesnt see (and doesnt re-emit) these — so peering
+# is safe to make bidirectional.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use POSIX qw(:sys_wait_h);
+
+use NetMgr::Config;
+use NetMgr::DB;
+use NetMgr::Relay;
+
+my $conf_path  = $ENV{NET_MGR_CONF} // '/etc/net-mgr/config';
+my $foreground = 0;
+my @peers_cli;
+GetOptions(
+    'config=s'     => \$conf_path,
+    'foreground|f' => \$foreground,
+    'peer=s@'      => \@peers_cli,
+) or die "bad options\n";
+
+my $cfg = NetMgr::Config->load($conf_path);
+
+# Peers: from config or --peer
+my @peers;
+if (@peers_cli) {
+    @peers = @peers_cli;
+} elsif (my $list = $cfg->{peers}{sources}) {
+    @peers = grep { length } map { s/^\s+|\s+$//gr } split /,/, $list;
+}
+unless (@peers) {
+    die "no peers configured (set [peers] sources = host1, host2 in $conf_path "
+      . "or pass --peer host)\n";
+}
+
+# DB connection (one shared by all children — but actually each child
+# needs its own to avoid socket sharing issues across forks).
+my $mycnf = $cfg->{mysql}{defaults} // '/root/.my.cnf';
+unless (-r $mycnf) {
+    $mycnf = "$ENV{HOME}/.my.cnf" if -r "$ENV{HOME}/.my.cnf";
+}
+die "no readable .my.cnf for [net-mgr]\n" unless -r $mycnf;
+
+print STDERR "[net-mgr-relay] peers: @peers\n";
+
+unless ($foreground) {
+    my $pid = fork; die "fork: $!" unless defined $pid;
+    exit 0 if $pid;
+    require POSIX; POSIX::setsid();
+    open STDIN,  '<',  '/dev/null';
+    open STDOUT, '>>', '/dev/null';
+}
+
+my %children;
+for my $peer (@peers) {
+    my $pid = fork; die "fork: $!" unless defined $pid;
+    if ($pid == 0) {
+        my $db = NetMgr::DB->new(
+            defaults_file => $mycnf,
+            section       => $cfg->{mysql}{section} // 'net-mgr',
+            db            => $cfg->{mysql}{db}      // 'netmgr',
+        );
+        $db->connect;
+        NetMgr::Relay::run(peer => $peer, db => $db, log_fh => \*STDERR);
+        exit 0;
+    }
+    $children{$pid} = $peer;
+    print STDERR "[net-mgr-relay] forked pid=$pid for $peer\n";
+}
+
+# Reap + restart children if they exit
+$SIG{TERM} = sub {
+    for my $pid (keys %children) { kill 'TERM', $pid }
+    exit 0;
+};
+$SIG{INT} = $SIG{TERM};
+while (1) {
+    my $pid = waitpid -1, 0;
+    last if $pid <= 0;
+    my $peer = delete $children{$pid};
+    print STDERR "[net-mgr-relay] child for $peer (pid=$pid) exited; restarting in 10s\n";
+    sleep 10;
+    my $new_pid = fork; die "fork: $!" unless defined $new_pid;
+    if ($new_pid == 0) {
+        my $db = NetMgr::DB->new(
+            defaults_file => $mycnf,
+            section       => $cfg->{mysql}{section} // 'net-mgr',
+            db            => $cfg->{mysql}{db}      // 'netmgr',
+        );
+        $db->connect;
+        NetMgr::Relay::run(peer => $peer, db => $db, log_fh => \*STDERR);
+        exit 0;
+    }
+    $children{$new_pid} = $peer;
+}

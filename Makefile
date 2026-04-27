@@ -20,11 +20,11 @@ UNITDIR    ?= $(SYSCONFDIR)/systemd/system
 DESTDIR    ?=
 
 BINS  = net-alias net-poll-ap net-discover net-import-dhcp net-fix net-scan net-report net-show
-SBINS = net-mgr net-mgr-setup net-dns
-UNITS = net-mgr.service net-dns.service
+SBINS = net-mgr net-mgr-setup net-dns net-mgr-relay
+UNITS = net-mgr.service net-dns.service net-mgr-relay.service
 LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \
         NetMgr/Manager.pm NetMgr/Client.pm NetMgr/Resolver.pm \
-        NetMgr/Vendor.pm NetMgr/Subnets.pm \
+        NetMgr/Relay.pm NetMgr/Vendor.pm NetMgr/Subnets.pm \
         NetMgr/Producer/AP.pm NetMgr/Producer/Scan.pm \
         NetMgr/Producer/DhcpMaster.pm NetMgr/Producer/Fingerprint.pm
 

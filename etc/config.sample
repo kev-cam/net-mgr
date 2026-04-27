@@ -60,3 +60,11 @@ domain   = grfx.com
 [bindings]
 # machine "kestrel"   = aa:bb:cc:dd:ee:01, aa:bb:cc:dd:ee:02
 # machine "router-up" = 11:22:33:44:55:66
+
+# Peer net-mgr instances to replicate from. Set on hosts that don't
+# run their own producers — a relay child opens a long-lived
+# SUBSCRIBE+stream connection to each peer and applies received ROWs
+# into the local DB. Bidirectional peering is safe (replicated rows
+# don't re-emit, so no loop).
+[peers]
+# sources = kc-qernel, nas3
