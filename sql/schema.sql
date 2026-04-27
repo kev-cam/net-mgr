@@ -63,6 +63,9 @@ CREATE TABLE IF NOT EXISTS addresses (
                                                --      'kestrel:dhcp.master', etc.
     last_seen     DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_observed DATETIME    NULL,            -- last live signal here; NULL = never seen
+    min_rtt_ms    FLOAT       NULL,            -- shortest fping RTT ever observed;
+                                               -- monotone-decreasing, manual reset only
+    last_rtt_ms   FLOAT       NULL,            -- most-recent fping RTT
     PRIMARY KEY (mac, family, addr),
     KEY idx_addr (addr),
     KEY idx_source (source),
@@ -148,3 +151,4 @@ INSERT IGNORE INTO schema_version (version) VALUES (1);
 INSERT IGNORE INTO schema_version (version) VALUES (2);
 INSERT IGNORE INTO schema_version (version) VALUES (3);
 INSERT IGNORE INTO schema_version (version) VALUES (4);
+INSERT IGNORE INTO schema_version (version) VALUES (5);

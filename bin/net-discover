@@ -185,7 +185,9 @@ sub _print_fingerprint {
 }
 
 if ($do_presence) {
-    # Snapshot known v4 addresses, fping them, mark dead ones GONE.
+    # Snapshot known v4 addresses, fping them with RTT, push observations.
+    # Alive hosts emit kind=ping (carries rtt_ms; manager updates min/last
+    # and fires ping_slow on transition); dead hosts get GONE on the iface.
     die "--presence requires --listen / daemon (no --print mode)\n" if $print_only;
     my $rows = $cli->snapshot(99, 'addresses', where => "family = 'v4'");
     my %ips;
@@ -194,10 +196,12 @@ if ($do_presence) {
     }
     my @ips = sort keys %ips;
     warn "presence-checking " . scalar(@ips) . " ips\n";
-    my $res = NetMgr::Producer::Scan::fping_presence(@ips);
-    for my $ip (@{ $res->{alive} }) {
+    my $res = NetMgr::Producer::Scan::fping_rtt(@ips);
+    for my $ip (sort keys %{ $res->{alive} }) {
+        my $rtt = $res->{alive}{$ip};
         for my $mac (@{ $ips{$ip} }) {
-            $cli->observe(kind => 'arp', mac => $mac, ip => $ip);
+            $cli->observe(kind => 'ping', mac => $mac, addr => $ip,
+                          rtt_ms => $rtt);
         }
     }
     for my $ip (@{ $res->{dead} }) {

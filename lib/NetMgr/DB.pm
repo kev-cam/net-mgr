@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 4;
+our $SCHEMA_VERSION = 5;
 
 sub new {
     my ($class, %args) = @_;
@@ -124,6 +124,18 @@ sub _apply_migration {
         );
         $self->{dbh}->do(
             "ALTER TABLE addresses ADD KEY idx_last_observed (last_observed)"
+        );
+        return;
+    }
+    if ($v == 5) {
+        # Per-(mac,addr) ping RTT tracking. min_rtt_ms is monotone-
+        # decreasing, reset_rtt() clears it. last_rtt_ms is the most-
+        # recent fping reading, used by the ping_slow event detector.
+        $self->{dbh}->do(
+            "ALTER TABLE addresses ADD COLUMN min_rtt_ms FLOAT NULL"
+        );
+        $self->{dbh}->do(
+            "ALTER TABLE addresses ADD COLUMN last_rtt_ms FLOAT NULL"
         );
         return;
     }
@@ -275,6 +287,77 @@ sub upsert_address {
     );
     return { op => 'insert', changed_fields => [qw(mac family addr source)],
              was => undef, now => $now };
+}
+
+# Update the ping RTT fields on an existing addresses row. Does NOT
+# upsert — pinging happens against IPs we already know; if the row is
+# missing it's a producer bug, not a discovery event. Returns
+#   { found => 0|1, prev_min => $f|undef, new_min => $f|undef,
+#     prev_last => $f|undef, last_rtt_ms => $f }
+# so the caller (Manager::_obs_ping) can decide whether the new
+# reading crossed a "ping_slow" threshold.
+sub update_rtt {
+    my ($self, %f) = @_;
+    croak "mac required"  unless $f{mac};
+    croak "addr required" unless $f{addr};
+    croak "rtt_ms required" unless defined $f{rtt_ms};
+    my $mac    = lc $f{mac};
+    my $addr   = $f{addr};
+    my $family = $f{family} // 'v4';
+    my $rtt    = $f{rtt_ms} + 0;
+
+    my $was = $self->{dbh}->selectrow_hashref(
+        "SELECT min_rtt_ms, last_rtt_ms FROM addresses
+          WHERE mac = ? AND family = ? AND addr = ?",
+        undef, $mac, $family, $addr
+    );
+    return { found => 0 } unless $was;
+
+    $self->{dbh}->do(
+        "UPDATE addresses
+            SET last_rtt_ms   = ?,
+                min_rtt_ms    = LEAST(IFNULL(min_rtt_ms, ?), ?),
+                last_observed = CURRENT_TIMESTAMP,
+                last_seen     = CURRENT_TIMESTAMP
+          WHERE mac = ? AND family = ? AND addr = ?",
+        undef, $rtt, $rtt, $rtt, $mac, $family, $addr
+    );
+    my ($new_min) = $self->{dbh}->selectrow_array(
+        "SELECT min_rtt_ms FROM addresses
+          WHERE mac = ? AND family = ? AND addr = ?",
+        undef, $mac, $family, $addr
+    );
+    return {
+        found       => 1,
+        prev_min    => $was->{min_rtt_ms},
+        new_min     => $new_min,
+        prev_last   => $was->{last_rtt_ms},
+        last_rtt_ms => $rtt,
+    };
+}
+
+# Manual reset of min_rtt_ms (and last_rtt_ms) so a known-bad
+# baseline measurement can be re-learned. Pass mac+addr to clear one
+# row, or no args to clear everything. Returns rowcount.
+sub reset_rtt {
+    my ($self, %f) = @_;
+    if ($f{mac} && $f{addr}) {
+        return $self->{dbh}->do(
+            "UPDATE addresses SET min_rtt_ms = NULL, last_rtt_ms = NULL
+              WHERE mac = ? AND family = ? AND addr = ?",
+            undef, lc $f{mac}, $f{family} // 'v4', $f{addr}
+        );
+    }
+    if ($f{addr}) {
+        return $self->{dbh}->do(
+            "UPDATE addresses SET min_rtt_ms = NULL, last_rtt_ms = NULL
+              WHERE addr = ?",
+            undef, $f{addr}
+        );
+    }
+    return $self->{dbh}->do(
+        "UPDATE addresses SET min_rtt_ms = NULL, last_rtt_ms = NULL"
+    );
 }
 
 # Higher = more authoritative. The exact strings are convention; the suffix

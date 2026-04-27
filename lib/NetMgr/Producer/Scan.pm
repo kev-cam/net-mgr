@@ -137,4 +137,32 @@ sub fping_presence {
     };
 }
 
+# Presence + per-host RTT. Returns
+#   { alive => { ip => $rtt_ms }, dead => [...] }
+# Uses `fping -C 1 -q` which writes one summary line per IP:
+#   192.168.15.31 : 0.34       (alive, 0.34 ms)
+#   192.168.15.99 : -          (unreachable)
+# `-C 1` does a single ping per host; for multiple samples bump the
+# arg, but the manager wants per-call snapshots so 1 is fine. The
+# summary goes to stderr; merge it via a shelled-out invocation.
+sub fping_rtt {
+    my (@ips) = @_;
+    return { alive => {}, dead => [] } unless @ips;
+    my $cmd = 'fping -C 1 -q '
+            . join(' ', map { quotemeta } @ips)
+            . ' 2>&1';
+    open my $fh, '-|', $cmd
+        or return { alive => {}, dead => [], error => "fping: $!" };
+    my %alive;
+    while (my $line = <$fh>) {
+        chomp $line;
+        if ($line =~ /^(\S+)\s*:\s*([\d.]+)\s*$/) {
+            $alive{$1} = $2 + 0;
+        }
+    }
+    close $fh;
+    my @dead = grep { !exists $alive{$_} } @ips;
+    return { alive => \%alive, dead => \@dead };
+}
+
 1;

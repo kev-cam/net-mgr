@@ -416,6 +416,25 @@ sub _handle_trigger {
         return $self->_send($cli, format_err("trigger '$name' not yet implemented"));
     }
 
+    if ($name eq 'reset-rtt') {
+        # In-process: no fork, just clear the RTT fields. addr= picks
+        # one IP; addr= absent + all=1 clears every row.
+        my $kv   = $cmd->{kv} || {};
+        my $addr = $kv->{addr};
+        my $all  = $kv->{all};
+        my $n;
+        if ($addr) {
+            $n = $self->{db}->reset_rtt(addr => $addr);
+        } elsif ($all) {
+            $n = $self->{db}->reset_rtt;
+        } else {
+            return $self->_send($cli,
+                format_err("reset-rtt needs addr=<ip> or all=1"));
+        }
+        $self->_log("trigger reset-rtt rows=$n addr=" . ($addr // '*'));
+        return $self->_send($cli, format_ok(name => $name, rows => $n));
+    }
+
     $self->_send($cli, format_err("unknown trigger '$name'"));
 }
 
@@ -596,6 +615,7 @@ sub _handle_observe {
         elsif ($kind eq 'lease')       { @events = $self->_obs_lease($cli, $kv) }
         elsif ($kind eq 'host')        { @events = $self->_obs_host($cli, $kv) }
         elsif ($kind eq 'port')        { @events = $self->_obs_port($cli, $kv) }
+        elsif ($kind eq 'ping')        { @events = $self->_obs_ping($cli, $kv) }
         else {
             die "unknown observation kind '$kind'\n";
         }
@@ -839,6 +859,47 @@ sub _obs_port {
                     details => qq({"port":$port}) };
     }
     return @ev;
+}
+
+# Threshold for emitting ping_slow: rtt must be at least 5× the
+# known minimum AND at least 50ms above it. Both gates: avoids
+# false positives on tiny baselines (1ms × 5 = 5ms isn't really
+# "slow") and on large stable baselines (100ms × 1.5 isn't a spike).
+use constant PING_SLOW_RATIO => 5.0;
+use constant PING_SLOW_MIN_DELTA_MS => 50.0;
+
+sub _obs_ping {
+    my ($self, $cli, $kv) = @_;
+    my $mac    = $kv->{mac}    or die "ping: mac required\n";
+    my $addr   = $kv->{addr}   or die "ping: addr required\n";
+    my $rtt    = $kv->{rtt_ms};
+    die "ping: rtt_ms required\n" unless defined $rtt;
+    die "ping: rtt_ms not numeric\n" unless $rtt =~ /^\d+(?:\.\d+)?$/;
+
+    my $r = $self->{db}->update_rtt(
+        mac => $mac, addr => $addr, family => 'v4', rtt_ms => $rtt
+    );
+    return unless $r->{found};   # row missing — silent no-op (producer bug)
+
+    # Emit ping_slow only on the OK→slow transition so a sustained
+    # slowness doesn't generate one event per probe. The transition
+    # check uses prev_last (the rtt from the previous ping cycle) —
+    # if it was already slow, we already emitted then.
+    my $min  = $r->{prev_min};
+    my $prev = $r->{prev_last};
+    return unless defined $min && $min > 0;
+    return unless $rtt > PING_SLOW_RATIO * $min
+               && ($rtt - $min) > PING_SLOW_MIN_DELTA_MS;
+    return if defined $prev
+           && $prev > PING_SLOW_RATIO * $min
+           && ($prev - $min) > PING_SLOW_MIN_DELTA_MS;
+
+    return {
+        type => 'ping_slow',
+        mac  => $mac,
+        addr => $addr,
+        details => sprintf('{"min_rtt_ms":%.3f,"rtt_ms":%.3f}', $min, $rtt),
+    };
 }
 
 1;

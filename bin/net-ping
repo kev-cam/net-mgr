@@ -1,0 +1,84 @@
+#!/usr/bin/perl
+# net-ping — manual fping-and-publish-RTT producer for debug.
+#
+# Usage:
+#   net-ping IP [IP ...]        Ping these IPs and push kind=ping observations.
+#   net-ping --auto             Ping every known v4 address.
+#   net-ping --reset IP [IP...] Clear min_rtt_ms / last_rtt_ms for these
+#                                addresses (so a bogus baseline can be re-learned).
+#   net-ping --reset --all      Clear them everywhere.
+#   net-ping --listen H:P ...   Override manager address.
+#
+# The regular `discover --presence` periodic does the same RTT push;
+# this exists for ad-hoc debugging and for triggering manual resets
+# without an SQL prompt.
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use NetMgr::Client;
+use NetMgr::Producer::Scan;
+
+my $listen;
+my $auto;
+my $reset;
+my $all;
+GetOptions(
+    'listen=s' => \$listen,
+    'auto'     => \$auto,
+    'reset'    => \$reset,
+    'all'      => \$all,
+) or die "bad options\n";
+
+my $cli = NetMgr::Client->new(listen => $listen);
+$cli->hello(consumer => "net-ping.$$");
+
+if ($reset) {
+    if ($all) {
+        my $r = $cli->trigger('reset-rtt', wait => 1, all => 1);
+        warn "reset-rtt: $r\n";
+        $cli->bye;
+        exit 0;
+    }
+    @ARGV or die "--reset needs IPs (or --all)\n";
+    for my $ip (@ARGV) {
+        my $r = $cli->trigger('reset-rtt', wait => 1, addr => $ip);
+        warn "reset-rtt $ip: $r\n";
+    }
+    $cli->bye;
+    exit 0;
+}
+
+my @ips;
+if ($auto) {
+    my $rows = $cli->snapshot(1, 'addresses', where => "family = 'v4'");
+    my %seen;
+    @ips = grep { !$seen{$_}++ } map { $_->{addr} } @$rows;
+}
+push @ips, @ARGV;
+@ips or die "usage: $0 [--auto] [--reset [--all]] [IP ...]\n";
+
+# Need the addr→[mac,...] map to attach the ping observation to the
+# right interface row(s).
+my $rows = $cli->snapshot(2, 'addresses', where => "family = 'v4'");
+my %macs_by_ip;
+for my $r (@$rows) {
+    next unless $r->{mac} && $r->{addr};
+    push @{ $macs_by_ip{ $r->{addr} } }, $r->{mac};
+}
+
+my $res = NetMgr::Producer::Scan::fping_rtt(@ips);
+warn sprintf("alive=%d dead=%d\n",
+             scalar(keys %{ $res->{alive} }), scalar(@{ $res->{dead} }));
+for my $ip (sort keys %{ $res->{alive} }) {
+    my $rtt  = $res->{alive}{$ip};
+    my $macs = $macs_by_ip{$ip} or next;
+    for my $mac (@$macs) {
+        my $reply = $cli->observe(kind => 'ping', mac => $mac, addr => $ip,
+                                  rtt_ms => $rtt);
+        warn "$ip ($mac): $reply\n" if $reply && $reply =~ /^ERR/;
+    }
+}
+
+$cli->bye;
