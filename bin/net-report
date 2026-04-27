@@ -98,6 +98,7 @@ if ($tail) {
 } else {
     my $rows = $cli->snapshot(1, $table, defined $where ? (where => $where) : ());
     enrich_with_machine_names($cli, $rows) if rows_have_mac($rows);
+    sort_rows_by_ip($rows);
     print_table($rows, \@cols);
 }
 
@@ -125,6 +126,27 @@ sub enrich_with_machine_names {
         my $name  = $name_by_id{ $iface->{machine_id} // '' };
         $r->{machine} = $name if defined $name && length $name;
     }
+}
+
+# If rows have an addr (or ip) column, sort them numerically by it.
+# Non-IP values sort to the end. No-op if neither column is present.
+sub sort_rows_by_ip {
+    my ($rows) = @_;
+    return unless @$rows;
+    my $field;
+    for my $f (qw(addr ip)) {
+        if (grep { defined $_->{$f} } @$rows) { $field = $f; last }
+    }
+    return unless $field;
+    @$rows = sort {
+        ip_sort_key($a->{$field}) cmp ip_sort_key($b->{$field})
+    } @$rows;
+}
+
+sub ip_sort_key {
+    my $v = shift // '';
+    return '9' x 16 unless $v =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+    return sprintf "%03d.%03d.%03d.%03d", $1, $2, $3, $4;
 }
 
 sub print_table {
