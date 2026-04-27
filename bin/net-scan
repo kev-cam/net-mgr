@@ -53,7 +53,7 @@ for my $mac (sort keys %iface_by_mac) {
                  ? @{ $hosts_by_mid{$iface->{machine_id}} || [] } : ());
     my $hn    = $hns[0] // '';
     my @ps    = sort { $a->{port} <=> $b->{port} } @{ $ports_by_mac{$mac} || [] };
-    my $ports = join(',', map { $_->{port} } @ps);
+    my $ports = join(',', port_labels(@ps));
     for my $ip (sort @ips) {
         push @rows, [ $ip, $mac, $hn, $iface->{vendor} // '', $ports,
                       ($iface->{online} ? 'up' : 'off') ];
@@ -69,6 +69,25 @@ for my $r (@rows) {
 }
 
 $cli->bye;
+
+# Render port rows as service names (nmap-tagged service > /etc/services
+# > numeric fallback). Dedupes labels so tcp/22+udp/22 don't both appear
+# as "ssh"; sticks with the numeric port if nothing else resolves.
+sub port_labels {
+    my @ps = @_;
+    my %seen;
+    my @out;
+    for my $p (@ps) {
+        my $label = $p->{service};
+        if (!defined $label || !length $label) {
+            my $proto = $p->{proto} // 'tcp';
+            $label = getservbyport($p->{port}, $proto) // $p->{port};
+        }
+        next if $seen{$label}++;
+        push @out, $label;
+    }
+    return @out;
+}
 
 sub _ip_key {
     my $ip = shift;
