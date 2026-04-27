@@ -58,14 +58,22 @@ my %DEFAULTS = (
         ttl      => 60,             # seconds for replies we generate
         domain   => '',             # e.g. 'grfx.com' for FQDN handling
     },
+    # Opt-in periodic TRIGGERs the daemon fires on its own.
+    # 0 = disabled. Set seconds in /etc/net-mgr/config [scheduling].
+    scheduling => {
+        'scan-ap' => 0,
+        presence  => 0,
+        discover  => 0,
+    },
 );
 
 # Per-section, which keys should be coerced to integer seconds.
 my %DURATION_KEYS = (
-    scanner  => { presence_interval => 1, discover_interval => 1, reprobe_ports => 1 },
-    ap_poll  => { interval => 1, ssh_timeout => 1 },
-    timeouts => { ap => 1, fping => 1, nmap => 1, dhcp => 1 },
-    dns      => { ttl => 1 },
+    scanner    => { presence_interval => 1, discover_interval => 1, reprobe_ports => 1 },
+    ap_poll    => { interval => 1, ssh_timeout => 1 },
+    timeouts   => { ap => 1, fping => 1, nmap => 1, dhcp => 1 },
+    dns        => { ttl => 1 },
+    scheduling => { 'scan-ap' => 1, presence => 1, discover => 1 },
 );
 
 sub load {

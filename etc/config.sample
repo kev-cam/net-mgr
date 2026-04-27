@@ -68,3 +68,15 @@ domain   = grfx.com
 # don't re-emit, so no loop).
 [peers]
 # sources = kc-qernel, nas3
+
+# Periodic TRIGGERs fired by the daemon itself (each value = interval).
+# Opt-in: only enable on hosts that can actually run the producer.
+#   - scan-ap polls all known APs over SSH (only works where the
+#     SSH keys are — typically kc-qernel).
+#   - presence fpings every known IP and updates last_seen.
+#   - discover runs a full nmap sweep of all detected /24s.
+# Comment out (or 0) to disable. Defaults: all off.
+[scheduling]
+# scan-ap  = 60s
+# presence = 90s
+# discover = 24h

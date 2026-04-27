@@ -102,7 +102,8 @@ sub run {
                 $self->_handle_readable($fh);
             }
         }
-        $self->_reap_triggers if %{ $self->{triggers} };
+        $self->_reap_triggers          if %{ $self->{triggers} };
+        $self->_check_periodic_triggers;
     }
     $self->_log("shutting down");
     for my $c (values %{ $self->{clients} }) {
@@ -385,11 +386,97 @@ sub _handle_trigger {
         return;
     }
 
+    if ($name eq 'presence') {
+        my $bin = $self->_producer_path('net-discover');
+        return $self->_send($cli, format_err("net-discover not found at $bin"))
+            unless -x $bin;
+        my $pid = fork();
+        return $self->_send($cli, format_err("fork: $!")) unless defined $pid;
+        if ($pid == 0) {
+            for my $c (values %{ $self->{clients} }) { close $c->{sock} if $c->{sock} }
+            close $self->{listen} if $self->{listen};
+            $ENV{NET_MGR_LISTEN} = $self->{config}{manager}{listen}
+                                // '127.0.0.1:7531';
+            exec $bin, '--presence';
+            exit 127;
+        }
+        $self->_log("trigger presence pid=$pid" . ($wait ? ' (WAIT)' : ''));
+        $self->{triggers}{$pid} = {
+            cli_fd     => ($wait ? fileno($cli->{sock}) : undef),
+            name       => $name,
+            started_at => time(),
+        };
+        $self->_send($cli, format_ok(name => $name, pid => $pid))
+            unless $wait;
+        return;
+    }
+
     if ($name eq 'probe-host') {
         return $self->_send($cli, format_err("trigger '$name' not yet implemented"));
     }
 
     $self->_send($cli, format_err("unknown trigger '$name'"));
+}
+
+# Periodic, daemon-initiated TRIGGERs. Reads intervals from
+# $cfg->{scheduling} and fires the matching producer when due.
+# Skips if a previous run of the same name is still pending.
+sub _check_periodic_triggers {
+    my ($self) = @_;
+    my $sched = $self->{config}{scheduling} || {};
+    my $now   = time();
+    $self->{periodic_last} //= {};
+
+    for my $name (qw(scan-ap presence discover)) {
+        my $interval = $sched->{$name} // 0;
+        next unless $interval && $interval > 0;
+        my $last = $self->{periodic_last}{$name} // 0;
+        next if ($now - $last) < $interval;
+
+        # Don't pile up if the previous run is still going
+        if (grep { $_->{name} eq $name } values %{ $self->{triggers} }) {
+            next;
+        }
+        $self->{periodic_last}{$name} = $now;
+        $self->_fire_periodic($name);
+    }
+}
+
+sub _fire_periodic {
+    my ($self, $name) = @_;
+    my ($bin, @args);
+    if ($name eq 'scan-ap') {
+        my @ips = $self->_known_ap_ips;
+        return unless @ips;
+        $bin  = $self->_producer_path('net-poll-ap');
+        @args = @ips;
+    } elsif ($name eq 'presence') {
+        $bin  = $self->_producer_path('net-discover');
+        @args = ('--presence');
+    } elsif ($name eq 'discover') {
+        $bin  = $self->_producer_path('net-discover');
+        @args = ('--discover');
+    } else {
+        return;
+    }
+    return unless $bin && -x $bin;
+
+    my $pid = fork();
+    return unless defined $pid;
+    if ($pid == 0) {
+        for my $c (values %{ $self->{clients} }) { close $c->{sock} if $c->{sock} }
+        close $self->{listen} if $self->{listen};
+        $ENV{NET_MGR_LISTEN} = $self->{config}{manager}{listen}
+                            // '127.0.0.1:7531';
+        exec $bin, @args;
+        exit 127;
+    }
+    $self->_log("periodic $name pid=$pid (next in $self->{config}{scheduling}{$name}s)");
+    $self->{triggers}{$pid} = {
+        cli_fd     => undef,
+        name       => $name,
+        started_at => time(),
+    };
 }
 
 # Non-blocking reap of any TRIGGER children that have exited.
