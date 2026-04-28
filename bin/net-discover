@@ -186,28 +186,38 @@ sub _print_fingerprint {
 
 if ($do_presence) {
     # Snapshot known v4 addresses, fping them with RTT, push observations.
-    # Alive hosts emit kind=ping (carries rtt_ms; manager updates min/last
-    # and fires ping_slow on transition); dead hosts get GONE on the iface.
+    # Alive hosts emit kind=ping (manager flips interface online=1, fires
+    # interface_online on transition). A mac is declared GONE only when
+    # ALL of its addresses are dead — otherwise a multi-addr host with
+    # one silent IP would oscillate online/offline every cycle as the
+    # alive ping and the dead-IP GONE undid each other.
     die "--presence requires --listen / daemon (no --print mode)\n" if $print_only;
     my $rows = $cli->snapshot(99, 'addresses', where => "family = 'v4'");
-    my %ips;
+    my %ips;          # ip → [mac, ...]
+    my %addrs_by_mac; # mac → { addr => 1 }
     for my $r (@$rows) {
         push @{ $ips{$r->{addr}} }, $r->{mac};
+        $addrs_by_mac{$r->{mac}}{$r->{addr}} = 1;
     }
     my @ips = sort keys %ips;
     warn "presence-checking " . scalar(@ips) . " ips\n";
     my $res = NetMgr::Producer::Scan::fping_rtt(@ips);
+
+    my %alive_addrs_by_mac;   # mac → { addr => 1 } observed alive this cycle
     for my $ip (sort keys %{ $res->{alive} }) {
         my $rtt = $res->{alive}{$ip};
         for my $mac (@{ $ips{$ip} }) {
             $cli->observe(kind => 'ping', mac => $mac, addr => $ip,
                           rtt_ms => $rtt);
+            $alive_addrs_by_mac{$mac}{$ip} = 1;
         }
     }
-    for my $ip (@{ $res->{dead} }) {
-        for my $mac (@{ $ips{$ip} }) {
-            $cli->send_recv("GONE mac=$mac");
-        }
+    # Send GONE only for macs whose every known v4 address came back dead.
+    my %dead_set = map { $_ => 1 } @{ $res->{dead} };
+    for my $mac (sort keys %addrs_by_mac) {
+        my @addrs = keys %{ $addrs_by_mac{$mac} };
+        next unless @addrs == grep { $dead_set{$_} } @addrs;
+        $cli->send_recv("GONE mac=$mac");
     }
 }
 

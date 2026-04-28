@@ -651,14 +651,6 @@ sub _log_event {
     return $id;
 }
 
-# Persist a high-frequency event (per-probe pings) without broadcasting
-# or writing a log line. Subscribers like net-report events --tail
-# stay readable; net-watch reads these back via a windowed snapshot at
-# startup to reconstruct retrospective stats.
-sub _log_event_silent {
-    my ($self, %ev) = @_;
-    return $self->{db}->log_event(%ev);
-}
 
 # ---- OBSERVE dispatch ------------------------------------------------
 
@@ -950,15 +942,16 @@ sub _obs_ping {
     $self->_emit_change(table => 'addresses', op => 'update', row => $row)
         if $row;
 
-    # Persist as a 'ping' event so net-watch can reconstruct history at
-    # startup. Silent: per-probe events would flood live subscribers,
-    # and live consumers already see the addresses-row update above.
-    $self->_log_event_silent(
-        type    => 'ping',
-        mac     => $mac,
-        addr    => $addr,
-        details => sprintf('{"rtt_ms":%.3f}', $rtt),
-    );
+    my @ev;
+
+    # Successful ping = the interface is reachable. Flip online=1 if it
+    # wasn't already; the interface_online event fires on the offline→
+    # online transition (paired with the interface_offline that GONE
+    # emits when all of a mac's addresses go silent). Without this,
+    # a host that recovered would never log a "came back" event.
+    my $iface = $self->_upsert('interfaces', 'upsert_interface',
+        mac => $mac, online => 1, live => 1);
+    push @ev, _events_from_iface_change($iface, $addr);
 
     # Emit ping_slow only on the OK→slow transition so a sustained
     # slowness doesn't generate one event per probe. The transition
@@ -966,19 +959,22 @@ sub _obs_ping {
     # if it was already slow, we already emitted then.
     my $min  = $r->{prev_min};
     my $prev = $r->{prev_last};
-    return unless defined $min && $min > 0;
-    return unless $rtt > PING_SLOW_RATIO * $min
-               && ($rtt - $min) > PING_SLOW_MIN_DELTA_MS;
-    return if defined $prev
-           && $prev > PING_SLOW_RATIO * $min
-           && ($prev - $min) > PING_SLOW_MIN_DELTA_MS;
+    if (defined $min && $min > 0
+        && $rtt > PING_SLOW_RATIO * $min
+        && ($rtt - $min) > PING_SLOW_MIN_DELTA_MS
+        && !(defined $prev
+             && $prev > PING_SLOW_RATIO * $min
+             && ($prev - $min) > PING_SLOW_MIN_DELTA_MS))
+    {
+        push @ev, {
+            type => 'ping_slow',
+            mac  => $mac,
+            addr => $addr,
+            details => sprintf('{"min_rtt_ms":%.3f,"rtt_ms":%.3f}', $min, $rtt),
+        };
+    }
 
-    return {
-        type => 'ping_slow',
-        mac  => $mac,
-        addr => $addr,
-        details => sprintf('{"min_rtt_ms":%.3f,"rtt_ms":%.3f}', $min, $rtt),
-    };
+    return @ev;
 }
 
 1;
