@@ -57,15 +57,38 @@ my $mach_rows  = $cli->snapshot(3, 'machines');
 my %iface_by_mac = map { lc $_->{mac} => $_ } @$iface_rows;
 my %name_by_id   = map { $_->{id} => $_->{primary_name} } @$mach_rows;
 
+# state{mac}{addr} = arrayref of [timestamp, rtt_ms]
+my %state;
+my %flagged;   # mac:addr → 1 once we've reported it as flaky (de-dupe)
+
+# Retrospective backfill: pull persistent ping events from the last
+# $window seconds so the display is meaningful right away rather than
+# starting empty and accumulating live. The manager translates the
+# `ts > ago(N)` predicate into a SQL filter, so this stays cheap even
+# with many days of history in the events table.
+my $hist = $cli->snapshot(4, 'events',
+    where => "type = 'ping' AND ts > ago($window)");
+for my $e (@$hist) {
+    next unless $e->{mac} && $e->{addr};
+    next if %ip_filter && !$ip_filter{ $e->{addr} };
+    my ($rtt) = ($e->{details} // '') =~ /"rtt_ms"\s*:\s*([\d.]+)/
+        or next;
+    my $ts = parse_event_ts($e->{ts}) or next;
+    push @{ $state{ lc $e->{mac} }{ $e->{addr} } }, [ $ts, $rtt + 0 ];
+}
+# Keep each per-host series in time order
+for my $m (keys %state) {
+    for my $a (keys %{ $state{$m} }) {
+        @{ $state{$m}{$a} } = sort { $a->[0] <=> $b->[0] }
+                                   @{ $state{$m}{$a} };
+    }
+}
+
 # Subscribe to addresses (snapshot + stream). The snapshot half lets
 # us see existing min/last_rtt_ms values immediately; the stream half
 # delivers ROWs as the manager processes new kind=ping observations.
 $cli->send_line("SUBSCRIBE sub=1 mode=snapshot+stream FROM addresses"
               . " WHERE family = 'v4'");
-
-# state{mac}{addr} = arrayref of [timestamp, rtt_ms]
-my %state;
-my %flagged;   # mac:addr → 1 once we've reported it as flaky (de-dupe)
 
 $| = 1;
 my $start = time();
@@ -184,6 +207,15 @@ sub ip_sort_key {
     my $ip = shift // '';
     return '999.999.999.999' unless $ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
     return sprintf "%03d.%03d.%03d.%03d", $1, $2, $3, $4;
+}
+
+sub parse_event_ts {
+    my $s = shift // '';
+    return undef unless $s =~ /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)(?:\.(\d+))?/;
+    require Time::Local;
+    my $epoch = eval { Time::Local::timelocal($6, $5, $4, $3, $2-1, $1) };
+    return undef unless defined $epoch;
+    return $epoch + ($7 ? "0.$7" : 0);
 }
 
 sub parse_seconds {

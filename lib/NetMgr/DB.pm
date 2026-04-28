@@ -705,15 +705,37 @@ sub delete_alias {
 }
 
 sub query_table {
-    my ($self, $table, $cols) = @_;
+    my ($self, $table, %opts) = @_;
     my %allowed = map { $_ => 1 } qw(
         machines hostnames interfaces addresses ports aps
         associations dhcp_leases events aliases
     );
     croak "unknown table '$table'" unless $allowed{$table};
-    my $sql = $cols ? "SELECT " . join(', ', @$cols) . " FROM $table"
-                    : "SELECT * FROM $table";
-    return $self->{dbh}->selectall_arrayref($sql, { Slice => {} });
+    my $cols = $opts{cols};
+    my $sql  = $cols ? "SELECT " . join(', ', @$cols) . " FROM $table"
+                     : "SELECT * FROM $table";
+    my @bind;
+    # since_epoch lets the caller cap a snapshot to recent rows on
+    # tables with a 'ts' column (events). Without this, ping logging
+    # at ~2/s × 7d = ~1.3M rows would all stream over the socket on
+    # every subscribe, blocking net-watch startup for tens of seconds.
+    if ($opts{since_epoch} && _has_ts_column($table)) {
+        $sql .= " WHERE ts > FROM_UNIXTIME(?)";
+        push @bind, $opts{since_epoch};
+    }
+    return $self->{dbh}->selectall_arrayref($sql, { Slice => {} }, @bind);
+}
+
+sub _has_ts_column { $_[0] eq 'events' }
+
+# Delete events older than $days. Returns rowcount.
+sub purge_events {
+    my ($self, %f) = @_;
+    my $days = $f{days} // 7;
+    return $self->{dbh}->do(
+        "DELETE FROM events WHERE ts < DATE_SUB(NOW(), INTERVAL ? DAY)",
+        undef, $days
+    );
 }
 
 1;

@@ -105,6 +105,7 @@ sub run {
         $self->_reap_triggers          if %{ $self->{triggers} };
         $self->_check_periodic_triggers;
         $self->_age_out_offline;
+        $self->_purge_old_events;
     }
     $self->_log("shutting down");
     for my $c (values %{ $self->{clients} }) {
@@ -239,9 +240,16 @@ sub _handle_subscribe {
     $self->_log("subscribe $cli->{ident} sub=$sub mode=$mode FROM $table"
               . (defined $where ? " WHERE $where" : ''));
 
-    # Snapshot phase
+    # Snapshot phase. For tables with a `ts` column (events) we look
+    # for a `ts > ago(N)` lower bound in the WHERE clause and push it
+    # to SQL, so a windowed snapshot doesn't have to load the entire
+    # ping history into Perl just to filter it out.
     if ($mode eq 'snapshot' || $mode eq 'snapshot+stream') {
-        my $rows = $self->{db}->query_table($table);
+        my %qopts;
+        if (my $bound = _extract_ts_lower_bound($where_ast)) {
+            $qopts{since_epoch} = $bound;
+        }
+        my $rows = $self->{db}->query_table($table, %qopts);
         for my $row (@$rows) {
             next if $where_ast && !eval_ast($where_ast, _row_for_match($row));
             $self->_send($cli, format_row($sub, $table, 'snapshot', %$row));
@@ -440,6 +448,48 @@ sub _handle_trigger {
 
 # Flip currently-online interfaces back to offline if their last_seen
 # is older than the grace period. Cheap query; runs at most every 30s.
+# Walk a parsed WHERE AST looking for a `ts > ago(N)` (or AND-chain
+# containing one), return the absolute epoch threshold. Used to push a
+# windowed snapshot down into SQL when the events table is queried.
+# Conservative — only matches a few common shapes; falls through (=
+# no SQL filter) for anything fancier and the in-Perl WHERE eval still
+# applies.
+sub _extract_ts_lower_bound {
+    my ($ast) = @_;
+    return undef unless ref $ast eq 'ARRAY' && @$ast;
+    my $op = $ast->[0];
+    if ($op eq 'and') {
+        for my $branch (@{$ast}[1 .. $#$ast]) {
+            my $b = _extract_ts_lower_bound($branch);
+            return $b if $b;
+        }
+        return undef;
+    }
+    if ($op eq '>' || $op eq '>=') {
+        my ($lhs, $rhs) = @{$ast}[1, 2];
+        return undef unless ref $lhs eq 'ARRAY' && $lhs->[0] eq 'col'
+                         && $lhs->[1] eq 'ts';
+        return undef unless ref $rhs eq 'ARRAY' && $rhs->[0] eq 'fn_ago';
+        my $secs = $rhs->[1];
+        return undef unless ref $secs eq 'ARRAY' && $secs->[0] eq 'num';
+        return time() - $secs->[1];
+    }
+    return undef;
+}
+
+# Run periodically: drop events older than retention. Bounded by an
+# hourly cap so the daemon doesn't keep slamming DELETE on a tiny table.
+sub _purge_old_events {
+    my ($self) = @_;
+    my $now = time();
+    return if ($now - ($self->{_last_purge} // 0)) < 3600;
+    $self->{_last_purge} = $now;
+    my $days = $self->{config}{manager}{event_retention_days} // 7;
+    return unless $days > 0;
+    my $n = $self->{db}->purge_events(days => $days);
+    $self->_log("purged $n event row(s) older than ${days}d") if $n && $n > 0;
+}
+
 sub _age_out_offline {
     my ($self) = @_;
     my $grace = $self->{config}{manager}{offline_after} // 300;
@@ -599,6 +649,15 @@ sub _log_event {
         "SELECT * FROM events WHERE id = ?", undef, $id);
     $self->_emit_change(table => 'events', op => 'insert', row => $row) if $row;
     return $id;
+}
+
+# Persist a high-frequency event (per-probe pings) without broadcasting
+# or writing a log line. Subscribers like net-report events --tail
+# stay readable; net-watch reads these back via a windowed snapshot at
+# startup to reconstruct retrospective stats.
+sub _log_event_silent {
+    my ($self, %ev) = @_;
+    return $self->{db}->log_event(%ev);
 }
 
 # ---- OBSERVE dispatch ------------------------------------------------
@@ -890,6 +949,16 @@ sub _obs_ping {
     );
     $self->_emit_change(table => 'addresses', op => 'update', row => $row)
         if $row;
+
+    # Persist as a 'ping' event so net-watch can reconstruct history at
+    # startup. Silent: per-probe events would flood live subscribers,
+    # and live consumers already see the addresses-row update above.
+    $self->_log_event_silent(
+        type    => 'ping',
+        mac     => $mac,
+        addr    => $addr,
+        details => sprintf('{"rtt_ms":%.3f}', $rtt),
+    );
 
     # Emit ping_slow only on the OK→slow transition so a sustained
     # slowness doesn't generate one event per probe. The transition
