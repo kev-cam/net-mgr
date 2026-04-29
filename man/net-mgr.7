@@ -71,6 +71,12 @@ net-roam                        # do it
 is an Apache CGI that renders the machine inventory as an HTML table
 with click-through badges for each open port (HTTP/HTTPS render as
 <scheme>://<ip>, plus ssh/vnc/rdp/smb custom-scheme links).
+A
+.B Tools
+link in the page header opens a small landing page of dashboard
+tools \(em currently a 24-hour disconnect histogram (SVG bar chart of
+.B interface_offline
+events bucketed per hour).
 Install with the bundled
 .I /etc/apache2/conf-available/net-mgr.conf
 which restricts access to 192.168/16 by default, with optional

@@ -1,10 +1,12 @@
 #!/usr/bin/perl
 # net-mgr-web.cgi — read-only HTML view of net-mgr's machine/port data.
 #
-# Two views, selected by query string:
-#   /net-mgr              compact list: name + clickable service badges
-#   /net-mgr?m=<id>       detail page for one machine (MAC/vendor/IPs/ports)
-#   /net-mgr?i=<mac>      detail for an unaffiliated interface
+# Views, selected by query string:
+#   /net-mgr                    compact list: name + clickable service badges
+#   /net-mgr?m=<id>             machine detail (MAC/vendor/IPs/ports)
+#   /net-mgr?i=<mac>            unaffiliated interface detail
+#   /net-mgr?view=tools         list of dashboard tools
+#   /net-mgr?view=flake         24-hour disconnect histogram
 #
 # Connects to the manager socket (no DB credentials needed). Apache
 # handles auth + IP restriction via the matching net-mgr.conf snippet.
@@ -13,9 +15,20 @@ use strict;
 use warnings;
 use lib '/usr/local/share/perl5';
 use CGI qw(escapeHTML);
+use Time::Local qw(timelocal);
 use NetMgr::Client;
 
 print "Content-Type: text/html; charset=utf-8\n\n";
+
+# Query parsing first so views can decide which snapshots they need.
+my %q;
+for my $kv (split /&/, $ENV{QUERY_STRING} // '') {
+    my ($k, $v) = split /=/, $kv, 2;
+    next unless defined $k;
+    $v //= '';
+    $v =~ s/%([0-9A-Fa-f]{2})/chr hex $1/ge;
+    $q{$k} = $v;
+}
 
 my $cli = eval { NetMgr::Client->new(listen => '127.0.0.1:7531') };
 if (!$cli || $@) {
@@ -23,6 +36,18 @@ if (!$cli || $@) {
     exit 0;
 }
 $cli->hello(consumer => "net-mgr-web.$$");
+
+# Lightweight views (don't need the full inventory).
+if (defined $q{view} && $q{view} eq 'tools') {
+    print render_tools();
+    $cli->bye;
+    exit 0;
+}
+if (defined $q{view} && $q{view} eq 'flake') {
+    print render_flake();
+    $cli->bye;
+    exit 0;
+}
 
 my $machines  = $cli->snapshot(1, 'machines');
 my $hostnames = $cli->snapshot(2, 'hostnames');
@@ -53,17 +78,6 @@ for my $i (@$ifaces) {
     my $mid = $i->{machine_id} // 0;
     push @{ $iface_by_machine{$mid} }, $i;
     $iface_by_mac{ $i->{mac} } = $i;
-}
-
-# Routing ------------------------------------------------------------
-
-my %q;
-for my $kv (split /&/, $ENV{QUERY_STRING} // '') {
-    my ($k, $v) = split /=/, $kv, 2;
-    next unless defined $k;
-    $v //= '';
-    $v =~ s/%([0-9A-Fa-f]{2})/chr hex $1/ge;
-    $q{$k} = $v;
 }
 
 # Port → (scheme, default-port?). default-port=1 means the scheme has
@@ -335,6 +349,108 @@ $port_html
 HTML
 }
 
+sub render_tools {
+    my $body = <<'HTML';
+<ul class=toollist>
+  <li><a href="?view=flake">Disconnect histogram</a> — count of
+      <code>interface_offline</code> events per hour over the last 24h.</li>
+</ul>
+HTML
+    return wrap_page("Tools — net-mgr", $body, "Tools");
+}
+
+sub render_flake {
+    my $events = $cli->snapshot(1, 'events',
+        where => "type = 'interface_offline' AND ts > ago(86400)");
+
+    my $now = time();
+    # Per-hour buckets, oldest at index 0 (24h ago) → newest at 23 (now).
+    my @counts = (0) x 24;
+    for my $e (@$events) {
+        my $ts = $e->{ts} // '';
+        next unless $ts =~ /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)/;
+        my $epoch = eval { timelocal($6, $5, $4, $3, $2-1, $1) };
+        next unless defined $epoch;
+        my $age_h = int(($now - $epoch) / 3600);
+        next if $age_h < 0 || $age_h >= 24;
+        $counts[23 - $age_h]++;
+    }
+
+    my $total = 0; $total += $_ for @counts;
+    my $max = 1;
+    for (@counts) { $max = $_ if $_ > $max }
+
+    # SVG layout
+    my $W = 720; my $H = 220;
+    my $L = 40; my $R = 10; my $T = 10; my $B = 30;
+    my $plot_w = $W - $L - $R;
+    my $plot_h = $H - $T - $B;
+    my $bar_gap = 2;
+    my $bar_w = ($plot_w - $bar_gap * 23) / 24;
+
+    # Hour-of-day labels (each bucket starts at this hour). The newest
+    # bucket ends at the current minute, but we round to whole hours
+    # for the label so every label shows hh:00.
+    my @labels;
+    for my $i (0 .. 23) {
+        my $age_h = 23 - $i;
+        my @lt = localtime($now - $age_h * 3600);
+        push @labels, sprintf("%02d", $lt[2]);
+    }
+
+    my @bars;
+    for my $i (0 .. 23) {
+        my $h = $counts[$i] / $max * $plot_h;
+        my $x = $L + $i * ($bar_w + $bar_gap);
+        my $y = $T + $plot_h - $h;
+        my $title = "$labels[$i]:00 — $counts[$i] disconnect"
+                  . ($counts[$i] == 1 ? '' : 's');
+        push @bars, sprintf
+            '<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" '
+          . 'fill="#6cf"><title>%s</title></rect>',
+            $x, $y, $bar_w, $h, escapeHTML($title);
+    }
+
+    # Y-axis: max value tick + zero line.
+    my $axis = sprintf
+        '<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#444"/>'
+      . '<text x="%d" y="%d" fill="#888" font-size="11" '
+        . 'text-anchor="end">%d</text>'
+      . '<text x="%d" y="%d" fill="#888" font-size="11" '
+        . 'text-anchor="end">0</text>',
+        $L, $T + $plot_h, $L + $plot_w, $T + $plot_h,
+        $L - 4, $T + 11, $max,
+        $L - 4, $T + $plot_h, ;
+
+    # X-axis labels every 3 hours.
+    my @xlabels;
+    for my $i (0 .. 23) {
+        next unless $i % 3 == 0;
+        my $x = $L + $i * ($bar_w + $bar_gap) + $bar_w / 2;
+        push @xlabels, sprintf
+            '<text x="%.1f" y="%d" fill="#888" font-size="11" '
+            . 'text-anchor="middle">%s</text>',
+            $x, $H - 14, $labels[$i];
+    }
+
+    my $bars   = join "\n  ", @bars;
+    my $xlabs  = join "\n  ", @xlabels;
+    my $note   = "$total disconnects in the last 24 hours · "
+               . "peak $max in one hour";
+
+    my $body = <<HTML;
+<p class=meta>$note</p>
+<svg viewBox="0 0 $W $H" xmlns="http://www.w3.org/2000/svg" class=flake>
+  $axis
+  $bars
+  $xlabs
+</svg>
+<p class=note>X-axis = hour of day (newest on the right). Hover a bar
+for the count.</p>
+HTML
+    return wrap_page("Disconnects — net-mgr", $body, "Disconnects (24h)");
+}
+
 sub wrap_page {
     my ($title, $body, $h1) = @_;
     $h1 //= 'net-mgr';
@@ -383,12 +499,18 @@ ul.addrlist li { padding: 1px 0; }
 span.src { color: #777; font-size: 0.85em; }
 .note { color: #666; font-style: italic; }
 nav { font-size: 0.9em; margin-bottom: 1em; }
-nav a { color: #6cf; text-decoration: none; }
+nav a { color: #6cf; text-decoration: none; margin-right: 1em; }
 nav a:hover { text-decoration: underline; }
+ul.toollist { list-style: none; padding-left: 0; }
+ul.toollist li { padding: 6px 0; }
+ul.toollist a { color: #6cf; }
+svg.flake { width: 100%; max-width: 720px;
+            background: #181818; border-radius: 4px; }
+svg.flake rect:hover { fill: #9df; }
 </style>
 </head>
 <body>
-<nav><a href="?">&larr; net-mgr</a></nav>
+<nav><a href="?">&larr; hosts</a><a href="?view=tools">tools</a></nav>
 <h1>@{[escapeHTML($h1)]}</h1>
 $body
 </body></html>
