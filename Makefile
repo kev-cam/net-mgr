@@ -165,6 +165,8 @@ install: deps
 	else \
 	  echo "  skip $(DESTDIR)$(SYSCONFDIR)/net-mgr/config (already exists)"; \
 	fi
+	@CFG=$(DESTDIR)$(SYSCONFDIR)/net-mgr/config; \
+	  perl -Ilib -MNetMgr::Config -e 'my @d = NetMgr::Config::dead_keys($$ARGV[0]); exit unless @d; print STDERR "\nWARN: $$ARGV[0] has keys no longer read by the daemon:\n"; print STDERR "  $$_\n" for @d; print STDERR "(harmless, but you can delete them.)\n"' "$$CFG"
 	@echo
 	@echo "Files installed."
 	@if [ -z "$(DESTDIR)" ] && [ "$$(id -u)" = "0" ]; then \

@@ -152,4 +152,51 @@ sub _deep_copy {
     return $x;
 }
 
+# Sections/keys actually consumed by code at runtime. Anything in a
+# user's config not on this list is reported by `dead_keys()` as
+# probably-vestigial — used by `make install` to warn about leftover
+# keys that the daemon silently ignores.
+#
+# Keep in sync with the grep:
+#   grep -rE '\$cfg->\{|config\}\{' lib bin sbin
+my %ACTIVE = (
+    manager    => [qw(listen log offline_after event_retention_days)],
+    mysql      => [qw(db defaults section)],
+    scanner    => [qw(presence_interval)],   # used by net-watch only
+    scheduling => [qw(scan-ap presence discover)],
+    paths      => '*',
+    dns        => '*',
+    bindings   => '*',                        # parsed for future use
+);
+
+# Returns a list of "[section] key" strings for entries in $path that
+# the runtime code doesn't read. Empty list = config is clean.
+sub dead_keys {
+    my ($path) = @_;
+    $path //= $ENV{NET_MGR_CONF} // '/etc/net-mgr/config';
+    return () unless -e $path;
+    open my $fh, '<', $path or return ();
+    my $section;
+    my @dead;
+    while (my $line = <$fh>) {
+        $line =~ s/[\r\n]+\z//;
+        $line =~ s/^\s+//;
+        $line =~ s/\s+$//;
+        next if $line eq '' || $line =~ /^[#;]/;
+        if ($line =~ /^\[([^\]]+)\]\s*$/) { $section = lc $1; next; }
+        next unless defined $section;
+        next unless $line =~ /^([\w-]+)\s*=/;
+        my $key = $1;
+        my $allowed = $ACTIVE{$section};
+        if (!$allowed) {
+            push @dead, "[$section] (whole section unused)";
+        } elsif ($allowed ne '*' && !grep { $_ eq $key } @$allowed) {
+            push @dead, "[$section] $key";
+        }
+    }
+    close $fh;
+    my %seen;
+    return grep { !$seen{$_}++ } @dead;
+}
+
 1;
