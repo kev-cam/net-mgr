@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS associations (
     client_mac   CHAR(17)     NOT NULL,
     `signal`     SMALLINT,                   -- RSSI dBm (negative); reserved word, backticked
     iface        VARCHAR(16),                -- AP-side radio name (eth1, ath0, etc.)
+    ssid         VARCHAR(64),                -- live SSID for that radio
     last_seen    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (ap_mac, client_mac),
     KEY idx_client (client_mac),
@@ -152,3 +153,4 @@ INSERT IGNORE INTO schema_version (version) VALUES (2);
 INSERT IGNORE INTO schema_version (version) VALUES (3);
 INSERT IGNORE INTO schema_version (version) VALUES (4);
 INSERT IGNORE INTO schema_version (version) VALUES (5);
+INSERT IGNORE INTO schema_version (version) VALUES (6);

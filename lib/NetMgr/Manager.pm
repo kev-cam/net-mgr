@@ -667,6 +667,7 @@ sub _handle_observe {
         elsif ($kind eq 'host')        { @events = $self->_obs_host($cli, $kv) }
         elsif ($kind eq 'port')        { @events = $self->_obs_port($cli, $kv) }
         elsif ($kind eq 'ping')        { @events = $self->_obs_ping($cli, $kv) }
+        elsif ($kind eq 'event')       { @events = $self->_obs_event($cli, $kv) }
         else {
             die "unknown observation kind '$kind'\n";
         }
@@ -803,6 +804,7 @@ sub _obs_association {
             client_mac => $client_mac,
             iface      => $kv->{iface},
             signal     => $kv->{signal},
+            ssid       => $kv->{ssid},
         );
         if ($r->{op} eq 'insert') {
             push @ev, { type => 'ap_associated', mac => $client_mac,
@@ -975,6 +977,21 @@ sub _obs_ping {
     }
 
     return @ev;
+}
+
+# Lets clients persist arbitrary events without DB credentials. Used by
+# net-roam to record wifi_deauth (so the next run can honor a cooldown).
+# The dispatch loop in _handle_observe runs returned events through
+# _log_event, which writes the row and broadcasts to subscribers.
+sub _obs_event {
+    my ($self, $cli, $kv) = @_;
+    my $type = $kv->{type} or die "event: type required\n";
+    return ({
+        type    => $type,
+        mac     => $kv->{mac},
+        addr    => $kv->{addr},
+        details => $kv->{details},
+    });
 }
 
 1;

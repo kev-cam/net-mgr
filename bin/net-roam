@@ -1,0 +1,370 @@
+#!/usr/bin/perl
+# net-roam — kick mobile clients off APs they're at the edge of, so
+# they re-associate to a stronger one (or fall back to cellular).
+#
+# A client is considered "mobile" if it has been observed associated to
+# at least two different APs over a configurable window. The signal
+# threshold defaults to -75 dBm. We only kick when the SSID is also
+# served by another AP — otherwise there's nowhere to go.
+#
+# Usage:
+#   net-roam                       Survey + kick weak mobile clients.
+#   net-roam --dry-run             Print what would happen, kick nothing.
+#   net-roam --list                Print the watched (mobile) set and exit.
+#   net-roam --list-all            Like --list but include non-mobile clients.
+#   net-roam --threshold -70       Kick when RSSI is weaker than -70 dBm.
+#   net-roam --window-days 7       Mobility window (default 30).
+#   net-roam --cooldown 600        Don't re-kick same MAC within N s (default 300).
+#   net-roam --mac AA:BB:..        Limit to one client.
+#   net-roam --listen H:P          Override manager.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use NetMgr::Client;
+
+my $listen;
+my $threshold   = -75;
+my $cooldown    = 300;
+my $window_days = 30;
+my $dry_run;
+my $ssh_user    = 'root';
+my $ssh_timeout = 10;
+my $only_mac;
+my $verbose;
+my $list;
+my $list_all;
+my $help;
+my $kick_mac;
+GetOptions(
+    'listen=s'      => \$listen,
+    'threshold=i'   => \$threshold,
+    'cooldown=i'    => \$cooldown,
+    'window-days=i' => \$window_days,
+    'dry-run|n'     => \$dry_run,
+    'ssh-user=s'    => \$ssh_user,
+    'ssh-timeout=i' => \$ssh_timeout,
+    'mac=s'         => \$only_mac,
+    'verbose|v'     => \$verbose,
+    'list'          => \$list,
+    'list-all'      => \$list_all,
+    'help|h'        => \$help,
+    'kick=s'        => \$kick_mac,
+) or do { print STDERR usage(); exit 2 };
+
+if ($help) { print usage(); exit 0 }
+
+sub usage {
+    return <<'EOT';
+net-roam — kick mobile clients off APs they're at the edge of, so they
+re-associate to a stronger one (or fall back to cellular).
+
+A client is "mobile" if it has been observed associated to at least two
+different APs over --window-days. Kicks happen only when the SSID is
+also served by another AP (otherwise there's nowhere to go).
+
+Usage:
+  net-roam                    Survey + kick weak mobile clients.
+  net-roam --dry-run          Print what would happen, kick nothing.
+  net-roam --list             Print the watched (mobile) set and exit.
+  net-roam --list-all         Like --list but include non-mobile clients.
+  net-roam --kick AA:BB:..    Force-kick one client off its current AP.
+
+Tuning:
+  --threshold N   RSSI dBm; kick clients weaker than this (default -75).
+  --window-days N Mobility window in days (default 30).
+  --cooldown N    Don't re-kick same MAC within N seconds (default 300).
+  --mac AA:BB:..  Limit to one client (works with --list / --list-all too).
+
+Plumbing:
+  --listen H:P    Override manager address.
+  --ssh-user U    User for SSH to APs (default root).
+  --ssh-timeout N SSH connect timeout in seconds (default 10).
+  --verbose / -v  In kick mode: explain why each candidate was skipped.
+  --help / -h     Show this help.
+EOT
+}
+
+my $cli = NetMgr::Client->new(listen => $listen);
+$cli->hello(consumer => "net-roam.$$");
+
+my $assocs = $cli->snapshot(1, 'associations');
+my $aps    = $cli->snapshot(2, 'aps');
+my $addrs  = $cli->snapshot(3, 'addresses', where => "family = 'v4'");
+
+# AP MAC → SSID list (comma-joined when multi-band)
+my %ap_ssid;
+for my $ap (@$aps) { $ap_ssid{lc $ap->{mac}} = $ap->{ssid} // '' }
+
+# AP MAC → preferred IP (first v4 we have for that MAC)
+my %ap_ip;
+for my $a (@$addrs) {
+    next unless $a->{mac} && $a->{addr};
+    my $m = lc $a->{mac};
+    next unless exists $ap_ssid{$m};
+    $ap_ip{$m} //= $a->{addr};
+}
+
+# Single SSID name → list of AP MACs serving it. Lets us ask
+# "is there another AP this client could land on?".
+my %ssid_to_aps;
+for my $m (keys %ap_ssid) {
+    for my $s (split /,/, $ap_ssid{$m}) {
+        next unless length $s;
+        push @{ $ssid_to_aps{$s} }, $m;
+    }
+}
+
+# Mobility filter: clients seen on >=2 distinct APs in the window.
+my $window_secs = $window_days * 86400;
+my $window = $cli->snapshot(4, 'associations',
+    where => "last_seen > ago($window_secs)");
+my %ap_count;
+for my $a (@$window) {
+    $ap_count{lc $a->{client_mac}}{lc $a->{ap_mac}} = 1;
+}
+my %is_mobile = map { $_ => 1 }
+                grep { scalar(keys %{ $ap_count{$_} }) >= 2 }
+                keys %ap_count;
+
+# --kick: explicit one-shot. Bypass mobility, signal, cooldown and
+# alt-AP checks — the user has decided. Kick whichever AP currently
+# holds the association for this MAC.
+if ($kick_mac) {
+    my $cmac = lc $kick_mac;
+    my @rows = grep { lc $_->{client_mac} eq $cmac } @$assocs;
+    if (!@rows) {
+        die "no association found for $kick_mac\n";
+    }
+    # Pick most recent if multiple (shouldn't happen, but be safe).
+    my ($a) = sort { ($b->{last_seen} // '') cmp ($a->{last_seen} // '') } @rows;
+    my $apm = lc $a->{ap_mac};
+    my $ip  = $ap_ip{$apm}
+        or die "no IP known for AP $apm — cannot SSH\n";
+    my $tag = sprintf "%s on %s (%s/%s)",
+        $cmac, $ip, ($a->{iface} // '?'), ($ap_ssid{$apm} // '-');
+    if ($dry_run) {
+        print "[dry] kick $tag\n";
+        $cli->bye;
+        exit 0;
+    }
+    print "kick $tag\n";
+    my $rc = system 'ssh',
+        '-o', 'BatchMode=yes',
+        '-o', "ConnectTimeout=$ssh_timeout",
+        '-o', 'StrictHostKeyChecking=accept-new',
+        '-n',
+        "$ssh_user\@$ip",
+        deauth_cmd($a->{iface}, $cmac);
+    $rc = $rc >> 8;
+    my $details = sprintf
+        '{"ap_mac":"%s","ssid":"%s","rc":%d,"manual":true}',
+        $apm, ($ap_ssid{$apm} // ''), $rc;
+    $cli->observe(
+        kind => 'event', type => 'wifi_deauth',
+        mac  => $cmac,   details => $details,
+    );
+    $cli->bye;
+    exit($rc ? 1 : 0);
+}
+
+# --list / --list-all: show the set of clients net-roam considers, then
+# exit. No kicking, no cooldown lookup needed. Pull machine names so
+# the output is human-readable.
+if ($list || $list_all) {
+    my $ifaces = $cli->snapshot(10, 'interfaces');
+    my $machs  = $cli->snapshot(11, 'machines');
+    my %name_by_id = map { $_->{id} => $_->{primary_name} } @$machs;
+    my %name_by_mac;
+    for my $i (@$ifaces) {
+        my $n = $name_by_id{ $i->{machine_id} // '' };
+        $name_by_mac{ lc $i->{mac} } = $n if defined $n;
+    }
+    my %ap_name_by_mac;
+    for my $ap (@$aps) {
+        my ($if) = grep { lc $_->{mac} eq lc $ap->{mac} } @$ifaces;
+        my $n = $if ? $name_by_id{ $if->{machine_id} // '' } : undef;
+        $ap_name_by_mac{ lc $ap->{mac} } = $n // ($ap_ip{lc $ap->{mac}} // lc $ap->{mac});
+    }
+
+    # Pick most recent association row per client_mac.
+    my %latest;
+    for my $a (@$assocs) {
+        next if $only_mac && lc($only_mac) ne lc $a->{client_mac};
+        my $cmac = lc $a->{client_mac};
+        my $cur  = $latest{$cmac};
+        my $ts   = $a->{last_seen} // '';
+        $latest{$cmac} = $a if !$cur || ($cur->{last_seen} // '') lt $ts;
+    }
+
+    my @rows;
+    for my $cmac (keys %latest) {
+        next unless $list_all || $is_mobile{$cmac};
+        my $a    = $latest{$cmac};
+        my $apm  = lc $a->{ap_mac};
+        my $ap_n = scalar keys %{ $ap_count{$cmac} || {} };
+        push @rows, {
+            name    => $name_by_mac{$cmac} // '',
+            cmac    => $cmac,
+            ap      => $ap_name_by_mac{$apm} // $apm,
+            # Per-row ssid (added v6) is what the client is actually on.
+            # Old rows from before this column existed have NULL ssid;
+            # showing the AP's full joined list there would be a guess —
+            # the AGE column tells the user it's stale.
+            ssid    => $a->{ssid},
+            signal  => $a->{signal},
+            aps     => $ap_n,
+            age     => age_of_ts($a->{last_seen}),
+            mobile  => $is_mobile{$cmac} ? 'yes' : 'no',
+        };
+    }
+    @rows = sort { ($a->{name} || 'zzz') cmp ($b->{name} || 'zzz')
+                || $a->{cmac} cmp $b->{cmac} } @rows;
+
+    my $fmt = "%-20s  %-17s  %-22s  %-16s  %6s  %4s  %5s\n";
+    printf $fmt, qw(NAME MAC AP SSID SIGNAL APs AGE);
+    printf $fmt, '-'x20, '-'x17, '-'x22, '-'x16, '-'x6, '-'x4, '-'x5;
+    for my $r (@rows) {
+        printf $fmt,
+            ($r->{name} || '-'),
+            $r->{cmac},
+            $r->{ap},
+            ($r->{ssid} || '?'),
+            (defined $r->{signal} ? $r->{signal} : '-'),
+            $r->{aps},
+            (defined $r->{age} ? age_str($r->{age}) : '-');
+    }
+    if ($list_all) {
+        my $tot = scalar @rows;
+        my $mob = grep { $_->{mobile} eq 'yes' } @rows;
+        printf "\n%d clients (%d mobile, %d stationary)\n", $tot, $mob, $tot - $mob;
+    } else {
+        printf "\n%d mobile client(s) being watched\n", scalar @rows;
+    }
+    $cli->bye;
+    exit 0;
+}
+
+# Cooldown: skip MACs we kicked recently. We log each kick as a
+# 'wifi_deauth' event below, so the manager's events table is the
+# durable source of truth.
+my $events = $cli->snapshot(5, 'events',
+    where => "type = 'wifi_deauth' AND ts > ago($cooldown)");
+my %recent_kick;
+$recent_kick{lc $_->{mac}} = 1 for grep { $_->{mac} } @$events;
+
+# Build the candidate list, then act.
+my @candidates;
+my @reasons;   # reasons for skipping when --verbose
+for my $a (@$assocs) {
+    my $cmac   = lc $a->{client_mac};
+    my $ap_mac = lc $a->{ap_mac};
+    my $sig    = $a->{signal};
+    my $why;
+
+    if ($only_mac && lc($only_mac) ne $cmac) { next }
+    if (!defined $sig)            { $why = 'no signal data' }
+    elsif (!$is_mobile{$cmac})    { $why = 'not mobile' }
+    elsif ($sig > $threshold)     { $why = "signal $sig > threshold" }
+    elsif ($recent_kick{$cmac})   { $why = 'in cooldown' }
+    else {
+        my $other = 0;
+        for my $s (split /,/, $ap_ssid{$ap_mac} // '') {
+            next unless length $s;
+            $other++ if grep { $_ ne $ap_mac } @{ $ssid_to_aps{$s} || [] };
+            last if $other;
+        }
+        if (!$other) { $why = 'SSID has no alt AP' }
+    }
+
+    if ($why) {
+        push @reasons, sprintf("skip %s on %s sig=%s: %s",
+            $cmac, $ap_mac, ($sig // '?'), $why) if $verbose;
+        next;
+    }
+    push @candidates, {
+        client_mac => $cmac, ap_mac => $ap_mac,
+        ap_ip      => $ap_ip{$ap_mac},
+        iface      => $a->{iface},
+        signal     => $sig,
+        ssid       => $ap_ssid{$ap_mac},
+    };
+}
+
+if ($verbose) { print "$_\n" for @reasons }
+
+if (!@candidates) {
+    print "no candidates to kick\n";
+    $cli->bye;
+    exit 0;
+}
+
+for my $c (@candidates) {
+    my $tag = sprintf "%s on %s (%s/%s) signal=%d",
+        $c->{client_mac}, ($c->{ap_ip} // $c->{ap_mac}),
+        $c->{iface}, ($c->{ssid} // '-'), $c->{signal};
+    if ($dry_run) {
+        print "[dry] kick $tag\n";
+        next;
+    }
+    if (!$c->{ap_ip}) {
+        warn "skip $c->{client_mac}: no IP for AP $c->{ap_mac}\n";
+        next;
+    }
+    print "kick $tag\n";
+    my $rc = system 'ssh',
+        '-o', 'BatchMode=yes',
+        '-o', "ConnectTimeout=$ssh_timeout",
+        '-o', 'StrictHostKeyChecking=accept-new',
+        '-n',
+        "$ssh_user\@$c->{ap_ip}",
+        deauth_cmd($c->{iface}, $c->{client_mac});
+    $rc = $rc >> 8;
+    # Log even on failure — the cooldown still applies, otherwise we'd
+    # hammer a flaky AP every cycle.
+    my $details = sprintf '{"ap_mac":"%s","signal":%d,"ssid":"%s","rc":%d}',
+        $c->{ap_mac}, $c->{signal}, ($c->{ssid} // ''), $rc;
+    $cli->observe(
+        kind    => 'event',
+        type    => 'wifi_deauth',
+        mac     => $c->{client_mac},
+        details => $details,
+    );
+}
+
+$cli->bye;
+
+# Build the remote shell command that kicks <mac> off <iface>.
+# Tries several wl subcommand spellings because Broadcom firmware
+# diverges: newer R6700 v3 builds reject `deauthenticate <MAC>`
+# (parses arg as integer/AID), but accept scb_deauthenticate_for_reason.
+# Reason 1 = unspecified, accepted everywhere.
+sub deauth_cmd {
+    my ($iface, $mac) = @_;
+    return "wl -i $iface scb_deauthenticate_for_reason $mac 1 2>&1"
+         . " || wl -i $iface deauthenticate_mac $mac 2>&1"
+         . " || wl -i $iface deauthenticate $mac 2>&1";
+}
+
+sub age_of_ts {
+    my ($v) = @_;
+    return undef unless defined $v
+                    && $v =~ /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)/;
+    require Time::Local;
+    my $epoch = eval { Time::Local::timelocal($6, $5, $4, $3, $2-1, $1) };
+    return undef unless defined $epoch;
+    return time() - $epoch;
+}
+
+sub age_str {
+    my $s = shift;
+    return '-' unless defined $s;
+    if ($s < 0)         { return "in " . age_str(-$s) }
+    if ($s < 60)        { return "${s}s" }
+    if ($s < 3600)      { return sprintf "%dm", int($s/60) }
+    if ($s < 86400)     { return sprintf "%dh", int($s/3600) }
+    if ($s < 365*86400) { return sprintf "%dd", int($s/86400) }
+    return sprintf "%dy", int($s/(365*86400));
+}

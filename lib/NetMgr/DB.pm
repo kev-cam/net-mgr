@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 5;
+our $SCHEMA_VERSION = 6;
 
 sub new {
     my ($class, %args) = @_;
@@ -136,6 +136,16 @@ sub _apply_migration {
         );
         $self->{dbh}->do(
             "ALTER TABLE addresses ADD COLUMN last_rtt_ms FLOAT NULL"
+        );
+        return;
+    }
+    if ($v == 6) {
+        # Per-association SSID — the actual network the client is on.
+        # Captured by net-poll-ap from `wl -i <iface> ssid`. Lets
+        # net-roam --list show "scorpius" instead of the AP's full
+        # joined SSID list.
+        $self->{dbh}->do(
+            "ALTER TABLE associations ADD COLUMN ssid VARCHAR(64) NULL AFTER iface"
         );
         return;
     }
@@ -542,7 +552,7 @@ sub upsert_association {
         my @set;
         my @bind;
         my @changed;
-        for my $k (qw(signal iface)) {
+        for my $k (qw(signal iface ssid)) {
             next unless exists $f{$k};
             my $old = $was->{$k}; my $new = $f{$k};
             next if (!defined $old && !defined $new);
@@ -565,15 +575,16 @@ sub upsert_association {
                  changed_fields => \@changed, was => $was, now => $now };
     }
     $self->{dbh}->do(
-        "INSERT INTO associations (ap_mac, client_mac, `signal`, iface)
-         VALUES (?, ?, ?, ?)", undef,
-        $f{ap_mac}, $f{client_mac}, $f{signal}, $f{iface}
+        "INSERT INTO associations (ap_mac, client_mac, `signal`, iface, ssid)
+         VALUES (?, ?, ?, ?, ?)", undef,
+        $f{ap_mac}, $f{client_mac}, $f{signal}, $f{iface}, $f{ssid}
     );
     my $now = $self->{dbh}->selectrow_hashref(
         "SELECT * FROM associations WHERE ap_mac = ? AND client_mac = ?",
         undef, $f{ap_mac}, $f{client_mac}
     );
-    return { op => 'insert', changed_fields => [qw(ap_mac client_mac signal iface)],
+    return { op => 'insert',
+             changed_fields => [qw(ap_mac client_mac signal iface ssid)],
              was => undef, now => $now };
 }
 

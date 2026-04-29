@@ -19,11 +19,19 @@ nvram show 2>/dev/null | grep -E '^wl[0-9]+(\.[0-9]+)?_ssid='
 echo ===INTERFACES===
 ifconfig 2>/dev/null
 echo ===ASSOC===
-for i in eth0 eth1 eth2 ath0 ath1 ath2 wl0 wl1; do
+for i in eth0 eth1 eth2 ath0 ath1 ath2 wl0 wl1 wl0.1 wl0.2 wl0.3 wl1.1 wl1.2 wl1.3; do
   out=$(wl -i $i assoclist 2>/dev/null)
   if [ -n "$out" ]; then
     echo "IFACE $i"
     echo "$out"
+    # Per-iface SSID — net-roam --list shows the SSID the client is on.
+    s=$(wl -i $i ssid 2>/dev/null | sed -n 's/.*SSID: "\(.*\)".*/\1/p')
+    [ -n "$s" ] && echo "SSID $i $s"
+    # Per-client RSSI: lets net-roam find phones/tablets at the cell edge
+    for cmac in $(echo "$out" | awk '{print $2}'); do
+      r=$(wl -i $i rssi $cmac 2>/dev/null)
+      [ -n "$r" ] && echo "RSSI $i $cmac $r"
+    done
   fi
 done
 echo ===ARP===
@@ -88,6 +96,7 @@ sub parse_remote {
     my $cur_iface;
     my @assoc;
     my $assoc_iface;
+    my %ssid_by_iface;     # iface (eth1, wl0.1, ...) → live SSID name
     my @arp;
     my @leases;
 
@@ -126,8 +135,22 @@ sub parse_remote {
             if ($line =~ /^IFACE\s+(\S+)/) {
                 $assoc_iface = $1;
             }
+            elsif ($line =~ /^SSID\s+(\S+)\s+(.+)/) {
+                $ssid_by_iface{$1} = $2;
+            }
             elsif ($line =~ /^assoclist\s+([0-9A-Fa-f:]{17})/ && $assoc_iface) {
                 push @assoc, { iface => $assoc_iface, client_mac => lc $1 };
+            }
+            elsif ($line =~ /^RSSI\s+(\S+)\s+([0-9A-Fa-f:]{17})\s+(-?\d+)/) {
+                # Last write wins per (iface, mac); attach to the matching
+                # association entry below in to_observations().
+                my ($if, $cmac, $rssi) = ($1, lc $2, $3 + 0);
+                for my $a (@assoc) {
+                    next unless $a->{iface} eq $if
+                             && $a->{client_mac} eq $cmac;
+                    $a->{signal} = $rssi;
+                    last;
+                }
             }
         }
         elsif ($section eq 'ARP') {
@@ -150,6 +173,14 @@ sub parse_remote {
                 };
             }
         }
+    }
+
+    # Attach the live SSID (from `wl ssid`) to each association entry,
+    # keyed by iface. Used by net-roam --list to show which network the
+    # client is actually on.
+    for my $a (@assoc) {
+        my $s = $ssid_by_iface{ $a->{iface} };
+        $a->{ssid} = $s if defined $s && length $s;
     }
 
     return {
@@ -200,6 +231,8 @@ sub to_observations {
             ap_ip      => $ap_ip,
             iface      => $a->{iface},
             client_mac => $a->{client_mac},
+            (defined $a->{signal} ? (signal => $a->{signal}) : ()),
+            (defined $a->{ssid}   ? (ssid   => $a->{ssid})   : ()),
         };
     }
 
