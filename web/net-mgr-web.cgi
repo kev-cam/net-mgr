@@ -116,6 +116,23 @@ sub primary_addr {
     return $all[0]{addr};
 }
 
+# Sort tier for the compact list:
+#   0 = has at least one HTTP/HTTPS service (most useful click-through)
+#   1 = has some other clickable service (ssh/vnc/rdp/etc.)
+#   2 = no clickable ports
+sub tier {
+    my ($ports) = @_;
+    my $any_clickable = 0;
+    for my $p (@$ports) {
+        my $sd = $SCHEME{$p->{port}};
+        next unless $sd && (($p->{proto} // 'tcp') eq 'tcp');
+        my ($scheme) = @$sd;
+        return 0 if $scheme eq 'http' || $scheme eq 'https';
+        $any_clickable = 1;
+    }
+    return $any_clickable ? 1 : 2;
+}
+
 sub port_badge {
     my ($port_row, $first_addr) = @_;
     my $port  = $port_row->{port};
@@ -173,39 +190,40 @@ sub machine_online {
 # Compact list ------------------------------------------------------
 
 sub render_list {
-    my @rows;
-    # Real machines, sorted by display label.
-    my @ordered_ids = sort {
-        lc(display_label($a)) cmp lc(display_label($b))
-    } grep { $_ } keys %iface_by_machine;
-    for my $mid (@ordered_ids) {
+    # Build (tier, label, html) tuples and sort. Tier 0 = has http/https,
+    # 1 = has other clickable service, 2 = no clickable ports.
+    my @entries;
+    for my $mid (grep { $_ } keys %iface_by_machine) {
         my @macs = map { $_->{mac} } @{ $iface_by_machine{$mid} };
         my $first_addr = primary_addr(@macs);
         my $label = display_label($mid, $first_addr);
         my $online = machine_online($mid) ? 'online' : 'offline';
-        my @port_html = map { port_badge($_, $first_addr) }
-                            aggregate_ports(@macs);
+        my @ports = aggregate_ports(@macs);
+        my @port_html = map { port_badge($_, $first_addr) } @ports;
         my $link = sprintf '<a class=hostlink href="?m=%d">%s</a>',
             $mid, escapeHTML($label);
-        push @rows, sprintf
+        my $html = sprintf
             '<tr class="%s"><td class=name>%s</td><td>%s</td><td class=ports>%s</td></tr>',
             $online, $link, escapeHTML($first_addr // ''),
             join(' ', @port_html);
+        push @entries, [ tier(\@ports), lc $label, $html ];
     }
-    # Unaffiliated interfaces, one per row.
     for my $iface (@{ $iface_by_machine{0} || [] }) {
         my $mac = $iface->{mac};
         my $first_addr = primary_addr($mac);
         my $label = $first_addr // $mac;
-        my @port_html = map { port_badge($_, $first_addr) }
-                            aggregate_ports($mac);
+        my @ports = aggregate_ports($mac);
+        my @port_html = map { port_badge($_, $first_addr) } @ports;
         my $online = $iface->{online} ? 'online' : 'offline';
         my $link = sprintf '<a class=hostlink href="?i=%s">%s</a>',
             escapeHTML($mac), escapeHTML($label);
-        push @rows, sprintf
+        my $html = sprintf
             '<tr class="%s unknown"><td class=name>%s</td><td></td><td class=ports>%s</td></tr>',
             $online, $link, join(' ', @port_html);
+        push @entries, [ tier(\@ports), lc $label, $html ];
     }
+    @entries = sort { $a->[0] <=> $b->[0] || $a->[1] cmp $b->[1] } @entries;
+    my @rows = map { $_->[2] } @entries;
 
     my $body  = join("\n", @rows);
     my $count = scalar @$machines;
