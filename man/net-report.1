@@ -78,17 +78,12 @@ Recent AP polls (last hour):
 .fi
 .RE
 .PP
-Rank the flakiest hosts by reconnect count over the last week. Counts
-\fBinterface_online\fR events per (mac, machine) and sorts descending
-\(em the top of the list is whoever is reconnecting most:
-.RS 4
-.nf
-.B net-report --columns mac,machine events \\\\
-.B "    \(dqtype = 'interface_online' AND ts > ago(604800)\(dq" \\\\
-.B "  | tail -n +3 | awk '{print $1, $2}' \\\\"
-.B "  | sort | uniq -c | sort -rn | head"
-.fi
-.RE
+See
+.BR net-mgr (7)
+for a worked example of ranking the flakiest hosts on the network
+using
+.B net-report
++ awk/sort.
 .SH SEE ALSO
 .BR net-scan (1),
 .BR net-show (1),
