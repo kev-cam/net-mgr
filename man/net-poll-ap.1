@@ -1,0 +1,80 @@
+.TH NET-POLL-AP 1 "2026-04-29" "net-mgr" "User Commands"
+.SH NAME
+net-poll-ap \- SSH-poll DD-WRT access points and push observations
+.SH SYNOPSIS
+.B net-poll-ap
+.RI [ options ]
+.RI [ IP
+.IR ... ]
+.br
+.B net-poll-ap \-\-auto
+.SH DESCRIPTION
+.B net-poll-ap
+SSHes into each given AP IP, runs a single shell script that gathers AP
+identity, SSIDs, associated clients (with per-client RSSI and per-iface SSID),
+ARP, and DHCP leases, parses the output, and pushes
+.BR kind=ap_self ", " kind=association ", " kind=arp ", and " kind=lease
+observations to the manager.
+.PP
+With
+.B \-\-auto
+the tool asks the manager for every host known to have port 22 open (plus
+existing AP rows), polls them all, and uses an exponential-backoff cache so
+non-AP sshd hosts only cost one round of attempts before being mostly skipped.
+.SH OPTIONS
+.TP
+.IR IP " [" IP " ...]"
+Explicit AP IPs to poll.
+.TP
+.B \-\-auto
+Discover candidates from the manager (port 22 + aps table).
+.TP
+\fB\-\-ssh-user\fR \fIUSER\fR
+SSH login user. Default
+.BR root .
+.TP
+\fB\-\-ssh-timeout\fR \fIN\fR
+SSH connect timeout in seconds. Default 10.
+.TP
+.B \-\-print
+Dump observations to stdout for debugging instead of pushing.
+.TP
+\fB\-\-cache\fR \fIPATH\fR
+Override the per-AP backoff cache path.
+.TP
+.B \-\-no\-cache
+Disable backoff (re-probe every host every time).
+.TP
+\fB\-\-listen\fR \fIHOST:PORT\fR
+Override the manager address.
+.SH EXAMPLES
+.PP
+Poll one AP and see what it reports, no DB write:
+.RS 4
+.nf
+.B net-poll-ap --print 192.168.15.151
+.fi
+.RE
+.PP
+Poll every known AP-or-sshd host:
+.RS 4
+.nf
+.B net-poll-ap --auto
+.fi
+.RE
+.PP
+Force fresh poll, ignore backoff:
+.RS 4
+.nf
+.B net-poll-ap --no-cache 192.168.15.151
+.fi
+.RE
+.SH FILES
+.TP
+.I /var/cache/net-mgr/ap-poll.tsv
+Per-AP backoff cache.
+.SH SEE ALSO
+.BR net-show (1),
+.BR net-roam (1),
+.BR net-discover (1),
+.BR net-mgr (7)

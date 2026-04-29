@@ -69,6 +69,11 @@ my %DEFAULTS = (
         presence  => 0,
         discover  => 0,
     },
+    # Output directory for net-gen-dnsmasq. Placeholder values
+    # themselves live in the dhcp_vars DB table — manage with net-var(1).
+    dhcp => {
+        out_dir => '/etc/net-mgr/dnsmasq.d',
+    },
 );
 
 # Per-section, which keys should be coerced to integer seconds.
@@ -167,6 +172,7 @@ my %ACTIVE = (
     paths      => '*',
     dns        => '*',
     bindings   => '*',                        # parsed for future use
+    dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
 );
 
 # Returns a list of "[section] key" strings for entries in $path that

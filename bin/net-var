@@ -1,0 +1,233 @@
+#!/usr/bin/perl
+# net-var — manage placeholder values stored in the dhcp_vars table.
+# Used by net-gen-dnsmasq to substitute DNSH/ROUTER_*/etc. when
+# generating dnsmasq config from /etc/net-mgr/dhcp.master.
+#
+# Usage:
+#   net-var list [PATTERN]
+#   net-var get NAME
+#   net-var set NAME VALUE [--notes 'text']
+#   net-var remove NAME
+#   net-var auto [--dry-run]
+#
+# Reads/writes the DB directly (same pattern as net-alias) so it must
+# run on the host with /root/.my.cnf or ~/.my.cnf.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling pass_through);
+use NetMgr::Config;
+use NetMgr::DB;
+
+my $notes;
+my $dry_run;
+my $help;
+GetOptions(
+    'notes=s'   => \$notes,
+    'dry-run|n' => \$dry_run,
+    'help|h'    => \$help,
+) or die "bad options\n";
+
+if ($help || !@ARGV) {
+    print <<'EOT';
+net-var — read/write the dhcp_vars table.
+
+  net-var list [PATTERN]               List variables (optional shell glob).
+  net-var get NAME                     Print one value (exit 1 if missing).
+  net-var set NAME VALUE [--notes "…"] Create or update.
+  net-var remove NAME                  Delete one entry.
+  net-var auto [--dry-run]             Detect placeholders fix_dhcp-style
+                                       (run on nas3) and seed the table.
+EOT
+    exit($help ? 0 : 2);
+}
+
+my $cmd = shift @ARGV;
+
+my $cfg = NetMgr::Config->load(
+    $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
+my $mycnf = (-r "$ENV{HOME}/.my.cnf") ? "$ENV{HOME}/.my.cnf"
+          : (-r '/root/.my.cnf')      ? '/root/.my.cnf'
+          : die "no readable .my.cnf for the [net-mgr] section\n";
+my $db = NetMgr::DB->new(
+    defaults_file => $mycnf,
+    section       => $cfg->{mysql}{section},
+    db            => $cfg->{mysql}{db},
+);
+$db->connect;
+
+if ($cmd eq 'list') {
+    my $pat = shift @ARGV;
+    my $rows = $db->query_table('dhcp_vars');
+    if ($pat) {
+        $pat =~ s/([^\w*?])/\\$1/g;
+        $pat =~ s/\*/.*/g;
+        $pat =~ s/\?/./g;
+        my $re = qr/^$pat$/;
+        $rows = [ grep { $_->{name} =~ $re } @$rows ];
+    }
+    @$rows = sort { $a->{name} cmp $b->{name} } @$rows;
+    if (!@$rows) {
+        print "(none)\n";
+        exit 0;
+    }
+    my $w = 0;
+    for my $r (@$rows) { $w = length $r->{name} if length $r->{name} > $w }
+    for my $r (@$rows) {
+        printf "%-${w}s  %-15s  %s\n",
+            $r->{name}, $r->{value},
+            $r->{notes} // '';
+    }
+    exit 0;
+}
+
+if ($cmd eq 'get') {
+    my $name = shift @ARGV or die "usage: net-var get NAME\n";
+    my $row = $db->dbh->selectrow_hashref(
+        "SELECT * FROM dhcp_vars WHERE name = ?", undef, $name);
+    if (!$row) {
+        warn "no such var: $name\n";
+        exit 1;
+    }
+    print "$row->{value}\n";
+    exit 0;
+}
+
+if ($cmd eq 'set') {
+    my $name  = shift @ARGV or die "usage: net-var set NAME VALUE [--notes '…']\n";
+    my $value = shift @ARGV;
+    die "value required (use empty string for none)\n" unless defined $value;
+    my $row = $db->upsert_dhcp_var(name => $name, value => $value, notes => $notes);
+    printf "set %s = %s%s\n", $row->{name}, $row->{value},
+        ($row->{notes} ? " ($row->{notes})" : '');
+    exit 0;
+}
+
+if ($cmd eq 'remove' || $cmd eq 'rm' || $cmd eq 'del') {
+    my $name = shift @ARGV or die "usage: net-var remove NAME\n";
+    my $rc = $db->delete_dhcp_var($name);
+    if ($rc) {
+        print "removed $name\n";
+        exit 0;
+    } else {
+        warn "no such var: $name\n";
+        exit 1;
+    }
+}
+
+if ($cmd eq 'auto') {
+    my %vars = detect_vars();
+    if (!%vars) {
+        die "auto-detect produced nothing — is this nas3?\n";
+    }
+    my $w = 0;
+    for my $k (keys %vars) { $w = length $k if length $k > $w }
+    for my $k (sort keys %vars) {
+        printf "%-${w}s = %-15s%s\n",
+            $k, $vars{$k}{value},
+            $vars{$k}{notes} ? "  ($vars{$k}{notes})" : '';
+    }
+    if ($dry_run) {
+        print "\n(dry-run — nothing written)\n";
+        exit 0;
+    }
+    for my $k (sort keys %vars) {
+        $db->upsert_dhcp_var(name => $k, value => $vars{$k}{value},
+                             notes => $vars{$k}{notes});
+    }
+    print "\nseeded ", scalar(keys %vars), " vars in dhcp_vars\n";
+    exit 0;
+}
+
+die "unknown subcommand '$cmd'; try: list, get, set, remove, auto\n";
+
+# fix_dhcp-equivalent runtime detection. Must run on nas3 (or any host
+# with both a 192.168.15 nameserver in /etc/resolv.conf and a local
+# 192.168.223.x interface).
+sub detect_vars {
+    my $self_223 = local_ip_in('192.168.223.');
+    my $dns15    = first_nameserver_in('192.168.15.');
+
+    # Prefer the highest-ranked AP from subnet_routers if set; else
+    # fall back to fix_dhcp's runtime detection (DNS upstream for .15,
+    # ping check for .223).
+    my $rtr_15  = top_router('192.168.15.0/24',  '192.168.15.')  // $dns15;
+    my $rtr_223 = top_router('192.168.223.0/24', '192.168.223.')
+               // (ping_host('192.168.223.79') ? '192.168.223.79' : $self_223);
+
+    my %v;
+    $v{DNSH}        = { value => $dns15,    notes => 'master DNS (from /etc/resolv.conf)' } if $dns15;
+    $v{DNSX}        = { value => $self_223, notes => 'fallback DNS (this host on .223)' } if $self_223;
+    $v{DNSR}        = { value => $rtr_223,  notes => 'router for .223' } if $rtr_223;
+    $v{ROUTER_15}   = { value => $rtr_15,   notes => 'DMZ router' } if $rtr_15;
+    $v{ROUTER_223}  = { value => $rtr_223,  notes => 'internal router' } if $rtr_223;
+    $v{ROUTER_0}    = { value => '192.168.0.229', notes => 'jbh router (hardcoded in fix_dhcp)' };
+    $v{TFTP_SERVER} = { value => $self_223, notes => 'this host on .223' } if $self_223;
+    $v{HTTP_SERVER} = { value => $self_223, notes => 'this host on .223' } if $self_223;
+    return %v;
+}
+
+# Look up the highest-ranked AP for $subnet_cidr in subnet_routers,
+# then return that AP's address whose octets begin with $ip_prefix
+# (so e.g. an AP that bridges both subnets gives back its .15 IP for
+# the DMZ lookup, .223 IP for internal). Undef if no match.
+sub top_router {
+    my ($subnet_cidr, $ip_prefix) = @_;
+    my $row = $db->dbh->selectrow_hashref(
+        "SELECT s.ap_mac
+           FROM subnet_routers s
+          WHERE s.subnet_cidr = ?
+          ORDER BY s.`rank` DESC, s.ap_mac
+          LIMIT 1", undef, $subnet_cidr);
+    return undef unless $row;
+    my $addrs = $db->dbh->selectall_arrayref(
+        "SELECT addr FROM addresses WHERE mac = ? AND family = 'v4'",
+        { Slice => {} }, $row->{ap_mac});
+    for my $a (@$addrs) {
+        return $a->{addr} if index($a->{addr}, $ip_prefix) == 0;
+    }
+    return undef;
+}
+
+sub local_ip_in {
+    my ($prefix) = @_;
+    my $out = `ip -4 -br addr 2>/dev/null`;
+    for my $line (split /\n/, $out) {
+        # eth0  UP  192.168.223.104/24 ...
+        for my $tok (split /\s+/, $line) {
+            if ($tok =~ m{^(\Q$prefix\E\d+)/}) {
+                return $1;
+            }
+        }
+    }
+    return undef;
+}
+
+sub first_nameserver_in {
+    my ($prefix) = @_;
+    if (open my $fh, '<', '/etc/resolv.conf') {
+        while (my $line = <$fh>) {
+            next unless $line =~ /^\s*nameserver\s+(\S+)/;
+            my $ns = $1;
+            return $ns if index($ns, $prefix) == 0;
+        }
+    }
+    # systemd-resolved hides real upstreams behind 127.0.0.53.
+    # `resolvectl --no-pager dns` lists them per-iface, e.g.
+    #   Global:
+    #   Link 2 (eth0): 192.168.15.163 ...
+    my $out = `resolvectl --no-pager dns 2>/dev/null`;
+    for my $line (split /\n/, $out) {
+        for my $tok (split /\s+/, $line) {
+            return $tok if index($tok, $prefix) == 0;
+        }
+    }
+    return undef;
+}
+
+sub ping_host {
+    my ($ip) = @_;
+    return system("ping -c 1 -W 1 -q $ip > /dev/null 2>&1") == 0;
+}

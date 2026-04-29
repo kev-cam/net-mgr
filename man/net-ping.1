@@ -1,0 +1,93 @@
+.TH NET-PING 1 "2026-04-29" "net-mgr" "User Commands"
+.SH NAME
+net-ping \- manual fping producer; reset RTT baselines
+.SH SYNOPSIS
+.B net-ping
+.I IP
+.RI [ IP
+.IR ... ]
+.br
+.B net-ping
+.B \-\-auto
+.br
+.B net-ping
+.B \-\-reset
+.RI [ IP
+.IR ... ]
+.br
+.B net-ping
+.B \-\-reset
+.B \-\-all
+.SH DESCRIPTION
+.B net-ping
+fpings the given IPs and pushes
+.B kind=ping
+observations to the daemon, updating each address's
+.B last_rtt_ms
+and
+.BR min_rtt_ms .
+The same data is gathered automatically by
+.B net-discover \-\-presence
+on a periodic schedule; this tool exists for ad-hoc probing and for clearing
+stale baselines.
+.PP
+.B \-\-reset
+issues a
+.B TRIGGER reset-rtt
+to the daemon (handled in-process, no fork) which clears
+.B min_rtt_ms
+and
+.BR last_rtt_ms .
+Useful when a host's recorded minimum was set during an unusual condition
+(e.g. you tested with the iface in promisc mode) and is no longer
+representative.
+.SH OPTIONS
+.TP
+.B \-\-auto
+Snapshot every known v4 address and ping them all.
+.TP
+.B \-\-reset
+Clear RTT baselines instead of pinging. Combine with IPs, or with
+.B \-\-all
+to clear everything.
+.TP
+.B \-\-all
+With
+.BR \-\-reset ,
+clear every row.
+.TP
+\fB\-\-listen\fR \fIHOST:PORT\fR
+Override the manager address.
+.SH EXAMPLES
+.PP
+Ping a few hosts and update their RTTs:
+.RS 4
+.nf
+.B net-ping 192.168.15.1 192.168.15.42
+.fi
+.RE
+.PP
+Ping everything we know about:
+.RS 4
+.nf
+.B net-ping --auto
+.fi
+.RE
+.PP
+Reset baseline for one IP after testing:
+.RS 4
+.nf
+.B net-ping --reset 192.168.15.42
+.fi
+.RE
+.PP
+Reset every baseline (e.g. after a network reconfig):
+.RS 4
+.nf
+.B net-ping --reset --all
+.fi
+.RE
+.SH SEE ALSO
+.BR net-watch (1),
+.BR net-discover (1),
+.BR net-mgr (7)

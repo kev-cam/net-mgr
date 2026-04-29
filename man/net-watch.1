@@ -1,0 +1,67 @@
+.TH NET-WATCH 1 "2026-04-29" "net-mgr" "User Commands"
+.SH NAME
+net-watch \- live RTT and packet-loss monitor for known hosts
+.SH SYNOPSIS
+.B net-watch
+.RI [ IP
+.IR ... ]
+.RB [ \-\-window
+.IR SECS ]
+.RB [ \-\-refresh
+.IR SECS ]
+.RB [ \-\-once ]
+.RB [ \-\-listen
+.IR HOST:PORT ]
+.SH DESCRIPTION
+.B net-watch
+is a pure consumer that subscribes to address-row updates from the manager
+and aggregates the periodic ping samples. The display is a top-style table
+showing per-host minimum, median, max, last RTT, sample count, and an inferred
+loss percentage over a sliding window.
+.PP
+Loss is approximate \(em it's inferred from gaps in the ping cycle. With the
+default presence interval (90 s) a gap longer than 1.5\(mu cycle counts the
+missing intervals as dropped probes.
+.SH OPTIONS
+.TP
+.IR IP " [" IP " ...]"
+If given, restrict the display to these addresses; otherwise watch all known v4.
+.TP
+\fB\-\-window\fR \fISECS\fR
+Sliding window in seconds. Default 1800 (30 min).
+.TP
+\fB\-\-refresh\fR \fISECS\fR
+Display refresh interval. Default 5.
+.TP
+.B \-\-once
+Print one snapshot and exit. Useful in cron or pipelines.
+.TP
+\fB\-\-listen\fR \fIHOST:PORT\fR
+Override the manager address.
+.SH EXAMPLES
+.PP
+Watch the whole network live:
+.RS 4
+.nf
+.B net-watch
+.fi
+.RE
+.PP
+Focus on one suspect IP, slow refresh:
+.RS 4
+.nf
+.B net-watch --refresh 10 192.168.15.42
+.fi
+.RE
+.PP
+Hourly cron snapshot to a log file:
+.RS 4
+.nf
+.B "*/60 * * * *  net-watch --once >> /var/log/net-watch.log"
+.fi
+.RE
+.SH SEE ALSO
+.BR net-ping (1),
+.BR net-discover (1),
+.BR net-report (1),
+.BR net-mgr (7)

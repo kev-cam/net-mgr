@@ -1,0 +1,85 @@
+.TH NET-VAR 1 "2026-04-29" "net-mgr" "User Commands"
+.SH NAME
+net-var \- read and write the dhcp_vars table (placeholder values)
+.SH SYNOPSIS
+.B net-var list
+.RI [ PATTERN ]
+.br
+.B net-var get
+.I NAME
+.br
+.B net-var set
+.I NAME
+.I VALUE
+.RB [ \-\-notes
+.IR TEXT ]
+.br
+.B net-var remove
+.I NAME
+.SH DESCRIPTION
+.B net-var
+manages a small key=value table used at config-generation time. The
+canonical use is feeding placeholder substitutions to
+.BR net-gen-dnsmasq (1):
+the dhcp.master template contains tokens like
+.BR DNSH ,
+.BR ROUTER_223 ,
+.B TFTP_SERVER
+that get rewritten to actual IPs (or other strings) before the
+generated config is written. Storing them in the DB keeps the values
+centralised — every host that runs net-gen-dnsmasq sees the same
+substitutions without per-host config drift.
+.PP
+Like
+.BR net-alias (1),
+.B net-var
+talks to the database directly, so it must run on the host with
+.I /root/.my.cnf
+or
+.IR ~/.my.cnf
+holding the
+.B [net-mgr]
+section.
+.SH SUBCOMMANDS
+.TP
+\fBlist\fR [\fIPATTERN\fR]
+List variables, optionally filtered by a glob pattern (e.g.
+.BR ROUTER_* ).
+.TP
+\fBget\fR \fINAME\fR
+Print the value, or exit 1 if there's no such name.
+.TP
+\fBset\fR \fINAME\fR \fIVALUE\fR [\fB\-\-notes\fR \fITEXT\fR]
+Create or update.
+.TP
+\fBremove\fR \fINAME\fR
+Delete one entry. Aliases:
+.B rm
+and
+.BR del .
+.SH EXAMPLES
+.PP
+Set the master DNS / DHCP server alias:
+.RS 4
+.nf
+.B net-var set DNSH 192.168.15.252 --notes "firewall (gateway3)"
+.fi
+.RE
+.PP
+Bulk view of router placeholders:
+.RS 4
+.nf
+.B net-var list 'ROUTER_*'
+.fi
+.RE
+.PP
+Pipe a value into another command:
+.RS 4
+.nf
+.B router=$(net-var get ROUTER_223)
+.fi
+.RE
+.SH SEE ALSO
+.BR net-gen-dnsmasq (1),
+.BR net-alias (1),
+.BR net-mgr (7)

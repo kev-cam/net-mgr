@@ -1,0 +1,54 @@
+.TH NET-SCAN 1 "2026-04-29" "net-mgr" "User Commands"
+.SH NAME
+net-scan \- list known hosts on the local network
+.SH SYNOPSIS
+.B net-scan
+.RB [ \-\-quick ]
+.RB [ \-\-discover ]
+.RB [ \-\-listen
+.IR HOST:PORT ]
+.SH DESCRIPTION
+.B net-scan
+prints the inventory of known hosts: MAC, IPs, vendor, hostname, and observed
+ports. It snapshots the
+.B interfaces
+and
+.B addresses
+tables from the daemon \(em it does not actively scan. To trigger an active
+sweep first, use
+.BR \-\-discover .
+This tool replaces the legacy
+.IR /usr/local/bin/scan-network .
+.SH OPTIONS
+.TP
+.B \-\-quick
+Default mode. Snapshot the database and exit.
+.TP
+.B \-\-discover
+Fire an nmap sweep
+.RB ( TRIGGER
+discover) and wait for it to finish before snapshotting.
+.TP
+\fB\-\-listen\fR \fIHOST:PORT\fR
+Override the manager address. Default 127.0.0.1:7531 or
+.BR $NET_MGR_LISTEN .
+.SH EXAMPLES
+.PP
+Show what's on the network right now:
+.RS 4
+.nf
+.B net-scan
+.fi
+.RE
+.PP
+Re-sweep and then list (slower; blocks until nmap finishes):
+.RS 4
+.nf
+.B net-scan --discover
+.fi
+.RE
+.SH SEE ALSO
+.BR net-discover (1),
+.BR net-show (1),
+.BR net-report (1),
+.BR net-mgr (7)

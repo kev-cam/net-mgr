@@ -1,0 +1,146 @@
+#!/usr/bin/perl
+# net-router — manage the subnet_routers table that ranks APs as
+# routers per subnet. net-var auto consults this when filling
+# ROUTER_<octet> placeholders for net-gen-dnsmasq.
+#
+# Usage:
+#   net-router list [SUBNET]
+#   net-router set SUBNET AP [--rank N] [--notes "…"]
+#   net-router remove SUBNET AP
+#
+# AP can be a MAC, primary_name, or hostname; the tool resolves it to
+# a MAC against the interfaces / hostnames tables. SUBNET is a CIDR
+# string like 192.168.15.0/24.
+#
+# Direct DB access (same pattern as net-alias / net-var) so it must
+# run on the host with /root/.my.cnf or ~/.my.cnf.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling pass_through);
+use NetMgr::Config;
+use NetMgr::DB;
+
+my $rank;
+my $notes;
+my $help;
+GetOptions(
+    'rank=i'  => \$rank,
+    'notes=s' => \$notes,
+    'help|h'  => \$help,
+) or die "bad options\n";
+
+if ($help || !@ARGV) {
+    print <<'EOT';
+net-router — list/edit per-subnet AP ranking.
+
+  net-router list [SUBNET]                  Show ranked APs (optionally filtered).
+  net-router set SUBNET AP [--rank N]       Add or update; rank N (default 0).
+                              [--notes "…"]
+  net-router remove SUBNET AP               Drop one row. Aliases: rm, del.
+
+AP may be a MAC, machine primary_name, or hostname.
+EOT
+    exit($help ? 0 : 2);
+}
+
+my $cmd = shift @ARGV;
+
+my $cfg = NetMgr::Config->load(
+    $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
+my $mycnf = (-r "$ENV{HOME}/.my.cnf") ? "$ENV{HOME}/.my.cnf"
+          : (-r '/root/.my.cnf')      ? '/root/.my.cnf'
+          : die "no readable .my.cnf for the [net-mgr] section\n";
+my $db = NetMgr::DB->new(
+    defaults_file => $mycnf,
+    section       => $cfg->{mysql}{section},
+    db            => $cfg->{mysql}{db},
+);
+$db->connect;
+
+sub resolve_ap {
+    my ($spec) = @_;
+    return lc $spec if $spec =~ /^[0-9a-f:]{17}$/i;
+    # Try primary_name on machines, then hostnames.
+    my $row = $db->dbh->selectrow_hashref(
+        "SELECT i.mac
+           FROM machines m
+           JOIN interfaces i ON i.machine_id = m.id
+          WHERE m.primary_name = ?
+          LIMIT 1", undef, $spec);
+    return lc $row->{mac} if $row;
+    $row = $db->dbh->selectrow_hashref(
+        "SELECT i.mac
+           FROM hostnames h
+           JOIN interfaces i ON i.machine_id = h.machine_id
+          WHERE h.name = ?
+          LIMIT 1", undef, $spec);
+    return lc $row->{mac} if $row;
+    die "couldn't resolve '$spec' to a MAC\n";
+}
+
+sub ap_label {
+    my ($mac) = @_;
+    my $row = $db->dbh->selectrow_hashref(
+        "SELECT m.primary_name, i.mac
+           FROM interfaces i
+           LEFT JOIN machines m ON m.id = i.machine_id
+          WHERE i.mac = ?", undef, $mac);
+    return $row && $row->{primary_name} ? $row->{primary_name} : $mac;
+}
+
+if ($cmd eq 'list') {
+    my $where_subnet = shift @ARGV;
+    my $sql  = "SELECT * FROM subnet_routers";
+    my @bind;
+    if ($where_subnet) {
+        $sql .= " WHERE subnet_cidr = ?";
+        push @bind, $where_subnet;
+    }
+    $sql .= " ORDER BY subnet_cidr, `rank` DESC, ap_mac";
+    my $rows = $db->dbh->selectall_arrayref($sql, { Slice => {} }, @bind);
+    if (!@$rows) {
+        print "(none)\n";
+        exit 0;
+    }
+    printf "%-20s  %-17s  %-20s  %4s  %s\n", qw(SUBNET AP_MAC AP RANK NOTES);
+    printf "%s\n", '-' x 80;
+    for my $r (@$rows) {
+        printf "%-20s  %-17s  %-20s  %4d  %s\n",
+            $r->{subnet_cidr}, $r->{ap_mac}, ap_label($r->{ap_mac}),
+            $r->{rank}, ($r->{notes} // '');
+    }
+    exit 0;
+}
+
+if ($cmd eq 'set') {
+    my $subnet = shift @ARGV or die "usage: net-router set SUBNET AP [--rank N]\n";
+    my $ap     = shift @ARGV or die "AP required\n";
+    my $mac = resolve_ap($ap);
+    my $row = $db->upsert_subnet_router(
+        subnet_cidr => $subnet, ap_mac => $mac,
+        rank => $rank, notes => $notes,
+    );
+    printf "set %s → %s (%s) rank=%d%s\n",
+        $row->{subnet_cidr}, $row->{ap_mac}, ap_label($row->{ap_mac}),
+        $row->{rank}, ($row->{notes} ? " ($row->{notes})" : '');
+    exit 0;
+}
+
+if ($cmd eq 'remove' || $cmd eq 'rm' || $cmd eq 'del') {
+    my $subnet = shift @ARGV or die "usage: net-router remove SUBNET AP\n";
+    my $ap     = shift @ARGV or die "AP required\n";
+    my $mac = resolve_ap($ap);
+    my $rc = $db->delete_subnet_router(subnet_cidr => $subnet, ap_mac => $mac);
+    if ($rc) {
+        print "removed $subnet → $mac\n";
+        exit 0;
+    } else {
+        warn "no matching row\n";
+        exit 1;
+    }
+}
+
+die "unknown subcommand '$cmd'; try: list, set, remove\n";

@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 6;
+our $SCHEMA_VERSION = 8;
 
 sub new {
     my ($class, %args) = @_;
@@ -147,6 +147,37 @@ sub _apply_migration {
         $self->{dbh}->do(
             "ALTER TABLE associations ADD COLUMN ssid VARCHAR(64) NULL AFTER iface"
         );
+        return;
+    }
+    if ($v == 7) {
+        # dhcp_vars: named placeholder values for net-gen-dnsmasq
+        # substitution (DNSH=192.168.15.252, etc.). Plain key=value.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS dhcp_vars (
+    name        VARCHAR(64)  NOT NULL PRIMARY KEY,
+    value       VARCHAR(255) NOT NULL,
+    notes       TEXT,
+    updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                             ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
+    if ($v == 8) {
+        # Per-subnet AP ranking, used when net-var auto picks which
+        # AP fills ROUTER_* placeholders. Higher rank wins.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS subnet_routers (
+    subnet_cidr  VARCHAR(45)  NOT NULL,
+    ap_mac       CHAR(17)     NOT NULL,
+    `rank`       INT          NOT NULL DEFAULT 0,
+    notes        TEXT,
+    PRIMARY KEY (subnet_cidr, ap_mac),
+    KEY idx_subnet (subnet_cidr),
+    CONSTRAINT fk_subnet_router_ap
+        FOREIGN KEY (ap_mac) REFERENCES interfaces(mac) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
         return;
     }
     if ($v == 3) {
@@ -715,11 +746,56 @@ sub delete_alias {
     return $self->{dbh}->do("DELETE FROM aliases WHERE name = ?", undef, $name);
 }
 
+sub upsert_dhcp_var {
+    my ($self, %f) = @_;
+    croak "name and value required" unless defined $f{name} && defined $f{value};
+    $self->{dbh}->do(
+        "INSERT INTO dhcp_vars (name, value, notes) VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE value = VALUES(value), notes = VALUES(notes)",
+        undef, $f{name}, $f{value}, $f{notes}
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM dhcp_vars WHERE name = ?", undef, $f{name}
+    );
+}
+
+sub delete_dhcp_var {
+    my ($self, $name) = @_;
+    return $self->{dbh}->do("DELETE FROM dhcp_vars WHERE name = ?", undef, $name);
+}
+
+sub upsert_subnet_router {
+    my ($self, %f) = @_;
+    croak "subnet_cidr and ap_mac required"
+        unless defined $f{subnet_cidr} && defined $f{ap_mac};
+    $f{ap_mac} = lc $f{ap_mac};
+    $f{rank}  //= 0;
+    $self->{dbh}->do(
+        "INSERT INTO subnet_routers (subnet_cidr, ap_mac, `rank`, notes)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE `rank` = VALUES(`rank`), notes = VALUES(notes)",
+        undef, $f{subnet_cidr}, $f{ap_mac}, $f{rank}, $f{notes}
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM subnet_routers WHERE subnet_cidr = ? AND ap_mac = ?",
+        undef, $f{subnet_cidr}, $f{ap_mac}
+    );
+}
+
+sub delete_subnet_router {
+    my ($self, %f) = @_;
+    return $self->{dbh}->do(
+        "DELETE FROM subnet_routers WHERE subnet_cidr = ? AND ap_mac = ?",
+        undef, $f{subnet_cidr}, lc $f{ap_mac}
+    );
+}
+
 sub query_table {
     my ($self, $table, %opts) = @_;
     my %allowed = map { $_ => 1 } qw(
         machines hostnames interfaces addresses ports aps
-        associations dhcp_leases events aliases
+        associations dhcp_leases events aliases dhcp_vars
+        subnet_routers
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};

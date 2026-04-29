@@ -1,0 +1,140 @@
+.TH NET-ROAM 1 "2026-04-29" "net-mgr" "User Commands"
+.SH NAME
+net-roam \- nudge mobile WiFi clients off APs they're at the edge of
+.SH SYNOPSIS
+.B net-roam
+.RB [ \-\-dry\-run ]
+.RB [ \-\-verbose ]
+.RB [ \-\-threshold
+.IR DBM ]
+.RB [ \-\-cooldown
+.IR SECS ]
+.RB [ \-\-window\-days
+.IR N ]
+.br
+.B net-roam \-\-list
+.RB [ \-\-mac
+.IR MAC ]
+.br
+.B net-roam \-\-list\-all
+.br
+.B net-roam \-\-kick
+.I MAC
+.RB [ \-\-dry\-run ]
+.SH DESCRIPTION
+.B net-roam
+identifies mobile WiFi clients (devices observed associated to two or more APs
+within
+.BR \-\-window\-days )
+that are currently at weak signal strength on an AP whose SSID is also served
+by a peer AP. It then SSHes the AP and issues a deauth so the client's
+supplicant picks the stronger BSS, or falls back to cellular.
+.PP
+Clients seen on only one AP are treated as stationary and ignored. The
+mobility test is empirical \(em no OUI heuristics or manual flags.
+.PP
+A cooldown prevents flapping: a kicked MAC won't be re-kicked within
+.B \-\-cooldown
+seconds, persisted as a
+.B wifi_deauth
+event in the manager's events table.
+.SH MODES
+.TP
+no flag
+Survey + kick every weak mobile client.
+.TP
+.B \-\-dry\-run
+Identify candidates and print what would happen; no SSH, no events written.
+.TP
+.B \-\-list
+Print the watched (mobile) set and exit. Useful for understanding what
+.B net-roam
+considers actionable on this network.
+.TP
+.B \-\-list\-all
+Same table as
+.BR \-\-list ,
+plus stationary clients. Each row is annotated by AP-count.
+.TP
+\fB\-\-kick\fR \fIMAC\fR
+Force-kick one specific client off whatever AP currently holds it.
+Bypasses the mobility, threshold, cooldown, and alt-AP checks.
+.SH OPTIONS
+.TP
+\fB\-\-threshold\fR \fIDBM\fR
+RSSI cutoff. Kick clients weaker than this. Default \-75.
+.TP
+\fB\-\-window\-days\fR \fIN\fR
+Mobility window. Default 30.
+.TP
+\fB\-\-seen\-within\fR \fISECS\fR
+Treat association rows older than this as disconnected. The AP poller can't
+unset a stale row when a client roams off the network entirely (phone leaves
+the house), so we filter on age here.
+.B \-\-list
+and auto-kick honor this;
+.B \-\-kick
+bypasses it. Default 3600.
+.TP
+\fB\-\-cooldown\fR \fISECS\fR
+Don't re-kick same MAC within this many seconds. Default 300.
+.TP
+\fB\-\-mac\fR \fIMAC\fR
+Limit
+.B \-\-list / \-\-list\-all
+output (or auto-mode kicks) to one client.
+.TP
+.BR \-v ", " \-\-verbose
+In auto-kick mode, print why each candidate was skipped.
+.TP
+\fB\-\-ssh-user\fR \fIUSER\fR ", " \fB\-\-ssh-timeout\fR \fISECS\fR
+SSH login + connect timeout. Defaults
+.BR root ", " 10.
+.TP
+\fB\-\-listen\fR \fIHOST:PORT\fR
+Override the manager address.
+.TP
+.BR \-h ", " \-\-help
+Show usage.
+.SH EXAMPLES
+.PP
+What devices are being watched?
+.RS 4
+.nf
+.B net-roam --list
+.fi
+.RE
+.PP
+What would a kick cycle do right now?
+.RS 4
+.nf
+.B net-roam --dry-run --verbose
+.fi
+.RE
+.PP
+Manually evict a specific phone:
+.RS 4
+.nf
+.B net-roam --kick aa:bb:cc:dd:ee:ff
+.fi
+.RE
+.PP
+More aggressive threshold for a small house:
+.RS 4
+.nf
+.B net-roam --threshold -68
+.fi
+.RE
+.SH NOTES
+On DD-WRT v3.0-r56119 (and similar stripped builds) the per-client deauth
+.B wl
+IOVARs are missing, so the kick path is currently inert on those APs.
+.B \-\-list
+and RSSI tracking still work. See
+.I TODO.md
+in the source tree.
+.SH SEE ALSO
+.BR net-poll-ap (1),
+.BR net-show (1),
+.BR net-report (1),
+.BR net-mgr (7)

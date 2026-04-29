@@ -1,0 +1,141 @@
+.TH NET-GEN-DNSMASQ 1 "2026-04-29" "net-mgr" "User Commands"
+.SH NAME
+net-gen-dnsmasq \- generate per-subnet dnsmasq DHCP config from dhcp.master/.extra
+.SH SYNOPSIS
+.B net-gen-dnsmasq
+.RB [ \-\-print ]
+.RB [ \-\-diff ]
+.RB [ \-\-reload ]
+.RB [ \-\-out
+.IR DIR ]
+.RB [ \-\-file
+.IR PATH ]
+.SH DESCRIPTION
+.B net-gen-dnsmasq
+parses
+.I /etc/net-mgr/dhcp.master
+(and
+.IR /etc/net-mgr/dhcp.extra ,
+if present), substitutes any uppercase placeholders against the
+.B [dhcp]
+section of
+.IR /etc/net-mgr/config ,
+and emits one
+.BR dnsmasq- <zone>
+file per subnet into the output directory. Each file contains only the
+.B dhcp-host=
+entries for that zone, so it can be shipped to just the AP that serves
+that subnet's WiFi.
+.PP
+This replaces the legacy
+.BR fix_dhcp (1)
+script's dnsmasq-config phase. The ISC dhcpd output, hosts.dhcp, and
+fix_ap pushing are out of scope here.
+.SH OPTIONS
+.TP
+.B \-\-print
+Dump generated config to stdout instead of writing files.
+.TP
+.B \-\-diff
+Show a unified diff between the would-be output and the existing files;
+write nothing.
+.TP
+.B \-\-reload
+After writing, send SIGHUP to the local dnsmasq so it re-reads its
+config directory. No-op if dnsmasq isn't running on this host.
+.TP
+\fB\-\-out\fR \fIDIR\fR
+Override output directory. Default
+.I /etc/net-mgr/dnsmasq.d
+(or whatever
+.B [dhcp].out_dir
+is set to in the config).
+.TP
+\fB\-\-file\fR \fIPATH\fR
+Override input file. Repeatable.
+.SH PLACEHOLDERS
+The dhcp.master format inherits a fix_dhcp convention of literal
+uppercase tokens that get substituted at generation time:
+.B DNSH ,
+.BR DNSX ,
+.BR DNSR ,
+.BR ROUTER_223 ,
+.BR ROUTER_15 ,
+.BR ROUTER_0 ,
+.BR TFTP_SERVER ,
+.BR HTTP_SERVER ,
+etc. Values come from the
+.B dhcp_vars
+table; manage them with
+.BR net-var (1):
+.PP
+.RS 4
+.nf
+net-var set DNSH 192.168.15.252  --notes "firewall (gateway3)"
+net-var set DNSX 192.168.223.104 --notes "internal fallback (nas3)"
+net-var set ROUTER_15 192.168.15.252
+net-var list
+.fi
+.RE
+.PP
+If any placeholder is still unresolved after the pass,
+.B net-gen-dnsmasq
+prints a list and exits non-zero rather than writing a half-substituted
+config.
+.SH ZONES
+A subnet's zone name comes from the
+.RI "# zone=" NAME
+annotation that follows the opening
+.B {
+of its
+.B subnet
+block in dhcp.master. Hosts are placed into the zone whose /24 their
+.B fixed-address
+falls in. Hosts in a /24 with no zone block get bucketed into a
+fallback file
+.RI dnsmasq-subnet- <octet> .
+.SH EXAMPLES
+.PP
+Inspect what would be written:
+.RS 4
+.nf
+.B net-gen-dnsmasq --print | head -40
+.fi
+.RE
+.PP
+Diff against the live config (no writes):
+.RS 4
+.nf
+.B net-gen-dnsmasq --diff
+.fi
+.RE
+.PP
+Regenerate after editing dhcp.master and reload dnsmasq:
+.RS 4
+.nf
+.B net-gen-dnsmasq --reload
+.fi
+.RE
+.PP
+Stage to a scratch directory for review:
+.RS 4
+.nf
+.B net-gen-dnsmasq --out /tmp/dnsmasq.try
+.fi
+.RE
+.SH FILES
+.TP
+.I /etc/net-mgr/dhcp.master
+Hand-curated authoritative reservations.
+.TP
+.I /etc/net-mgr/dhcp.extra
+Additional reservations (typically appended by
+.BR net-fix (1)).
+.TP
+.I /etc/net-mgr/dnsmasq.d/dnsmasq-<zone>
+Generated per-zone output files.
+.SH SEE ALSO
+.BR net-fix (1),
+.BR net-import-dhcp (1),
+.BR net-mgr (7),
+.BR dnsmasq (8)

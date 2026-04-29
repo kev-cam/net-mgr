@@ -1,0 +1,73 @@
+.TH NET-IMPORT-DHCP 1 "2026-04-29" "net-mgr" "User Commands"
+.SH NAME
+net-import-dhcp \- import dhcp.master / dhcp.extra into net-mgr
+.SH SYNOPSIS
+.B net-import-dhcp
+.RB [ \-\-print ]
+.RB [ \-\-listen
+.IR HOST:PORT ]
+.br
+.B net-import-dhcp \-\-file
+.I PATH
+.SH DESCRIPTION
+.B net-import-dhcp
+parses dhcpd-format
+.I host
+blocks out of
+.I /etc/net-mgr/dhcp.master
+and (if present)
+.IR /etc/net-mgr/dhcp.extra ,
+and pushes each reservation as a
+.B kind=host
+observation into the manager. The address source is tagged
+.IB <hostname> : <basename>
+(e.g.
+.BR kc-qernel:dhcp.master )
+so subsequent AP-lease observations don't downgrade these authoritative
+entries.
+.PP
+This is the seeding path \(em it tells net-mgr about devices that have a
+reservation but haven't yet appeared on the network.
+.SH OPTIONS
+.TP
+\fB\-\-file\fR \fIPATH\fR
+Import just one file. Repeatable. Default: both master + extra.
+.TP
+.B \-\-print
+Dump the observations to stdout instead of pushing them.
+.TP
+\fB\-\-listen\fR \fIHOST:PORT\fR
+Override the manager address.
+.SH EXAMPLES
+.PP
+Re-import everything (after editing dhcp.master):
+.RS 4
+.nf
+.B net-import-dhcp
+.fi
+.RE
+.PP
+Just the extras file:
+.RS 4
+.nf
+.B net-import-dhcp --file /etc/net-mgr/dhcp.extra
+.fi
+.RE
+.PP
+Inspect what would be pushed:
+.RS 4
+.nf
+.B net-import-dhcp --print | head
+.fi
+.RE
+.SH FILES
+.TP
+.I /etc/net-mgr/dhcp.master
+Hand-curated authoritative reservations.
+.TP
+.I /etc/net-mgr/dhcp.extra
+Append-only file written by
+.BR net-fix (1).
+.SH SEE ALSO
+.BR net-fix (1),
+.BR net-mgr (7)

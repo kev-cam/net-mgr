@@ -65,18 +65,37 @@ sub _parse_into {
     }
 
     # subnet NET netmask MASK { ... range A B; ... }
-    while ($text =~ /\bsubnet\s+(\d+\.\d+\.\d+\.\d+)\s+netmask\s+(\d+\.\d+\.\d+\.\d+)\s*\{([^{}]*?)\}/gs) {
+    # Also captures the optional `# zone=NAME` comment that appears after
+    # the opening brace, plus inner `option` directives — needed by
+    # net-gen-dnsmasq which translates these to dnsmasq tag-options.
+    # Run on raw text so the comment-stripped pass above doesn't kill
+    # the `# zone=` annotation; we strip whitespace explicitly here.
+    my $raw = do { open my $f, '<', $path or croak "open $path: $!"; local $/; <$f> };
+    while ($raw =~ /\bsubnet\s+(\d+\.\d+\.\d+\.\d+)\s+netmask\s+(\d+\.\d+\.\d+\.\d+)\s*\{([^{}]*)\}/gs) {
         my ($net, $mask, $body) = ($1, $2, $3);
+        # Take the first `# zone=foo` that appears anywhere in the block.
+        my $zone = ($body =~ /#\s*zone\s*=\s*([\w-]+)/) ? $1 : undef;
+        # Strip line comments before parsing options/ranges.
+        (my $clean = $body) =~ s/#[^\n]*//g;
         my @ranges;
-        while ($body =~ /\brange\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s*;/g) {
+        while ($clean =~ /\brange\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s*;/g) {
             push @ranges, [$1, $2];
         }
+        my %options;
+        while ($clean =~ /\boption\s+([\w-]+)\s+([^;]+);/g) {
+            my ($k, $v) = ($1, $2);
+            $v =~ s/^\s+|\s+$//g;
+            $v =~ s/^"(.*)"$/$1/;
+            $options{$k} = $v;
+        }
         push @$out, {
-            type   => 'subnet',
-            net    => $net,
-            mask   => $mask,
-            ranges => \@ranges,
-            file   => $path,
+            type    => 'subnet',
+            net     => $net,
+            mask    => $mask,
+            zone    => $zone,
+            ranges  => \@ranges,
+            options => \%options,
+            file    => $path,
         };
     }
 }

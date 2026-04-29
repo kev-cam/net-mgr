@@ -1,0 +1,85 @@
+.TH NET-MGR 7 "2026-04-29" "net-mgr" "net-mgr"
+.SH NAME
+net-mgr \- network observation broker and tools overview
+.SH DESCRIPTION
+.B net-mgr
+is a Perl daemon plus a set of CLI tools that maintain a MySQL/MariaDB-backed
+inventory of every device on the local network: machines, interfaces, IP
+addresses, listening ports, WiFi access points, client associations, and DHCP
+leases. The daemon is the only process that writes to the database. Producers
+push observations to it over a line-based TCP protocol; consumers subscribe
+to live updates over the same socket.
+.SH ARCHITECTURE
+Three roles:
+.IP \(bu 2
+.B Daemon \fR(\fBnet-mgr\fR(8), \fBnet-dns\fR(8), \fBnet-mgr-relay\fR(8)) \(em
+listens on 127.0.0.1:7531, owns the DB, dispatches OBSERVE messages, fires
+events on transitions.
+.IP \(bu 2
+.B Producers \fR(\fBnet-discover\fR(1), \fBnet-poll-ap\fR(1),
+\fBnet-import-dhcp\fR(1), \fBnet-ping\fR(1)) \(em scan or poll the network
+and push observations.
+.IP \(bu 2
+.B Consumers \fR(\fBnet-scan\fR(1), \fBnet-show\fR(1), \fBnet-report\fR(1),
+\fBnet-watch\fR(1), \fBnet-roam\fR(1)) \(em snapshot tables or stream events
+without writing.
+.SH TYPICAL WORKFLOWS
+.SS Survey the network
+.nf
+.RS 4
+net-scan                # known hosts
+net-show                # APs and SSIDs
+net-report aps          # raw aps table
+.RE
+.fi
+.SS Add a new fixed-IP host
+.nf
+.RS 4
+net-fix --mac aa:bb:cc:dd:ee:ff --name printer
+fix_dhcp                # regenerate dhcpd.conf
+.RE
+.fi
+.SS Investigate a flaky connection
+.nf
+.RS 4
+net-watch 192.168.15.42         # live RTT/loss for one IP
+net-report events \\
+  "type IN ('interface_online','interface_offline') AND mac = 'aa:bb:..'"
+.RE
+.fi
+.SS Push roaming clients off weak APs
+.nf
+.RS 4
+net-roam --list                 # who's being watched
+net-roam --dry-run --verbose    # what would be kicked
+net-roam                        # do it
+.RE
+.fi
+.SH FILES
+.TP
+.I /etc/net-mgr/config
+Daemon and tool configuration. See
+.BR net-mgr (8).
+.TP
+.I /etc/net-mgr/dhcp.master
+Hand-curated authoritative DHCP reservations. Imported via
+.BR net-import-dhcp (1).
+.TP
+.I /var/log/net-mgr.log
+Daemon log.
+.TP
+.I /var/cache/net-mgr/
+Per-tool state caches (AP poll backoff, fingerprint results).
+.SH SEE ALSO
+.BR net-alias (1),
+.BR net-discover (1),
+.BR net-fix (1),
+.BR net-import-dhcp (1),
+.BR net-ping (1),
+.BR net-poll-ap (1),
+.BR net-report (1),
+.BR net-roam (1),
+.BR net-scan (1),
+.BR net-show (1),
+.BR net-watch (1),
+.BR net-mgr (8)

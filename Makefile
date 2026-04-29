@@ -15,13 +15,18 @@ BINDIR     ?= $(PREFIX)/bin
 SBINDIR    ?= $(PREFIX)/sbin
 PERL5DIR   ?= $(PREFIX)/share/perl5
 SHAREDIR   ?= $(PREFIX)/share/net-mgr
+MANDIR     ?= $(PREFIX)/share/man
 SYSCONFDIR ?= /etc
 UNITDIR    ?= $(SYSCONFDIR)/systemd/system
 DESTDIR    ?=
 
-BINS  = net-alias net-poll-ap net-discover net-import-dhcp net-fix net-ping net-roam net-scan net-report net-show net-watch
+BINS  = net-alias net-poll-ap net-discover net-gen-dnsmasq net-import-dhcp net-fix net-ping net-roam net-router net-scan net-report net-show net-var net-watch
 SBINS = net-mgr net-mgr-setup net-dns net-mgr-relay
 UNITS = net-mgr.service net-dns.service net-mgr-relay.service
+MAN1S = net-alias.1 net-discover.1 net-fix.1 net-gen-dnsmasq.1 \
+        net-import-dhcp.1 net-ping.1 net-poll-ap.1 net-report.1 \
+        net-roam.1 net-router.1 net-scan.1 net-show.1 net-var.1 net-watch.1
+MAN7S = net-mgr.7
 LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \
         NetMgr/Manager.pm NetMgr/Client.pm NetMgr/Resolver.pm \
         NetMgr/Relay.pm NetMgr/Vendor.pm NetMgr/Subnets.pm \
@@ -102,6 +107,9 @@ list:
 	@echo "  $(DESTDIR)$(SYSCONFDIR)/net-mgr/config  (only if not already present)"
 	@echo "  (legacy $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf gets moved automatically)"
 	@echo
+	@echo "man pages → $(DESTDIR)$(MANDIR)/man1, man7:"
+	@for f in $(MAN1S) $(MAN7S); do echo "  $$f"; done
+	@echo
 	@echo "systemd units → $(DESTDIR)$(UNITDIR):"
 	@for f in $(UNITS); do echo "  $$f"; done
 	@echo
@@ -146,6 +154,16 @@ install: deps
 	done
 	@echo "  sql/schema.sql → $(DESTDIR)$(SHAREDIR)/sql/schema.sql"
 	@$(INSTALL) -m 644 sql/schema.sql $(DESTDIR)$(SHAREDIR)/sql/schema.sql
+	$(INSTALL) -d $(DESTDIR)$(MANDIR)/man1
+	$(INSTALL) -d $(DESTDIR)$(MANDIR)/man7
+	@for f in $(MAN1S); do \
+	  echo "  man/$$f → $(DESTDIR)$(MANDIR)/man1/$$f"; \
+	  $(INSTALL) -m 644 man/$$f $(DESTDIR)$(MANDIR)/man1/$$f; \
+	done
+	@for f in $(MAN7S); do \
+	  echo "  man/$$f → $(DESTDIR)$(MANDIR)/man7/$$f"; \
+	  $(INSTALL) -m 644 man/$$f $(DESTDIR)$(MANDIR)/man7/$$f; \
+	done
 	@for f in $(UNITS); do \
 	  echo "  systemd/$$f → $(DESTDIR)$(UNITDIR)/$$f"; \
 	  $(INSTALL) -m 644 systemd/$$f $(DESTDIR)$(UNITDIR)/$$f; \
@@ -205,6 +223,8 @@ uninstall:
 	@for f in $(SBINS); do rm -fv $(DESTDIR)$(SBINDIR)/$$f; done
 	@for f in $(LIBS);  do rm -fv $(DESTDIR)$(PERL5DIR)/$$f; done
 	@for f in $(UNITS); do rm -fv $(DESTDIR)$(UNITDIR)/$$f; done
+	@for f in $(MAN1S); do rm -fv $(DESTDIR)$(MANDIR)/man1/$$f; done
+	@for f in $(MAN7S); do rm -fv $(DESTDIR)$(MANDIR)/man7/$$f; done
 	@rm -fv $(DESTDIR)$(SHAREDIR)/sql/schema.sql
 	-@rmdir $(DESTDIR)$(PERL5DIR)/NetMgr/Producer 2>/dev/null || true
 	-@rmdir $(DESTDIR)$(PERL5DIR)/NetMgr          2>/dev/null || true

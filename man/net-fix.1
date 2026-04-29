@@ -1,0 +1,89 @@
+.TH NET-FIX 1 "2026-04-29" "net-mgr" "User Commands"
+.SH NAME
+net-fix \- assign a fixed IP to a MAC and append it to dhcp.extra
+.SH SYNOPSIS
+.B net-fix
+.B \-\-mac
+.I MAC
+.B \-\-name
+.I NAME
+.RB [ \-\-subnet
+.IR CIDR ]
+.RB [ \-\-ip
+.IR IP ]
+.RB [ \-\-file
+.IR PATH ]
+.RB [ \-\-dry\-run ]
+.RB [ \-\-listen
+.IR HOST:PORT ]
+.SH DESCRIPTION
+.B net-fix
+picks a free IP in a subnet, appends a dhcpd-style host block to
+.IR /etc/net-mgr/dhcp.extra ,
+and pushes a
+.B kind=host
+observation so the daemon's DB is in sync. After running, regenerate
+.I /etc/dhcp/dhcpd.conf
+with
+.IR /usr/local/bin/fix_dhcp .
+.PP
+Without
+.BR \-\-ip ,
+the picker shows free IP ranges in the subnet (skipping dhcpd's dynamic range)
+and the immediate neighbours, so you can group cameras / power plugs / etc.
+near their kin. Default selection is the first IP of the first listed range;
+typing a specific IP overrides.
+.SH OPTIONS
+.TP
+\fB\-\-mac\fR \fIMAC\fR
+MAC address to assign. Required.
+.TP
+\fB\-\-name\fR \fINAME\fR
+Hostname for the dhcpd block. Required.
+.TP
+\fB\-\-subnet\fR \fICIDR\fR
+Which subnet to allocate from. Default 192.168.223.0/24.
+.TP
+\fB\-\-ip\fR \fIIP\fR
+Skip the picker; assign this exact IP.
+.TP
+\fB\-\-file\fR \fIPATH\fR
+Append target. Default
+.IR /etc/net-mgr/dhcp.extra .
+.TP
+.B \-\-dry\-run
+Show what would be appended; don't write or push.
+.TP
+\fB\-\-listen\fR \fIHOST:PORT\fR
+Override the manager address.
+.SH EXAMPLES
+.PP
+Allocate a fixed IP for a new printer (interactive picker):
+.RS 4
+.nf
+.B net-fix --mac aa:bb:cc:dd:ee:ff --name lj-printer
+.fi
+.RE
+.PP
+Pin to a specific IP:
+.RS 4
+.nf
+.B net-fix --mac aa:bb:cc:dd:ee:ff --name lj-printer --ip 192.168.223.42
+.fi
+.RE
+.PP
+Preview only:
+.RS 4
+.nf
+.B net-fix --mac aa:bb:cc:dd:ee:ff --name lj-printer --dry-run
+.fi
+.RE
+.SH FILES
+.TP
+.I /etc/net-mgr/dhcp.extra
+Append target. Reloaded by
+.IR fix_dhcp .
+.SH SEE ALSO
+.BR net-import-dhcp (1),
+.BR net-scan (1),
+.BR net-mgr (7)

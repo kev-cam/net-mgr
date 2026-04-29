@@ -1,0 +1,285 @@
+#!/usr/bin/perl
+# net-gen-dnsmasq — read /etc/net-mgr/dhcp.master (and dhcp.extra) and
+# emit a dnsmasq DHCP configuration into /etc/net-mgr/dnsmasq.d/. The
+# legacy fix_dhcp(8) generated /etc/dhcp/dhcpd.conf for ISC dhcpd; this
+# does the equivalent for dnsmasq, so dnsmasq can serve DHCP from the
+# same source-of-truth files.
+#
+# Usage:
+#   net-gen-dnsmasq                       # write zones.conf + hosts.conf
+#   net-gen-dnsmasq --print               # dump to stdout, write nothing
+#   net-gen-dnsmasq --out DIR             # override output dir
+#   net-gen-dnsmasq --reload              # SIGHUP dnsmasq after writing
+#   net-gen-dnsmasq --diff                # show diff vs current files, no write
+#
+# Placeholders (DNSH, DNSX, ROUTER_223, …) are substituted from
+# /etc/net-mgr/config [dhcp]. Anything still unsubstituted after the
+# pass is treated as a hard error so a typo doesn't silently leak into
+# dnsmasq's config.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use File::Path qw(make_path);
+use File::Basename qw(dirname);
+use NetMgr::Config;
+use NetMgr::Client;
+use NetMgr::Producer::DhcpMaster;
+
+my $print_only;
+my $reload;
+my $diff;
+my $out_dir;
+my @files;
+my $listen;
+my $help;
+GetOptions(
+    'print'    => \$print_only,
+    'reload'   => \$reload,
+    'diff'     => \$diff,
+    'out=s'    => \$out_dir,
+    'file=s@'  => \@files,
+    'listen=s' => \$listen,
+    'help|h'   => \$help,
+) or do { print STDERR usage(); exit 2 };
+
+if ($help) { print usage(); exit 0 }
+
+sub usage {
+    return <<'EOT';
+net-gen-dnsmasq — generate per-subnet dnsmasq DHCP config from
+dhcp.master / dhcp.extra. Each subnet (matched by /24 prefix) gets its
+own dnsmasq-<zone>.conf so it can be shipped to just the AP that
+serves that subnet's WiFi.
+
+Usage:
+  net-gen-dnsmasq                  Write per-subnet files into [dhcp].out_dir.
+  net-gen-dnsmasq --print          Dump generated config to stdout.
+  net-gen-dnsmasq --diff           Show diff vs current files; write nothing.
+  net-gen-dnsmasq --reload         After writing, SIGHUP the local dnsmasq.
+  net-gen-dnsmasq --out DIR        Override output directory.
+  net-gen-dnsmasq --file PATH      Override input file(s); repeatable.
+                                   Default: /etc/net-mgr/dhcp.master (+ dhcp.extra
+                                   if it exists).
+EOT
+}
+
+my $cfg = NetMgr::Config->load;
+my %dhcp_cfg = %{ $cfg->{dhcp} || {} };
+$out_dir //= $dhcp_cfg{out_dir} // '/etc/net-mgr/dnsmasq.d';
+
+unless (@files) {
+    @files = ('/etc/net-mgr/dhcp.master');
+    push @files, '/etc/net-mgr/dhcp.extra' if -e '/etc/net-mgr/dhcp.extra';
+}
+
+my @records;
+for my $f (@files) {
+    -e $f or die "input file not found: $f\n";
+    push @records, NetMgr::Producer::DhcpMaster::parse_file($f);
+}
+
+# Substitution table: pulled from the dhcp_vars table via the manager
+# socket (so the same DB-backed values are used wherever this runs).
+# [dhcp] in /etc/net-mgr/config still controls non-placeholder things
+# like out_dir.
+my %subst;
+{
+    my $cli = NetMgr::Client->new(listen => $listen);
+    $cli->hello(consumer => "net-gen-dnsmasq.$$");
+    my $rows = $cli->snapshot(1, 'dhcp_vars');
+    $cli->bye;
+    for my $r (@$rows) {
+        $subst{ $r->{name} } = $r->{value} if defined $r->{value};
+    }
+}
+
+sub apply_subst {
+    my ($s) = @_;
+    return $s unless defined $s;
+    # Sort by length (longest first) so e.g. ROUTER_223 doesn't get
+    # half-rewritten by a shorter ROUTER key.
+    for my $k (sort { length($b) <=> length($a) } keys %subst) {
+        my $v = $subst{$k};
+        next unless defined $v;
+        $s =~ s/\Q$k\E/$v/g;
+    }
+    return $s;
+}
+
+my %unresolved;   # placeholder → first context where it was seen
+sub check_unresolved {
+    my ($where, $s) = @_;
+    return unless defined $s;
+    # Bare uppercase tokens (DNSH, ROUTER_*, etc.) are placeholders by
+    # convention. Anything still matching after subst is a config gap;
+    # accumulate them all and report at the end.
+    while ($s =~ /\b([A-Z][A-Z0-9_]{2,})\b/g) {
+        $unresolved{$1} //= $where;
+    }
+}
+
+sub report_unresolved {
+    return unless %unresolved;
+    print STDERR "ERROR: unresolved placeholders — add them to [dhcp] in "
+               . "/etc/net-mgr/config:\n";
+    for my $k (sort keys %unresolved) {
+        printf STDERR "  %-15s  (first seen in: %s)\n", $k, $unresolved{$k};
+    }
+    exit 1;
+}
+
+# ---- emit ----------------------------------------------------------
+
+my @subnets = grep { $_->{type} eq 'subnet' } @records;
+my @hosts   = grep { $_->{type} eq 'host'   } @records;
+
+# Default zone tag for subnets without a `# zone=` annotation: just
+# the third octet, so e.g. 192.168.223.0 → "223". Mostly cosmetic.
+sub zone_tag {
+    my ($s) = @_;
+    return $s->{zone} if $s->{zone};
+    my @oct = split /\./, $s->{net};
+    return $oct[2] // 'default';
+}
+
+# Bucket hosts into per-subnet groups so each AP only gets the
+# dhcp-host entries for its own WiFi. Subnet → zone mapping comes from
+# the `# zone=NAME` annotation in dhcp.master; hosts are placed into
+# the zone whose /24 their IP falls in. Hosts in a /24 with no zone
+# block get bucketed under "dnsmasq-<3rd-octet>" so they're not lost.
+sub net_24_of { my $ip = shift; $ip =~ /^(\d+\.\d+\.\d+)\./; return $1 }
+
+my %zone_of_24;   # "192.168.223" → "home"
+for my $s (@subnets) {
+    next unless $s->{zone};
+    $zone_of_24{ net_24_of($s->{net}) } = $s->{zone};
+}
+
+sub zone_for_host {
+    my ($h) = @_;
+    return $zone_of_24{ net_24_of($h->{ip}) } // ('subnet-' . (split /\./, $h->{ip})[2]);
+}
+
+# Default lease time appended to each dhcp-host line. The legacy nas3
+# files used 1440 (seconds → ~24 min); dhcp.master's
+# `default-lease-time` is the source-of-truth if set.
+my $default_lease = 1440;
+{
+    my $raw = do { open my $f, '<', $files[0] or die; local $/; <$f> };
+    $default_lease = $1 if $raw =~ /\bdefault-lease-time\s+(\d+)\s*;/;
+    $default_lease = $dhcp_cfg{host_lease} if $dhcp_cfg{host_lease};
+}
+
+sub emit_zone_file {
+    my ($zone, $hs) = @_;
+    my @sorted = sort {
+        my @a = split /\./, $a->{ip};
+        my @b = split /\./, $b->{ip};
+        ($a[2]<=>$b[2]) || ($a[3]<=>$b[3]) || ($a->{name} cmp $b->{name});
+    } @$hs;
+
+    my $out = '';
+    my %seen_mac;
+    for my $h (@sorted) {
+        if (my $prev = $seen_mac{ lc $h->{mac} }) {
+            warn "duplicate mac $h->{mac}: skipping '$h->{name}' "
+               . "(kept '$prev->{name}' from $prev->{file})\n";
+            next;
+        }
+        $seen_mac{ lc $h->{mac} } = $h;
+        $out .= "dhcp-host=$h->{mac},$h->{name},$h->{ip},$default_lease\n";
+    }
+    return $out;
+}
+
+# Group hosts by zone.
+my %hosts_by_zone;
+for my $h (@hosts) {
+    push @{ $hosts_by_zone{ zone_for_host($h) } }, $h;
+}
+
+my %generated;   # path → content
+for my $zone (sort keys %hosts_by_zone) {
+    $generated{"$out_dir/dnsmasq-$zone"} = emit_zone_file($zone, $hosts_by_zone{$zone});
+}
+
+# Run all unresolved-placeholder checks now (against generated text).
+for my $p (keys %generated) {
+    check_unresolved("file $p", $generated{$p});
+}
+report_unresolved();
+
+if ($print_only) {
+    for my $p (sort keys %generated) {
+        print "# === $p ===\n", $generated{$p};
+    }
+    exit 0;
+}
+
+if ($diff) {
+    show_diff($_, $generated{$_}) for sort keys %generated;
+    exit 0;
+}
+
+make_path($out_dir);
+for my $p (sort keys %generated) {
+    write_atomic($p, $generated{$p});
+    print "wrote $p\n";
+}
+
+if ($reload) {
+    my $rc = sighup_dnsmasq();
+    print "reloaded dnsmasq\n" if $rc;
+}
+
+# ---- helpers -------------------------------------------------------
+
+sub write_atomic {
+    my ($path, $content) = @_;
+    my $tmp = "$path.tmp.$$";
+    open my $fh, '>', $tmp or die "open $tmp: $!\n";
+    print $fh $content;
+    close $fh or die "close $tmp: $!\n";
+    rename $tmp, $path or die "rename $tmp $path: $!\n";
+}
+
+sub show_diff {
+    my ($path, $new_content) = @_;
+    require File::Temp;
+    my $tmp = File::Temp->new;
+    print $tmp $new_content;
+    $tmp->flush;
+    if (-e $path) {
+        system 'diff', '-u', $path, "$tmp";
+    } else {
+        print "+++ would create $path (" . length($new_content) . " bytes)\n";
+    }
+}
+
+sub sighup_dnsmasq {
+    my $pid;
+    for my $f (qw(/run/dnsmasq/dnsmasq.pid /var/run/dnsmasq.pid /run/dnsmasq.pid)) {
+        next unless -r $f;
+        open my $fh, '<', $f or next;
+        chomp(my $line = <$fh>);
+        close $fh;
+        $pid = $line if $line && $line =~ /^\d+$/;
+        last if $pid;
+    }
+    if (!$pid) {
+        chomp($pid = `pidof dnsmasq 2>/dev/null` // '');
+        $pid = (split /\s+/, $pid)[0];
+    }
+    if (!$pid) {
+        warn "couldn't find dnsmasq pid; not reloaded\n";
+        return 0;
+    }
+    if (!kill 'HUP', $pid) {
+        warn "kill HUP $pid: $!\n";
+        return 0;
+    }
+    return 1;
+}

@@ -1,0 +1,84 @@
+.TH NET-REPORT 1 "2026-04-29" "net-mgr" "User Commands"
+.SH NAME
+net-report \- query the net-mgr database
+.SH SYNOPSIS
+.B net-report
+.RI [ options ]
+.I TABLE
+.RI [ WHERE ]
+.br
+.B net-report
+.B events
+.B \-\-tail
+.RI [ WHERE ]
+.SH DESCRIPTION
+.B net-report
+snapshots any logical table managed by net-mgr or streams events as they
+happen. It connects to the manager socket; no DB credentials needed. The
+.I WHERE
+argument is an SQL-subset expression evaluated server-side: column comparisons,
+.BR AND / OR ,
+.BR LIKE ,
+.BR IN ,
+parentheses, and the time helper
+.B ago(\fIN\fB)
+(seconds).
+.SH OPTIONS
+.TP
+\fB\-\-listen\fR \fIHOST:PORT\fR
+Override the manager address.
+.TP
+\fB\-\-columns\fR \fICOL\fR,\fICOL\fR,...
+Restrict output to these columns.
+.TP
+.B \-\-tail
+Stream new rows as the daemon emits them (only for the
+.B events
+table currently). Combine with a
+.I WHERE
+clause to filter.
+.SH TABLES
+.B machines, hostnames, interfaces, addresses, ports, aps, associations,
+.B dhcp_leases, events, aliases.
+.SH EXAMPLES
+.PP
+List all APs:
+.RS 4
+.nf
+.B net-report aps
+.fi
+.RE
+.PP
+Online interfaces only, MAC + last_observed:
+.RS 4
+.nf
+.B net-report --columns mac,last_observed interfaces "online = 1"
+.fi
+.RE
+.PP
+Addresses on the .15 subnet:
+.RS 4
+.nf
+.B net-report addresses "addr LIKE '192.168.15.%'"
+.fi
+.RE
+.PP
+Live tail of online/offline transitions:
+.RS 4
+.nf
+.B net-report events --tail \\
+.B "  \(dqtype IN ('interface_online','interface_offline')\(dq"
+.fi
+.RE
+.PP
+Recent AP polls (last hour):
+.RS 4
+.nf
+.B net-report events "type = 'ap_polled' AND ts > ago(3600)"
+.fi
+.RE
+.SH SEE ALSO
+.BR net-scan (1),
+.BR net-show (1),
+.BR net-watch (1),
+.BR net-mgr (7)

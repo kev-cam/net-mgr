@@ -1,0 +1,103 @@
+.TH NET-ALIAS 1 "2026-04-29" "net-mgr" "User Commands"
+.SH NAME
+net-alias \- add, list, resolve, and remove DNS aliases in net-mgr
+.SH SYNOPSIS
+.B net-alias add
+.I NAME
+.I MACHINE
+.RB [ \-\-subnet
+.IR CIDR ]
+.RB [ \-\-notes
+.IR TEXT ]
+.br
+.B net-alias list
+.RI [ PATTERN ]
+.br
+.B net-alias resolve
+.I NAME
+.RB [ \-\-from\-ip
+.IR IP ]
+.br
+.B net-alias remove
+.I NAME
+.SH DESCRIPTION
+.B net-alias
+manages the
+.B aliases
+table that
+.BR net-dns (8)
+consults when answering DNS queries. An alias is a name that resolves to a
+machine, optionally with a preferred subnet so that (for example)
+.B printer
+points to its 192.168.223 IP from the internal network and its 192.168.15 IP
+from the DMZ.
+.PP
+.I MACHINE
+may be a
+.BR primary_name ,
+a numeric machine id, or any hostname recorded in the
+.B hostnames
+table; the tool resolves it to a machine_id.
+.PP
+.B net-alias
+talks to the database directly (it needs read/write to a non-trigger table) so
+it must run on the host where
+.IR /root/.my.cnf
+or
+.IR ~/.my.cnf
+holds the
+.B [net-mgr]
+section.
+.SH SUBCOMMANDS
+.TP
+\fBadd\fR \fINAME\fR \fIMACHINE\fR
+Create the alias. With
+.B \-\-subnet
+records a preferred subnet so resolution can pick the right IP for the
+asking client.
+.TP
+\fBlist\fR [\fIPATTERN\fR]
+List aliases. Optional shell-style
+.I PATTERN
+filters by name.
+.TP
+\fBresolve\fR \fINAME\fR [\fB\-\-from\-ip\fR \fIIP\fR]
+Show the IP an alias would return, optionally as if asked from
+.IR IP .
+.TP
+\fBremove\fR \fINAME\fR
+Delete the alias.
+.SH EXAMPLES
+.PP
+Make
+.B printer
+resolve to a specific machine, preferring the internal subnet:
+.RS 4
+.nf
+.B net-alias add printer lj-printer --subnet 192.168.223.0/24
+.fi
+.RE
+.PP
+List everything:
+.RS 4
+.nf
+.B net-alias list
+.fi
+.RE
+.PP
+Test resolution as if asked from the DMZ:
+.RS 4
+.nf
+.B net-alias resolve printer --from-ip 192.168.15.42
+.fi
+.RE
+.PP
+Drop an alias:
+.RS 4
+.nf
+.B net-alias remove old-name
+.fi
+.RE
+.SH SEE ALSO
+.BR net-dns (8),
+.BR net-mgr (7)

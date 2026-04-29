@@ -1,0 +1,106 @@
+.TH NET-DISCOVER 1 "2026-04-29" "net-mgr" "User Commands"
+.SH NAME
+net-discover \- nmap/fping/ssh-fingerprint active-scan producer
+.SH SYNOPSIS
+.B net-discover
+.RB [ \-\-discover ]
+.RB [ \-\-network
+.IR CIDR ]...
+.br
+.B net-discover \-\-presence
+.br
+.B net-discover \-\-fingerprint
+.br
+.B net-discover \-\-print
+.RB [ \-\-discover | \-\-presence ]
+.SH DESCRIPTION
+.B net-discover
+is the active-scanning producer. It runs three modes:
+.IP \(bu 2
+.B \-\-discover
+nmap-sweeps each network and pushes
+.BR kind=host / port
+observations.
+.IP \(bu 2
+.B \-\-presence
+fpings every known IP, captures per-host RTT, pushes
+.B kind=ping
+observations, and sends
+.B GONE
+for any MAC whose every v4 address came back dead.
+.IP \(bu 2
+.B \-\-fingerprint
+SSH-probes hosts known to have port 22 open and classifies them
+(DD-WRT/OpenWRT/Linux). Results are cached for a week so reruns are cheap.
+.PP
+Without a mode flag,
+.B \-\-discover
+is the default. The daemon also fires this tool periodically when
+.B [scheduling]
+is configured.
+.SH OPTIONS
+.TP
+.B \-\-discover
+Full nmap sweep of each network.
+.TP
+\fB\-\-network\fR \fICIDR\fR
+Restrict to one CIDR; may be repeated. Default: auto-detect from interfaces.
+.TP
+.B \-\-presence
+fping known IPs and update presence + RTT.
+.TP
+.B \-\-fingerprint
+SSH-classify port-22-open hosts.
+.TP
+\fB\-\-ports\fR \fISPEC\fR
+nmap port spec (default: top-1000).
+.TP
+\fB\-\-host-timeout\fR \fISECS\fR
+nmap per-host timeout. Default 20.
+.TP
+\fB\-\-cache\fR \fIPATH\fR ", " \fB\-\-ttl\fR \fIDAYS\fR ", " \fB\-\-force\fR
+Fingerprint cache controls.
+.TP
+.B \-\-print
+Dump observations to stdout instead of pushing them. Debug mode.
+.TP
+\fB\-\-listen\fR \fIHOST:PORT\fR
+Override the manager address.
+.SH EXAMPLES
+.PP
+Manually fire a presence cycle (the periodic scheduler does this otherwise):
+.RS 4
+.nf
+.B net-discover --presence
+.fi
+.RE
+.PP
+nmap-sweep one specific subnet only:
+.RS 4
+.nf
+.B net-discover --discover --network 192.168.223.0/24
+.fi
+.RE
+.PP
+See what observations a discover would push, without sending them:
+.RS 4
+.nf
+.B net-discover --discover --print | head
+.fi
+.RE
+.PP
+Refresh SSH fingerprints for everything (cache may be stale):
+.RS 4
+.nf
+.B net-discover --fingerprint --force
+.fi
+.RE
+.SH FILES
+.TP
+.I /var/cache/net-mgr/fingerprints.tsv
+SSH fingerprint cache.
+.SH SEE ALSO
+.BR net-scan (1),
+.BR net-ping (1),
+.BR net-poll-ap (1),
+.BR net-mgr (7)

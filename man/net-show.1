@@ -1,0 +1,74 @@
+.TH NET-SHOW 1 "2026-04-29" "net-mgr" "User Commands"
+.SH NAME
+net-show \- list WiFi access points and look up which AP saw a given IP
+.SH SYNOPSIS
+.B net-show
+.RB [ \-\-no\-scan ]
+.br
+.B net-show
+.BI \-find= IP
+.RB [ \-\-no\-scan ]
+.br
+.B net-show
+.RB [ \-\-listen
+.IR HOST:PORT ]
+.SH DESCRIPTION
+.B net-show
+lists access points known to net-mgr along with their SSIDs, board models, and
+last-seen times. With
+.BI \-find= IP
+it locates which AP and lease history the given address came from \(em useful
+for tracking down where a device joined the network.
+.PP
+By default
+.B net-show
+fires a scan-ap trigger to refresh AP data before printing. Pass
+.B \-\-no\-scan
+to skip the refresh and print whatever's already in the database.
+.PP
+This tool replaces the legacy
+.IR /usr/local/bin/show-ap .
+.SH OPTIONS
+.TP
+\fB\-find=\fIIP\fR
+Show which AP saw
+.IR IP ,
+including the lease record (if any) and recent association history.
+.TP
+.B \-\-no\-scan
+Skip the
+.B TRIGGER scan-ap
+step. Faster; uses the DB as-is.
+.TP
+\fB\-\-listen\fR \fIHOST:PORT\fR
+Override the manager address.
+.TP
+.BR \-h ", " \-\-help
+Show usage.
+.SH EXAMPLES
+.PP
+List all APs:
+.RS 4
+.nf
+.B net-show
+.fi
+.RE
+.PP
+Find the AP that gave 192.168.15.42 its lease:
+.RS 4
+.nf
+.B net-show -find=192.168.15.42
+.fi
+.RE
+.PP
+Quick listing, no fresh poll:
+.RS 4
+.nf
+.B net-show --no-scan
+.fi
+.RE
+.SH SEE ALSO
+.BR net-poll-ap (1),
+.BR net-roam (1),
+.BR net-report (1),
+.BR net-mgr (7)

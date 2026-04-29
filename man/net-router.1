@@ -1,0 +1,95 @@
+.TH NET-ROUTER 1 "2026-04-29" "net-mgr" "User Commands"
+.SH NAME
+net-router \- per-subnet AP ranking for ROUTER_* placeholder selection
+.SH SYNOPSIS
+.B net-router list
+.RI [ SUBNET ]
+.br
+.B net-router set
+.I SUBNET
+.I AP
+.RB [ \-\-rank
+.IR N ]
+.RB [ \-\-notes
+.IR TEXT ]
+.br
+.B net-router remove
+.I SUBNET
+.I AP
+.SH DESCRIPTION
+.B net-router
+manages the
+.B subnet_routers
+table, which maps subnets to APs and ranks the APs as routers.
+.BR net-var "(1) " auto
+consults this when seeding
+.B ROUTER_15
+/
+.B ROUTER_223
+placeholders \(em it picks the highest-ranked AP for the subnet and
+uses that AP's IP in the matching subnet, so a capable AP (e.g. an
+R8000) can be promoted over the host's default-route gateway.
+.PP
+.I SUBNET
+is a CIDR string (e.g.
+.BR 192.168.15.0/24 ).
+.I AP
+may be a MAC, the machine's
+.BR primary_name ,
+or any
+.B hostnames
+entry; the tool resolves it to a MAC. Higher
+.B rank
+wins.
+.PP
+Direct DB access (same pattern as
+.BR net-alias (1)
+and
+.BR net-var (1));
+must run on a host with
+.IR /root/.my.cnf
+or
+.IR ~/.my.cnf
+holding the
+.B [net-mgr]
+section.
+.SH SUBCOMMANDS
+.TP
+\fBlist\fR [\fISUBNET\fR]
+Show ranked APs sorted by subnet then descending rank. Optional
+.I SUBNET
+filter.
+.TP
+\fBset\fR \fISUBNET\fR \fIAP\fR [\fB\-\-rank\fR \fIN\fR] [\fB\-\-notes\fR \fITEXT\fR]
+Insert or update one row.
+.TP
+\fBremove\fR \fISUBNET\fR \fIAP\fR
+Drop one row. Aliases:
+.B rm ,
+.BR del .
+.SH EXAMPLES
+.PP
+Promote the R8000 as the DMZ router:
+.RS 4
+.nf
+.B net-router set 192.168.15.0/24 wndr8k1 --rank 100 --notes "R8000"
+.fi
+.RE
+.PP
+Add a fallback at lower rank:
+.RS 4
+.nf
+.B net-router set 192.168.15.0/24 wndrhawk --rank 50
+.fi
+.RE
+.PP
+See the picks for one subnet:
+.RS 4
+.nf
+.B net-router list 192.168.15.0/24
+.fi
+.RE
+.SH SEE ALSO
+.BR net-var (1),
+.BR net-gen-dnsmasq (1),
+.BR net-mgr (7)

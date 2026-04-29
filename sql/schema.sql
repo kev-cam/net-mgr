@@ -148,9 +148,38 @@ CREATE TABLE IF NOT EXISTS aliases (
         FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Named placeholder values used when generating config files (e.g. by
+-- net-gen-dnsmasq, which substitutes DNSH/ROUTER_223/etc. from this
+-- table). Plain key=value; intentionally not tied to machines so it
+-- can hold literal IPs, hostnames, or any string the generator needs.
+CREATE TABLE IF NOT EXISTS dhcp_vars (
+    name        VARCHAR(64)  NOT NULL PRIMARY KEY,
+    value       VARCHAR(255) NOT NULL,
+    notes       TEXT,
+    updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                             ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Per-subnet AP ranking, used when picking which AP should fill the
+-- ROUTER_* placeholders in dhcp.master. Higher `rank` wins; ties broken
+-- by AP MAC (deterministic). Auto-detect (net-var auto) consults this
+-- before falling back to the host's default route.
+CREATE TABLE IF NOT EXISTS subnet_routers (
+    subnet_cidr  VARCHAR(45)  NOT NULL,
+    ap_mac       CHAR(17)     NOT NULL,
+    `rank`       INT          NOT NULL DEFAULT 0,
+    notes        TEXT,
+    PRIMARY KEY (subnet_cidr, ap_mac),
+    KEY idx_subnet (subnet_cidr),
+    CONSTRAINT fk_subnet_router_ap
+        FOREIGN KEY (ap_mac) REFERENCES interfaces(mac) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 INSERT IGNORE INTO schema_version (version) VALUES (1);
 INSERT IGNORE INTO schema_version (version) VALUES (2);
 INSERT IGNORE INTO schema_version (version) VALUES (3);
 INSERT IGNORE INTO schema_version (version) VALUES (4);
 INSERT IGNORE INTO schema_version (version) VALUES (5);
 INSERT IGNORE INTO schema_version (version) VALUES (6);
+INSERT IGNORE INTO schema_version (version) VALUES (7);
+INSERT IGNORE INTO schema_version (version) VALUES (8);
