@@ -29,6 +29,7 @@ my $listen;
 my $threshold   = -75;
 my $cooldown    = 300;
 my $window_days = 30;
+my $seen_within = 3600;   # ignore association rows older than this (seconds)
 my $dry_run;
 my $ssh_user    = 'root';
 my $ssh_timeout = 10;
@@ -43,6 +44,7 @@ GetOptions(
     'threshold=i'   => \$threshold,
     'cooldown=i'    => \$cooldown,
     'window-days=i' => \$window_days,
+    'seen-within=i' => \$seen_within,
     'dry-run|n'     => \$dry_run,
     'ssh-user=s'    => \$ssh_user,
     'ssh-timeout=i' => \$ssh_timeout,
@@ -75,6 +77,9 @@ Usage:
 Tuning:
   --threshold N   RSSI dBm; kick clients weaker than this (default -75).
   --window-days N Mobility window in days (default 30).
+  --seen-within N Treat association rows older than N seconds as
+                  disconnected and ignore them (default 3600). --kick
+                  bypasses this; --list and auto-kick honor it.
   --cooldown N    Don't re-kick same MAC within N seconds (default 300).
   --mac AA:BB:..  Limit to one client (works with --list / --list-all too).
 
@@ -203,6 +208,11 @@ if ($list || $list_all) {
     for my $cmac (keys %latest) {
         next unless $list_all || $is_mobile{$cmac};
         my $a    = $latest{$cmac};
+        my $age  = age_of_ts($a->{last_seen});
+        # Stale association rows linger even after a client roams off
+        # the network entirely (e.g. phone left the house). The AP
+        # poller can't unset them, so we filter on age here.
+        next if defined $age && $age > $seen_within;
         my $apm  = lc $a->{ap_mac};
         my $ap_n = scalar keys %{ $ap_count{$cmac} || {} };
         push @rows, {
@@ -216,7 +226,7 @@ if ($list || $list_all) {
             ssid    => $a->{ssid},
             signal  => $a->{signal},
             aps     => $ap_n,
-            age     => age_of_ts($a->{last_seen}),
+            age     => $age,
             mobile  => $is_mobile{$cmac} ? 'yes' : 'no',
         };
     }
@@ -265,7 +275,11 @@ for my $a (@$assocs) {
     my $why;
 
     if ($only_mac && lc($only_mac) ne $cmac) { next }
-    if (!defined $sig)            { $why = 'no signal data' }
+    my $age = age_of_ts($a->{last_seen});
+    if (defined $age && $age > $seen_within) {
+        $why = "stale (last_seen ${age}s ago)";
+    }
+    elsif (!defined $sig)         { $why = 'no signal data' }
     elsif (!$is_mobile{$cmac})    { $why = 'not mobile' }
     elsif ($sig > $threshold)     { $why = "signal $sig > threshold" }
     elsif ($recent_kick{$cmac})   { $why = 'in cooldown' }
