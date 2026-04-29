@@ -47,6 +47,17 @@ net-report events \\
   "type IN ('interface_online','interface_offline') AND mac = 'aa:bb:..'"
 .RE
 .fi
+.SS Find the flakiest hosts on the network (last 7 days)
+Counts \fBinterface_online\fR transitions per machine in the last week
+and ranks them — the top of the list is whoever is reconnecting most.
+.nf
+.RS 4
+net-report --columns mac,machine events \\
+    "type = 'interface_online' AND ts > ago(604800)" \\
+  | tail -n +3 | awk '{print $1, $2}' \\
+  | sort | uniq -c | sort -rn | head
+.RE
+.fi
 .SS Push roaming clients off weak APs
 .nf
 .RS 4
