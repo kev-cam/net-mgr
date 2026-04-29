@@ -1,3 +1,40 @@
+# Internet gateway failover
+
+Two working internet uplinks:
+
+- **gateway3 → Comcast** — primary; unlimited bandwidth.
+- **gateway2 → T-mobile** — emergency fallback; bandwidth-and-data
+  capped, only meant for outages of the primary.
+
+Goal: net-mgr automatically points the APs at gateway2 when gateway3
+loses internet, and **auto-reverts** to gateway3 as soon as it
+recovers — failover dwell time on T-mobile must be minimised.
+
+Approach: fast-path (no DHCP-renewal wait).
+
+- **Detect**: periodic probe of each gateway's actual internet
+  reachability, e.g. `ping -I <gw-ip> 1.1.1.1` so the test routes
+  via that specific gateway rather than the host's current default.
+  Track in a `gateway_health(name, ip, last_ok, last_failed)` table.
+- **Switch**: when the picked gateway changes, SSH each AP and either
+  replace its default route or `pkill dhclient && dhclient` so it
+  re-fetches and immediately serves the new `option:router` to its
+  clients. Sub-minute switchover.
+- **Revert**: same path on the way back. Drive both transitions off
+  the same probe loop so revert is automatic the moment Comcast
+  responds again. Add hysteresis (e.g. require N consecutive good
+  probes) so a single packet loss doesn't bounce the network.
+- Slow path (just regenerate dnsmasq + sighup) is simpler but waits
+  on DHCP renewal — 4h with current lease time. Not acceptable when
+  T-mobile is metered.
+
+Open questions when we come back to it:
+- Where does the probe run? Probably the host with the patched
+  net-mgr daemon (kc-qernel today, eventually nas3).
+- How many bad probes before failover? Suggest 3 × 30 s.
+- Same threshold for revert, or asymmetric (faster revert)?
+- Does auto-revert trigger another full AP push, or do we batch?
+
 # net-roam: per-client deauth on DD-WRT v3.0-r56119
 
 bin/net-roam can identify weak mobile clients but cannot actually kick
