@@ -18,6 +18,8 @@ SHAREDIR   ?= $(PREFIX)/share/net-mgr
 MANDIR     ?= $(PREFIX)/share/man
 SYSCONFDIR ?= /etc
 UNITDIR    ?= $(SYSCONFDIR)/systemd/system
+CGIDIR     ?= /usr/lib/cgi-bin
+APACHE_CONF_DIR ?= $(SYSCONFDIR)/apache2/conf-available
 DESTDIR    ?=
 
 BINS  = net-alias net-poll-ap net-discover net-gen-dnsmasq net-import-dhcp net-fix net-ping net-roam net-router net-scan net-report net-show net-var net-watch
@@ -168,6 +170,16 @@ install: deps
 	  echo "  systemd/$$f → $(DESTDIR)$(UNITDIR)/$$f"; \
 	  $(INSTALL) -m 644 systemd/$$f $(DESTDIR)$(UNITDIR)/$$f; \
 	done
+	@if [ -d $(DESTDIR)$(APACHE_CONF_DIR) ]; then \
+	  $(INSTALL) -d $(DESTDIR)$(CGIDIR); \
+	  echo "  web/net-mgr-web.cgi → $(DESTDIR)$(CGIDIR)/net-mgr-web.cgi"; \
+	  $(INSTALL) -m 755 web/net-mgr-web.cgi $(DESTDIR)$(CGIDIR)/net-mgr-web.cgi; \
+	  echo "  web/net-mgr.conf → $(DESTDIR)$(APACHE_CONF_DIR)/net-mgr.conf"; \
+	  $(INSTALL) -m 644 web/net-mgr.conf $(DESTDIR)$(APACHE_CONF_DIR)/net-mgr.conf; \
+	  echo "  (run: a2enmod cgid && a2enconf net-mgr && systemctl restart apache2)"; \
+	else \
+	  echo "  skip web/* (no apache at $(APACHE_CONF_DIR))"; \
+	fi
 	@if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then \
 	  systemctl daemon-reload; \
 	fi
@@ -225,6 +237,8 @@ uninstall:
 	@for f in $(UNITS); do rm -fv $(DESTDIR)$(UNITDIR)/$$f; done
 	@for f in $(MAN1S); do rm -fv $(DESTDIR)$(MANDIR)/man1/$$f; done
 	@for f in $(MAN7S); do rm -fv $(DESTDIR)$(MANDIR)/man7/$$f; done
+	@rm -fv $(DESTDIR)$(CGIDIR)/net-mgr-web.cgi 2>/dev/null || true
+	@rm -fv $(DESTDIR)$(APACHE_CONF_DIR)/net-mgr.conf 2>/dev/null || true
 	@rm -fv $(DESTDIR)$(SHAREDIR)/sql/schema.sql
 	-@rmdir $(DESTDIR)$(PERL5DIR)/NetMgr/Producer 2>/dev/null || true
 	-@rmdir $(DESTDIR)$(PERL5DIR)/NetMgr          2>/dev/null || true

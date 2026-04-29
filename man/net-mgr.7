@@ -55,6 +55,23 @@ net-roam --dry-run --verbose    # what would be kicked
 net-roam                        # do it
 .RE
 .fi
+.SH WEB UI
+.B net-mgr-web.cgi
+is an Apache CGI that renders the machine inventory as an HTML table
+with click-through badges for each open port (HTTP/HTTPS render as
+<scheme>://<ip>, plus ssh/vnc/rdp/smb custom-scheme links).
+Install with the bundled
+.I /etc/apache2/conf-available/net-mgr.conf
+which restricts access to 192.168/16 by default, with optional
+basic-auth fallback for off-LAN access. Enable with:
+.PP
+.RS 4
+.nf
+a2enmod cgid && a2enconf net-mgr && systemctl restart apache2
+htpasswd -c /etc/net-mgr/htpasswd <user>   # only needed off-LAN
+.fi
+.RE
+(Use \fBrestart\fR not \fBreload\fR the first time so cgid spawns.)
 .SH FILES
 .TP
 .I /etc/net-mgr/config
