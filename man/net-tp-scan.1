@@ -1,0 +1,91 @@
+.TH NET-TP-SCAN 1 "2026-04-29" "net-mgr" "User Commands"
+.SH NAME
+net-tp-scan \- pin TP-Link Kasa plug aliases as net-mgr friendly names
+.SH SYNOPSIS
+.B net-tp-scan
+.RB [ \-\-dry\-run ]
+.RB [ \-\-force ]
+.RB [ \-\-filter
+.IR REGEX ]
+.RI [ IP
+.IR ... ]
+.SH DESCRIPTION
+.B net-tp-scan
+discovers TP-Link Kasa smart plugs and strips on the network (using
+the existing net-mgr inventory), queries each via
+.BR hsx (1)
+for its user-set alias, and pins that alias as the
+.B friendly_name
+on the corresponding machine row. Replaces the older
+.IR /usr/local/bin/tp-scan ,
+which read
+.IR /tmp/scan.log
+and only printed.
+.PP
+Auto-find walks the
+.B machines
+table for entries whose
+.B primary_name
+matches a regex (default
+.BR pwr(plug|strip) )
+and skips any that already have a friendly name set unless
+.B \-\-force
+is given. With explicit
+.IR IP
+arguments, just those addresses are probed; the tool still resolves
+each to a machine in the DB so the alias goes on the right row.
+.PP
+Probes via
+.BR hsx (1):
+the legacy "abyss" path (HS100/HS110) returns JSON that contains an
+.B alias
+field; the
+.BR \-tapo
+path runs the kasa Python CLI for newer plugs. Generic placeholder
+names (\fBStrip_42\fR, \fBTP-LINK_Power\fR, etc.) are skipped \(em
+they aren't useful display labels.
+.SH OPTIONS
+.TP
+.IR IP " [" IP " ...]"
+Skip auto-find; just probe these.
+.TP
+.B \-\-dry\-run ", " \-n
+Show what would be set; write nothing.
+.TP
+.B \-\-force
+Overwrite existing
+.B friendly_names
+entries. Default is to skip them.
+.TP
+\fB\-\-filter\fR \fIREGEX\fR
+Override the auto-find regex. Default
+.BR pwr(plug|strip) .
+.TP
+\fB\-\-listen\fR \fIHOST:PORT\fR
+Override the manager address.
+.SH EXAMPLES
+.PP
+Default scan, just see what would change:
+.RS 4
+.nf
+.B net-tp-scan --dry-run
+.fi
+.RE
+.PP
+Apply the scan:
+.RS 4
+.nf
+.B net-tp-scan
+.fi
+.RE
+.PP
+Re-scan one plug whose alias you changed in the Kasa app:
+.RS 4
+.nf
+.B net-tp-scan --force 192.168.15.200
+.fi
+.RE
+.SH SEE ALSO
+.BR net-name (1),
+.BR net-mgr (7),
+.BR hsx (1)

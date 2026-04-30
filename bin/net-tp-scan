@@ -1,0 +1,193 @@
+#!/usr/bin/perl
+# net-tp-scan — discover TP-Link Kasa smart plugs/strips on the network
+# (via the existing net-mgr inventory), query each for its user-set
+# alias, and pin that alias as the friendly_name in net-mgr's DB.
+#
+# Replaces the older /usr/local/bin/tp-scan, which read /tmp/scan.log
+# and only printed; this tool reads from net-mgr and updates the DB.
+#
+# Usage:
+#   net-tp-scan                      Auto-find plugs/strips, query, set names.
+#   net-tp-scan IP [IP ...]          Just these IPs.
+#   net-tp-scan --filter REGEX       Override the auto-find regex
+#                                    (default: pwr(plug|strip)).
+#   net-tp-scan --dry-run            Show what would happen, write nothing.
+#   net-tp-scan --force              Overwrite existing friendly_names.
+#   net-tp-scan --listen H:P         Manager address (else NET_MGR_LISTEN
+#                                    or 127.0.0.1:7531).
+#
+# Probes via hs100(1) over the legacy "abyss" protocol. Tapo
+# (KP/HS-newer) plugs use a different protocol — not implemented here.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use NetMgr::Config;
+use NetMgr::DB;
+use NetMgr::Client;
+
+my $listen;
+my $dry_run;
+my $force;
+my $filter = 'pwr(plug|strip)';
+my $help;
+GetOptions(
+    'listen=s'  => \$listen,
+    'dry-run|n' => \$dry_run,
+    'force'     => \$force,
+    'filter=s'  => \$filter,
+    'help|h'    => \$help,
+) or die "bad options\n";
+
+if ($help) {
+    print <<'EOT';
+net-tp-scan — query TP-Link plugs and pin their aliases as
+              net-mgr friendly names.
+
+  net-tp-scan                  Auto: find pwr(plug|strip)*, scan, set names.
+  net-tp-scan IP [IP ...]      Just these IPs (skips DB candidate lookup).
+  net-tp-scan --filter REGEX   Custom auto-find regex (against primary_name).
+  net-tp-scan --dry-run        Print what would be set, write nothing.
+  net-tp-scan --force          Overwrite existing friendly names (default
+                               is to skip machines that already have one).
+EOT
+    exit 0;
+}
+
+# Build candidate list -----------------------------------------------
+
+my $cli = NetMgr::Client->new(listen => $listen);
+$cli->hello(consumer => "net-tp-scan.$$");
+my $machines  = $cli->snapshot(1, 'machines');
+my $ifaces    = $cli->snapshot(2, 'interfaces');
+my $addresses = $cli->snapshot(3, 'addresses', where => "family = 'v4'");
+my $friendly  = $cli->snapshot(4, 'friendly_names');
+$cli->bye;
+
+my %friendly_by_id = map { $_->{machine_id} => $_->{name} } @$friendly;
+my %iface_by_machine;
+push @{ $iface_by_machine{$_->{machine_id}} }, $_
+    for grep { defined $_->{machine_id} } @$ifaces;
+my %addr_by_mac;
+push @{ $addr_by_mac{$_->{mac}} }, $_->{addr} for @$addresses;
+
+# id_by_ip lets us find the matching machine when the user passes IPs
+# directly (positional args).
+my %id_by_ip;
+for my $a (@$addresses) {
+    next unless $a->{mac} && $a->{addr};
+    my @ifs = grep { $_->{mac} eq $a->{mac} } @$ifaces;
+    next unless @ifs && defined $ifs[0]{machine_id};
+    $id_by_ip{$a->{addr}} //= $ifs[0]{machine_id};
+}
+
+my @candidates;
+if (@ARGV) {
+    for my $ip (@ARGV) {
+        my $id = $id_by_ip{$ip};
+        my $name = $id ? (grep { $_->{id} == $id } @$machines)[0]->{primary_name}
+                       : '';
+        push @candidates, { id => $id, name => $name // '', ip => $ip };
+    }
+} else {
+    my $re = qr/$filter/i;
+    for my $m (@$machines) {
+        next unless $m->{primary_name} && $m->{primary_name} =~ $re;
+        next if !$force && exists $friendly_by_id{$m->{id}};
+        my $ifs = $iface_by_machine{$m->{id}} or next;
+        my $ip;
+        for my $i (@$ifs) {
+            for my $a (@{ $addr_by_mac{$i->{mac}} || [] }) {
+                next unless $a =~ /^\d+\.\d+\.\d+\.\d+$/;
+                $ip = $a;
+                last;
+            }
+            last if $ip;
+        }
+        next unless $ip;
+        push @candidates, { id => $m->{id}, name => $m->{primary_name}, ip => $ip };
+    }
+}
+
+if (!@candidates) {
+    print "no candidates (filter: $filter)\n";
+    exit 0;
+}
+
+# Probe + write ------------------------------------------------------
+
+my $db;
+unless ($dry_run) {
+    my $cfg = NetMgr::Config->load(
+        $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
+    my $mycnf = (-r "$ENV{HOME}/.my.cnf") ? "$ENV{HOME}/.my.cnf"
+              : (-r '/root/.my.cnf')      ? '/root/.my.cnf'
+              : die "no readable .my.cnf for the [net-mgr] section\n";
+    $db = NetMgr::DB->new(
+        defaults_file => $mycnf,
+        section       => $cfg->{mysql}{section},
+        db            => $cfg->{mysql}{db},
+    );
+    $db->connect;
+}
+
+my $hits = 0; my $skipped = 0; my $silent = 0;
+for my $c (@candidates) {
+    my $alias = probe($c->{ip});
+    if (!defined $alias || !length $alias) {
+        printf "  %-12s %-15s no alias\n", $c->{name}, $c->{ip};
+        $silent++;
+        next;
+    }
+    if (!$c->{id}) {
+        printf "  %-12s %-15s %s (no machine in DB — skipped)\n",
+               $c->{name}, $c->{ip}, $alias;
+        $skipped++;
+        next;
+    }
+    my $existing = $friendly_by_id{$c->{id}};
+    if (defined $existing && !$force) {
+        printf "  %-12s %-15s %s (have '%s' — pass --force to overwrite)\n",
+               $c->{name}, $c->{ip}, $alias, $existing;
+        $skipped++;
+        next;
+    }
+    printf "  %-12s %-15s %s%s\n", $c->{name}, $c->{ip}, $alias,
+        ($dry_run ? '  [dry-run]' : '');
+    next if $dry_run;
+    $db->upsert_friendly_name(
+        machine_id => $c->{id},
+        name       => $alias,
+        notes      => "set by net-tp-scan from $c->{ip}",
+    );
+    $hits++;
+}
+printf "\n%d set, %d skipped, %d no-response\n", $hits, $skipped, $silent;
+
+# ---- helpers -------------------------------------------------------
+
+sub probe {
+    my ($ip) = @_;
+    # hsx without -tapo execs hs100, which speaks the legacy "abyss"
+    # protocol used by HS100/HS110. JSON response with `alias`.
+    my $out = `timeout 5 hsx \Q$ip\E info 2>/dev/null` // '';
+    if ($out =~ /"alias"\s*:\s*"([^"]+)"/) {
+        my $a = $1;
+        return undef if $a =~ /^(Strip_\d+|TP-LINK_(?:Power|Smart Plug))/;
+        return $a;
+    }
+
+    # hsx -tapo speaks the newer auth-based protocol. Output format:
+    #   == <alias> - <model> ==
+    # or with cloud auth: "== <alias> (<id>) =="
+    $out = `timeout 8 hsx -tapo \Q$ip\E discover 2>/dev/null` // '';
+    if ($out =~ /==\s+(.+?)\s+-\s+(?:HS|KP)\d+\s+==/m) {
+        return $1;
+    }
+    if ($out =~ /==\s+(.+?)\s+\(.*?\)\s+==/m) {
+        return $1;
+    }
+    return undef;
+}
