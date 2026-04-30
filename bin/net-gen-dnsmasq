@@ -163,14 +163,17 @@ sub zone_for_host {
     return $zone_of_24{ net_24_of($h->{ip}) } // ('subnet-' . (split /\./, $h->{ip})[2]);
 }
 
-# Default lease time appended to each dhcp-host line. The legacy nas3
-# files used 1440 (seconds → ~24 min); dhcp.master's
-# `default-lease-time` is the source-of-truth if set.
+# Defaults sourced from dhcp.master (or [dhcp] config). Lease time
+# appears on each dhcp-host line; domain-name appears in each
+# generated hosts-<zone> file's FQDN column.
 my $default_lease = 1440;
+my $domain        = '';
 {
     my $raw = do { open my $f, '<', $files[0] or die; local $/; <$f> };
     $default_lease = $1 if $raw =~ /\bdefault-lease-time\s+(\d+)\s*;/;
     $default_lease = $dhcp_cfg{host_lease} if $dhcp_cfg{host_lease};
+    $domain        = $1 if $raw =~ /\boption\s+domain-name\s+"([^"]+)"/;
+    $domain        = $dhcp_cfg{domain} if $dhcp_cfg{domain};
 }
 
 sub emit_zone_file {
@@ -195,6 +198,31 @@ sub emit_zone_file {
     return $out;
 }
 
+# Hosts-file companion for a zone: one line per host with
+#   <ip-padded-25>  <name>\t<fqdn>\tM<mac with '_' instead of ':'>
+# matching the legacy fix_dhcp / hosts-<zone> layout. dnsmasq picks
+# these up via `addn-hosts=` directives in its main config.
+sub emit_hosts_file {
+    my ($zone, $hs) = @_;
+    my @sorted = sort {
+        my @a = split /\./, $a->{ip};
+        my @b = split /\./, $b->{ip};
+        ($a[2]<=>$b[2]) || ($a[3]<=>$b[3]) || ($a->{name} cmp $b->{name});
+    } @$hs;
+
+    my $out = '';
+    my %seen_mac;
+    for my $h (@sorted) {
+        next if $seen_mac{ lc $h->{mac} }++;   # same dedupe rule as DHCP
+        my $mac_id = $h->{mac};
+        $mac_id =~ s/:/_/g;
+        my $fqdn = $domain ? "$h->{name}.$domain" : $h->{name};
+        $out .= sprintf "%-25s%s\t%s\tM%s\n",
+            $h->{ip}, $h->{name}, $fqdn, $mac_id;
+    }
+    return $out;
+}
+
 # Group hosts by zone.
 my %hosts_by_zone;
 for my $h (@hosts) {
@@ -203,7 +231,10 @@ for my $h (@hosts) {
 
 my %generated;   # path → content
 for my $zone (sort keys %hosts_by_zone) {
-    $generated{"$out_dir/dnsmasq-$zone"} = emit_zone_file($zone, $hosts_by_zone{$zone});
+    $generated{"$out_dir/dnsmasq-$zone"} =
+        emit_zone_file($zone, $hosts_by_zone{$zone});
+    $generated{"$out_dir/hosts-$zone"} =
+        emit_hosts_file($zone, $hosts_by_zone{$zone});
 }
 
 # Run all unresolved-placeholder checks now (against generated text).
