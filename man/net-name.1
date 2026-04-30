@@ -1,0 +1,89 @@
+.TH NET-NAME 1 "2026-04-29" "net-mgr" "User Commands"
+.SH NAME
+net-name \- friendly display names for the web UI
+.SH SYNOPSIS
+.B net-name list
+.RI [ PATTERN ]
+.br
+.B net-name set
+.I MACHINE
+.I NAME
+.RB [ \-\-notes
+.IR TEXT ]
+.br
+.B net-name remove
+.I MACHINE
+.SH DESCRIPTION
+.B net-name
+manages the
+.B friendly_names
+table, which holds user-supplied display labels that override the
+auto-detected
+.B machines.primary_name
+on the web UI's compact host list. Producer-set names \(em DHCP
+hostnames, ARP hits, vendor strings \(em can be ugly
+(\fBunknown1\fR, \fBdesktop\-amfdwjr\fR, etc.); this lets you pin a
+nicer label without disturbing what producers report.
+.PP
+The detail page (and tools that consult
+.BR machines.primary_name )
+still show the underlying name, so the override is purely cosmetic.
+.PP
+.I MACHINE
+may be a numeric machine id, a
+.BR primary_name ,
+or any
+.B hostnames
+entry; the tool resolves it to an id.
+.PP
+Direct DB access (same pattern as
+.BR net-alias (1)
+and
+.BR net-var (1));
+must run on a host with
+.IR /root/.my.cnf
+or
+.IR ~/.my.cnf
+holding the
+.B [net-mgr]
+section.
+.SH SUBCOMMANDS
+.TP
+\fBlist\fR [\fIPATTERN\fR]
+List entries; optional shell-style
+.I PATTERN
+filters by friendly name.
+.TP
+\fBset\fR \fIMACHINE\fR \fINAME\fR [\fB\-\-notes\fR \fITEXT\fR]
+Insert or update.
+.TP
+\fBremove\fR \fIMACHINE\fR
+Drop one row. Aliases:
+.B rm ,
+.BR del .
+.SH EXAMPLES
+.PP
+Pin a friendly label on a machine the producers know as
+.B unknown1 :
+.RS 4
+.nf
+.B net-name set unknown1 "kitchen-pi" --notes "Raspberry Pi in the kitchen"
+.fi
+.RE
+.PP
+Find all entries you've added:
+.RS 4
+.nf
+.B net-name list
+.fi
+.RE
+.PP
+Drop one:
+.RS 4
+.nf
+.B net-name remove kitchen-pi
+.fi
+.RE
+.SH SEE ALSO
+.BR net-alias (1),
+.BR net-mgr (7)

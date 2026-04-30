@@ -1,0 +1,132 @@
+#!/usr/bin/perl
+# net-name — manage user-supplied display names that override
+# machines.primary_name on the web UI's compact list. The producer-set
+# names (from DHCP-supplied hostnames, etc.) can be ugly; this lets
+# you pin a nicer label without disturbing what producers report.
+#
+# Usage:
+#   net-name list [PATTERN]
+#   net-name set MACHINE NAME [--notes "…"]
+#   net-name remove MACHINE
+#
+# MACHINE may be a machine id, primary_name, or any hostnames entry;
+# the tool resolves it to a machine id.
+#
+# Direct DB access (same pattern as net-alias / net-var).
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling pass_through);
+use NetMgr::Config;
+use NetMgr::DB;
+
+my $notes;
+my $help;
+GetOptions(
+    'notes=s' => \$notes,
+    'help|h'  => \$help,
+) or die "bad options\n";
+
+if ($help || !@ARGV) {
+    print <<'EOT';
+net-name — friendly display names for the web UI.
+
+  net-name list [PATTERN]                List names (optional shell glob).
+  net-name set MACHINE NAME [--notes …]  Create or update.
+  net-name remove MACHINE                Delete one entry.
+
+MACHINE may be a numeric id, primary_name, or hostname.
+EOT
+    exit($help ? 0 : 2);
+}
+
+my $cmd = shift @ARGV;
+
+my $cfg = NetMgr::Config->load(
+    $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
+my $mycnf = (-r "$ENV{HOME}/.my.cnf") ? "$ENV{HOME}/.my.cnf"
+          : (-r '/root/.my.cnf')      ? '/root/.my.cnf'
+          : die "no readable .my.cnf for the [net-mgr] section\n";
+my $db = NetMgr::DB->new(
+    defaults_file => $mycnf,
+    section       => $cfg->{mysql}{section},
+    db            => $cfg->{mysql}{db},
+);
+$db->connect;
+
+sub resolve_machine_id {
+    my ($spec) = @_;
+    return $spec + 0 if $spec =~ /^\d+$/;
+    my ($id) = $db->dbh->selectrow_array(
+        "SELECT id FROM machines WHERE primary_name = ? LIMIT 1",
+        undef, $spec);
+    return $id if $id;
+    ($id) = $db->dbh->selectrow_array(
+        "SELECT machine_id FROM hostnames WHERE name = ? LIMIT 1",
+        undef, $spec);
+    return $id if $id;
+    die "couldn't resolve '$spec' to a machine\n";
+}
+
+sub primary_name {
+    my ($id) = @_;
+    my ($n) = $db->dbh->selectrow_array(
+        "SELECT primary_name FROM machines WHERE id = ?", undef, $id);
+    return $n // "($id)";
+}
+
+if ($cmd eq 'list') {
+    my $pat = shift @ARGV;
+    my $rows = $db->dbh->selectall_arrayref(
+        "SELECT f.machine_id, f.name, f.notes, m.primary_name
+           FROM friendly_names f
+           LEFT JOIN machines m ON m.id = f.machine_id
+           ORDER BY f.name",
+        { Slice => {} });
+    if ($pat) {
+        $pat =~ s/([^\w*?])/\\$1/g;
+        $pat =~ s/\*/.*/g;
+        $pat =~ s/\?/./g;
+        my $re = qr/^$pat$/;
+        $rows = [ grep { $_->{name} =~ $re } @$rows ];
+    }
+    if (!@$rows) {
+        print "(none)\n";
+        exit 0;
+    }
+    my $w = 0;
+    for my $r (@$rows) { $w = length $r->{name} if length $r->{name} > $w }
+    for my $r (@$rows) {
+        printf "%-${w}s  %-20s  %s\n",
+            $r->{name},
+            ($r->{primary_name} // "(machine $r->{machine_id})"),
+            ($r->{notes} // '');
+    }
+    exit 0;
+}
+
+if ($cmd eq 'set') {
+    my $machine = shift @ARGV or die "usage: net-name set MACHINE NAME\n";
+    my $name    = shift @ARGV;
+    die "name required\n" unless defined $name && length $name;
+    my $id = resolve_machine_id($machine);
+    my $row = $db->upsert_friendly_name(
+        machine_id => $id, name => $name, notes => $notes);
+    printf "set machine %d (%s) → %s%s\n",
+        $id, primary_name($id), $row->{name},
+        ($row->{notes} ? " ($row->{notes})" : '');
+    exit 0;
+}
+
+if ($cmd eq 'remove' || $cmd eq 'rm' || $cmd eq 'del') {
+    my $machine = shift @ARGV or die "usage: net-name remove MACHINE\n";
+    my $id = resolve_machine_id($machine);
+    my $rc = $db->delete_friendly_name($id);
+    if ($rc) { print "removed friendly name for machine $id\n"; exit 0 }
+    warn "no friendly name set for machine $id\n";
+    exit 1;
+}
+
+die "unknown subcommand '$cmd'; try: list, set, remove\n";

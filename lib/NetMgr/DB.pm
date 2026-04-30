@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 8;
+our $SCHEMA_VERSION = 9;
 
 sub new {
     my ($class, %args) = @_;
@@ -176,6 +176,22 @@ CREATE TABLE IF NOT EXISTS subnet_routers (
     KEY idx_subnet (subnet_cidr),
     CONSTRAINT fk_subnet_router_ap
         FOREIGN KEY (ap_mac) REFERENCES interfaces(mac) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
+    if ($v == 9) {
+        # User-supplied display names, override the producer-set
+        # primary_name on the web UI list.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS friendly_names (
+    machine_id  INT          NOT NULL PRIMARY KEY,
+    name        VARCHAR(255) NOT NULL,
+    notes       TEXT,
+    updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                             ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_friendly_machine
+        FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
         return;
@@ -764,6 +780,27 @@ sub delete_dhcp_var {
     return $self->{dbh}->do("DELETE FROM dhcp_vars WHERE name = ?", undef, $name);
 }
 
+sub upsert_friendly_name {
+    my ($self, %f) = @_;
+    croak "machine_id and name required"
+        unless defined $f{machine_id} && defined $f{name};
+    $self->{dbh}->do(
+        "INSERT INTO friendly_names (machine_id, name, notes) VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE name = VALUES(name), notes = VALUES(notes)",
+        undef, $f{machine_id}, $f{name}, $f{notes}
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM friendly_names WHERE machine_id = ?",
+        undef, $f{machine_id}
+    );
+}
+
+sub delete_friendly_name {
+    my ($self, $mid) = @_;
+    return $self->{dbh}->do(
+        "DELETE FROM friendly_names WHERE machine_id = ?", undef, $mid);
+}
+
 sub upsert_subnet_router {
     my ($self, %f) = @_;
     croak "subnet_cidr and ap_mac required"
@@ -795,7 +832,7 @@ sub query_table {
     my %allowed = map { $_ => 1 } qw(
         machines hostnames interfaces addresses ports aps
         associations dhcp_leases events aliases dhcp_vars
-        subnet_routers
+        subnet_routers friendly_names
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};

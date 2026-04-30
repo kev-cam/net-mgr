@@ -160,6 +160,20 @@ CREATE TABLE IF NOT EXISTS dhcp_vars (
                              ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- User-supplied display names that override the auto-detected
+-- primary_name on the web UI's compact list. Auto-detected names
+-- come from DHCP-supplied hostnames and can be ugly; this lets the
+-- user pin a nicer label without disturbing what producers report.
+CREATE TABLE IF NOT EXISTS friendly_names (
+    machine_id  INT          NOT NULL PRIMARY KEY,
+    name        VARCHAR(255) NOT NULL,
+    notes       TEXT,
+    updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                             ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_friendly_machine
+        FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- Per-subnet AP ranking, used when picking which AP should fill the
 -- ROUTER_* placeholders in dhcp.master. Higher `rank` wins; ties broken
 -- by AP MAC (deterministic). Auto-detect (net-var auto) consults this
@@ -183,3 +197,4 @@ INSERT IGNORE INTO schema_version (version) VALUES (5);
 INSERT IGNORE INTO schema_version (version) VALUES (6);
 INSERT IGNORE INTO schema_version (version) VALUES (7);
 INSERT IGNORE INTO schema_version (version) VALUES (8);
+INSERT IGNORE INTO schema_version (version) VALUES (9);

@@ -61,6 +61,7 @@ my $addresses = $cli->snapshot(4, 'addresses', where => "family = 'v4'");
 my $ports     = $cli->snapshot(5, 'ports');
 my $aps       = $cli->snapshot(6, 'aps');
 my $aliases   = $cli->snapshot(7, 'aliases');
+my $friendly  = $cli->snapshot(8, 'friendly_names');
 $cli->bye;
 
 # Indexes ------------------------------------------------------------
@@ -68,6 +69,7 @@ $cli->bye;
 my %machine_by_id = map { $_->{id} => $_ } @$machines;
 my %hostnames_by_machine;
 push @{ $hostnames_by_machine{ $_->{machine_id} } }, $_->{name} for @$hostnames;
+my %friendly_by_machine = map { $_->{machine_id} => $_->{name} } @$friendly;
 
 my %addrs_by_mac;
 push @{ $addrs_by_mac{ $_->{mac} } }, $_ for @$addresses;
@@ -188,11 +190,12 @@ sub aggregate_ports {
     return sort { $a->{port} <=> $b->{port} } @out;
 }
 
-# Display label for a machine row in the compact list. Prefer
-# primary_name; fall back to a hostnames entry; fall back to the
-# representative IP.
+# Display label for a machine row in the compact list. Prefer the
+# user-supplied friendly_name; fall back to primary_name; then to a
+# hostnames entry; finally to the representative IP.
 sub display_label {
     my ($mid, $primary_addr) = @_;
+    if (my $f = $friendly_by_machine{$mid}) { return $f }
     my $m = $machine_by_id{$mid};
     if ($m && $m->{primary_name}) { return $m->{primary_name} }
     my $hns = $hostnames_by_machine{$mid};
@@ -267,7 +270,8 @@ sub render_machine_detail {
             qq{<p style="color:#f55;">no machine with id=$mid</p>}
           . qq{<p><a href="?">back</a></p>});
     }
-    my $name = $m && $m->{primary_name} ? $m->{primary_name} : "machine $mid";
+    my $name = $friendly_by_machine{$mid}
+            // ($m && $m->{primary_name} ? $m->{primary_name} : "machine $mid");
     my @hns = @{ $hostnames_by_machine{$mid} || [] };
     my @als = @{ $aliases_by_machine{$mid}   || [] };
 
