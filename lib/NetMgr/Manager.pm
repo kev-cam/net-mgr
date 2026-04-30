@@ -43,6 +43,7 @@ sub new {
         select    => undef,
         clients   => {},      # fd → { sock, source/consumer, buffer, peer }
         triggers  => {},      # pid → { cli_fd, name, started_at } pending TRIGGER WAITs
+        dnsmasq_listeners => {}, # "host:port" → { sock, host, port, buffer }
         stop      => 0,
     }, $class;
     return $self;
@@ -107,6 +108,7 @@ sub run {
         $self->_check_periodic_triggers;
         $self->_age_out_offline;
         $self->_purge_old_events;
+        $self->_check_dnsmasq_listeners;
     }
     $self->_log("shutting down");
     for my $c (values %{ $self->{clients} }) {
@@ -136,6 +138,12 @@ sub _accept {
 sub _handle_readable {
     my ($self, $fh) = @_;
     my $fd  = fileno($fh);
+    # dnsmasq event-socket listeners: handled inline (no client struct).
+    for my $key (keys %{ $self->{dnsmasq_listeners} }) {
+        my $L = $self->{dnsmasq_listeners}{$key};
+        return $self->_handle_dnsmasq_data($key)
+            if fileno($L->{sock}) == $fd;
+    }
     my $cli = $self->{clients}{$fd} or return;
     my $n   = sysread($fh, my $buf, 8192);
     if (!defined $n) {
@@ -993,6 +1001,125 @@ sub _obs_event {
         addr    => $kv->{addr},
         details => $kv->{details},
     });
+}
+
+# ---- dnsmasq event-socket listeners ----------------------------------
+#
+# Each --event-listen=HOST:PORT-equipped dnsmasq we can reach gets a
+# persistent TCP connection from inside this daemon. Sockets are added
+# to the same IO::Select that handles client traffic, so events flow
+# through the existing main-loop dispatch with no extra threads.
+
+use IO::Socket::INET ();
+
+# Periodic: scan the DB for hosts likely to be running dnsmasq (port
+# 53 or 67 known open) and try to connect to their event-listen port,
+# default 7532. Re-attempt every minute by default; once attached the
+# socket stays in select() forever.
+sub _check_dnsmasq_listeners {
+    my ($self) = @_;
+    my $cfg = $self->{config}{scanner} // {};
+    my $port  = $cfg->{dnsmasq_event_port}           // 7532;
+    my $every = $cfg->{dnsmasq_event_check_interval} // 60;
+    my $now = time();
+    $self->{periodic_last} //= {};
+    return if ($now - ($self->{periodic_last}{dnsmasq_listeners} // 0)) < $every;
+    $self->{periodic_last}{dnsmasq_listeners} = $now;
+
+    my $rows = $self->{db}->dbh->selectall_arrayref(<<'SQL', { Slice => {} });
+        SELECT DISTINCT a.addr
+          FROM addresses a
+          JOIN ports     p ON p.mac = a.mac
+         WHERE a.family = 'v4'
+           AND p.port IN (53, 67)
+SQL
+    for my $r (@$rows) {
+        my $key = "$r->{addr}:$port";
+        next if $self->{dnsmasq_listeners}{$key};
+        $self->_try_connect_dnsmasq($r->{addr}, $port);
+    }
+}
+
+sub _try_connect_dnsmasq {
+    my ($self, $host, $port) = @_;
+    my $sock = IO::Socket::INET->new(
+        PeerAddr => $host, PeerPort => $port,
+        Proto    => 'tcp', Timeout => 1,
+    );
+    return unless $sock;
+    $sock->blocking(0);
+    my $key = "$host:$port";
+    $self->{dnsmasq_listeners}{$key} = {
+        sock => $sock, host => $host, port => $port, buffer => '',
+    };
+    $self->{select}->add($sock);
+    $self->_log("dnsmasq listener attached to $key");
+}
+
+sub _drop_dnsmasq_listener {
+    my ($self, $key) = @_;
+    my $L = delete $self->{dnsmasq_listeners}{$key} // return;
+    $self->{select}->remove($L->{sock});
+    eval { $L->{sock}->close };
+    $self->_log("dnsmasq listener dropped from $key");
+}
+
+sub _handle_dnsmasq_data {
+    my ($self, $key) = @_;
+    my $L = $self->{dnsmasq_listeners}{$key} or return;
+    my $buf;
+    my $n = sysread $L->{sock}, $buf, 4096;
+    if (!defined $n || $n == 0) {
+        $self->_drop_dnsmasq_listener($key);
+        return;
+    }
+    $L->{buffer} .= $buf;
+    while ($L->{buffer} =~ s/^([^\n]*)\n//) {
+        $self->_process_dnsmasq_event($1, $key);
+    }
+}
+
+# Wire format from src/event-socket.c in our patched dnsmasq:
+#   EVENT action=<add|del|old|have> ts=<unix> mac=<hex:..> ip=<v4|v6>
+#         hostname=<name>
+sub _process_dnsmasq_event {
+    my ($self, $line, $key) = @_;
+    return unless $line =~ /^EVENT\s/;
+    my %kv;
+    while ($line =~ /\b([\w-]+)=(\S+)/g) { $kv{$1} = $2 }
+    my $action = $kv{action} // '';
+    my $mac    = $kv{mac};
+    my $ip     = $kv{ip};
+    return unless $mac && $ip;
+
+    my @ev;
+    if ($action =~ /^(?:add|old|have)$/) {
+        my $iface = $self->_upsert('interfaces', 'upsert_interface',
+            mac => $mac, online => 1, live => 1);
+        push @ev, _events_from_iface_change($iface, $ip);
+        my $a = $self->_upsert('addresses', 'upsert_address',
+            mac => $mac, family => ($ip =~ /:/ ? 'v6' : 'v4'),
+            addr => $ip, live => 1, source => "$key:dnsmasq");
+        push @ev, { type => 'address_added', mac => $mac, addr => $ip }
+            if $a->{op} eq 'insert';
+        $self->_upsert('dhcp_leases', 'upsert_lease',
+            mac      => $mac,
+            ip       => $ip,
+            hostname => $kv{hostname},
+        );
+        $self->_associate_machine($mac, $kv{hostname}, 'dhcp')
+            if $kv{hostname};
+    }
+    elsif ($action eq 'del') {
+        my $r = $self->_upsert('interfaces', 'upsert_interface',
+            mac => $mac, online => 0);
+        if ($r->{op} eq 'update'
+            && grep { $_ eq 'online' } @{ $r->{changed_fields} })
+        {
+            push @ev, { type => 'interface_offline', mac => $mac };
+        }
+    }
+    $self->_log_event(%$_) for @ev;
 }
 
 1;

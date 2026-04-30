@@ -167,7 +167,8 @@ sub _deep_copy {
 my %ACTIVE = (
     manager    => [qw(listen log offline_after event_retention_days)],
     mysql      => [qw(db defaults section)],
-    scanner    => [qw(presence_interval)],   # used by net-watch only
+    scanner    => [qw(presence_interval
+                       dnsmasq_event_port dnsmasq_event_check_interval)],
     scheduling => [qw(scan-ap presence discover)],
     paths      => '*',
     dns        => '*',
