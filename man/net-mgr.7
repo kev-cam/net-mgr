@@ -23,6 +23,46 @@ and push observations.
 .B Consumers \fR(\fBnet-scan\fR(1), \fBnet-show\fR(1), \fBnet-report\fR(1),
 \fBnet-watch\fR(1), \fBnet-roam\fR(1)) \(em snapshot tables or stream events
 without writing.
+.SH POPULATING A FRESH DB
+After
+.BR net-mgr-setup (8)
+creates the database, it's empty until producers start pushing
+observations. To get an initial inventory:
+.PP
+.nf
+.RS 4
+# 1. seed from the hand-curated reservations
+sudo net-import-dhcp
+
+# 2. find live hosts (nmap sweep + fping + SSH fingerprint)
+sudo net-discover --discover
+sudo net-discover --presence
+sudo net-discover --fingerprint
+
+# 3. pull associations + leases from the APs
+sudo net-poll-ap --auto
+
+# 4. (optional) seed placeholder values for net-gen-dnsmasq
+sudo net-var auto
+sudo net-router set 192.168.15.0/24  wndr8k1  --rank 100
+sudo net-router set 192.168.223.0/24 wndr8k2-down --rank 100
+.RE
+.fi
+.PP
+For ongoing population, enable the periodic scheduler in
+.IR /etc/net-mgr/config :
+.PP
+.nf
+.RS 4
+[scheduling]
+presence = 90s     # fping known IPs
+scan-ap  = 60s     # SSH-poll APs
+discover = 24h     # full nmap sweep
+.RE
+.fi
+.PP
+The daemon fires each trigger on its interval, so the steps above
+become unnecessary except to bootstrap.
 .SH TYPICAL WORKFLOWS
 .SS Survey the network
 .nf
