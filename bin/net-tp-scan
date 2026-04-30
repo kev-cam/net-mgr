@@ -176,7 +176,7 @@ for my $c (sort { $a->{name} cmp $b->{name} } @candidates) {
             $c->{name}, $c->{ip}, $r->{alias}, $model,
             scalar @{ $r->{outlets} };
         for my $o (@{ $r->{outlets} }) {
-            printf "  %-12s %-15s   %2d: %-26s [%s]\n",
+            printf "  %-12s %-15s %2d: %-26s [%s]\n",
                 '', '', $o->{outlet}, $o->{name},
                 (defined $o->{state} ? $o->{state} : '?');
             $outlets_total++;
