@@ -48,6 +48,11 @@ if (defined $q{view} && $q{view} eq 'flake') {
     $cli->bye;
     exit 0;
 }
+if (defined $q{view} && $q{view} eq 'dhcp') {
+    print render_dhcp();
+    $cli->bye;
+    exit 0;
+}
 
 my $machines  = $cli->snapshot(1, 'machines');
 my $hostnames = $cli->snapshot(2, 'hostnames');
@@ -354,6 +359,8 @@ sub render_tools {
 <ul class=toollist>
   <li><a href="?view=flake">Disconnect histogram</a> — count of
       <code>interface_offline</code> events per hour over the last 24h.</li>
+  <li><a href="?view=dhcp">DHCP grants</a> — which AP / host gave out
+      each IP, derived from the source tag on each address row.</li>
 </ul>
 HTML
     return wrap_page("Tools — net-mgr", $body, "Tools");
@@ -449,6 +456,79 @@ sub render_flake {
 for the count.</p>
 HTML
     return wrap_page("Disconnects — net-mgr", $body, "Disconnects (24h)");
+}
+
+sub render_dhcp {
+    my $machines  = $cli->snapshot(1, 'machines');
+    my $ifaces    = $cli->snapshot(2, 'interfaces');
+    my $addresses = $cli->snapshot(3, 'addresses', where => "family = 'v4'");
+
+    my %name_by_id   = map { $_->{id} => $_->{primary_name} } @$machines;
+    my %iface_by_mac = map { $_->{mac} => $_ } @$ifaces;
+
+    # IP → name lookup so a granter source like "192.168.15.151:DHCP"
+    # renders as "wndr8k1" / etc.
+    my %name_by_ip;
+    for my $a (@$addresses) {
+        next unless $a->{mac} && $a->{addr};
+        my $iface = $iface_by_mac{$a->{mac}};
+        next unless $iface && $iface->{machine_id};
+        my $name = $name_by_id{$iface->{machine_id}} // '';
+        $name_by_ip{$a->{addr}} //= $name if length $name;
+    }
+
+    # Group address rows by granting IP. Skip everything that wasn't
+    # tagged :DHCP (paper records, ARP, etc.).
+    my %by_granter;
+    for my $a (@$addresses) {
+        my $src = $a->{source} // '';
+        next unless $src =~ /^(\d+\.\d+\.\d+\.\d+):DHCP$/;
+        my $g = $1;
+        push @{ $by_granter{$g} }, $a;
+    }
+
+    my @sections;
+    my $total = 0;
+    for my $g (sort { ip_sort_key($a) cmp ip_sort_key($b) } keys %by_granter) {
+        my @rows = sort {
+            ip_sort_key($a->{addr}) cmp ip_sort_key($b->{addr})
+        } @{ $by_granter{$g} };
+        $total += scalar @rows;
+        my $g_name = $name_by_ip{$g};
+        my $hdr = $g_name
+            ? sprintf '%s (<code>%s</code>) — %d',
+                escapeHTML($g_name), escapeHTML($g), scalar @rows
+            : sprintf '<code>%s</code> — %d',
+                escapeHTML($g), scalar @rows;
+        my @row_html;
+        for my $a (@rows) {
+            my $iface = $iface_by_mac{$a->{mac}};
+            my $client_name = '';
+            if ($iface && $iface->{machine_id}) {
+                $client_name = $name_by_id{$iface->{machine_id}} // '';
+            }
+            my $client_link = $client_name
+                ? sprintf '<a class=hostlink href="?m=%d">%s</a>',
+                    $iface->{machine_id}, escapeHTML($client_name)
+                : sprintf '<a class=hostlink href="?i=%s">%s</a>',
+                    escapeHTML($a->{mac}), escapeHTML($a->{mac});
+            push @row_html, sprintf
+                '<tr><td>%s</td><td>%s</td><td><code>%s</code></td></tr>',
+                escapeHTML($a->{addr}), $client_link, escapeHTML($a->{mac});
+        }
+        my $section_body = '<table><tr><th>ip</th><th>client</th><th>mac</th></tr>'
+            . join('', @row_html) . '</table>';
+        push @sections, "<h2>$hdr</h2>$section_body";
+    }
+
+    if (!@sections) {
+        push @sections, '<p class=note>No DHCP-sourced addresses found.</p>';
+    }
+
+    my $body = qq{<p class=meta>$total leases across }
+             . scalar(keys %by_granter) . qq{ granters</p>}
+             . join("\n", @sections);
+    return wrap_page("DHCP grants — net-mgr", $body, "DHCP grants");
 }
 
 sub wrap_page {
