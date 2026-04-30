@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 9;
+our $SCHEMA_VERSION = 10;
 
 sub new {
     my ($class, %args) = @_;
@@ -191,6 +191,25 @@ CREATE TABLE IF NOT EXISTS friendly_names (
     updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
                              ON UPDATE CURRENT_TIMESTAMP,
     CONSTRAINT fk_friendly_machine
+        FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
+    if ($v == 10) {
+        # Things plugged into Wi-Fi smart sockets, populated by
+        # net-tp-scan. One row per outlet.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS wifi_sockets (
+    machine_id      INT          NOT NULL,
+    outlet          INT          NOT NULL,
+    name            VARCHAR(255),
+    state           TINYINT      NULL,
+    controller_type VARCHAR(64),
+    last_seen       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                 ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (machine_id, outlet),
+    CONSTRAINT fk_wifi_socket_machine
         FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
@@ -780,6 +799,36 @@ sub delete_dhcp_var {
     return $self->{dbh}->do("DELETE FROM dhcp_vars WHERE name = ?", undef, $name);
 }
 
+sub upsert_wifi_socket {
+    my ($self, %f) = @_;
+    croak "machine_id and outlet required"
+        unless defined $f{machine_id} && defined $f{outlet};
+    $self->{dbh}->do(
+        "INSERT INTO wifi_sockets (machine_id, outlet, name, state, controller_type)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE name = VALUES(name),
+                                 state = VALUES(state),
+                                 controller_type = VALUES(controller_type)",
+        undef, $f{machine_id}, $f{outlet}, $f{name}, $f{state}, $f{controller_type}
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM wifi_sockets WHERE machine_id = ? AND outlet = ?",
+        undef, $f{machine_id}, $f{outlet}
+    );
+}
+
+sub delete_wifi_socket {
+    my ($self, %f) = @_;
+    if (defined $f{outlet}) {
+        return $self->{dbh}->do(
+            "DELETE FROM wifi_sockets WHERE machine_id = ? AND outlet = ?",
+            undef, $f{machine_id}, $f{outlet});
+    }
+    return $self->{dbh}->do(
+        "DELETE FROM wifi_sockets WHERE machine_id = ?",
+        undef, $f{machine_id});
+}
+
 sub upsert_friendly_name {
     my ($self, %f) = @_;
     croak "machine_id and name required"
@@ -832,7 +881,7 @@ sub query_table {
     my %allowed = map { $_ => 1 } qw(
         machines hostnames interfaces addresses ports aps
         associations dhcp_leases events aliases dhcp_vars
-        subnet_routers friendly_names
+        subnet_routers friendly_names wifi_sockets
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};

@@ -14,13 +14,25 @@ net-tp-scan \- pin TP-Link Kasa plug aliases as net-mgr friendly names
 discovers TP-Link Kasa smart plugs and strips on the network (using
 the existing net-mgr inventory), queries each via
 .BR hsx (1)
-for its user-set alias, and pins that alias as the
-.B friendly_name
-on the corresponding machine row. Replaces the older
+for its outlet aliases and on/off state, and updates two tables:
+.IP \(bu 2
+.B wifi_sockets
+\(em one row per outlet (controller, outlet#, name, state,
+controller_type). Always refreshed since state changes over time.
+.IP \(bu 2
+.B friendly_names
+\(em pinned to the outlet alias for single-outlet plugs (skipped
+for strips, whose top-level alias is usually a placeholder like
+.BR TP-LINK_Power_Strip_42 ).
+.PP
+Output mirrors the legacy
 .IR /usr/local/bin/tp-scan ,
-which read
-.IR /tmp/scan.log
-and only printed.
+with
+.B [1]
+/
+.B [0]
+marking on/off and per-outlet rows numbered 1..N for multi-outlet
+strips.
 .PP
 Auto-find walks the
 .B machines

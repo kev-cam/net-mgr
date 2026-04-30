@@ -160,6 +160,24 @@ CREATE TABLE IF NOT EXISTS dhcp_vars (
                              ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Things plugged into Wi-Fi smart sockets — populated by net-tp-scan.
+-- One row per outlet (outlet=0 for single plugs, 1..N for strips).
+-- The controller machine is the smart plug/strip itself; this table
+-- records what's *plugged into it*. Useful for the web UI to render
+-- "Office strip > 3: Soldering iron [on]".
+CREATE TABLE IF NOT EXISTS wifi_sockets (
+    machine_id      INT          NOT NULL,
+    outlet          INT          NOT NULL,
+    name            VARCHAR(255),
+    state           TINYINT      NULL,        -- 0=off, 1=on, NULL=unknown
+    controller_type VARCHAR(64),
+    last_seen       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                 ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (machine_id, outlet),
+    CONSTRAINT fk_wifi_socket_machine
+        FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- User-supplied display names that override the auto-detected
 -- primary_name on the web UI's compact list. Auto-detected names
 -- come from DHCP-supplied hostnames and can be ugly; this lets the
@@ -198,3 +216,4 @@ INSERT IGNORE INTO schema_version (version) VALUES (6);
 INSERT IGNORE INTO schema_version (version) VALUES (7);
 INSERT IGNORE INTO schema_version (version) VALUES (8);
 INSERT IGNORE INTO schema_version (version) VALUES (9);
+INSERT IGNORE INTO schema_version (version) VALUES (10);

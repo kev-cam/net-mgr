@@ -1,29 +1,33 @@
 #!/usr/bin/perl
-# net-tp-scan — discover TP-Link Kasa smart plugs/strips on the network
-# (via the existing net-mgr inventory), query each for its user-set
-# alias, and pin that alias as the friendly_name in net-mgr's DB.
+# net-tp-scan — discover TP-Link Kasa smart plugs/strips on the network,
+# query each for its outlet aliases + on/off state, and update net-mgr's
+# DB:
 #
-# Replaces the older /usr/local/bin/tp-scan, which read /tmp/scan.log
-# and only printed; this tool reads from net-mgr and updates the DB.
+#   * wifi_sockets gets one row per outlet (controller, outlet#,
+#     name, state, controller_type).
+#   * friendly_names gets the alias for single plugs (skipping
+#     placeholder names like "TP-LINK_Power Strip_42").
 #
-# Usage:
-#   net-tp-scan                      Auto-find plugs/strips, query, set names.
-#   net-tp-scan IP [IP ...]          Just these IPs.
-#   net-tp-scan --filter REGEX       Override the auto-find regex
-#                                    (default: pwr(plug|strip)).
-#   net-tp-scan --dry-run            Show what would happen, write nothing.
-#   net-tp-scan --force              Overwrite existing friendly_names.
-#   net-tp-scan --listen H:P         Manager address (else NET_MGR_LISTEN
-#                                    or 127.0.0.1:7531).
+# Replaces the older /usr/local/bin/tp-scan, which only printed and
+# numbered strips inconsistently. Output mirrors tp-scan's per-outlet
+# layout, with [1] / [0] marking on/off:
 #
-# Probes via hs100(1) over the legacy "abyss" protocol. Tapo
-# (KP/HS-newer) plugs use a different protocol — not implemented here.
+#   pwrplug0     192.168.15.200  1+ psu [1]                          (HS110)
+#   pwrstrip0    192.168.15.190  TP-LINK_Power Strip_0CBF            (HS300)
+#                                  1: Patio Network         [0]
+#                                  2: Patio DVD             [0]
+#                                  3: Patio Computer        [0]
+#                                  ...
+#
+# Probes via hsx(1): without -tapo it execs hs100 (legacy abyss for
+# HS100/HS110/HS300); with -tapo it runs the kasa Python CLI.
 
 use strict;
 use warnings;
 use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
+use JSON::PP qw(decode_json);
 use NetMgr::Config;
 use NetMgr::DB;
 use NetMgr::Client;
@@ -43,15 +47,15 @@ GetOptions(
 
 if ($help) {
     print <<'EOT';
-net-tp-scan — query TP-Link plugs and pin their aliases as
-              net-mgr friendly names.
+net-tp-scan — query TP-Link plugs and pin aliases / outlet state.
 
-  net-tp-scan                  Auto: find pwr(plug|strip)*, scan, set names.
+  net-tp-scan                  Auto: find pwr(plug|strip)*, scan, update DB.
   net-tp-scan IP [IP ...]      Just these IPs (skips DB candidate lookup).
   net-tp-scan --filter REGEX   Custom auto-find regex (against primary_name).
-  net-tp-scan --dry-run        Print what would be set, write nothing.
-  net-tp-scan --force          Overwrite existing friendly names (default
-                               is to skip machines that already have one).
+  net-tp-scan --dry-run        Print but don't write to the DB.
+  net-tp-scan --force          Overwrite friendly_names (default skips them
+                               if already set; wifi_sockets is always
+                               refreshed since state changes over time).
 EOT
     exit 0;
 }
@@ -72,9 +76,8 @@ push @{ $iface_by_machine{$_->{machine_id}} }, $_
     for grep { defined $_->{machine_id} } @$ifaces;
 my %addr_by_mac;
 push @{ $addr_by_mac{$_->{mac}} }, $_->{addr} for @$addresses;
+my %machine_by_id = map { $_->{id} => $_ } @$machines;
 
-# id_by_ip lets us find the matching machine when the user passes IPs
-# directly (positional args).
 my %id_by_ip;
 for my $a (@$addresses) {
     next unless $a->{mac} && $a->{addr};
@@ -87,15 +90,13 @@ my @candidates;
 if (@ARGV) {
     for my $ip (@ARGV) {
         my $id = $id_by_ip{$ip};
-        my $name = $id ? (grep { $_->{id} == $id } @$machines)[0]->{primary_name}
-                       : '';
-        push @candidates, { id => $id, name => $name // '', ip => $ip };
+        my $name = $id ? $machine_by_id{$id}{primary_name} // '' : '';
+        push @candidates, { id => $id, name => $name, ip => $ip };
     }
 } else {
     my $re = qr/$filter/i;
     for my $m (@$machines) {
         next unless $m->{primary_name} && $m->{primary_name} =~ $re;
-        next if !$force && exists $friendly_by_id{$m->{id}};
         my $ifs = $iface_by_machine{$m->{id}} or next;
         my $ip;
         for my $i (@$ifs) {
@@ -133,61 +134,144 @@ unless ($dry_run) {
     $db->connect;
 }
 
-my $hits = 0; my $skipped = 0; my $silent = 0;
-for my $c (@candidates) {
-    my $alias = probe($c->{ip});
-    if (!defined $alias || !length $alias) {
-        printf "  %-12s %-15s no alias\n", $c->{name}, $c->{ip};
+my $devices = 0; my $outlets_total = 0; my $silent = 0;
+for my $c (sort { $a->{name} cmp $b->{name} } @candidates) {
+    my $r = probe($c->{ip});
+    if (!$r) {
+        printf "  %-12s %-15s no response\n", $c->{name}, $c->{ip};
         $silent++;
         next;
     }
-    if (!$c->{id}) {
-        printf "  %-12s %-15s %s (no machine in DB — skipped)\n",
-               $c->{name}, $c->{ip}, $alias;
-        $skipped++;
-        next;
+    $devices++;
+    my $model = $r->{model} // '';
+    if ($r->{type} eq 'plug') {
+        printf "  %-12s %-15s %-30s [%s]  (%s)\n",
+            $c->{name}, $c->{ip}, $r->{alias},
+            (defined $r->{state} ? $r->{state} : '?'),
+            $model;
+        $outlets_total++;
+        next unless $c->{id};
+        if (!$dry_run) {
+            $db->upsert_wifi_socket(
+                machine_id      => $c->{id}, outlet => 0,
+                name            => $r->{alias},
+                state           => $r->{state},
+                controller_type => $model,
+            );
+            # Single-outlet alias is a good display name unless the
+            # user already pinned one.
+            if (length $r->{alias}
+                && $r->{alias} !~ /^(Strip_\d+|TP-LINK_(?:Power|Smart Plug))/
+                && ($force || !exists $friendly_by_id{$c->{id}}))
+            {
+                $db->upsert_friendly_name(
+                    machine_id => $c->{id},
+                    name       => $r->{alias},
+                    notes      => "from net-tp-scan ($c->{ip})",
+                );
+            }
+        }
+    } else {
+        printf "  %-12s %-15s %-30s          (%s, %d outlets)\n",
+            $c->{name}, $c->{ip}, $r->{alias}, $model,
+            scalar @{ $r->{outlets} };
+        for my $o (@{ $r->{outlets} }) {
+            printf "  %-12s %-15s   %2d: %-26s [%s]\n",
+                '', '', $o->{outlet}, $o->{name},
+                (defined $o->{state} ? $o->{state} : '?');
+            $outlets_total++;
+            next unless $c->{id};
+            if (!$dry_run) {
+                $db->upsert_wifi_socket(
+                    machine_id      => $c->{id},
+                    outlet          => $o->{outlet},
+                    name            => $o->{name},
+                    state           => $o->{state},
+                    controller_type => $model,
+                );
+            }
+        }
+        # Don't pin the strip's own alias as friendly_name when it's
+        # the placeholder. The primary_name (pwrstrip0) is more useful.
     }
-    my $existing = $friendly_by_id{$c->{id}};
-    if (defined $existing && !$force) {
-        printf "  %-12s %-15s %s (have '%s' — pass --force to overwrite)\n",
-               $c->{name}, $c->{ip}, $alias, $existing;
-        $skipped++;
-        next;
-    }
-    printf "  %-12s %-15s %s%s\n", $c->{name}, $c->{ip}, $alias,
-        ($dry_run ? '  [dry-run]' : '');
-    next if $dry_run;
-    $db->upsert_friendly_name(
-        machine_id => $c->{id},
-        name       => $alias,
-        notes      => "set by net-tp-scan from $c->{ip}",
-    );
-    $hits++;
 }
-printf "\n%d set, %d skipped, %d no-response\n", $hits, $skipped, $silent;
+printf "\n%d device(s), %d outlet(s) recorded, %d no-response\n",
+       $devices, $outlets_total, $silent;
 
 # ---- helpers -------------------------------------------------------
 
+# Returns either:
+#   { type => 'plug',  model, alias, state }
+#   { type => 'strip', model, alias, outlets => [{outlet, name, state}, ...] }
+# or undef on failure.
 sub probe {
     my ($ip) = @_;
-    # hsx without -tapo execs hs100, which speaks the legacy "abyss"
-    # protocol used by HS100/HS110. JSON response with `alias`.
+
+    # Try the JSON path first (hsx without -tapo execs hs100, which
+    # speaks the abyss protocol used by HS100/HS110/HS300).
     my $out = `timeout 5 hsx \Q$ip\E info 2>/dev/null` // '';
-    if ($out =~ /"alias"\s*:\s*"([^"]+)"/) {
-        my $a = $1;
-        return undef if $a =~ /^(Strip_\d+|TP-LINK_(?:Power|Smart Plug))/;
-        return $a;
+    if (length $out) {
+        my $j = eval { decode_json($out) };
+        my $info = $j && $j->{system} && $j->{system}{get_sysinfo};
+        if ($info) {
+            my $alias = $info->{alias} // '';
+            my $model = $info->{model} // '';
+            $model =~ s/\(US\)$//;   # 'HS110(US)' → 'HS110'
+            if ($info->{children} && ref $info->{children} eq 'ARRAY') {
+                my @outlets;
+                my $i = 1;
+                for my $c (@{ $info->{children} }) {
+                    push @outlets, {
+                        outlet => $i++,
+                        name   => $c->{alias} // "outlet$i",
+                        state  => (defined $c->{state} ? $c->{state} + 0 : undef),
+                    };
+                }
+                return {
+                    type    => 'strip', model => $model,
+                    alias   => $alias,  outlets => \@outlets,
+                };
+            }
+            return {
+                type  => 'plug',
+                model => $model,
+                alias => $alias,
+                state => (defined $info->{relay_state}
+                         ? $info->{relay_state} + 0 : undef),
+            };
+        }
     }
 
-    # hsx -tapo speaks the newer auth-based protocol. Output format:
-    #   == <alias> - <model> ==
-    # or with cloud auth: "== <alias> (<id>) =="
+    # Fall back to tapo (kasa-python via hsx -tapo). Output is text
+    # rather than JSON; keep it best-effort.
     $out = `timeout 8 hsx -tapo \Q$ip\E discover 2>/dev/null` // '';
-    if ($out =~ /==\s+(.+?)\s+-\s+(?:HS|KP)\d+\s+==/m) {
-        return $1;
+    return undef unless length $out;
+    my @blocks = split /(?=^==\s)/m, $out;
+    return undef unless @blocks;
+    # First block = device; subsequent ones = outlets if multi.
+    my $first = shift @blocks;
+    return undef unless $first =~ /==\s+(.+?)\s+(?:-\s+(\S+)\s+)?==/;
+    my ($d_alias, $d_model) = ($1, $2 // '');
+    if (!@blocks) {
+        # Single device, parse Device state
+        my $state;
+        $state = 1 if $first =~ /Device state:\s+True/i;
+        $state = 0 if $first =~ /Device state:\s+False/i;
+        return { type => 'plug', model => $d_model,
+                 alias => $d_alias, state => $state };
     }
-    if ($out =~ /==\s+(.+?)\s+\(.*?\)\s+==/m) {
-        return $1;
+    my @outlets;
+    my $i = 1;
+    for my $b (@blocks) {
+        my ($alias) = $b =~ /==\s+(.+?)\s+(?:\(.*?\)\s+)?==/;
+        next unless $alias;
+        my $state;
+        $state = 1 if $b =~ /State \(state\)[^:]*:\s+True/i
+                   || $b =~ /Device state:\s+True/i;
+        $state = 0 if $b =~ /State \(state\)[^:]*:\s+False/i
+                   || $b =~ /Device state:\s+False/i;
+        push @outlets, { outlet => $i++, name => $alias, state => $state };
     }
-    return undef;
+    return { type => 'strip', model => $d_model,
+             alias => $d_alias, outlets => \@outlets };
 }
