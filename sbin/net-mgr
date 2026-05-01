@@ -11,6 +11,7 @@ use Getopt::Long qw(:config no_ignore_case bundling);
 use NetMgr::Config;
 use NetMgr::DB;
 use NetMgr::Manager;
+use Sys::Hostname ();
 
 my $conf_path  = $ENV{NET_MGR_CONF} // '/etc/net-mgr/config';
 my $foreground = 0;
@@ -34,6 +35,8 @@ $db->connect;
 my $v = $db->bootstrap_schema;
 warn "[net-mgr] schema v$v\n";
 
+register_self($db, \*STDERR);
+
 my $log_fh = \*STDERR;
 if (!$foreground && $cfg->{manager}{log}) {
     open $log_fh, '>>', $cfg->{manager}{log}
@@ -55,3 +58,57 @@ unless ($foreground) {
 }
 
 $mgr->run;
+
+# Insert/refresh a row for the host running the daemon so clients can
+# find this machine in the inventory.  Without this, the manager's host
+# is invisible to consumers of machines/interfaces/addresses.
+sub register_self {
+    my ($db, $log) = @_;
+    my $host = Sys::Hostname::hostname();
+    $host =~ s/\..*$//;
+
+    # Find primary interface + IPv4 by route to the internet.
+    my ($iface, $ipv4);
+    if (open my $rh, '-|', 'ip', 'route', 'get', '1.1.1.1') {
+        while (<$rh>) {
+            if (/\bdev\s+(\S+)\b.*\bsrc\s+(\S+)/) { $iface = $1; $ipv4 = $2 }
+        }
+        close $rh;
+    }
+
+    # MAC of that interface.
+    my $mac;
+    if ($iface && open my $lh, '-|', 'ip', '-o', 'link', 'show', $iface) {
+        while (<$lh>) {
+            if (m{link/ether\s+(\S+)}) { $mac = lc $1; last }
+        }
+        close $lh;
+    }
+
+    # Machine row by primary_name.
+    my ($mid) = $db->dbh->selectrow_array(
+        "SELECT id FROM machines WHERE primary_name = ?", undef, $host);
+    if ($mid) {
+        $db->upsert_machine(id => $mid, primary_name => $host, online => 1);
+    } else {
+        my $r = $db->upsert_machine(primary_name => $host, online => 1);
+        $mid = $r->{now}{id};
+    }
+    $db->upsert_hostname(machine_id => $mid, name => $host, source => 'self');
+
+    if ($mac) {
+        $db->upsert_interface(
+            mac => $mac, machine_id => $mid,
+            kind => 'ethernet', online => 1, live => 1,
+        );
+        if ($ipv4) {
+            $db->upsert_address(
+                mac => $mac, family => 'v4', addr => $ipv4,
+                source => "$host:self", live => 1,
+            );
+        }
+    }
+
+    print {$log} sprintf("[net-mgr] registered self: host=%s mac=%s ip=%s iface=%s\n",
+        $host, $mac // '?', $ipv4 // '?', $iface // '?');
+}
