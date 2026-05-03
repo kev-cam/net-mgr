@@ -172,7 +172,7 @@ for my $c (sort { $a->{name} cmp $b->{name} } @candidates) {
             }
         }
     } else {
-        printf "  %-12s %-15s %-30s          (%s, %d outlets)\n",
+        printf "  %-12s %-15s %-30s      (%s, %d outlets)\n",
             $c->{name}, $c->{ip}, $r->{alias}, $model,
             scalar @{ $r->{outlets} };
         for my $o (@{ $r->{outlets} }) {
