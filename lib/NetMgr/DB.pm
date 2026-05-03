@@ -316,6 +316,34 @@ sub upsert_address {
     my $live = delete $f{live};
     my $last_observed_explicit = delete $f{last_observed};
 
+    # Cross-MAC IP conflict resolution.  A given IP normally belongs to
+    # exactly one MAC at a time; stale ARP scans + paper records like
+    # dhcp.master can leave behind rows for the same (family, addr) but
+    # a different mac.  Compare source priorities:
+    #   * If a strictly higher-priority claim already names a different
+    #     mac at this addr, skip the incoming observation entirely (the
+    #     authoritative source wins).
+    #   * If our priority is at least equal, the existing rows are
+    #     superseded — delete them after our upsert lands.
+    my @to_supersede;
+    if (defined $f{source}) {
+        my $new_prio = _source_priority($f{source});
+        my $existing = $self->{dbh}->selectall_arrayref(
+            "SELECT mac, source FROM addresses
+              WHERE family = ? AND addr = ? AND mac != ?",
+            { Slice => {} }, $f{family}, $f{addr}, $f{mac}
+        );
+        for my $e (@$existing) {
+            my $old_prio = _source_priority($e->{source});
+            if ($new_prio < $old_prio) {
+                # An authoritative claim from another mac wins — drop this.
+                return { op => 'skipped_lower_priority',
+                         changed_fields => [], was => undef, now => undef };
+            }
+            push @to_supersede, $e->{mac};   # equal-or-higher → we win
+        }
+    }
+
     my $was = $self->{dbh}->selectrow_hashref(
         "SELECT * FROM addresses WHERE mac = ? AND family = ? AND addr = ?",
         undef, $f{mac}, $f{family}, $f{addr}
@@ -346,8 +374,11 @@ sub upsert_address {
             "SELECT * FROM addresses WHERE mac = ? AND family = ? AND addr = ?",
             undef, $f{mac}, $f{family}, $f{addr}
         );
+        $self->_supersede_addresses($f{family}, $f{addr}, \@to_supersede)
+            if @to_supersede;
         return { op => @changed ? 'update' : 'noop',
-                 changed_fields => \@changed, was => $was, now => $now };
+                 changed_fields => \@changed, was => $was, now => $now,
+                 superseded => [@to_supersede] };
     }
     my $insert_last_observed;
     if    (defined $last_observed_explicit) { $insert_last_observed = $last_observed_explicit }
@@ -361,8 +392,20 @@ sub upsert_address {
         "SELECT * FROM addresses WHERE mac = ? AND family = ? AND addr = ?",
         undef, $f{mac}, $f{family}, $f{addr}
     );
+    $self->_supersede_addresses($f{family}, $f{addr}, \@to_supersede)
+        if @to_supersede;
     return { op => 'insert', changed_fields => [qw(mac family addr source)],
-             was => undef, now => $now };
+             was => undef, now => $now, superseded => [@to_supersede] };
+}
+
+sub _supersede_addresses {
+    my ($self, $family, $addr, $macs) = @_;
+    return unless $macs && @$macs;
+    my $placeholders = join(',', ('?') x @$macs);
+    $self->{dbh}->do(
+        "DELETE FROM addresses
+          WHERE family = ? AND addr = ? AND mac IN ($placeholders)",
+        undef, $family, $addr, @$macs);
 }
 
 # Update the ping RTT fields on an existing addresses row. Does NOT

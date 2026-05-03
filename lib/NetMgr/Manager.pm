@@ -764,6 +764,18 @@ sub _events_from_iface_change {
     return @ev;
 }
 
+sub _events_for_addr_op {
+    my ($a, $mac, $ip) = @_;
+    return () unless ref $a;
+    my @ev;
+    push @ev, { type => 'address_added', mac => $mac, addr => $ip }
+        if ($a->{op} // '') eq 'insert';
+    push @ev, { type => 'address_removed', mac => $_, addr => $ip,
+                reason => 'superseded' }
+        for @{ $a->{superseded} // [] };
+    return @ev;
+}
+
 sub _obs_ap_self {
     my ($self, $cli, $kv) = @_;
     my $mac = $kv->{mac} or die "ap_self: mac required (br0 not parsed?)\n";
@@ -776,9 +788,7 @@ sub _obs_ap_self {
         my $a = $self->_upsert('addresses', 'upsert_address',
             mac => $mac, family => 'v4', addr => $kv->{ip}, live => 1,
             defined $kv->{source} ? (source => $kv->{source}) : ());
-        if ($a->{op} eq 'insert') {
-            push @ev, { type => 'address_added', mac => $mac, addr => $kv->{ip} };
-        }
+        push @ev, _events_for_addr_op($a, $mac, $kv->{ip});
     }
     $self->_upsert('aps', 'upsert_ap',
         mac => $mac, ssid => $kv->{ssid},
@@ -834,9 +844,7 @@ sub _obs_arp {
     my $a = $self->_upsert('addresses', 'upsert_address',
         mac => $mac, family => 'v4', addr => $ip, live => 1,
         defined $kv->{source} ? (source => $kv->{source}) : ());
-    if ($a->{op} eq 'insert') {
-        push @ev, { type => 'address_added', mac => $mac, addr => $ip };
-    }
+    push @ev, _events_for_addr_op($a, $mac, $ip);
     return @ev;
 }
 
@@ -851,9 +859,7 @@ sub _obs_lease {
     my $a = $self->_upsert('addresses', 'upsert_address',
         mac => $mac, family => 'v4', addr => $ip, live => 1,
         defined $kv->{source} ? (source => $kv->{source}) : ());
-    if ($a->{op} eq 'insert') {
-        push @ev, { type => 'address_added', mac => $mac, addr => $ip };
-    }
+    push @ev, _events_for_addr_op($a, $mac, $ip);
     $self->_upsert('dhcp_leases', 'upsert_lease',
         mac      => $mac,
         ip       => $ip,
@@ -891,9 +897,7 @@ sub _obs_host {
                 mac => $mac, family => $kv->{family} // 'v4', addr => $ip,
                 ($is_live ? (live => 1) : ()),
                 defined $kv->{source} ? (source => $kv->{source}) : ());
-            if ($a->{op} eq 'insert') {
-                push @ev, { type => 'address_added', mac => $mac, addr => $ip };
-            }
+            push @ev, _events_for_addr_op($a, $mac, $ip);
         }
         # Producer supplied a hostname (e.g. dhcp.master importer) →
         # promote to a machine identity. name_source classifies the
@@ -1100,8 +1104,7 @@ sub _process_dnsmasq_event {
         my $a = $self->_upsert('addresses', 'upsert_address',
             mac => $mac, family => ($ip =~ /:/ ? 'v6' : 'v4'),
             addr => $ip, live => 1, source => "$key:dnsmasq");
-        push @ev, { type => 'address_added', mac => $mac, addr => $ip }
-            if $a->{op} eq 'insert';
+        push @ev, _events_for_addr_op($a, $mac, $ip);
         $self->_upsert('dhcp_leases', 'upsert_lease',
             mac      => $mac,
             ip       => $ip,

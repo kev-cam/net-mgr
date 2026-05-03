@@ -111,6 +111,45 @@ cleanup();
     is($r->{op}, 'noop', 'addr noop on dup');
 }
 
+# --- cross-MAC IP conflict resolution ---------------------------------
+# An IP usually belongs to one MAC at a time; if a stale arp recorded
+# a different MAC, an authoritative source must supersede it.
+{
+    # Need real interfaces for the conflict macs (FK).
+    $db->upsert_interface(mac => "${TEST_MAC_PREFIX}cf:01", kind => 'ethernet');
+    $db->upsert_interface(mac => "${TEST_MAC_PREFIX}cf:02", kind => 'ethernet');
+
+    # Stale arp claim — low priority.
+    my $r1 = $db->upsert_address(mac => "${TEST_MAC_PREFIX}cf:01",
+                                 family => 'v4', addr => '203.0.113.50',
+                                 source => 'somehost:arp');
+    is($r1->{op}, 'insert', 'arp insert');
+
+    # Higher-priority dhcp.master claim from a different mac at same ip.
+    my $r2 = $db->upsert_address(mac => "${TEST_MAC_PREFIX}cf:02",
+                                 family => 'v4', addr => '203.0.113.50',
+                                 source => 'kc-qernel:dhcp.master');
+    is($r2->{op}, 'insert', 'dhcp.master insert at conflicting ip');
+    is_deeply($r2->{superseded}, ["${TEST_MAC_PREFIX}cf:01"],
+              'lower-priority arp row marked as superseded');
+
+    # The arp row should be gone.
+    my $rows = $db->{dbh}->selectall_arrayref(
+        "SELECT mac FROM addresses WHERE family = 'v4' AND addr = '203.0.113.50' ORDER BY mac",
+        { Slice => {} });
+    is_deeply([map { lc $_->{mac} } @$rows],
+              [lc "${TEST_MAC_PREFIX}cf:02"],
+              'only authoritative mac remains at the addr');
+
+    # A subsequent stale arp scan re-claiming the addr for the old mac
+    # must be skipped — the higher-priority claim still holds.
+    my $r3 = $db->upsert_address(mac => "${TEST_MAC_PREFIX}cf:01",
+                                 family => 'v4', addr => '203.0.113.50',
+                                 source => 'somehost:arp');
+    is($r3->{op}, 'skipped_lower_priority',
+       'arp skipped when authoritative claim exists');
+}
+
 # --- ports -------------------------------------------------------------
 {
     my $r = $db->upsert_port(mac => "${TEST_MAC_PREFIX}00:01",
