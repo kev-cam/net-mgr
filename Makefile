@@ -43,42 +43,52 @@ INSTALL ?= install
 # --- dependency check (Debian/Ubuntu apt names) ----------------------
 # Required deps must be present; optional deps print a hint but don't
 # fail the install (e.g. Net::DNS only matters for sbin/net-dns).
+#
+# A client-only install (e.g. on Cygwin, where you only want the
+# NetMgr::Client lib for find-xpra) doesn't need the server-side deps
+# (MariaDB, DBI, DBD::mysql, fping, ip, ...).  Set FORCE=1 to skip the
+# prompt; on a tty `make install` will offer to continue anyway.
+FORCE ?=
+
+define DEPS_CHECK_SH
+miss=""; opt_miss=""; \
+check() { \
+  if /bin/sh -c "$$1" >/dev/null 2>&1; then \
+    printf "  ok       %-20s %s\n" "$$2" "$$3"; \
+  else \
+    printf "  MISSING  %-20s %s\n" "$$2" "$$3"; \
+    miss="$$miss $$2"; \
+  fi; \
+}; \
+check_opt() { \
+  if /bin/sh -c "$$1" >/dev/null 2>&1; then \
+    printf "  ok       %-20s %s (optional)\n" "$$2" "$$3"; \
+  else \
+    printf "  optional %-20s %s\n" "$$2" "$$3"; \
+    opt_miss="$$opt_miss $$2"; \
+  fi; \
+}; \
+check 'command -v nmap'           nmap              'nmap (discovery sweep)'; \
+check 'command -v fping'          fping             'fping (presence check)'; \
+check 'command -v ssh'            openssh-client    'ssh client (AP polling)'; \
+check 'command -v ip'             iproute2          'ip command (auto-detect networks)'; \
+check 'command -v mysql'          mariadb-client    'mysql client (setup script)'; \
+check '/usr/bin/perl -MDBI -e 1'        libdbi-perl       'Perl DBI'; \
+check '/usr/bin/perl -MDBD::mysql -e 1' libdbd-mysql-perl 'Perl DBD::mysql'; \
+check '{ dpkg -l mariadb-server 2>/dev/null | grep -q "^ii "; } \
+    || { dpkg -l mysql-server 2>/dev/null | grep -q "^ii "; } \
+    || { dpkg -l mysql-server-8.0 2>/dev/null | grep -q "^ii "; } \
+    || { dpkg -l mysql-server-8.4 2>/dev/null | grep -q "^ii "; }' \
+                                  mariadb-server    'MariaDB or MySQL server (either is fine)'; \
+check_opt '/usr/bin/perl -MNet::DNS -e 1' libnet-dns-perl 'Net::DNS — only needed if you run sbin/net-dns'; \
+miss=$$(echo $$miss | tr ' ' '\n' | sort -u | tr '\n' ' '); \
+miss=$${miss% }; miss=$${miss# }; \
+opt_miss=$$(echo $$opt_miss | tr ' ' '\n' | sort -u | tr '\n' ' '); \
+opt_miss=$${opt_miss% }; opt_miss=$${opt_miss# }
+endef
 
 deps:
-	@miss=""; opt_miss=""; \
-	check() { \
-	  if /bin/sh -c "$$1" >/dev/null 2>&1; then \
-	    printf "  ok       %-20s %s\n" "$$2" "$$3"; \
-	  else \
-	    printf "  MISSING  %-20s %s\n" "$$2" "$$3"; \
-	    miss="$$miss $$2"; \
-	  fi; \
-	}; \
-	check_opt() { \
-	  if /bin/sh -c "$$1" >/dev/null 2>&1; then \
-	    printf "  ok       %-20s %s (optional)\n" "$$2" "$$3"; \
-	  else \
-	    printf "  optional %-20s %s\n" "$$2" "$$3"; \
-	    opt_miss="$$opt_miss $$2"; \
-	  fi; \
-	}; \
-	check 'command -v nmap'           nmap              'nmap (discovery sweep)'; \
-	check 'command -v fping'          fping             'fping (presence check)'; \
-	check 'command -v ssh'            openssh-client    'ssh client (AP polling)'; \
-	check 'command -v ip'             iproute2          'ip command (auto-detect networks)'; \
-	check 'command -v mysql'          mariadb-client    'mysql client (setup script)'; \
-	check '/usr/bin/perl -MDBI -e 1'        libdbi-perl       'Perl DBI'; \
-	check '/usr/bin/perl -MDBD::mysql -e 1' libdbd-mysql-perl 'Perl DBD::mysql'; \
-	check '{ dpkg -l mariadb-server 2>/dev/null | grep -q "^ii "; } \
-	    || { dpkg -l mysql-server 2>/dev/null | grep -q "^ii "; } \
-	    || { dpkg -l mysql-server-8.0 2>/dev/null | grep -q "^ii "; } \
-	    || { dpkg -l mysql-server-8.4 2>/dev/null | grep -q "^ii "; }' \
-	                                  mariadb-server    'MariaDB or MySQL server (either is fine)'; \
-	check_opt '/usr/bin/perl -MNet::DNS -e 1' libnet-dns-perl 'Net::DNS — only needed if you run sbin/net-dns'; \
-	miss=$$(echo $$miss | tr ' ' '\n' | sort -u | tr '\n' ' '); \
-	miss=$${miss% }; miss=$${miss# }; \
-	opt_miss=$$(echo $$opt_miss | tr ' ' '\n' | sort -u | tr '\n' ' '); \
-	opt_miss=$${opt_miss% }; opt_miss=$${opt_miss# }; \
+	@$(DEPS_CHECK_SH); \
 	if [ -n "$$miss" ]; then \
 	  echo; \
 	  echo "install missing required packages with:"; \
@@ -129,7 +139,22 @@ list:
 	@$(MAKE) -s deps || true
 
 # --- install ----------------------------------------------------------
-install: deps
+install:
+	@$(DEPS_CHECK_SH); \
+	if [ -n "$$miss" ]; then \
+	  echo; echo "Missing required: $$miss"; \
+	  echo "Install on Debian/Ubuntu:  sudo apt install -y $$miss"; \
+	  if [ "$(FORCE)" = "1" ]; then \
+	    echo "(FORCE=1: continuing despite missing dependencies)"; \
+	  elif [ -t 0 ]; then \
+	    printf "Continue install anyway? [y/N] "; \
+	    read ans; \
+	    case "$$ans" in [yY]*) ;; *) echo "Aborted."; exit 1 ;; esac; \
+	  else \
+	    echo "(non-interactive: aborting; rerun with FORCE=1 to override)" >&2; \
+	    exit 1; \
+	  fi; \
+	fi
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(SBINDIR)
 	$(INSTALL) -d $(DESTDIR)$(PERL5DIR)/NetMgr/Producer
