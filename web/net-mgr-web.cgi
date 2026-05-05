@@ -585,9 +585,10 @@ sub render_lost {
 
     my @body;
     push @body, qq{<p class=meta>$count entries · $now</p>};
-    push @body, qq{<p class=meta>Populated by <code>net-find-lost --recover --quiet</code> }
-              . qq{(typically run from cron). Each row is a device that turned up on a }
-              . qq{vendor-default subnet and what we did about it.</p>};
+    push @body, qq{<p class=meta>Populated by <code>net-find-lost</code> }
+              . qq{(add <code>--recover --quiet</code> for a cron-friendly run that }
+              . qq{also invokes matching recovery scripts). Each row is a device }
+              . qq{that turned up on a vendor-default subnet and what we did about it.</p>};
 
     if (!@sorted) {
         push @body, '<p class=note>nothing recorded.</p>';
