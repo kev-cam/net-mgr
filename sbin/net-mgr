@@ -42,8 +42,6 @@ $db->connect;
 my $v = $db->bootstrap_schema;
 warn "[net-mgr] schema v$v\n";
 
-register_self($db, \*STDERR);
-
 my $log_fh = \*STDERR;
 if (!$foreground && $cfg->{manager}{log}) {
     open $log_fh, '>>', $cfg->{manager}{log}
@@ -53,6 +51,11 @@ if (!$foreground && $cfg->{manager}{log}) {
 
 my $mgr = NetMgr::Manager->new(config => $cfg, db => $db, log_fh => $log_fh);
 $mgr->start_listener;
+
+# Run after start_listener so register_self can prefer a bound LAN
+# listener address over the route-to-internet lookup (which on a
+# firewall picks the WAN interface).
+register_self($db, \*STDERR, $mgr);
 
 unless ($foreground) {
     # simple daemonize
@@ -70,13 +73,27 @@ $mgr->run;
 # find this machine in the inventory.  Without this, the manager's host
 # is invisible to consumers of machines/interfaces/addresses.
 sub register_self {
-    my ($db, $log) = @_;
+    my ($db, $log, $mgr) = @_;
     my $host = Sys::Hostname::hostname();
     $host =~ s/\..*$//;
 
-    # Find primary interface + IPv4 by route to the internet.
+    # Pick the address to register as our own. Preference order:
+    #   1. A non-loopback listener IP the daemon is actually serving on
+    #      (the user's declarative answer to "which interface am I").
+    #      Skips loopback so we don't store 127.0.0.1.
+    #   2. The src of the route to 1.1.1.1 (legacy behaviour) — used
+    #      only if the daemon isn't listening on any LAN address, e.g.
+    #      a loopback-only test config.
     my ($iface, $ipv4);
-    if (open my $rh, '-|', 'ip', 'route', 'get', '1.1.1.1') {
+    if ($mgr) {
+        for my $l (values %{ $mgr->{listeners} || {} }) {
+            next if !$l->{host} || $l->{host} =~ /^127\./;
+            $ipv4 = $l->{host};
+            last;
+        }
+        $iface = _iface_for_ip($ipv4) if $ipv4;
+    }
+    if (!$ipv4 && open my $rh, '-|', 'ip', 'route', 'get', '1.1.1.1') {
         while (<$rh>) {
             if (/\bdev\s+(\S+)\b.*\bsrc\s+(\S+)/) { $iface = $1; $ipv4 = $2 }
         }
@@ -118,4 +135,26 @@ sub register_self {
 
     print {$log} sprintf("[net-mgr] registered self: host=%s mac=%s ip=%s iface=%s\n",
         $host, $mac // '?', $ipv4 // '?', $iface // '?');
+}
+
+# Find the interface name that owns a given IPv4 address. Returns
+# undef if the address isn't on any local interface.
+sub _iface_for_ip {
+    my ($ip) = @_;
+    return undef unless $ip;
+    open my $fh, '-|', 'ip', '-br', '-4', 'addr', 'show'
+        or return undef;
+    my $found;
+    while (my $line = <$fh>) {
+        chomp $line;
+        my ($iface, $state, @addrs) = split ' ', $line;
+        next if !$iface || $iface eq 'lo';
+        for my $a (@addrs) {
+            (my $bare = $a) =~ s|/.*||;
+            if ($bare eq $ip) { $found = $iface; last }
+        }
+        last if $found;
+    }
+    close $fh;
+    return $found;
 }
