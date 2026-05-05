@@ -239,10 +239,31 @@ install:
 	@echo
 	@echo "Files installed."
 	@if [ -z "$(DESTDIR)" ] && [ "$$(id -u)" = "0" ]; then \
+	  need_setup=0; \
 	  if [ ! -f /root/.my.cnf ] || ! grep -q '^\[net-mgr\]' /root/.my.cnf 2>/dev/null; then \
-	    echo; \
-	    echo "Running first-time DB setup..."; \
-	    $(DESTDIR)$(SBINDIR)/net-mgr-setup; \
+	    need_setup=1; \
+	  fi; \
+	  if [ $$need_setup = 1 ]; then \
+	    if [ -t 0 ] && [ -t 1 ]; then \
+	      echo; echo "Running first-time DB setup..."; \
+	      if ! $(DESTDIR)$(SBINDIR)/net-mgr-setup; then \
+	        echo; \
+	        echo "*** net-mgr-setup did NOT complete. /root/.my.cnf was not written."; \
+	        echo "*** The daemon will fail to start until you re-run it:"; \
+	        echo "***   sudo $(SBINDIR)/net-mgr-setup"; \
+	      elif [ ! -f /root/.my.cnf ] || ! grep -q '^\[net-mgr\]' /root/.my.cnf 2>/dev/null; then \
+	        echo; \
+	        echo "*** net-mgr-setup exited 0 but /root/.my.cnf still has no [net-mgr] section."; \
+	        echo "*** Re-run it before starting the daemon:"; \
+	        echo "***   sudo $(SBINDIR)/net-mgr-setup"; \
+	      fi; \
+	    else \
+	      echo; \
+	      echo "*** No TTY for interactive setup. /root/.my.cnf is missing or"; \
+	      echo "*** has no [net-mgr] section, so the daemon will fail to start."; \
+	      echo "*** Run setup manually before starting the service:"; \
+	      echo "***   sudo $(SBINDIR)/net-mgr-setup"; \
+	    fi; \
 	  else \
 	    echo "(/root/.my.cnf already has [net-mgr] section — skipping setup)"; \
 	  fi; \

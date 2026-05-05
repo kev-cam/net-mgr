@@ -25,6 +25,13 @@ my $cfg = NetMgr::Config->load($conf_path);
 die "must run as root (need to read $cfg->{mysql}{defaults})\n"
     if $> != 0 && $cfg->{mysql}{defaults} =~ m{^/root/};
 
+if (!-r $cfg->{mysql}{defaults}) {
+    die "MySQL defaults file '$cfg->{mysql}{defaults}' is missing or unreadable.\n"
+      . "First-time setup hasn't been run (or didn't finish). Run:\n"
+      . "  sudo $FindBin::Bin/net-mgr-setup\n"
+      . "to create the [net-mgr] account and write the credentials file.\n";
+}
+
 my $db = NetMgr::DB->new(
     defaults_file => $cfg->{mysql}{defaults},
     section       => $cfg->{mysql}{section},
