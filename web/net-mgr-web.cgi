@@ -645,12 +645,77 @@ sub render_peers {
     my @configured = configured_peers();
     my $discovered = eval { $cli->snapshot(13, 'peers') } || [];
 
+    # Look-up tables so we can map each peer IP back to a machine,
+    # show its friendly name, group co-machine rows by colour, and
+    # flag machines that have any non-RFC1918 (WAN-facing) address.
+    my $addr_rows = eval { $cli->snapshot(14, 'addresses', where => "family = 'v4'") } || [];
+    my $iface_rs  = eval { $cli->snapshot(15, 'interfaces') } || [];
+    my $machine_r = eval { $cli->snapshot(16, 'machines') } || [];
+    my $friendly  = eval { $cli->snapshot(17, 'friendly_names') } || [];
+
+    my %mac_mid = map { $_->{mac} => $_->{machine_id} }
+                  grep { $_->{machine_id} } @$iface_rs;
+    my %ip_mid;
+    for my $a (@$addr_rows) {
+        my $mid = $mac_mid{ $a->{mac} } or next;
+        $ip_mid{ $a->{addr} } //= $mid;
+    }
+    my %mid_label;
+    $mid_label{ $_->{id} } = $_->{primary_name}
+        for grep { $_->{primary_name} } @$machine_r;
+    $mid_label{ $_->{machine_id} } = $_->{name} for @$friendly;
+
+    my %mid_has_wan;
+    for my $a (@$addr_rows) {
+        my $mid = $mac_mid{ $a->{mac} } or next;
+        $mid_has_wan{$mid} = 1 if _is_wan_ip($a->{addr});
+    }
+    # A machine is also "WAN-routing" if (a) its IP is a default
+    # gateway from this host's perspective, or (b) its name starts
+    # with gateway/firewall/router/gw/fw — best-effort, since we
+    # don't actually scan the WAN side of the firewall.
+    my %wan_router_ip;
+    for my $line (`ip -br -4 route show default 2>/dev/null`) {
+        $wan_router_ip{$1} = 1 if $line =~ /^default\s+via\s+(\S+)/;
+    }
+    for my $mid (keys %mid_label) {
+        # Match gateway / gateway3 / fw_router / gw1-up / firewall, etc.
+        # The trailing class is a digit, dash, underscore, or end-of-string —
+        # \b doesn't work because gateway3's 'y3' has no word boundary.
+        $mid_has_wan{$mid} = 1
+            if $mid_label{$mid} =~ /^(?:gateway|firewall|router|gw|fw)(?:[\d_-]|$)/i;
+    }
+
+    # Group by family stem (so nas3-up + nas3-down + nas3-dwn2 share a
+    # slot) instead of raw machine_id. Each distinct stem gets one of
+    # the palette slots, cycled and stable across reloads.
+    my %mid_stem;
+    for my $mid (keys %mid_label) {
+        $mid_stem{$mid} = family_stem($mid_label{$mid});
+    }
+    my %slot;
+    my @palette = qw(c1 c2 c3 c4 c5 c6);
+    my $i = 0;
+    my %stem_slot;
+    for my $stem (sort { $a cmp $b } keys %{ { map { $_ => 1 } values %mid_stem } }) {
+        next if $stem eq '';
+        $stem_slot{$stem} = $palette[$i++ % @palette];
+    }
+    for my $mid (keys %mid_stem) {
+        my $stem = $mid_stem{$mid};
+        $slot{$mid} = $stem_slot{$stem} if defined $stem_slot{$stem};
+    }
+
     my $body = '';
     $body .= qq{<p class=meta>Peers are other net-mgr instances we replicate from }
            . qq{(see <code>net-mgr-relay</code>). Discovered automatically by }
            . qq{<code>net-find-peers</code> (probes TCP/7531 on every }
            . qq{ssh-open host); listed manually in }
            . qq{<code>[peers] sources</code> in <code>/etc/net-mgr/config</code>.</p>};
+    $body .= qq{<p class=note>Row stripe colour groups peers that resolve to }
+           . qq{the same machine (e.g. NAS3's three interfaces). A red stripe }
+           . qq{means that machine has at least one non-RFC1918 address, i.e. }
+           . qq{it has a path to the Internet.</p>};
 
     if (!@configured && !@$discovered) {
         $body .= qq{<p class=note>no peers configured or discovered yet.</p>};
@@ -660,17 +725,26 @@ sub render_peers {
     if (@configured) {
         $body .= '<h2>configured</h2>';
         $body .= '<table class=peers>';
-        $body .= '<tr><th>peer</th><th>address</th><th>status</th>'
-               . '<th>connect (ms)</th><th>machines</th><th>note</th></tr>';
+        $body .= '<tr><th>peer</th><th>machine</th><th>address</th>'
+               . '<th>status</th><th>connect (ms)</th>'
+               . '<th>machines</th><th>note</th></tr>';
         for my $p (@configured) {
-            my $r = probe_peer($p);
-            my $cls = $r->{ok} ? 'ok' : 'down';
+            my $r       = probe_peer($p);
+            my ($host)  = split /:/, $p->{addr}, 2;
+            my $mid     = $ip_mid{$host};
+            my $machine = $mid ? ($mid_label{$mid} // "machine $mid") : '';
+            my @cls     = ('peer-' . ($r->{ok} ? 'ok' : 'down'));
+            my $is_wan  = $wan_router_ip{$host} || ($mid && $mid_has_wan{$mid});
+            if ($is_wan)            { push @cls, 'wan-router' }
+            elsif ($mid && $slot{$mid}) { push @cls, "machine-$slot{$mid}" }
             $body .= sprintf
-                '<tr class="peer-%s"><td class=name>%s</td><td><code>%s</code></td>'
+                '<tr class="%s"><td class=name>%s</td><td>%s</td>'
+              . '<td><code>%s</code></td>'
               . '<td class=status>%s</td><td class=meta>%s</td>'
               . '<td class=meta>%s</td><td class=meta>%s</td></tr>',
-                $cls,
+                join(' ', @cls),
                 escapeHTML($p->{label}),
+                escapeHTML($machine),
                 escapeHTML($p->{addr}),
                 ($r->{ok} ? 'reachable' : 'unreachable'),
                 (defined $r->{rtt_ms} ? sprintf('%.1f', $r->{rtt_ms}) : '—'),
@@ -684,20 +758,34 @@ sub render_peers {
         my %skip = map { ($_->{addr} => 1) } @configured;
         $body .= '<h2>discovered</h2>';
         $body .= '<table class=peers>';
-        $body .= '<tr><th>host</th><th>port</th><th>last status</th>'
-               . '<th>schema</th><th>last RTT (ms)</th>'
+        $body .= '<tr><th>host</th><th>machine</th><th>port</th>'
+               . '<th>last status</th><th>schema</th><th>last RTT (ms)</th>'
                . '<th>peer uptime since</th><th>last seen</th></tr>';
-        for my $p (sort { $a->{host} cmp $b->{host} } @$discovered) {
+        # Sort: same family stem clusters together; within a stem, by IP.
+        my $stem_of = sub {
+            my $mid = $ip_mid{ $_[0]->{host} };
+            return $mid && defined $mid_stem{$mid} ? $mid_stem{$mid} : '~';
+        };
+        for my $p (sort {
+                $stem_of->($a) cmp $stem_of->($b)
+             || $a->{host}     cmp $b->{host}
+        } @$discovered) {
             my $addr = "$p->{host}:$p->{port}";
-            my $cls  = ($p->{last_status} // '') eq 'reachable' ? 'ok' : 'down';
-            my $tag  = $skip{$addr} ? ' <span class=src>(also configured)</span>' : '';
+            my $mid     = $ip_mid{ $p->{host} };
+            my $machine = $mid ? ($mid_label{$mid} // "machine $mid") : '';
+            my @cls = ('peer-' . (($p->{last_status} // '') eq 'reachable' ? 'ok' : 'down'));
+            my $is_wan = $wan_router_ip{ $p->{host} } || ($mid && $mid_has_wan{$mid});
+            if ($is_wan)            { push @cls, 'wan-router' }
+            elsif ($mid && $slot{$mid}) { push @cls, "machine-$slot{$mid}" }
+            my $tag = $skip{$addr} ? ' <span class=src>(also configured)</span>' : '';
             $body .= sprintf
-                '<tr class="peer-%s"><td class=name><code>%s</code>%s</td>'
-              . '<td>%s</td><td class=status>%s</td>'
+                '<tr class="%s"><td class=name><code>%s</code>%s</td>'
+              . '<td>%s</td><td>%s</td><td class=status>%s</td>'
               . '<td>%s</td><td class=meta>%s</td>'
               . '<td class=meta>%s</td><td class=meta>%s</td></tr>',
-                $cls,
+                join(' ', @cls),
                 escapeHTML($p->{host}), $tag,
+                escapeHTML($machine),
                 escapeHTML($p->{port} // ''),
                 escapeHTML($p->{last_status} // ''),
                 escapeHTML($p->{schema_version} // '?'),
@@ -709,6 +797,23 @@ sub render_peers {
     }
 
     return wrap_page("Peers — net-mgr", $body, "Peers");
+}
+
+# True if $ip looks like a publicly-routable IPv4 address — i.e. not
+# in any RFC1918 range, link-local, loopback, multicast, or the
+# usual 0.0.0.0 / reserved blocks.
+sub _is_wan_ip {
+    my ($ip) = @_;
+    return 0 unless $ip && $ip =~ /^(\d+)\.(\d+)\.(\d+)\.\d+$/;
+    my ($a, $b) = ($1, $2);
+    return 0 if $a == 10;
+    return 0 if $a == 172 && $b >= 16 && $b <= 31;
+    return 0 if $a == 192 && $b == 168;
+    return 0 if $a == 169 && $b == 254;
+    return 0 if $a == 127;
+    return 0 if $a == 0;
+    return 0 if $a >= 224;
+    return 1;
 }
 
 # Parse [peers] sources from /etc/net-mgr/config (world-readable).
@@ -1304,6 +1409,16 @@ table.lost tr.status-attempted  td { background: rgba(60, 200, 100, 0.14); }
 table.peers td.status { font-weight: bold; }
 table.peers tr.peer-ok   td { background: rgba(60, 200, 100, 0.14); }
 table.peers tr.peer-down td { background: rgba(220, 60, 60, 0.18); }
+/* Same-machine grouping: a 4px coloured stripe on the leftmost cell.
+   Six-slot palette cycled by machine_id; .wan-router overrides red
+   regardless of slot to flag any host with a public-IP interface. */
+table.peers tr.machine-c1 td.name { box-shadow: inset 4px 0 0 #4af; padding-left: 12px; }
+table.peers tr.machine-c2 td.name { box-shadow: inset 4px 0 0 #fa4; padding-left: 12px; }
+table.peers tr.machine-c3 td.name { box-shadow: inset 4px 0 0 #6c6; padding-left: 12px; }
+table.peers tr.machine-c4 td.name { box-shadow: inset 4px 0 0 #c6c; padding-left: 12px; }
+table.peers tr.machine-c5 td.name { box-shadow: inset 4px 0 0 #cc6; padding-left: 12px; }
+table.peers tr.machine-c6 td.name { box-shadow: inset 4px 0 0 #6cc; padding-left: 12px; }
+table.peers tr.wan-router td.name { box-shadow: inset 4px 0 0 #f44; padding-left: 12px; }
 </style>
 </head>
 <body>
