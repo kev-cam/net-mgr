@@ -6,7 +6,8 @@
 #   /net-mgr?m=<id>             machine detail (MAC/vendor/IPs/ports)
 #   /net-mgr?i=<mac>            unaffiliated interface detail
 #   /net-mgr?view=tools         list of dashboard tools
-#   /net-mgr?view=flake         24-hour disconnect histogram
+#   /net-mgr?view=flake         disconnect histogram (range=1h|4h|24h|1w|4w)
+#   /net-mgr?view=flakers       host ranking by disconnect count (same range=)
 #
 # Connects to the manager socket (no DB credentials needed). Apache
 # handles auth + IP restriction via the matching net-mgr.conf snippet.
@@ -37,6 +38,25 @@ if (!$cli || $@) {
 }
 $cli->hello(consumer => "net-mgr-web.$$");
 
+# Range presets for the disconnect histogram. Each entry defines the
+# total span, bucket size, x-tick stride (in buckets), per-bucket time
+# label format, and a human-readable bucket-unit string used in tooltips
+# and the summary line. Defined before the routing block below so
+# render_flake() (called from there) sees the hash populated.
+my %FLAKE_RANGES = (
+    '1h' => { label => '1 hour',   span => 3600,        bucket =>    60,
+              tick => 10, tfmt => '%H:%M', unit => 'minute' },
+    '4h' => { label => '4 hours',  span => 4*3600,      bucket =>   300,
+              tick =>  6, tfmt => '%H:%M', unit => '5 minutes' },
+    '24h'=> { label => '24 hours', span => 86400,       bucket =>  3600,
+              tick =>  3, tfmt => '%H:00', unit => 'hour' },
+    '1w' => { label => '1 week',   span => 7*86400,     bucket => 6*3600,
+              tick =>  4, tfmt => '%a %H:00', unit => '6 hours' },
+    '4w' => { label => '4 weeks',  span => 28*86400,    bucket => 86400,
+              tick =>  7, tfmt => '%m-%d',  unit => 'day' },
+);
+my @FLAKE_ORDER = qw(1h 4h 24h 1w 4w);
+
 # Lightweight views (don't need the full inventory).
 if (defined $q{view} && $q{view} eq 'tools') {
     print render_tools();
@@ -45,6 +65,11 @@ if (defined $q{view} && $q{view} eq 'tools') {
 }
 if (defined $q{view} && $q{view} eq 'flake') {
     print render_flake();
+    $cli->bye;
+    exit 0;
+}
+if (defined $q{view} && $q{view} eq 'flakers') {
+    print render_flakers();
     $cli->bye;
     exit 0;
 }
@@ -62,6 +87,17 @@ my $ports     = $cli->snapshot(5, 'ports');
 my $aps       = $cli->snapshot(6, 'aps');
 my $aliases   = $cli->snapshot(7, 'aliases');
 my $friendly  = $cli->snapshot(8, 'friendly_names');
+
+# For the iface-detail route, also pull recent events for that MAC so
+# we can show some history on otherwise-anonymous interfaces. Bounded
+# to 30d so the snapshot stays small.
+my $iface_events;
+if (defined $q{i}) {
+    my $imac = lc $q{i};
+    (my $safe = $imac) =~ s/'/''/g;
+    $iface_events = $cli->snapshot(9, 'events',
+        where => "mac = '$safe' AND ts > ago(2592000)");
+}
 $cli->bye;
 
 # Indexes ------------------------------------------------------------
@@ -325,13 +361,21 @@ sub render_iface_block {
     my $first_addr = @addrs ? $addrs[0]{addr} : undef;
     my $kind = $iface->{kind} // '';
     $kind .= ' (AP)' if $ap_by_mac{$mac};
+    # Vendor: prefer the iface row's stored vendor; fall back to OUI
+    # lookup so anonymous MACs at least show a manufacturer.
     my $vendor = $iface->{vendor} // '';
+    if (!length $vendor) {
+        my $oui = oui_vendor($mac);
+        $vendor = "$oui (OUI)" if defined $oui;
+    }
     my $online = $iface->{online} ? 'online' : 'offline';
 
-    my $addr_html = join '', map {
-        my $src = $_->{source} ? " <span class=src>($_->{source})</span>" : '';
-        '<li><code>' . escapeHTML($_->{addr}) . '</code>' . $src . '</li>';
-    } @addrs;
+    my $addr_html = @addrs
+        ? join '', map {
+            my $src = $_->{source} ? " <span class=src>($_->{source})</span>" : '';
+            '<li><code>' . escapeHTML($_->{addr}) . '</code>' . $src . '</li>';
+        } @addrs
+        : '<li class=note>none on file</li>';
 
     my @port_rows;
     for my $p (sort { $a->{port} <=> $b->{port} } @{ $ports_by_mac{$mac} || [] }) {
@@ -347,22 +391,87 @@ sub render_iface_block {
           . join('', @port_rows) . '</table>'
         : '<p class=note>no ports observed</p>';
 
+    # Recent events for this MAC, when fetched (iface-detail route only).
+    my $events_html = '';
+    if ($iface_events) {
+        my @evs = grep { ($_->{mac} // '') eq $mac } @$iface_events;
+        @evs = sort { ($b->{ts} // '') cmp ($a->{ts} // '') } @evs;
+        my $shown = @evs > 20 ? 20 : scalar @evs;
+        if ($shown) {
+            my @rows;
+            for my $e (@evs[0 .. $shown - 1]) {
+                push @rows, sprintf
+                    '<tr><td class=meta>%s</td><td>%s</td><td>%s</td></tr>',
+                    escapeHTML($e->{ts} // ''),
+                    escapeHTML($e->{type} // ''),
+                    escapeHTML($e->{addr} // '');
+            }
+            my $more = @evs > $shown
+                ? sprintf('<p class=note>showing %d of %d events</p>',
+                          $shown, scalar @evs)
+                : '';
+            $events_html = '<dt>recent events</dt><dd>'
+                         . '<table class=events>'
+                         . '<tr><th>ts</th><th>type</th><th>addr</th></tr>'
+                         . join('', @rows)
+                         . '</table>'
+                         . $more
+                         . '</dd>';
+        } else {
+            $events_html = '<dt>recent events</dt>'
+                         . '<dd class=note>none in last 30 days</dd>';
+        }
+    }
+
     return <<HTML;
 <section class="iface $online">
 <h3>$mac <span class=meta>$kind · $vendor · $online</span></h3>
 <dl class=info>
   <dt>addresses</dt><dd><ul class=addrlist>$addr_html</ul></dd>
+  $events_html
 </dl>
 $port_html
 </section>
 HTML
 }
 
+# OUI vendor lookup from the IEEE registry CSV. Returns the
+# Organization Name for the MAC's first three octets, or undef if not
+# found. The index is built lazily on first call and cached for the
+# lifetime of the request.
+my %_OUI;
+my $_oui_loaded = 0;
+sub oui_vendor {
+    my ($mac) = @_;
+    return undef unless defined $mac && $mac =~ /^([0-9a-f]{2}):([0-9a-f]{2}):([0-9a-f]{2})/i;
+    my $key = uc "$1$2$3";
+    if (!$_oui_loaded) {
+        $_oui_loaded = 1;
+        for my $path ('/usr/local/share/ieee-data/oui.csv',
+                      '/var/lib/ieee-data/oui.csv') {
+            next unless -r $path;
+            if (open my $fh, '<', $path) {
+                while (my $line = <$fh>) {
+                    next unless $line =~ /^MA-L,([0-9A-F]{6}),"?([^",]+)/;
+                    $_OUI{$1} = $2;
+                }
+                close $fh;
+                last;
+            }
+        }
+    }
+    return $_OUI{$key};
+}
+
 sub render_tools {
     my $body = <<'HTML';
 <ul class=toollist>
   <li><a href="?view=flake">Disconnect histogram</a> — count of
-      <code>interface_offline</code> events per hour over the last 24h.</li>
+      <code>interface_offline</code> events bucketed over a chosen
+      range (1h, 4h, 24h, 1w, 4w).</li>
+  <li><a href="?view=flakers">Disconnect ranking</a> — hosts ranked
+      by how many <code>interface_offline</code> events they generated
+      over the same range options.</li>
   <li><a href="?view=dhcp">DHCP grants</a> — which AP / host gave out
       each IP, derived from the source tag on each address row.</li>
 </ul>
@@ -371,20 +480,27 @@ HTML
 }
 
 sub render_flake {
+    my $key = $q{range} // '24h';
+    $key = '24h' unless exists $FLAKE_RANGES{$key};
+    my $cfg = $FLAKE_RANGES{$key};
+    my $span    = $cfg->{span};
+    my $bucket  = $cfg->{bucket};
+    my $nbuckets = int($span / $bucket);
+
     my $events = $cli->snapshot(1, 'events',
-        where => "type = 'interface_offline' AND ts > ago(86400)");
+        where => "type = 'interface_offline' AND ts > ago($span)");
 
     my $now = time();
-    # Per-hour buckets, oldest at index 0 (24h ago) → newest at 23 (now).
-    my @counts = (0) x 24;
+    # Buckets oldest at index 0 → newest at $nbuckets-1.
+    my @counts = (0) x $nbuckets;
     for my $e (@$events) {
         my $ts = $e->{ts} // '';
         next unless $ts =~ /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)/;
         my $epoch = eval { timelocal($6, $5, $4, $3, $2-1, $1) };
         next unless defined $epoch;
-        my $age_h = int(($now - $epoch) / 3600);
-        next if $age_h < 0 || $age_h >= 24;
-        $counts[23 - $age_h]++;
+        my $age_b = int(($now - $epoch) / $bucket);
+        next if $age_b < 0 || $age_b >= $nbuckets;
+        $counts[$nbuckets - 1 - $age_b]++;
     }
 
     my $total = 0; $total += $_ for @counts;
@@ -396,28 +512,27 @@ sub render_flake {
     my $L = 40; my $R = 10; my $T = 10; my $B = 30;
     my $plot_w = $W - $L - $R;
     my $plot_h = $H - $T - $B;
-    my $bar_gap = 2;
-    my $bar_w = ($plot_w - $bar_gap * 23) / 24;
+    my $bar_gap = $nbuckets > 30 ? 1 : 2;
+    my $bar_w = ($plot_w - $bar_gap * ($nbuckets - 1)) / $nbuckets;
 
-    # Hour-of-day labels (each bucket starts at this hour). The newest
-    # bucket ends at the current minute, but we round to whole hours
-    # for the label so every label shows hh:00.
+    # Per-bucket time labels using the configured strftime format.
     my @labels;
-    for my $i (0 .. 23) {
-        my $age_h = 23 - $i;
-        my @lt = localtime($now - $age_h * 3600);
-        push @labels, sprintf("%02d", $lt[2]);
+    for my $i (0 .. $nbuckets - 1) {
+        my $age_b = $nbuckets - 1 - $i;
+        my @lt = localtime($now - $age_b * $bucket);
+        push @labels, _strftime_lite($cfg->{tfmt}, @lt);
     }
 
+    my $unit = $cfg->{unit};
     my @bars;
-    for my $i (0 .. 23) {
+    for my $i (0 .. $nbuckets - 1) {
         my $h = $counts[$i] / $max * $plot_h;
         my $x = $L + $i * ($bar_w + $bar_gap);
         my $y = $T + $plot_h - $h;
-        my $title = "$labels[$i]:00 — $counts[$i] disconnect"
+        my $title = "$labels[$i] — $counts[$i] disconnect"
                   . ($counts[$i] == 1 ? '' : 's');
         push @bars, sprintf
-            '<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" '
+            '<rect x="%.2f" y="%.2f" width="%.2f" height="%.2f" '
           . 'fill="#6cf"><title>%s</title></rect>',
             $x, $y, $bar_w, $h, escapeHTML($title);
     }
@@ -433,33 +548,223 @@ sub render_flake {
         $L - 4, $T + 11, $max,
         $L - 4, $T + $plot_h, ;
 
-    # X-axis labels every 3 hours.
+    # X-axis labels every $tick buckets, anchored on the newest bar so
+    # the rightmost label always shows the current bucket.
+    my $tick = $cfg->{tick};
     my @xlabels;
-    for my $i (0 .. 23) {
-        next unless $i % 3 == 0;
+    for (my $i = $nbuckets - 1; $i >= 0; $i -= $tick) {
         my $x = $L + $i * ($bar_w + $bar_gap) + $bar_w / 2;
         push @xlabels, sprintf
-            '<text x="%.1f" y="%d" fill="#888" font-size="11" '
+            '<text x="%.2f" y="%d" fill="#888" font-size="11" '
             . 'text-anchor="middle">%s</text>',
-            $x, $H - 14, $labels[$i];
+            $x, $H - 14, escapeHTML($labels[$i]);
     }
 
     my $bars   = join "\n  ", @bars;
     my $xlabs  = join "\n  ", @xlabels;
-    my $note   = "$total disconnects in the last 24 hours · "
-               . "peak $max in one hour";
+    my $note   = "$total disconnects in the last $cfg->{label} · "
+               . "peak $max in one $unit";
+
+    my $switcher = flake_nav('flake', $key);
 
     my $body = <<HTML;
+$switcher
 <p class=meta>$note</p>
 <svg viewBox="0 0 $W $H" xmlns="http://www.w3.org/2000/svg" class=flake>
   $axis
   $bars
   $xlabs
 </svg>
-<p class=note>X-axis = hour of day (newest on the right). Hover a bar
-for the count.</p>
+<p class=note>Newest bucket on the right. Each bar covers $unit. Hover
+a bar for the count.</p>
 HTML
-    return wrap_page("Disconnects — net-mgr", $body, "Disconnects (24h)");
+    return wrap_page("Disconnects — net-mgr", $body,
+        "Disconnects ($cfg->{label})");
+}
+
+# Shared nav for the flake/flakers pages: a "view: histogram | ranking"
+# tab row and a "range: 1h · 4h · ..." switcher under it. $view is
+# either 'flake' or 'flakers'; $key is the active range key.
+sub flake_nav {
+    my ($view, $key) = @_;
+    my @views = (
+        [ 'flake',   'histogram' ],
+        [ 'flakers', 'ranking'   ],
+    );
+    my @vlinks;
+    for my $v (@views) {
+        if ($v->[0] eq $view) {
+            push @vlinks, "<strong>$v->[1]</strong>";
+        } else {
+            push @vlinks, sprintf '<a href="?view=%s&amp;range=%s">%s</a>',
+                $v->[0], $key, escapeHTML($v->[1]);
+        }
+    }
+    my @rlinks;
+    for my $k (@FLAKE_ORDER) {
+        if ($k eq $key) {
+            push @rlinks, "<strong>$FLAKE_RANGES{$k}{label}</strong>";
+        } else {
+            push @rlinks, sprintf '<a href="?view=%s&amp;range=%s">%s</a>',
+                $view, $k, escapeHTML($FLAKE_RANGES{$k}{label});
+        }
+    }
+    return '<p class=meta>view: ' . join(' · ', @vlinks) . '</p>'
+         . '<p class=meta>range: ' . join(' · ', @rlinks) . '</p>';
+}
+
+sub render_flakers {
+    my $key = $q{range} // '24h';
+    $key = '24h' unless exists $FLAKE_RANGES{$key};
+    my $cfg = $FLAKE_RANGES{$key};
+    my $span = $cfg->{span};
+
+    my $events    = $cli->snapshot(1, 'events',
+        where => "type = 'interface_offline' AND ts > ago($span)");
+    my $machines  = $cli->snapshot(2, 'machines');
+    my $ifaces    = $cli->snapshot(3, 'interfaces');
+    my $hostnames = $cli->snapshot(4, 'hostnames');
+    my $friendly  = $cli->snapshot(5, 'friendly_names');
+    my $addresses = $cli->snapshot(6, 'addresses', where => "family = 'v4'");
+
+    my %iface_by_mac = map { $_->{mac} => $_ } @$ifaces;
+    my %machine_by_id = map { $_->{id} => $_ } @$machines;
+    my %hns_by_machine;
+    push @{ $hns_by_machine{ $_->{machine_id} } }, $_->{name} for @$hostnames;
+    my %fr_by_machine = map { $_->{machine_id} => $_->{name} } @$friendly;
+    my %addrs_by_mac;
+    push @{ $addrs_by_mac{ $_->{mac} } }, $_ for @$addresses;
+
+    # Tally per-mac counts and the most recent event timestamp.
+    my (%count, %last);
+    for my $e (@$events) {
+        my $mac = $e->{mac};
+        next unless defined $mac && length $mac;
+        $count{$mac}++;
+        my $ts = $e->{ts} // '';
+        $last{$mac} = $ts if !defined($last{$mac}) || $ts gt $last{$mac};
+    }
+
+    # Resolve a display name for each mac (machine friendly_name →
+    # primary_name → first hostname → bare mac).
+    my $name_for = sub {
+        my ($mac) = @_;
+        my $iface = $iface_by_mac{$mac};
+        my $mid   = $iface && $iface->{machine_id};
+        if ($mid) {
+            return $fr_by_machine{$mid} if $fr_by_machine{$mid};
+            my $m = $machine_by_id{$mid};
+            return $m->{primary_name} if $m && $m->{primary_name};
+            my $hns = $hns_by_machine{$mid};
+            return $hns->[0] if $hns && @$hns;
+        }
+        return $mac;
+    };
+    my $link_for = sub {
+        my ($mac) = @_;
+        my $iface = $iface_by_mac{$mac};
+        my $mid   = $iface && $iface->{machine_id};
+        return $mid
+            ? sprintf('?m=%d', $mid)
+            : sprintf('?i=%s', $mac);
+    };
+
+    my @rows = sort {
+           $count{$b} <=> $count{$a}
+        || lc($name_for->($a)) cmp lc($name_for->($b))
+    } keys %count;
+
+    my $total   = 0; $total += $_ for values %count;
+    my $hosts   = scalar @rows;
+    my $note    = "$total disconnects across $hosts host"
+                . ($hosts == 1 ? '' : 's')
+                . " in the last $cfg->{label}";
+    my $switcher = flake_nav('flakers', $key);
+
+    my $table;
+    if (!@rows) {
+        $table = '<p class=note>No disconnect events in this range.</p>';
+    } else {
+        my @row_html;
+        my $rank = 0;
+        for my $mac (@rows) {
+            $rank++;
+            my $name = $name_for->($mac);
+            my $link = $link_for->($mac);
+            my $iface = $iface_by_mac{$mac};
+            my $kind  = $iface && $iface->{kind} ? $iface->{kind} : '';
+            my @addrs = sort { ip_sort_key($a->{addr}) cmp ip_sort_key($b->{addr}) }
+                        @{ $addrs_by_mac{$mac} || [] };
+            my $addr  = @addrs ? $addrs[0] : undef;
+            my $ip    = $addr ? $addr->{addr} : '';
+            # Classify by inspecting every source row for this MAC:
+            # an observed dynamic lease (granter:DHCP) wins over a
+            # static reservation (host:dhcp.master); arp/ssh/other
+            # leave the row uncolored.
+            my ($granter, $dhcp_kind);
+            for my $a (@addrs) {
+                my $src = $a->{source} // '';
+                if (!$dhcp_kind && $src =~ /^(\d+\.\d+\.\d+\.\d+):DHCP$/) {
+                    $granter = $1;
+                    $dhcp_kind = 'dyn';
+                } elsif (!$dhcp_kind && $src =~ /:dhcp\.master$/i) {
+                    $dhcp_kind = 'stat';
+                }
+            }
+            my $row_class = $dhcp_kind ? " class=$dhcp_kind" : '';
+            my $ip_html = '';
+            if (length $ip) {
+                if (defined $granter) {
+                    $ip_html = sprintf
+                        '<a class=hostlink href="?view=dhcp#g-%s" '
+                      . 'title="DHCP grant from %s"><code>%s</code></a>',
+                        escapeHTML($granter), escapeHTML($granter),
+                        escapeHTML($ip);
+                } else {
+                    $ip_html = '<code>' . escapeHTML($ip) . '</code>';
+                }
+            }
+            push @row_html, sprintf
+                '<tr%s><td class=rank>%d</td>'
+              . '<td class=name><a class=hostlink href="%s">%s</a></td>'
+              . '<td>%s</td>'
+              . '<td>%s</td>'
+              . '<td class=count>%d</td>'
+              . '<td class=meta>%s</td></tr>',
+                $row_class, $rank, escapeHTML($link), escapeHTML($name),
+                $ip_html, escapeHTML($kind),
+                $count{$mac}, escapeHTML($last{$mac} // '');
+        }
+        $table = '<table class=flakers>'
+               . '<tr><th>#</th><th>host</th><th>ip</th><th>kind</th>'
+               . '<th>disconnects</th><th>last seen</th></tr>'
+               . join('', @row_html)
+               . '</table>';
+    }
+
+    my $legend = '<p class=flakelegend>'
+               . '<span class="swatch dyn"></span>dynamic DHCP lease'
+               . '<span class="swatch stat"></span>static DHCP reservation'
+               . '</p>';
+    my $body = "$switcher<p class=meta>$note</p>$legend$table";
+    return wrap_page("Disconnect ranking — net-mgr", $body,
+        "Disconnect ranking ($cfg->{label})");
+}
+
+# Tiny strftime — handles only the directives FLAKE_RANGES uses, so we
+# don't pull in POSIX just for this view. @lt is a localtime() list.
+sub _strftime_lite {
+    my ($fmt, @lt) = @_;
+    my @wday = qw(Sun Mon Tue Wed Thu Fri Sat);
+    my %sub = (
+        '%H' => sprintf('%02d', $lt[2]),
+        '%M' => sprintf('%02d', $lt[1]),
+        '%m' => sprintf('%02d', $lt[4] + 1),
+        '%d' => sprintf('%02d', $lt[3]),
+        '%a' => $wday[$lt[6]],
+    );
+    $fmt =~ s/(%[HMmda])/$sub{$1}/g;
+    return $fmt;
 }
 
 sub render_dhcp {
@@ -522,7 +827,8 @@ sub render_dhcp {
         }
         my $section_body = '<table><tr><th>ip</th><th>client</th><th>mac</th></tr>'
             . join('', @row_html) . '</table>';
-        push @sections, "<h2>$hdr</h2>$section_body";
+        my $anchor = "g-$g";
+        push @sections, qq{<h2 id="$anchor">$hdr</h2>$section_body};
     }
 
     if (!@sections) {
@@ -591,6 +897,21 @@ ul.toollist a { color: #6cf; }
 svg.flake { width: 100%; max-width: 720px;
             background: #181818; border-radius: 4px; }
 svg.flake rect:hover { fill: #9df; }
+table.flakers td.rank  { color: #888; text-align: right; width: 2.5em; }
+table.flakers td.count { text-align: right; font-weight: bold; }
+table.flakers td.meta  { color: #888; font-size: 0.9em; }
+table.flakers tr.dyn   td { background: rgba(220, 60, 60, 0.18); }
+table.flakers tr.stat  td { background: rgba(220, 200, 60, 0.14); }
+table.events { font-size: 0.9em; }
+table.events td { padding: 2px 8px; }
+.flakelegend { font-size: 0.85em; color: #888; }
+.flakelegend .swatch {
+    display: inline-block; width: 0.9em; height: 0.9em;
+    margin: 0 0.25em -1px 0.6em; border-radius: 2px;
+    vertical-align: middle;
+}
+.flakelegend .swatch.dyn  { background: rgba(220, 60, 60, 0.6); }
+.flakelegend .swatch.stat { background: rgba(220, 200, 60, 0.6); }
 </style>
 </head>
 <body>
