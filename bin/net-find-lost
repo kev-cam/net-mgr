@@ -168,21 +168,29 @@ CANDIDATE: for my $c (@CANDIDATES) {
             next;
         }
 
-        # ARP sweep. We don't actually need nmap's output — we just want
-        # the kernel's neighbour table populated. nmap is the most
-        # reliable cross-distro way to do that without root-only tools.
-        system('nmap', '-sn', '-PR', '-e', $iface, '--max-retries', '1',
-               '-T4', $cidr, '-oN', '/dev/null') >= 0
-            or warn "  nmap returned $?\n";
-
-        for my $line (`ip -4 neigh show dev $iface`) {
-            chomp $line;
-            next unless $line =~ /^(\S+)\s+lladdr\s+(\S+)\s+(\S+)/;
-            my ($ip, $mac, $state) = ($1, lc $2, $3);
-            next if $state eq 'FAILED';
-            next unless ip_in_cidr($ip, $cidr);
-            next if $ip eq $alias_ip;
-            $hits{$ip} //= { mac => $mac, iface => $iface };
+        # ARP sweep. Parse nmap's stdout directly — when run as root,
+        # nmap uses raw sockets and the kernel ARP cache is never
+        # populated, so reading 'ip neigh' after the fact finds nothing.
+        my $cur_ip;
+        if (open my $fh, '-|', 'nmap', '-sn', '-PR', '-e', $iface,
+                                  '--max-retries', '1', '-T4', $cidr) {
+            while (my $line = <$fh>) {
+                if ($line =~ /^Nmap scan report for/
+                        && $line =~ /(\d+\.\d+\.\d+\.\d+)/) {
+                    $cur_ip = $1;
+                }
+                elsif ($line =~ /^MAC Address:\s+([0-9A-Fa-f:]{17})/) {
+                    my $mac = lc $1;
+                    next unless $cur_ip && ip_in_cidr($cur_ip, $cidr);
+                    next if $cur_ip eq $alias_ip;
+                    $hits{$cur_ip} //= { mac => $mac, iface => $iface };
+                    $cur_ip = undef;
+                }
+            }
+            close $fh;
+        }
+        else {
+            warn "  could not run nmap: $!\n";
         }
 
         system('ip', 'addr', 'del', $alias, 'dev', $iface);
