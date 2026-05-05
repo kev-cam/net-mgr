@@ -1,0 +1,172 @@
+#!/usr/bin/perl
+# net-find-peers — discover other net-mgr instances on the LAN by
+# probing TCP/7531 on every IP that the local daemon already knows
+# has port 22 open (heuristic: net-mgr lives on Linux/server hosts).
+# Each successful STATUS reply is recorded in the `peers` DB table so
+# the web UI's view=peers page can list discovered peers alongside
+# manually-configured ones.
+#
+# Usage:
+#   net-find-peers [--port 7531] [--timeout 2] [--quiet] [--print]
+#   net-find-peers --listen HOST:PORT     # override local daemon
+#
+# Cron-friendly: --quiet suppresses per-IP lines and only reports new
+# discoveries (existing peers get refreshed silently).
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use Time::HiRes qw(gettimeofday tv_interval);
+
+use NetMgr::Config;
+use NetMgr::DB;
+use NetMgr::Client;
+
+my $listen      = $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
+my $port        = 7531;
+my $timeout     = 2;
+my $quiet;
+my $print_only;
+my $help;
+
+GetOptions(
+    'listen=s'  => \$listen,
+    'port=i'    => \$port,
+    'timeout=i' => \$timeout,
+    'quiet|q'   => \$quiet,
+    'print|n'   => \$print_only,
+    'help|h'    => \$help,
+) or usage();
+usage() if $help;
+
+# Local daemon — for snapshots + identifying our own addresses so we
+# don't probe ourselves.
+my $cli = NetMgr::Client->new(listen => $listen, timeout => 5);
+$cli->hello(consumer => "find-peers.$$");
+
+my $self_status   = eval { $cli->status } || {};
+my %self_listeners;
+for my $hp (split /,/, ($self_status->{listeners} // '')) {
+    my ($h) = split /:/, $hp, 2;
+    $self_listeners{$h} = 1 if defined $h;
+}
+
+# Candidate hosts: every IP whose MAC is on a port-22-open interface.
+my $ports_rows = $cli->snapshot(101, 'ports', where => "port = 22 AND proto = 'tcp'");
+my %mac22 = map { $_->{mac} => 1 } @$ports_rows;
+my $addr_rows  = $cli->snapshot(102, 'addresses', where => "family = 'v4'");
+my %candidate;   # ip => 1
+for my $a (@$addr_rows) {
+    next unless $mac22{ $a->{mac} };
+    next if $a->{addr} =~ /^127\./;
+    next if $self_listeners{ $a->{addr} };
+    $candidate{ $a->{addr} } = 1;
+}
+$cli->bye;
+
+my @ips = sort { _ipkey($a) cmp _ipkey($b) } keys %candidate;
+warn scalar(@ips), " candidate IPs (port-22 open, excluding self)\n" unless $quiet;
+
+# DB handle for upserts (skipped in --print mode).
+my $db;
+unless ($print_only) {
+    my $cfg = NetMgr::Config->load(
+        $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
+    my $mycnf = (-r "$ENV{HOME}/.my.cnf") ? "$ENV{HOME}/.my.cnf"
+              : (-r '/root/.my.cnf')      ? '/root/.my.cnf'
+              : die "no readable .my.cnf for [net-mgr]\n";
+    $db = NetMgr::DB->new(
+        defaults_file => $mycnf,
+        section       => $cfg->{mysql}{section},
+        db            => $cfg->{mysql}{db},
+    );
+    $db->connect;
+}
+
+# Pull existing peers so we can announce *new* ones in --quiet mode.
+my %known;
+if ($db) {
+    for my $row (@{ $db->query_table('peers') }) {
+        $known{"$row->{host}:$row->{port}"} = 1;
+    }
+}
+
+my $found = 0;
+my $new   = 0;
+for my $ip (@ips) {
+    my $t0 = [gettimeofday];
+    my $peer_cli = eval {
+        NetMgr::Client->new(listen => "$ip:$port", timeout => $timeout);
+    };
+    next unless $peer_cli;
+
+    eval { $peer_cli->hello(consumer => "find-peers-probe.$$") };
+    if ($@) {
+        eval { $peer_cli->bye };
+        next;
+    }
+    my $st = eval { $peer_cli->status };
+    eval { $peer_cli->bye };
+    next unless $st && ref $st eq 'HASH' && $st->{started_at};
+
+    my $rtt = tv_interval($t0) * 1000;
+    $found++;
+    my $is_new = !$known{"$ip:$port"};
+    $new++ if $is_new;
+
+    my $started_iso = _iso_time($st->{started_at});
+    if (!$quiet || $is_new) {
+        printf "%s%-15s  port=%d  rtt=%.1fms  schema=v%s  up since %s\n",
+            ($is_new ? '+ ' : '  '),
+            $ip, $port, $rtt,
+            ($st->{schema_version} // '?'),
+            $started_iso;
+    }
+
+    next if $print_only;
+    $db->upsert_peer(
+        host           => $ip,
+        port           => $port,
+        last_status    => 'reachable',
+        schema_version => ($st->{schema_version} // undef),
+        started_at     => $started_iso,
+        rtt_ms         => $rtt,
+    );
+}
+
+warn "found $found peer(s); $new new\n" if !$quiet || $new;
+exit 0;
+
+sub _ipkey {
+    my $ip = shift // '';
+    return '999.999.999.999' unless $ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+    return sprintf "%03d.%03d.%03d.%03d", $1, $2, $3, $4;
+}
+
+sub _iso_time {
+    my ($ts) = @_;
+    return undef unless $ts;
+    my @t = localtime($ts);
+    return sprintf '%04d-%02d-%02d %02d:%02d:%02d',
+        $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0];
+}
+
+sub usage {
+    print <<USAGE;
+net-find-peers — discover other net-mgr instances on the LAN.
+
+Usage:
+  net-find-peers [--port 7531] [--timeout 2] [--quiet] [--print]
+  net-find-peers --listen HOST:PORT      # override local daemon
+
+Probes TCP/--port on every IP the local daemon knows has port 22 open
+(excluding our own listen addresses) and asks each candidate for its
+STATUS. Successful replies are upserted into the peers DB table.
+
+  --quiet, -q   only report newly-discovered peers (cron-friendly)
+  --print, -n   don't write to the DB, just print findings
+USAGE
+    exit 1;
+}

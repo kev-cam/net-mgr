@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 11;
+our $SCHEMA_VERSION = 12;
 
 sub new {
     my ($class, %args) = @_;
@@ -253,6 +253,28 @@ CREATE TABLE IF NOT EXISTS lost_devices (
     notes        TEXT,
     UNIQUE KEY uniq_subnet_mac (subnet, mac),
     KEY idx_status    (status),
+    KEY idx_last_seen (last_seen)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
+    if ($v == 12) {
+        # Peer net-mgr instances discovered on the LAN by net-find-peers.
+        # Upserted on (host, port). schema_version / started_at /
+        # rtt_ms come from the peer's STATUS reply.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS peers (
+    host           VARCHAR(64)  NOT NULL,
+    port           SMALLINT     UNSIGNED NOT NULL DEFAULT 7531,
+    first_seen     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                ON UPDATE CURRENT_TIMESTAMP,
+    last_status    VARCHAR(32)  NOT NULL DEFAULT 'reachable',
+    schema_version INT          NULL,
+    started_at     DATETIME     NULL,
+    rtt_ms         FLOAT        NULL,
+    notes          TEXT,
+    PRIMARY KEY (host, port),
     KEY idx_last_seen (last_seen)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
@@ -973,6 +995,31 @@ sub delete_lost_device {
     );
 }
 
+sub upsert_peer {
+    my ($self, %f) = @_;
+    croak "host required" unless defined $f{host};
+    $f{port}        //= 7531;
+    $f{last_status} //= 'reachable';
+    $self->{dbh}->do(
+        "INSERT INTO peers
+            (host, port, last_status, schema_version, started_at, rtt_ms, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            last_status    = VALUES(last_status),
+            schema_version = COALESCE(VALUES(schema_version), schema_version),
+            started_at     = COALESCE(VALUES(started_at),     started_at),
+            rtt_ms         = COALESCE(VALUES(rtt_ms),         rtt_ms),
+            notes          = COALESCE(VALUES(notes),          notes)",
+        undef,
+        $f{host}, $f{port}, $f{last_status}, $f{schema_version},
+        $f{started_at}, $f{rtt_ms}, $f{notes},
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM peers WHERE host = ? AND port = ?",
+        undef, $f{host}, $f{port}
+    );
+}
+
 sub delete_subnet_router {
     my ($self, %f) = @_;
     return $self->{dbh}->do(
@@ -986,7 +1033,7 @@ sub query_table {
     my %allowed = map { $_ => 1 } qw(
         machines hostnames interfaces addresses ports aps
         associations dhcp_leases events aliases dhcp_vars
-        subnet_routers friendly_names wifi_sockets lost_devices
+        subnet_routers friendly_names wifi_sockets lost_devices peers
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};

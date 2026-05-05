@@ -642,37 +642,72 @@ sub _human_time {
 }
 
 sub render_peers {
-    my @peers = configured_peers();
-    my $body  = '';
-    $body .= qq{<p class=meta>Peers are other net-mgr instances we replicate from }
-           . qq{(see <code>net-mgr-relay</code>). Configured in }
-           . qq{<code>[peers] sources = host1, host2</code> in }
-           . qq{<code>/etc/net-mgr/config</code>.</p>};
+    my @configured = configured_peers();
+    my $discovered = eval { $cli->snapshot(13, 'peers') } || [];
 
-    if (!@peers) {
-        $body .= qq{<p class=note>no peers configured.</p>};
+    my $body = '';
+    $body .= qq{<p class=meta>Peers are other net-mgr instances we replicate from }
+           . qq{(see <code>net-mgr-relay</code>). Discovered automatically by }
+           . qq{<code>net-find-peers</code> (probes TCP/7531 on every }
+           . qq{ssh-open host); listed manually in }
+           . qq{<code>[peers] sources</code> in <code>/etc/net-mgr/config</code>.</p>};
+
+    if (!@configured && !@$discovered) {
+        $body .= qq{<p class=note>no peers configured or discovered yet.</p>};
         return wrap_page("Peers — net-mgr", $body, "Peers");
     }
 
-    $body .= '<table class=peers>';
-    $body .= '<tr><th>peer</th><th>address</th><th>status</th>'
-           . '<th>connect (ms)</th><th>machines</th><th>note</th></tr>';
-    for my $p (@peers) {
-        my $r = probe_peer($p);
-        my $cls = $r->{ok} ? 'ok' : 'down';
-        $body .= sprintf
-            '<tr class="peer-%s"><td class=name>%s</td><td><code>%s</code></td>'
-          . '<td class=status>%s</td><td class=meta>%s</td>'
-          . '<td class=meta>%s</td><td class=meta>%s</td></tr>',
-            $cls,
-            escapeHTML($p->{label}),
-            escapeHTML($p->{addr}),
-            ($r->{ok} ? 'reachable' : 'unreachable'),
-            (defined $r->{rtt_ms} ? sprintf('%.1f', $r->{rtt_ms}) : '—'),
-            (defined $r->{machines} ? $r->{machines} : '—'),
-            escapeHTML($r->{note} // '');
+    if (@configured) {
+        $body .= '<h2>configured</h2>';
+        $body .= '<table class=peers>';
+        $body .= '<tr><th>peer</th><th>address</th><th>status</th>'
+               . '<th>connect (ms)</th><th>machines</th><th>note</th></tr>';
+        for my $p (@configured) {
+            my $r = probe_peer($p);
+            my $cls = $r->{ok} ? 'ok' : 'down';
+            $body .= sprintf
+                '<tr class="peer-%s"><td class=name>%s</td><td><code>%s</code></td>'
+              . '<td class=status>%s</td><td class=meta>%s</td>'
+              . '<td class=meta>%s</td><td class=meta>%s</td></tr>',
+                $cls,
+                escapeHTML($p->{label}),
+                escapeHTML($p->{addr}),
+                ($r->{ok} ? 'reachable' : 'unreachable'),
+                (defined $r->{rtt_ms} ? sprintf('%.1f', $r->{rtt_ms}) : '—'),
+                (defined $r->{machines} ? $r->{machines} : '—'),
+                escapeHTML($r->{note} // '');
+        }
+        $body .= '</table>';
     }
-    $body .= '</table>';
+
+    if (@$discovered) {
+        my %skip = map { ($_->{addr} => 1) } @configured;
+        $body .= '<h2>discovered</h2>';
+        $body .= '<table class=peers>';
+        $body .= '<tr><th>host</th><th>port</th><th>last status</th>'
+               . '<th>schema</th><th>last RTT (ms)</th>'
+               . '<th>peer uptime since</th><th>last seen</th></tr>';
+        for my $p (sort { $a->{host} cmp $b->{host} } @$discovered) {
+            my $addr = "$p->{host}:$p->{port}";
+            my $cls  = ($p->{last_status} // '') eq 'reachable' ? 'ok' : 'down';
+            my $tag  = $skip{$addr} ? ' <span class=src>(also configured)</span>' : '';
+            $body .= sprintf
+                '<tr class="peer-%s"><td class=name><code>%s</code>%s</td>'
+              . '<td>%s</td><td class=status>%s</td>'
+              . '<td>%s</td><td class=meta>%s</td>'
+              . '<td class=meta>%s</td><td class=meta>%s</td></tr>',
+                $cls,
+                escapeHTML($p->{host}), $tag,
+                escapeHTML($p->{port} // ''),
+                escapeHTML($p->{last_status} // ''),
+                escapeHTML($p->{schema_version} // '?'),
+                (defined $p->{rtt_ms} ? sprintf('%.1f', $p->{rtt_ms}) : '—'),
+                escapeHTML($p->{started_at} // '—'),
+                escapeHTML($p->{last_seen}  // '');
+        }
+        $body .= '</table>';
+    }
+
     return wrap_page("Peers — net-mgr", $body, "Peers");
 }
 

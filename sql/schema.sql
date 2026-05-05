@@ -207,6 +207,24 @@ CREATE TABLE IF NOT EXISTS subnet_routers (
         FOREIGN KEY (ap_mac) REFERENCES interfaces(mac) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Peer net-mgr instances discovered on the LAN by net-find-peers.
+-- Upserted on (host, port). schema_version, started_at and rtt_ms
+-- come from the peer's STATUS reply.
+CREATE TABLE IF NOT EXISTS peers (
+    host           VARCHAR(64)  NOT NULL,
+    port           SMALLINT     UNSIGNED NOT NULL DEFAULT 7531,
+    first_seen     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                ON UPDATE CURRENT_TIMESTAMP,
+    last_status    VARCHAR(32)  NOT NULL DEFAULT 'reachable',
+    schema_version INT          NULL,
+    started_at     DATETIME     NULL,
+    rtt_ms         FLOAT        NULL,
+    notes          TEXT,
+    PRIMARY KEY (host, port),
+    KEY idx_last_seen (last_seen)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- Devices found by net-find-lost on a vendor-default subnet but not
 -- (yet) recovered. Upserted by (subnet, mac); status reflects what
 -- net-find-lost knew at the time of the most recent sighting.
@@ -242,3 +260,4 @@ INSERT IGNORE INTO schema_version (version) VALUES (8);
 INSERT IGNORE INTO schema_version (version) VALUES (9);
 INSERT IGNORE INTO schema_version (version) VALUES (10);
 INSERT IGNORE INTO schema_version (version) VALUES (11);
+INSERT IGNORE INTO schema_version (version) VALUES (12);
