@@ -82,7 +82,7 @@ my $RECOVERY_DIR = $ENV{NET_MGR_RECOVERY_DIR}
                 // "$FindBin::Bin/../recovery";
 
 my @ifaces;
-my $only_cidr;
+my @only_cidrs;
 my $dry_run;
 my $recover;            # undef = off, '' or 'all' = any match, MAC = filter
 my $quiet;
@@ -90,15 +90,39 @@ my $list;
 my $help;
 
 GetOptions(
-    'iface|i=s'   => \@ifaces,
-    'cidr|c=s'    => \$only_cidr,
-    'dry-run|n'   => \$dry_run,
-    'recover:s'   => \$recover,
-    'quiet|q'     => \$quiet,
-    'list'        => \$list,
-    'help|h'      => \$help,
+    'iface|i=s'        => \@ifaces,
+    'cidr|subnet|c=s'  => \@only_cidrs,
+    'dry-run|n'        => \$dry_run,
+    'recover:s'        => \$recover,
+    'quiet|q'          => \$quiet,
+    'list'             => \$list,
+    'help|h'           => \$help,
 ) or usage();
 usage() if $help;
+
+# Build the working candidate list. With no --cidr/--subnet, scan the
+# full @CANDIDATES registry. With one or more, use just those — taking
+# the registered entry when it matches a known /24, otherwise
+# synthesizing one with .99 as the alias IP.
+my @CANDIDATES_TO_SCAN;
+if (@only_cidrs) {
+    my %by_cidr = map { $_->[0] => $_ } @CANDIDATES;
+    for my $c (@only_cidrs) {
+        if (my $known = $by_cidr{$c}) {
+            push @CANDIDATES_TO_SCAN, $known;
+            next;
+        }
+        my ($net, $pl) = split '/', $c, 2;
+        die "invalid CIDR '$c' (expected dotted-quad/prefix)\n"
+            unless defined $pl && $net =~ /^\d+\.\d+\.\d+\.\d+$/;
+        die "--cidr only supports /24 subnets (got $c)\n" unless $pl eq '24';
+        (my $alias = $net) =~ s/\.\d+$/.99/;
+        push @CANDIDATES_TO_SCAN, [ $c, $alias, '(user-specified)' ];
+    }
+}
+else {
+    @CANDIDATES_TO_SCAN = @CANDIDATES;
+}
 
 if ($list) {
     print_recovery_list();
@@ -144,9 +168,8 @@ my $db = open_db();
 my %OUI;
 my $oui_loaded = 0;
 
-CANDIDATE: for my $c (@CANDIDATES) {
+CANDIDATE: for my $c (@CANDIDATES_TO_SCAN) {
     my ($cidr, $alias_ip, $label) = @$c;
-    next if $only_cidr && $cidr ne $only_cidr;
 
     for my $r (@routes) {
         next CANDIDATE if cidrs_overlap($r, $cidr);
@@ -453,14 +476,18 @@ sub usage {
 net-find-lost — probe vendor-default subnets for stray devices on local L2.
 
 Usage:
-  net-find-lost [--iface NAME]... [--cidr CIDR] [--dry-run]
+  net-find-lost [--iface NAME]... [--cidr CIDR]... [--dry-run]
                 [--recover[=MAC|all]] [--quiet]
   net-find-lost --list
 
 Options:
   --iface, -i NAME   Interface to add temporary aliases on (repeatable;
                      default: every UP non-loopback interface).
-  --cidr, -c CIDR    Only probe this candidate /24 (default: all listed).
+  --cidr, --subnet, -c CIDR
+                     Only probe this /24 (repeatable; default: every
+                     entry in the candidate list below). A CIDR not in
+                     the list is accepted too — its alias IP defaults
+                     to <network>.99.
   --dry-run, -n      List candidates and what we'd do, no changes.
   --recover[=ARG]    On a hit, run the matching recovery script. Bare
                      --recover or --recover=all triggers on every match;
