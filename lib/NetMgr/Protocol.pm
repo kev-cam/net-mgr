@@ -62,6 +62,7 @@ sub parse_line {
     elsif ($verb eq 'OBSERVE')   { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'GONE')      { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'BYE')       { croak "BYE takes no args" if @toks }
+    elsif ($verb eq 'STATUS')    { croak "STATUS takes no args" if @toks }
     elsif ($verb eq 'UNSUB') {
         my $kv = _parse_kv_only(\@toks);
         croak "UNSUB requires sub=" unless defined $kv->{sub};

@@ -44,6 +44,7 @@ sub new {
         clients   => {},      # fd → { sock, source/consumer, buffer, peer }
         triggers  => {},      # pid → { cli_fd, name, started_at } pending TRIGGER WAITs
         dnsmasq_listeners => {}, # "host:port" → { sock, host, port, buffer }
+        started_at => time(),    # for STATUS uptime reporting
         stop      => 0,
     }, $class;
     return $self;
@@ -280,9 +281,34 @@ sub _handle_line {
     elsif ($verb eq 'UNSUB')     { $self->_handle_unsub($cli, $cmd) }
     elsif ($verb eq 'TRIGGER')   { $self->_handle_trigger($cli, $cmd) }
     elsif ($verb eq 'BYE')       { $self->_drop_client(fileno($cli->{sock}), 'bye') }
+    elsif ($verb eq 'STATUS')    { $self->_handle_status($cli) }
     else {
         $self->_send($cli, format_err("verb $verb not handled"));
     }
+}
+
+sub _handle_status {
+    my ($self, $cli) = @_;
+    my @listeners = map { "$_->{host}:$_->{port}" } values %{ $self->{listeners} };
+    my ($producers, $consumers, $unknown) = (0, 0, 0);
+    for my $c (values %{ $self->{clients} }) {
+        my $k = $c->{kind} // '';
+        if    ($k eq 'producer') { $producers++ }
+        elsif ($k eq 'consumer') { $consumers++ }
+        else                     { $unknown++ }
+    }
+    my $schema_v = eval { $self->{db}->current_schema_version } // 0;
+    $self->_send($cli, format_ok(
+        started_at       => $self->{started_at},
+        now              => time(),
+        listeners        => join(',', sort @listeners),
+        clients          => scalar(keys %{ $self->{clients} }),
+        producers        => $producers,
+        consumers        => $consumers,
+        unknown          => $unknown,
+        triggers_pending => scalar(keys %{ $self->{triggers} }),
+        schema_version   => $schema_v,
+    ));
 }
 
 sub _handle_hello {

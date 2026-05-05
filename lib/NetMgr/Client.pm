@@ -102,6 +102,18 @@ sub trigger {
     return $self->recv_line(60);   # generous timeout for WAIT
 }
 
+# Ask the daemon for one-line state. Returns a hashref of the kv
+# fields from its OK reply, or undef if the daemon doesn't recognise
+# the verb (older builds).
+sub status {
+    my ($self) = @_;
+    my $r = $self->send_recv("STATUS");
+    return undef unless defined $r;
+    my $cmd = eval { parse_line($r) } or return undef;
+    return undef unless $cmd->{verb} eq 'OK';
+    return $cmd->{kv} || {};
+}
+
 sub bye {
     my ($self) = @_;
     $self->send_line("BYE");

@@ -10,6 +10,7 @@
 #   /net-mgr?view=flakers       host ranking by disconnect count (same range=)
 #   /net-mgr?view=lost          devices found by net-find-lost
 #   /net-mgr?view=peers         configured peer net-mgr instances + reachability
+#   /net-mgr?view=status        daemon status: listeners, uptime, clients
 #
 # Connects to the manager socket (no DB credentials needed). Apache
 # handles auth + IP restriction via the matching net-mgr.conf snippet.
@@ -87,6 +88,11 @@ if (defined $q{view} && $q{view} eq 'lost') {
 }
 if (defined $q{view} && $q{view} eq 'peers') {
     print render_peers();
+    $cli->bye;
+    exit 0;
+}
+if (defined $q{view} && $q{view} eq 'status') {
+    print render_status();
     $cli->bye;
     exit 0;
 }
@@ -564,9 +570,75 @@ sub render_tools {
   <li><a href="?view=peers">Peers</a> — configured peer net-mgr
       instances (from <code>[peers] sources</code> in the config) and
       whether each is reachable right now.</li>
+  <li><a href="?view=status">Status</a> — daemon listeners, uptime,
+      connected clients, schema version.</li>
 </ul>
 HTML
     return wrap_page("Tools — net-mgr", $body, "Tools");
+}
+
+sub render_status {
+    my $st = eval { $cli->status };
+    if (!$st || ref $st ne 'HASH') {
+        return wrap_page("Status — net-mgr",
+            qq{<p style="color:#f55;">STATUS verb not supported by this daemon }
+          . qq{(or no response). Restart net-mgr after upgrading.</p>},
+            "Status");
+    }
+
+    my $uptime_s = ($st->{now} // time()) - ($st->{started_at} // time());
+    my @listeners = split /,/, ($st->{listeners} // '');
+
+    my $body = '';
+    $body .= '<dl class=info>';
+    $body .= sprintf '<dt>uptime</dt><dd>%s <span class=src>(since %s)</span></dd>',
+                escapeHTML(_human_duration($uptime_s)),
+                escapeHTML(_human_time($st->{started_at}));
+    $body .= sprintf '<dt>schema</dt><dd>v%s</dd>',
+                escapeHTML($st->{schema_version} // '?');
+    $body .= '<dt>listeners</dt><dd>'
+           . (@listeners
+                ? '<ul class=addrlist>'
+                  . join('', map { '<li><code>' . escapeHTML($_) . '</code></li>' }
+                                 sort @listeners)
+                  . '</ul>'
+                : '<span class=note>(none)</span>')
+           . '</dd>';
+    $body .= sprintf '<dt>clients</dt><dd>%s connected</dd>',
+                escapeHTML($st->{clients} // 0);
+    $body .= sprintf '<dt>· producers</dt><dd>%s</dd>',
+                escapeHTML($st->{producers} // 0);
+    $body .= sprintf '<dt>· consumers</dt><dd>%s</dd>',
+                escapeHTML($st->{consumers} // 0);
+    $body .= sprintf '<dt>· unknown</dt><dd>%s</dd>',
+                escapeHTML($st->{unknown}   // 0)
+        if ($st->{unknown} // 0) > 0;
+    $body .= sprintf '<dt>triggers pending</dt><dd>%s</dd>',
+                escapeHTML($st->{triggers_pending} // 0);
+    $body .= '</dl>';
+    return wrap_page("Status — net-mgr", $body, "Status");
+}
+
+sub _human_duration {
+    my ($s) = @_;
+    return '0s' unless $s && $s > 0;
+    my $d = int($s / 86400); $s %= 86400;
+    my $h = int($s / 3600);  $s %= 3600;
+    my $m = int($s / 60);    $s %= 60;
+    my @parts;
+    push @parts, "${d}d" if $d;
+    push @parts, "${h}h" if $h || $d;
+    push @parts, "${m}m" if $m || $h || $d;
+    push @parts, "${s}s";
+    return join(' ', @parts);
+}
+
+sub _human_time {
+    my ($ts) = @_;
+    return '?' unless $ts;
+    my @t = localtime($ts);
+    return sprintf '%04d-%02d-%02d %02d:%02d:%02d',
+        $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0];
 }
 
 sub render_peers {
