@@ -19,7 +19,12 @@ use Carp qw(croak);
 
 my %DEFAULTS = (
     manager => {
-        listen        => '127.0.0.1:7531',
+        # 'auto' = bind to every 192.168.*.* address on this host, plus
+        # 127.0.0.1, all on the default port. Override with a comma-
+        # separated list of host[:port] entries (e.g. on a firewall:
+        # listen = 192.168.15.1:7531). 0.0.0.0:PORT also still works
+        # for the legacy "bind everywhere" behaviour.
+        listen        => 'auto',
         log           => '/var/log/net-mgr.log',
         # Flip interfaces.online back to 0 when last_seen is older than
         # this many seconds. Combined with the periodic scan-ap /

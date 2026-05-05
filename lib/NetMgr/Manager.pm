@@ -39,7 +39,7 @@ sub new {
         config    => $args{config},
         db        => $args{db},
         log_fh    => $log_fh,
-        listen    => undef,
+        listeners => {},      # fd → { sock, host, port }
         select    => undef,
         clients   => {},      # fd → { sock, source/consumer, buffer, peer }
         triggers  => {},      # pid → { cli_fd, name, started_at } pending TRIGGER WAITs
@@ -70,26 +70,98 @@ sub _ts {
 
 sub start_listener {
     my ($self) = @_;
-    my $listen = $self->{config}{manager}{listen} || '127.0.0.1:7531';
-    my ($host, $port) = split /:/, $listen, 2;
-    my $sock = IO::Socket::INET->new(
-        LocalAddr => $host,
-        LocalPort => $port,
-        Listen    => 16,
-        ReuseAddr => 1,
-        Proto     => 'tcp',
-    ) or croak "bind $listen: $!";
-    $self->{listen} = $sock;
-    $self->{select} = IO::Select->new($sock);
-    $self->_log("listening on $listen");
-    return $sock;
+    my $spec = $self->{config}{manager}{listen} || 'auto';
+    my @binds = _resolve_listen_spec($spec);
+    croak "no listen addresses resolved from '$spec'" unless @binds;
+
+    $self->{select} = IO::Select->new;
+    for my $b (@binds) {
+        my $sock = IO::Socket::INET->new(
+            LocalAddr => $b->{host},
+            LocalPort => $b->{port},
+            Listen    => 16,
+            ReuseAddr => 1,
+            Proto     => 'tcp',
+        );
+        if (!$sock) {
+            $self->_log("WARN: bind $b->{host}:$b->{port} failed: $!");
+            next;
+        }
+        my $fd = fileno($sock);
+        $self->{listeners}{$fd} = { sock => $sock, host => $b->{host}, port => $b->{port} };
+        $self->{select}->add($sock);
+        $self->_log("listening on $b->{host}:$b->{port}");
+    }
+    croak "no listeners could be bound from '$spec'" unless %{ $self->{listeners} };
+    return [ map { $_->{sock} } values %{ $self->{listeners} } ];
+}
+
+# Parse a manager.listen spec into a list of { host, port } entries.
+# 'auto'        → every 192.168.*.* address on this host + 127.0.0.1
+# 'a:p, b:p, …' → one per entry; missing port defaults to 7531
+# 'a, b, …'     → ditto, port 7531 implicit
+# 'host'        → single entry, port 7531
+sub _resolve_listen_spec {
+    my ($spec) = @_;
+    my $default_port = 7531;
+    my @out;
+    my %seen;
+    for my $tok (grep { length } map { s/^\s+|\s+$//gr } split /,/, $spec) {
+        if (lc $tok eq 'auto') {
+            for my $ip (_local_192_168_ips()) {
+                next if $seen{"$ip:$default_port"}++;
+                push @out, { host => $ip, port => $default_port };
+            }
+            my $lo = "127.0.0.1:$default_port";
+            push @out, { host => '127.0.0.1', port => $default_port }
+                unless $seen{$lo}++;
+            next;
+        }
+        my ($host, $port) = $tok =~ /^(.+):(\d+)$/
+            ? ($1, $2 + 0)
+            : ($tok, $default_port);
+        next if $seen{"$host:$port"}++;
+        push @out, { host => $host, port => $port };
+    }
+    return @out;
+}
+
+# Pick the address forked producers should connect to. They run on this
+# same host, so prefer 127.0.0.1 if we're listening on it (the 'auto'
+# default puts loopback in the list). Otherwise fall back to the first
+# bound address.
+sub _child_connect_addr {
+    my ($self) = @_;
+    for my $l (values %{ $self->{listeners} }) {
+        return "127.0.0.1:$l->{port}" if $l->{host} eq '127.0.0.1';
+    }
+    my ($l) = values %{ $self->{listeners} };
+    return $l ? "$l->{host}:$l->{port}" : '127.0.0.1:7531';
+}
+
+# Enumerate IPv4 addresses on this host that fall under 192.168.0.0/16.
+# Skips loopback. Best-effort via the `ip` command (already a hard
+# dependency for the daemon's other paths).
+sub _local_192_168_ips {
+    my @ips;
+    for my $line (`ip -br -4 addr show 2>/dev/null`) {
+        chomp $line;
+        my ($iface, $state, @addrs) = split ' ', $line;
+        next unless defined $iface;
+        next if $iface eq 'lo';
+        for my $a (@addrs) {
+            $a =~ s|/.*||;
+            push @ips, $a if $a =~ /^192\.168\./;
+        }
+    }
+    return @ips;
 }
 
 sub stop  { $_[0]->{stop} = 1 }
 
 sub run {
     my ($self) = @_;
-    $self->start_listener unless $self->{listen};
+    $self->start_listener unless %{ $self->{listeners} };
 
     local $SIG{INT}  = sub { $self->stop };
     local $SIG{TERM} = sub { $self->stop };
@@ -98,8 +170,9 @@ sub run {
     while (!$self->{stop}) {
         my @ready = $self->{select}->can_read(1.0);
         for my $fh (@ready) {
-            if ($fh == $self->{listen}) {
-                $self->_accept;
+            my $fd = fileno($fh);
+            if ($self->{listeners}{$fd}) {
+                $self->_accept($self->{listeners}{$fd}{sock});
             } else {
                 $self->_handle_readable($fh);
             }
@@ -114,12 +187,14 @@ sub run {
     for my $c (values %{ $self->{clients} }) {
         eval { $c->{sock}->close };
     }
-    eval { $self->{listen}->close };
+    for my $l (values %{ $self->{listeners} }) {
+        eval { $l->{sock}->close };
+    }
 }
 
 sub _accept {
-    my ($self) = @_;
-    my $cli = $self->{listen}->accept or return;
+    my ($self, $listener) = @_;
+    my $cli = $listener->accept or return;
     $cli->blocking(0);
     my $peer = sprintf "%s:%d", $cli->peerhost // '?', $cli->peerport // 0;
     my $fd   = fileno($cli);
@@ -349,9 +424,10 @@ sub _handle_trigger {
             for my $c (values %{ $self->{clients} }) {
                 close $c->{sock} if $c->{sock};
             }
-            close $self->{listen} if $self->{listen};
-            $ENV{NET_MGR_LISTEN} = $self->{config}{manager}{listen}
-                                // '127.0.0.1:7531';
+            for my $l (values %{ $self->{listeners} }) {
+                close $l->{sock} if $l->{sock};
+            }
+            $ENV{NET_MGR_LISTEN} = $self->_child_connect_addr;
             exec $bin, @ips;
             exit 127;
         }
@@ -386,9 +462,10 @@ sub _handle_trigger {
             for my $c (values %{ $self->{clients} }) {
                 close $c->{sock} if $c->{sock};
             }
-            close $self->{listen} if $self->{listen};
-            $ENV{NET_MGR_LISTEN} = $self->{config}{manager}{listen}
-                                // '127.0.0.1:7531';
+            for my $l (values %{ $self->{listeners} }) {
+                close $l->{sock} if $l->{sock};
+            }
+            $ENV{NET_MGR_LISTEN} = $self->_child_connect_addr;
             exec $bin, @args;
             exit 127;
         }
@@ -412,9 +489,10 @@ sub _handle_trigger {
         return $self->_send($cli, format_err("fork: $!")) unless defined $pid;
         if ($pid == 0) {
             for my $c (values %{ $self->{clients} }) { close $c->{sock} if $c->{sock} }
-            close $self->{listen} if $self->{listen};
-            $ENV{NET_MGR_LISTEN} = $self->{config}{manager}{listen}
-                                // '127.0.0.1:7531';
+            for my $l (values %{ $self->{listeners} }) {
+                close $l->{sock} if $l->{sock};
+            }
+            $ENV{NET_MGR_LISTEN} = $self->_child_connect_addr;
             exec $bin, '--presence';
             exit 127;
         }
