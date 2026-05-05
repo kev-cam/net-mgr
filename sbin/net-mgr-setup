@@ -73,6 +73,11 @@ sub mysql_root_query {
     return @rows;
 }
 
+sub is_mariadb {
+    my @r = mysql_root_query("SELECT VERSION()");
+    return $r[0] && $r[0] =~ /MariaDB/i;
+}
+
 sub user_exists {
     my ($user, $host) = @_;
     my @r = mysql_root_query(
@@ -133,10 +138,15 @@ if ($use_root) {
     $pass = undef;
 } else {
     $user = prompt("MySQL username for net-mgr", 'net-mgr');
-    # Pin to the legacy auth plugin so the same connection string works
-    # on MariaDB and on MySQL 8 (whose default `caching_sha2_password`
-    # may not be supported by older DBD::mysql).
-    my $WITH = "IDENTIFIED WITH mysql_native_password";
+    # Pick auth syntax by server vendor:
+    #   MySQL  → IDENTIFIED WITH mysql_native_password BY '...'
+    #            (pinning to the legacy plugin since MySQL 8's default
+    #            caching_sha2_password isn't always supported by DBD::mysql)
+    #   MariaDB → IDENTIFIED BY '...'
+    #            (its CREATE USER doesn't accept the WITH … BY form)
+    my $WITH = is_mariadb()
+        ? "IDENTIFIED"
+        : "IDENTIFIED WITH mysql_native_password";
     if (user_exists($user, 'localhost')) {
         print "User '$user'\@'localhost' already exists; will reuse.\n";
         $pass = prompt_pass("Existing password for '$user' (leave blank to reset)");
