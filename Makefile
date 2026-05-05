@@ -22,7 +22,7 @@ CGIDIR     ?= /usr/lib/cgi-bin
 APACHE_CONF_DIR ?= $(SYSCONFDIR)/apache2/conf-available
 DESTDIR    ?=
 
-BINS  = net-alias net-poll-ap net-discover net-gen-dnsmasq net-import-dhcp net-fix net-name net-ping net-roam net-router net-scan net-report net-show net-tp-scan net-var net-watch
+BINS  = net-alias net-poll-ap net-discover net-find-lost net-gen-dnsmasq net-import-dhcp net-fix net-name net-ping net-recover-tlsg2424 net-roam net-router net-scan net-report net-show net-tp-scan net-var net-watch
 SBINS = net-mgr net-mgr-setup net-dns net-mgr-relay
 UNITS = net-mgr.service net-dns.service net-mgr-relay.service
 MAN1S = net-alias.1 net-discover.1 net-fix.1 net-gen-dnsmasq.1 \

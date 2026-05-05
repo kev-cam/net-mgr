@@ -1,0 +1,325 @@
+#!/usr/bin/perl
+# net-find-lost — sweep vendor-default subnets for stray hardware on the
+# local L2. Useful when a device factory-resets and falls off DHCP.
+#
+# For each candidate /24:
+#   1. Skip if the subnet overlaps an existing route on this host.
+#   2. Add a temporary IP alias on the chosen interface(s).
+#   3. Send an ARP sweep (nmap -sn -PR), then read the kernel ARP cache
+#      to capture MACs (works regardless of nmap's privileges).
+#   4. Remove the alias.
+#
+# Findings are printed: ip, mac, vendor (OUI lookup), and — if the
+# net-mgr daemon is reachable — whether we already know that MAC.
+#
+# Usage:
+#   net-find-lost [--iface eth0]... [--cidr 192.168.0.0/24] [--dry-run]
+#                 [--recover[=MAC|all]] [--quiet]
+#
+# With no --iface, scans every UP non-loopback interface.
+#
+# --recover hands a hit off to the matching recovery script (see the
+# %RECOVERY registry below). Bare --recover or --recover=all means
+# "any matching device". --recover=AA:BB:CC:DD:EE:FF means "only this
+# MAC". --quiet suppresses per-subnet headers when nothing was found,
+# so a cron-driven 'net-find-lost --recover --quiet' stays silent
+# until a stray device actually shows up.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+# Per-row: cidr, alias_ip (must be in cidr), label
+my @CANDIDATES = (
+    [ '192.168.0.0/24',   '192.168.0.99',  'TP-Link / D-Link / Tenda' ],
+    [ '192.168.1.0/24',   '192.168.1.99',  'Netgear / Linksys / Asus / Cisco' ],
+    [ '192.168.2.0/24',   '192.168.2.99',  'Belkin' ],
+    [ '192.168.4.0/24',   '192.168.4.99',  'ESP softAP / IoT' ],
+    [ '192.168.10.0/24',  '192.168.10.99', 'Edimax / misc IoT' ],
+    [ '192.168.11.0/24',  '192.168.11.99', 'Buffalo' ],
+    [ '192.168.50.0/24',  '192.168.50.99', 'Asus AiMesh' ],
+    [ '192.168.100.0/24', '192.168.100.99','cable modem / printer' ],
+    [ '10.0.0.0/24',      '10.0.0.99',     'misc' ],
+    [ '10.0.1.0/24',      '10.0.1.99',     'Apple AirPort' ],
+);
+
+# Recovery handlers — each entry says: when a hit on this subnet, IP,
+# and OUI prefix shows up, run this script with --iface <found_iface>.
+# The script is located via $FindBin::Bin first, then $PATH.
+my @RECOVERY = (
+    {
+        name       => 'TL-SG2424',
+        on_subnet  => '192.168.0.0/24',
+        on_ip      => '192.168.0.1',         # default mgmt IP
+        oui_prefix => '14:cc:20',            # TP-Link Technologies
+        script     => 'net-recover-tlsg2424',
+    },
+);
+
+my @ifaces;
+my $only_cidr;
+my $dry_run;
+my $recover;            # undef = off, '' or 'all' = any match, MAC = filter
+my $quiet;
+my $help;
+
+GetOptions(
+    'iface|i=s'   => \@ifaces,
+    'cidr|c=s'    => \$only_cidr,
+    'dry-run|n'   => \$dry_run,
+    'recover:s'   => \$recover,
+    'quiet|q'     => \$quiet,
+    'help|h'      => \$help,
+) or usage();
+usage() if $help;
+
+# Normalize --recover: bare flag or =all means "every match". Otherwise
+# treat it as a MAC filter (lowercased).
+my $recover_mac;
+if (defined $recover) {
+    if ($recover eq '' || lc $recover eq 'all') {
+        $recover_mac = '';
+    } else {
+        ($recover_mac = lc $recover) =~ tr/-/:/;
+        die "--recover MAC '$recover' isn't a valid MAC\n"
+            unless $recover_mac =~ /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/;
+    }
+}
+
+if (!@ifaces) {
+    chomp(my @up = `ip -br link | awk '\$2=="UP" && \$1!="lo" {print \$1}'`);
+    @ifaces = @up;
+}
+die "no UP interfaces found\n" unless @ifaces;
+die "must run as root (need 'ip addr add/del')\n" if !$dry_run && $> != 0;
+
+# Existing routes on this host — skip any candidate that overlaps.
+my @routes;
+for my $line (`ip -br route`) {
+    my ($dest) = split ' ', $line;
+    push @routes, $dest if $dest =~ m{/};
+}
+
+# Best-effort MAC → known-machine lookup.
+my $known_mac = load_known_macs();
+
+# OUI cache, lazy-loaded the same way the web CGI does it.
+my %OUI;
+my $oui_loaded = 0;
+
+CANDIDATE: for my $c (@CANDIDATES) {
+    my ($cidr, $alias_ip, $label) = @$c;
+    next if $only_cidr && $cidr ne $only_cidr;
+
+    for my $r (@routes) {
+        next CANDIDATE if cidrs_overlap($r, $cidr);
+    }
+
+    print "[$cidr] $label\n" unless $quiet;
+    if ($dry_run) {
+        printf "  (dry-run) would alias %s on %s\n", $alias_ip, join(',', @ifaces)
+            unless $quiet;
+        next;
+    }
+
+    my %hits;   # ip => { mac, iface }
+    for my $iface (@ifaces) {
+        my $alias = "$alias_ip/24";
+        my $rc = system('ip', 'addr', 'add', $alias, 'dev', $iface);
+        if ($rc != 0) {
+            warn "  alias add failed on $iface (already present?)\n";
+            next;
+        }
+
+        # ARP sweep. We don't actually need nmap's output — we just want
+        # the kernel's neighbour table populated. nmap is the most
+        # reliable cross-distro way to do that without root-only tools.
+        system('nmap', '-sn', '-PR', '-e', $iface, '--max-retries', '1',
+               '-T4', $cidr, '-oN', '/dev/null') >= 0
+            or warn "  nmap returned $?\n";
+
+        for my $line (`ip -4 neigh show dev $iface`) {
+            chomp $line;
+            next unless $line =~ /^(\S+)\s+lladdr\s+(\S+)\s+(\S+)/;
+            my ($ip, $mac, $state) = ($1, lc $2, $3);
+            next if $state eq 'FAILED';
+            next unless ip_in_cidr($ip, $cidr);
+            next if $ip eq $alias_ip;
+            $hits{$ip} //= { mac => $mac, iface => $iface };
+        }
+
+        system('ip', 'addr', 'del', $alias, 'dev', $iface);
+    }
+
+    if (!keys %hits) {
+        print "  nothing found\n" unless $quiet;
+        next;
+    }
+    # If we suppressed the header in --quiet mode, emit it now that we
+    # actually have something to show.
+    print "[$cidr] $label\n" if $quiet;
+
+    for my $ip (sort { ip_sort($a) cmp ip_sort($b) } keys %hits) {
+        my $h = $hits{$ip};
+        my $vendor = oui_vendor($h->{mac}) // '';
+        my $known  = $known_mac->{ $h->{mac} };
+        my $tag    = $known ? " [known: $known]" : ' [unknown to net-mgr]';
+        printf "  %-15s  %s  %-30s  via %s%s\n",
+            $ip, $h->{mac}, $vendor, $h->{iface}, $tag;
+
+        next unless defined $recover;
+        next if $recover_mac ne '' && $recover_mac ne $h->{mac};
+
+        my $handler = match_recovery($cidr, $ip, $h->{mac});
+        if (!$handler) {
+            print "    (no recovery handler registered)\n";
+            next;
+        }
+        my $script = locate_script($handler->{script});
+        if (!$script) {
+            warn "    recovery script '$handler->{script}' not found in PATH\n";
+            next;
+        }
+        print "    -> running $handler->{name} recovery: $script --iface $h->{iface}\n";
+        my @cmd = ($script, '--iface', $h->{iface}, '--no-browser');
+        my $rc = system(@cmd);
+        if ($rc != 0) {
+            warn "    recovery script exited with status " . ($rc >> 8) . "\n";
+        }
+    }
+}
+
+# --- helpers -------------------------------------------------------
+
+# First registered handler whose subnet, IP (if any), and OUI prefix
+# match the hit. Returns undef if nothing matches.
+sub match_recovery {
+    my ($cidr, $ip, $mac) = @_;
+    for my $h (@RECOVERY) {
+        next if $h->{on_subnet}  && $h->{on_subnet}  ne $cidr;
+        next if $h->{on_ip}      && $h->{on_ip}      ne $ip;
+        next if $h->{oui_prefix} && lc(substr($mac, 0, length $h->{oui_prefix}))
+                                    ne lc $h->{oui_prefix};
+        return $h;
+    }
+    return undef;
+}
+
+# Find a sibling script: prefer the bin/ dir we live in (so a development
+# tree resolves correctly), then fall back to PATH.
+sub locate_script {
+    my ($name) = @_;
+    my $sib = "$FindBin::Bin/$name";
+    return $sib if -x $sib;
+    for my $d (split /:/, $ENV{PATH} // '') {
+        my $p = "$d/$name";
+        return $p if -x $p;
+    }
+    return undef;
+}
+
+sub ip_to_int {
+    my ($ip) = @_;
+    return undef unless $ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+    return ($1 << 24) | ($2 << 16) | ($3 << 8) | $4;
+}
+
+sub cidrs_overlap {
+    my ($a, $b) = @_;
+    my ($an, $ap) = split '/', $a, 2;
+    my ($bn, $bp) = split '/', $b, 2;
+    return 0 unless defined $ap && defined $bp;
+    my $pl = $ap < $bp ? $ap : $bp;
+    my $mask = $pl == 0 ? 0 : ((0xffffffff << (32 - $pl)) & 0xffffffff);
+    my $ai = ip_to_int($an); return 0 unless defined $ai;
+    my $bi = ip_to_int($bn); return 0 unless defined $bi;
+    return ($ai & $mask) == ($bi & $mask);
+}
+
+sub ip_in_cidr {
+    my ($ip, $cidr) = @_;
+    my ($net, $pl) = split '/', $cidr, 2;
+    return 0 unless defined $pl;
+    my $mask = $pl == 0 ? 0 : ((0xffffffff << (32 - $pl)) & 0xffffffff);
+    my $ipi  = ip_to_int($ip);  return 0 unless defined $ipi;
+    my $neti = ip_to_int($net); return 0 unless defined $neti;
+    return ($ipi & $mask) == ($neti & $mask);
+}
+
+sub ip_sort {
+    my ($ip) = @_;
+    return '999.999.999.999' unless $ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+    return sprintf "%03d.%03d.%03d.%03d", $1, $2, $3, $4;
+}
+
+sub oui_vendor {
+    my ($mac) = @_;
+    return undef unless $mac && $mac =~ /^([0-9a-f]{2}):([0-9a-f]{2}):([0-9a-f]{2}):/i;
+    my $oui = uc "$1$2$3";
+    if (!$oui_loaded) {
+        $oui_loaded = 1;
+        my $f = '/var/lib/ieee-data/oui.csv';
+        if (open my $fh, '<', $f) {
+            while (<$fh>) {
+                next unless /^MA-L,([0-9A-F]{6}),"?([^",]+)/;
+                $OUI{$1} = $2;
+            }
+            close $fh;
+        }
+    }
+    return $OUI{$oui};
+}
+
+sub load_known_macs {
+    my $cli = eval {
+        require NetMgr::Client;
+        NetMgr::Client->new(listen => '127.0.0.1:7531');
+    };
+    return {} unless $cli;
+    eval { $cli->hello(consumer => "find-lost.$$") };
+    return {} if $@;
+    my $ifaces    = eval { $cli->snapshot(1, 'interfaces')     } || [];
+    my $machines  = eval { $cli->snapshot(2, 'machines')       } || [];
+    my $friendly  = eval { $cli->snapshot(3, 'friendly_names') } || [];
+    eval { $cli->bye };
+    my %m = map { $_->{id} => ($_->{primary_name} // '') } @$machines;
+    $m{ $_->{machine_id} } = $_->{name} for @$friendly;
+    my %out;
+    for my $i (@$ifaces) {
+        my $name = ($i->{machine_id} && $m{ $i->{machine_id} })
+                 ? $m{ $i->{machine_id} }
+                 : '(unaffiliated)';
+        $out{ $i->{mac} } = $name;
+    }
+    return \%out;
+}
+
+sub usage {
+    print <<USAGE;
+net-find-lost — probe vendor-default subnets for stray devices on local L2.
+
+Usage:
+  net-find-lost [--iface NAME]... [--cidr CIDR] [--dry-run]
+                [--recover[=MAC|all]] [--quiet]
+
+Options:
+  --iface, -i NAME   Interface to add temporary aliases on (repeatable;
+                     default: every UP non-loopback interface).
+  --cidr, -c CIDR    Only probe this candidate /24 (default: all listed).
+  --dry-run, -n      List candidates and what we'd do, no changes.
+  --recover[=ARG]    On a hit, run the matching recovery script. Bare
+                     --recover or --recover=all triggers on every match;
+                     --recover=AA:BB:... only triggers for that MAC.
+  --quiet, -q        Suppress per-subnet output unless something was
+                     found (cron-friendly).
+  --help, -h         Print this help.
+
+Default candidate subnets:
+USAGE
+    for my $c (@CANDIDATES) {
+        printf "  %-18s %s\n", $c->[0], $c->[2];
+    }
+    exit 1;
+}

@@ -1,0 +1,197 @@
+#!/usr/bin/perl
+# net-recover-tlsg2424 — bring a factory-reset TL-SG2424 back to its
+# configured management IP. Adds a temporary IP alias in the switch's
+# default subnet (192.168.0.0/24), ARP-probes the factory IP, and prints
+# the parameters you'll need to enter through the web UI.
+#
+# Re-run with --cleanup to remove the alias once the switch reboots
+# onto its new address.
+#
+# Usage:
+#   net-recover-tlsg2424 --iface eth0
+#   net-recover-tlsg2424 --iface eth0 --cleanup
+#
+# Defaults are tuned for the TL-SG2424 (factory IP 192.168.0.1, web UI
+# on http://, login admin/admin). Override with --factory if needed.
+
+use strict;
+use warnings;
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+my $iface;
+my $alias_ip   = '192.168.0.99';
+my $factory_ip = '192.168.0.1';
+my $expect_oui = '14:cc:20';            # TP-Link Technologies
+my $netrc_host = 'swtch15';
+my $cleanup;
+my $no_browser;
+my $help;
+
+GetOptions(
+    'iface|i=s'    => \$iface,
+    'alias=s'      => \$alias_ip,
+    'factory=s'    => \$factory_ip,
+    'host=s'       => \$netrc_host,
+    'cleanup'      => \$cleanup,
+    'no-browser'   => \$no_browser,
+    'help|h'       => \$help,
+) or usage();
+usage() if $help;
+die "must run as root (need 'ip addr add/del')\n" if $> != 0;
+die "need --iface\n" unless $iface;
+
+my $alias_cidr = "$alias_ip/24";
+
+if ($cleanup) {
+    my $rc = system('ip', 'addr', 'del', $alias_cidr, 'dev', $iface);
+    if ($rc == 0) { print "removed $alias_cidr from $iface\n" }
+    else          { warn  "alias del returned $rc (already gone?)\n" }
+    exit($rc == 0 ? 0 : 1);
+}
+
+# --- Add the alias --------------------------------------------------
+print "adding $alias_cidr to $iface ...\n";
+my $rc = system('ip', 'addr', 'add', $alias_cidr, 'dev', $iface);
+if ($rc != 0) {
+    warn "ip addr add returned $rc; trying to continue (alias may already exist)\n";
+}
+
+# --- ARP-probe factory IP ------------------------------------------
+print "arping $factory_ip on $iface ...\n";
+my $arp = `arping -c 3 -w 3 -I $iface $factory_ip 2>&1`;
+my ($mac) = $arp =~ /\[([0-9a-fA-F:]{17})\]/;
+if (!$mac) {
+    print STDERR "$arp\n";
+    print STDERR "no response from $factory_ip.\n";
+    print STDERR "things to check:\n";
+    print STDERR "  - switch is powered on and link LEDs are lit\n";
+    print STDERR "  - it's plugged into the L2 segment '$iface' reaches\n";
+    print STDERR "  - factory IP isn't different (try --factory <ip>)\n";
+    print STDERR "alias $alias_cidr left on $iface; remove with:\n";
+    print STDERR "  net-recover-tlsg2424 --iface $iface --cleanup\n";
+    exit 1;
+}
+$mac = lc $mac;
+print "found MAC $mac at $factory_ip\n";
+if (substr($mac, 0, 8) ne lc($expect_oui)) {
+    print "  note: OUI doesn't match TP-Link $expect_oui — proceed only if you're sure.\n";
+}
+
+# --- Look up the desired settings ----------------------------------
+my %target = lookup_target($netrc_host);
+
+print "\n--- recovery steps ---\n";
+print "Open the web UI:        http://$factory_ip/\n";
+print "Login:                  admin / admin\n";
+print "Navigate to:            System -> System Info -> System IP\n";
+print "Set:\n";
+print "  IP Address Mode:      Static\n";
+printf "  IP Address:           %s\n", $target{ip}      // '(your mgmt IP)';
+printf "  Subnet Mask:          %s\n", $target{netmask} // '255.255.255.0';
+printf "  Default Gateway:      %s\n", $target{gateway} // '(your gateway)';
+print "Apply, then click       'Save Config' (top of UI), then 'Reboot'.\n";
+print "\nWhen the switch is back at " . ($target{ip} // 'its new IP') . ":\n";
+print "  net-recover-tlsg2424 --iface $iface --cleanup\n";
+
+if (!$no_browser) {
+    for my $b (qw(xdg-open sensible-browser firefox chromium)) {
+        my $path = "/usr/bin/$b";
+        next unless -x $path;
+        system { $path } $b, "http://$factory_ip/";
+        last;
+    }
+}
+
+exit 0;
+
+# --- helpers -------------------------------------------------------
+
+# Pull the desired mgmt IP / gateway / netmask from net-mgr's
+# dhcp.master if it's there. Falls back to "ask the user" placeholders.
+# host{} entries are typically declared outside any subnet{} block, so
+# we collect all subnets first, then match the host's fixed-address
+# against them.
+sub lookup_target {
+    my ($host) = @_;
+    my %t;
+    my $f = '/etc/net-mgr/dhcp.master';
+    open my $fh, '<', $f or return %t;
+
+    my @subnets;            # list of { cidr, mask, gw }
+    my $cur;                # in-progress subnet hash, undef when outside
+    my $host_ip;
+    while (<$fh>) {
+        if (/^subnet\s+(\S+)\s+netmask\s+(\S+)/) {
+            $cur = { cidr => $1, mask => $2 };
+            push @subnets, $cur;
+        }
+        if ($cur && /option\s+routers\s+(\S+);/) {
+            $cur->{gw} = $1;
+        }
+        if ($cur && /^\s*\}/) {
+            $cur = undef;
+        }
+        if (/host\s+\Q$host\E\b.*?fixed-address\s+(\S+);/) {
+            $host_ip = $1;
+        }
+    }
+    close $fh;
+    return %t unless $host_ip;
+    $t{ip} = $host_ip;
+    for my $s (@subnets) {
+        next unless ip_in_subnet($host_ip, $s->{cidr}, $s->{mask});
+        $t{netmask} = $s->{mask};
+        $t{gateway} = $s->{gw} if $s->{gw};
+        last;
+    }
+
+    # dhcp.master uses uppercase placeholders like ROUTER_15 that are
+    # substituted by net-var at config-gen time. If we got one, ask
+    # net-var to resolve it for us.
+    if ($t{gateway} && $t{gateway} =~ /^[A-Z][A-Z0-9_]*$/) {
+        my $name = $t{gateway};
+        for my $line (`net-var auto 2>/dev/null`) {
+            if ($line =~ /^\Q$name\E\s*=\s*(\d+\.\d+\.\d+\.\d+)/) {
+                $t{gateway} = $1;
+                last;
+            }
+        }
+    }
+    return %t;
+}
+
+sub ip_in_subnet {
+    my ($ip, $net, $mask) = @_;
+    my $ipi   = ip_to_int($ip);   return 0 unless defined $ipi;
+    my $neti  = ip_to_int($net);  return 0 unless defined $neti;
+    my $maski = ip_to_int($mask); return 0 unless defined $maski;
+    return ($ipi & $maski) == ($neti & $maski);
+}
+
+sub ip_to_int {
+    my ($ip) = @_;
+    return undef unless $ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+    return ($1 << 24) | ($2 << 16) | ($3 << 8) | $4;
+}
+
+sub usage {
+    print <<USAGE;
+net-recover-tlsg2424 — bring a factory-reset TL-SG2424 back online.
+
+Usage:
+  net-recover-tlsg2424 --iface NAME [--alias IP] [--factory IP] [--host NAME]
+  net-recover-tlsg2424 --iface NAME --cleanup
+
+Options:
+  --iface, -i NAME   Interface the switch is reachable through (required).
+  --alias IP         Temporary IP to add (default 192.168.0.99/24).
+  --factory IP       Switch's factory IP (default 192.168.0.1).
+  --host NAME        Hostname to look up in /etc/net-mgr/dhcp.master to
+                     fill in the target IP/gateway/netmask (default
+                     swtch15).
+  --cleanup          Remove the alias and exit.
+  --no-browser       Don't try to launch a browser at the factory IP.
+  --help, -h         Print this help.
+USAGE
+    exit 1;
+}
