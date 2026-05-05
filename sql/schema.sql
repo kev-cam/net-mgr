@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS interfaces (
     kind          VARCHAR(16) NOT NULL DEFAULT 'unknown',  -- ethernet/wifi/virtual
     first_seen    DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_seen     DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_observed DATETIME    NULL,           -- last live signal (DHCP/SSH/ARP/nmap/fping);
+    last_observed DATETIME    NULL,           -- last live signal (DHCP/SSH/ARP/nmap/fping)
                                               -- NULL = never observed live (paper-only)
     online        TINYINT     NOT NULL DEFAULT 0,
     KEY idx_machine        (machine_id),
@@ -63,8 +63,8 @@ CREATE TABLE IF NOT EXISTS addresses (
                                                --      'kestrel:dhcp.master', etc.
     last_seen     DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_observed DATETIME    NULL,            -- last live signal here; NULL = never seen
-    min_rtt_ms    FLOAT       NULL,            -- shortest fping RTT ever observed;
-                                               -- monotone-decreasing, manual reset only
+    min_rtt_ms    FLOAT       NULL,            -- shortest fping RTT ever observed
+                                               -- (monotone-decreasing; manual reset only)
     last_rtt_ms   FLOAT       NULL,            -- most-recent fping RTT
     PRIMARY KEY (mac, family, addr),
     KEY idx_addr (addr),

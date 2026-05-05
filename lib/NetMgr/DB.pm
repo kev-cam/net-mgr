@@ -74,10 +74,14 @@ sub bootstrap_schema {
         open my $fh, '<', $path or croak "open $path: $!";
         my $sql = do { local $/; <$fh> };
         close $fh;
+        # Strip '-- ...' line comments before splitting on ';' — a stray
+        # ';' inside a comment would otherwise be mis-treated as a
+        # statement terminator and chop a CREATE TABLE in half.
+        $sql =~ s/--[^\n]*//g;
         my @stmts = split /;\s*\n/, $sql;
         for my $s (@stmts) {
             $s =~ s/^\s+|\s+$//g;
-            next if $s eq '' || $s =~ /^--/;
+            next if $s eq '';
             $self->{dbh}->do($s);
         }
         return $self->current_schema_version;
