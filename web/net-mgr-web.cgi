@@ -245,6 +245,65 @@ sub machine_online {
     return grep { $_->{online} } @{ $iface_by_machine{$mid} || [] };
 }
 
+# Strip a direction/medium suffix off a machine label to get a "family
+# stem" — lets us match mediapc to mediapc-up, amfpc to amfpc-air,
+# wndr8k2 to wndr8k2-down, etc. Returns lowercased stem (or empty
+# string if there's no usable label).
+sub family_stem {
+    my ($label) = @_;
+    return '' unless defined $label && length $label;
+    my $s = lc $label;
+    $s =~ s/-(up|down|dwn\d*|air|wired|wifi|eth\d*|wlan\d*)$//;
+    return $s;
+}
+
+# Distinct /24 subnets a machine has addresses on. Used to label
+# sibling links and to decide whether the sibling block is interesting.
+sub machine_subnets {
+    my ($mid) = @_;
+    my %nets;
+    for my $iface (@{ $iface_by_machine{$mid} || [] }) {
+        for my $a (@{ $addrs_by_mac{ $iface->{mac} } || [] }) {
+            next unless $a->{addr} =~ /^(\d+\.\d+\.\d+)\.\d+$/;
+            $nets{"$1.0/24"} = 1;
+        }
+    }
+    return sort keys %nets;
+}
+
+# Sibling machines: other machine_ids whose display label shares a
+# family stem with this one. Returns sorted list of { id, label,
+# subnets } hashes. The %_STEM_INDEX cache is built on first call.
+my %_STEM_INDEX;
+sub sibling_machines {
+    my ($mid) = @_;
+    if (!%_STEM_INDEX) {
+        for my $other_mid (keys %iface_by_machine) {
+            next unless $other_mid;
+            my @macs = map { $_->{mac} } @{ $iface_by_machine{$other_mid} };
+            my $stem = family_stem(display_label($other_mid, primary_addr(@macs)));
+            next if $stem eq '';
+            push @{ $_STEM_INDEX{$stem} }, $other_mid;
+        }
+    }
+    my @macs = map { $_->{mac} } @{ $iface_by_machine{$mid} || [] };
+    my $stem = family_stem(display_label($mid, primary_addr(@macs)));
+    return () if $stem eq '';
+    my @cands = grep { $_ != $mid } @{ $_STEM_INDEX{$stem} || [] };
+    return () unless @cands;
+
+    my @out;
+    for my $sid (@cands) {
+        my @sm = map { $_->{mac} } @{ $iface_by_machine{$sid} };
+        push @out, {
+            id      => $sid,
+            label   => display_label($sid, primary_addr(@sm)),
+            subnets => [ machine_subnets($sid) ],
+        };
+    }
+    return sort { lc $a->{label} cmp lc $b->{label} } @out;
+}
+
 # Compact list ------------------------------------------------------
 
 sub render_list {
@@ -326,6 +385,19 @@ sub render_machine_detail {
                        $s;
                    } @als)
                . '</dd>';
+    }
+
+    my @sibs = sibling_machines($mid);
+    if (@sibs) {
+        my @items;
+        for my $s (@sibs) {
+            my $subs = @{ $s->{subnets} }
+                ? ' <span class=src>(' . escapeHTML(join(', ', @{ $s->{subnets} })) . ')</span>'
+                : '';
+            push @items, sprintf '<a class=hostlink href="?m=%d">%s</a>%s',
+                $s->{id}, escapeHTML($s->{label}), $subs;
+        }
+        $info .= '<dt>other interfaces</dt><dd>' . join(', ', @items) . '</dd>';
     }
 
     my @iface_blocks;
