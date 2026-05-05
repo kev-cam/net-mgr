@@ -986,7 +986,7 @@ sub query_table {
     my %allowed = map { $_ => 1 } qw(
         machines hostnames interfaces addresses ports aps
         associations dhcp_leases events aliases dhcp_vars
-        subnet_routers friendly_names wifi_sockets
+        subnet_routers friendly_names wifi_sockets lost_devices
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};
