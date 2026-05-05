@@ -49,6 +49,11 @@
 #     <script> --iface <iface>
 # with NET_MGR_AUTOMATED=1 set in the environment so they can suppress
 # interactive bits (browser launch, prompts, etc.).
+#
+# Each hit is also recorded (best-effort) in the lost_devices DB table
+# so the web UI can report things found-but-not-recovered. status is:
+#   no-handler / pending / attempted / failed.
+# A successful recovery (script rc=0) flips status to attempted.
 
 use strict;
 use warnings;
@@ -130,6 +135,11 @@ for my $line (`ip -br route`) {
 # Best-effort MAC → known-machine lookup.
 my $known_mac = load_known_macs();
 
+# Best-effort DB handle for lost_devices upserts. If the DB isn't
+# reachable (no config, no creds, daemon offline), we just skip the
+# write — find-lost still works as a CLI.
+my $db = open_db();
+
 # OUI cache, lazy-loaded the same way the web CGI does it.
 my %OUI;
 my $oui_loaded = 0;
@@ -194,21 +204,32 @@ CANDIDATE: for my $c (@CANDIDATES) {
         printf "  %-15s  %s  %-30s  via %s%s\n",
             $ip, $h->{mac}, $vendor, $h->{iface}, $tag;
 
-        next unless defined $recover;
-        next if $recover_mac ne '' && $recover_mac ne $h->{mac};
-
         my $handler = match_recovery($cidr, $ip, $h->{mac});
-        if (!$handler) {
-            print "    (no recovery handler registered)\n";
+        my $status  = $handler
+                    ? (defined $recover ? 'attempted' : 'pending')
+                    : 'no-handler';
+        my $skip_for_filter = defined $recover && $recover_mac ne ''
+                              && $recover_mac ne $h->{mac};
+
+        if (!defined $recover) {
+            # Just detection — record and move on.
+            record_lost($cidr, $ip, $h, $vendor, $handler, $status);
             next;
         }
+        if (!$handler || $skip_for_filter) {
+            record_lost($cidr, $ip, $h, $vendor, $handler, $status);
+            next;
+        }
+
         print "    -> running $handler->{name} recovery: $handler->{script} --iface $h->{iface}\n";
         local $ENV{NET_MGR_AUTOMATED} = 1;
         my @cmd = ($handler->{script}, '--iface', $h->{iface});
         my $rc = system(@cmd);
         if ($rc != 0) {
             warn "    recovery script exited with status " . ($rc >> 8) . "\n";
+            $status = 'failed';
         }
+        record_lost($cidr, $ip, $h, $vendor, $handler, $status, attempted_now => 1);
     }
 }
 
@@ -344,6 +365,55 @@ sub oui_vendor {
         }
     }
     return $OUI{$oui};
+}
+
+# Open NetMgr::DB best-effort. Returns undef if config or creds aren't
+# available — the caller treats undef as "skip the upsert" and find-lost
+# carries on as a stand-alone CLI.
+sub open_db {
+    my $h = eval {
+        require NetMgr::Config;
+        require NetMgr::DB;
+        my $cfg = NetMgr::Config::load(
+            $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
+        my $mycnf = (-r "$ENV{HOME}/.my.cnf") ? "$ENV{HOME}/.my.cnf"
+                  : (-r '/root/.my.cnf')      ? '/root/.my.cnf'
+                  : return undef;
+        my $db = NetMgr::DB->new(
+            defaults_file => $mycnf,
+            section       => $cfg->{mysql}{section},
+            db            => $cfg->{mysql}{db},
+        );
+        $db->connect;
+        $db;
+    };
+    return $h;  # undef on any failure
+}
+
+sub record_lost {
+    my ($cidr, $ip, $h, $vendor, $handler, $status, %opts) = @_;
+    return unless $db;
+    eval {
+        $db->upsert_lost_device(
+            iface   => $h->{iface},
+            subnet  => $cidr,
+            ip      => $ip,
+            mac     => $h->{mac},
+            vendor  => $vendor,
+            handler => $handler ? $handler->{name} : undef,
+            status  => $status,
+            ($opts{attempted_now}
+                ? (last_attempt => sql_now())
+                : ()),
+        );
+    };
+    warn "    DB upsert failed: $@" if $@;
+}
+
+sub sql_now {
+    my @t = localtime;
+    return sprintf '%04d-%02d-%02d %02d:%02d:%02d',
+        $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0];
 }
 
 sub load_known_macs {

@@ -26,7 +26,7 @@ use NetMgr::Where    qw(parse eval_ast);
 my %SUBSCRIBABLE = map { $_ => 1 } qw(
     machines hostnames interfaces addresses ports aps
     associations dhcp_leases events aliases dhcp_vars
-    subnet_routers friendly_names wifi_sockets
+    subnet_routers friendly_names wifi_sockets lost_devices
 );
 
 sub new {

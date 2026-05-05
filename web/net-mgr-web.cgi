@@ -8,6 +8,7 @@
 #   /net-mgr?view=tools         list of dashboard tools
 #   /net-mgr?view=flake         disconnect histogram (range=1h|4h|24h|1w|4w)
 #   /net-mgr?view=flakers       host ranking by disconnect count (same range=)
+#   /net-mgr?view=lost          devices found by net-find-lost
 #
 # Connects to the manager socket (no DB credentials needed). Apache
 # handles auth + IP restriction via the matching net-mgr.conf snippet.
@@ -75,6 +76,11 @@ if (defined $q{view} && $q{view} eq 'flakers') {
 }
 if (defined $q{view} && $q{view} eq 'dhcp') {
     print render_dhcp();
+    $cli->bye;
+    exit 0;
+}
+if (defined $q{view} && $q{view} eq 'lost') {
+    print render_lost();
     $cli->bye;
     exit 0;
 }
@@ -546,9 +552,85 @@ sub render_tools {
       over the same range options.</li>
   <li><a href="?view=dhcp">DHCP grants</a> — which AP / host gave out
       each IP, derived from the source tag on each address row.</li>
+  <li><a href="?view=lost">Lost devices</a> — devices found by
+      <code>net-find-lost</code> on a vendor-default subnet, with
+      recovery status.</li>
 </ul>
 HTML
     return wrap_page("Tools — net-mgr", $body, "Tools");
+}
+
+sub render_lost {
+    my $rows = eval { $cli->snapshot(11, 'lost_devices') };
+    my $err  = $@;
+    if ($err) {
+        return wrap_page("Lost devices — net-mgr",
+            qq{<p style="color:#f55;">snapshot failed: } . escapeHTML($err) . qq{</p>}
+          . qq{<p>Restart the net-mgr daemon after upgrading so the }
+          . qq{<code>lost_devices</code> table is snapshot-able.</p>},
+            "Lost devices");
+    }
+    $rows ||= [];
+
+    # Order: failed first (most actionable), then pending, no-handler,
+    # attempted, then anything else; within each, most recent first.
+    my %order = ('failed' => 0, 'pending' => 1, 'no-handler' => 2, 'attempted' => 3);
+    my @sorted = sort {
+        ($order{$a->{status}} // 9) <=> ($order{$b->{status}} // 9)
+        || ($b->{last_seen} // '') cmp ($a->{last_seen} // '')
+    } @$rows;
+
+    my $count = scalar @sorted;
+    my $now   = scalar localtime;
+
+    my @body;
+    push @body, qq{<p class=meta>$count entries · $now</p>};
+    push @body, qq{<p class=meta>Populated by <code>net-find-lost --recover --quiet</code> }
+              . qq{(typically run from cron). Each row is a device that turned up on a }
+              . qq{vendor-default subnet and what we did about it.</p>};
+
+    if (!@sorted) {
+        push @body, '<p class=note>nothing recorded.</p>';
+        return wrap_page("Lost devices — net-mgr", join("\n", @body), "Lost devices");
+    }
+
+    push @body, '<table class=lost>';
+    push @body, '<tr><th>status</th><th>handler</th><th>ip</th><th>mac</th>'
+              . '<th>vendor</th><th>iface</th><th>subnet</th>'
+              . '<th>last seen</th><th>last attempt</th></tr>';
+    for my $r (@sorted) {
+        my $status_class = $r->{status} // 'unknown';
+        $status_class =~ s/[^a-z0-9-]/-/g;
+        my $mac = lc($r->{mac} // '');
+        my $mac_link = $mac
+            ? sprintf('<a class=hostlink href="?i=%s"><code>%s</code></a>',
+                      escapeHTML($mac), escapeHTML($mac))
+            : '';
+        push @body, sprintf
+            '<tr class="status-%s"><td class=status>%s</td><td>%s</td>'
+          . '<td><code>%s</code></td><td>%s</td><td>%s</td>'
+          . '<td><code>%s</code></td><td><code>%s</code></td>'
+          . '<td class=meta>%s</td><td class=meta>%s</td></tr>',
+            $status_class,
+            escapeHTML($r->{status} // ''),
+            escapeHTML($r->{handler} // '—'),
+            escapeHTML($r->{ip} // ''),
+            $mac_link,
+            escapeHTML($r->{vendor} // ''),
+            escapeHTML($r->{iface} // ''),
+            escapeHTML($r->{subnet} // ''),
+            escapeHTML($r->{last_seen} // ''),
+            escapeHTML($r->{last_attempt} // '—');
+    }
+    push @body, '</table>';
+
+    push @body, '<p class=note>status legend: '
+              . '<span class="swatch s-failed"></span>failed '
+              . '<span class="swatch s-pending"></span>pending '
+              . '<span class="swatch s-no-handler"></span>no handler '
+              . '<span class="swatch s-attempted"></span>attempted</p>';
+
+    return wrap_page("Lost devices — net-mgr", join("\n", @body), "Lost devices");
 }
 
 sub render_flake {
@@ -984,6 +1066,21 @@ table.events td { padding: 2px 8px; }
 }
 .flakelegend .swatch.dyn  { background: rgba(220, 60, 60, 0.6); }
 .flakelegend .swatch.stat { background: rgba(220, 200, 60, 0.6); }
+table.lost td, table.lost th { vertical-align: top; }
+table.lost td.status { font-weight: bold; }
+table.lost tr.status-failed     td { background: rgba(220, 60, 60, 0.22); }
+table.lost tr.status-pending    td { background: rgba(220, 200, 60, 0.18); }
+table.lost tr.status-no-handler td { background: rgba(150, 150, 150, 0.14); }
+table.lost tr.status-attempted  td { background: rgba(60, 200, 100, 0.14); }
+.note .swatch {
+    display: inline-block; width: 0.9em; height: 0.9em;
+    margin: 0 0.25em -1px 0.6em; border-radius: 2px;
+    vertical-align: middle;
+}
+.note .swatch.s-failed     { background: rgba(220, 60, 60, 0.6); }
+.note .swatch.s-pending    { background: rgba(220, 200, 60, 0.6); }
+.note .swatch.s-no-handler { background: rgba(150, 150, 150, 0.6); }
+.note .swatch.s-attempted  { background: rgba(60, 200, 100, 0.6); }
 </style>
 </head>
 <body>

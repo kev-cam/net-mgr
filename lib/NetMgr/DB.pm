@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 10;
+our $SCHEMA_VERSION = 11;
 
 sub new {
     my ($class, %args) = @_;
@@ -229,6 +229,31 @@ CREATE TABLE IF NOT EXISTS aliases (
     KEY idx_alias_machine (machine_id),
     CONSTRAINT fk_alias_machine
         FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
+    if ($v == 11) {
+        # Devices found by net-find-lost on a vendor-default subnet but
+        # not yet recovered. Upserted on (subnet, mac).
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS lost_devices (
+    id           INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    first_seen   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                              ON UPDATE CURRENT_TIMESTAMP,
+    iface        VARCHAR(16)  NOT NULL,
+    subnet       VARCHAR(45)  NOT NULL,
+    ip           VARCHAR(45)  NOT NULL,
+    mac          CHAR(17)     NOT NULL,
+    vendor       VARCHAR(128),
+    handler      VARCHAR(64),
+    status       VARCHAR(32)  NOT NULL DEFAULT 'no-handler',
+    last_attempt DATETIME     NULL,
+    notes        TEXT,
+    UNIQUE KEY uniq_subnet_mac (subnet, mac),
+    KEY idx_status    (status),
+    KEY idx_last_seen (last_seen)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
         return;
@@ -908,6 +933,43 @@ sub upsert_subnet_router {
     return $self->{dbh}->selectrow_hashref(
         "SELECT * FROM subnet_routers WHERE subnet_cidr = ? AND ap_mac = ?",
         undef, $f{subnet_cidr}, $f{ap_mac}
+    );
+}
+
+sub upsert_lost_device {
+    my ($self, %f) = @_;
+    croak "subnet, mac, ip, iface required"
+        unless defined $f{subnet} && defined $f{mac}
+            && defined $f{ip}     && defined $f{iface};
+    $f{mac}    = lc $f{mac};
+    $f{status} //= 'no-handler';
+    $self->{dbh}->do(
+        "INSERT INTO lost_devices
+            (iface, subnet, ip, mac, vendor, handler, status, last_attempt, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            iface        = VALUES(iface),
+            ip           = VALUES(ip),
+            vendor       = COALESCE(VALUES(vendor), vendor),
+            handler      = COALESCE(VALUES(handler), handler),
+            status       = VALUES(status),
+            last_attempt = COALESCE(VALUES(last_attempt), last_attempt),
+            notes        = COALESCE(VALUES(notes), notes)",
+        undef,
+        $f{iface}, $f{subnet}, $f{ip}, $f{mac},
+        $f{vendor}, $f{handler}, $f{status}, $f{last_attempt}, $f{notes},
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM lost_devices WHERE subnet = ? AND mac = ?",
+        undef, $f{subnet}, $f{mac}
+    );
+}
+
+sub delete_lost_device {
+    my ($self, %f) = @_;
+    return $self->{dbh}->do(
+        "DELETE FROM lost_devices WHERE subnet = ? AND mac = ?",
+        undef, $f{subnet}, lc $f{mac}
     );
 }
 

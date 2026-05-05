@@ -207,6 +207,30 @@ CREATE TABLE IF NOT EXISTS subnet_routers (
         FOREIGN KEY (ap_mac) REFERENCES interfaces(mac) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Devices found by net-find-lost on a vendor-default subnet but not
+-- (yet) recovered. Upserted by (subnet, mac); status reflects what
+-- net-find-lost knew at the time of the most recent sighting.
+CREATE TABLE IF NOT EXISTS lost_devices (
+    id           INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    first_seen   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                              ON UPDATE CURRENT_TIMESTAMP,
+    iface        VARCHAR(16)  NOT NULL,
+    subnet       VARCHAR(45)  NOT NULL,        -- e.g. 192.168.0.0/24
+    ip           VARCHAR(45)  NOT NULL,        -- IP at time of sighting
+    mac          CHAR(17)     NOT NULL,
+    vendor       VARCHAR(128),                 -- OUI lookup result
+    handler      VARCHAR(64),                  -- recovery handler name (if any)
+    status       VARCHAR(32)  NOT NULL DEFAULT 'no-handler',
+                                                -- no-handler / pending /
+                                                -- attempted / failed / recovered
+    last_attempt DATETIME     NULL,             -- when --recover was invoked
+    notes        TEXT,
+    UNIQUE KEY uniq_subnet_mac (subnet, mac),
+    KEY idx_status    (status),
+    KEY idx_last_seen (last_seen)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 INSERT IGNORE INTO schema_version (version) VALUES (1);
 INSERT IGNORE INTO schema_version (version) VALUES (2);
 INSERT IGNORE INTO schema_version (version) VALUES (3);
@@ -217,3 +241,4 @@ INSERT IGNORE INTO schema_version (version) VALUES (7);
 INSERT IGNORE INTO schema_version (version) VALUES (8);
 INSERT IGNORE INTO schema_version (version) VALUES (9);
 INSERT IGNORE INTO schema_version (version) VALUES (10);
+INSERT IGNORE INTO schema_version (version) VALUES (11);
