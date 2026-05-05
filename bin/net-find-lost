@@ -14,16 +14,41 @@
 #
 # Usage:
 #   net-find-lost [--iface eth0]... [--cidr 192.168.0.0/24] [--dry-run]
-#                 [--recover[=MAC|all]] [--quiet]
+#                 [--recover[=MAC|all]] [--quiet] [--list]
 #
 # With no --iface, scans every UP non-loopback interface.
 #
-# --recover hands a hit off to the matching recovery script (see the
-# %RECOVERY registry below). Bare --recover or --recover=all means
-# "any matching device". --recover=AA:BB:CC:DD:EE:FF means "only this
-# MAC". --quiet suppresses per-subnet headers when nothing was found,
-# so a cron-driven 'net-find-lost --recover --quiet' stays silent
-# until a stray device actually shows up.
+# --recover hands a hit off to the matching recovery script. Bare
+# --recover or --recover=all means "any matching device".
+# --recover=AA:BB:CC:DD:EE:FF means "only this MAC". --quiet suppresses
+# per-subnet headers when nothing was found, so a cron-driven
+# 'net-find-lost --recover --quiet' stays silent until a stray device
+# actually shows up. --list prints the registered recovery scripts.
+#
+# Recovery scripts live off PATH (default $RECOVERY_DIR below; override
+# with $NET_MGR_RECOVERY_DIR). Two flavours:
+#
+#  1. Scripts that support --describe, emitting one 'key: value' per
+#     line. Recognised keys:
+#       name         - short label
+#       description  - one-line summary
+#       on_subnet    - CIDR this handler applies to (e.g. 192.168.0.0/24)
+#       on_ip        - specific IP that triggers it (e.g. factory mgmt IP)
+#       oui_prefix   - MAC OUI prefix (e.g. 14:cc:20)
+#       match_mac    - exact MAC this handler is for
+#     A script matches a hit if every present on_*/oui_*/match_mac key
+#     matches.
+#
+#  2. Scrappy scripts named net-recover-<MAC> (12 hex chars, optionally
+#     dash-separated). The MAC is taken from the filename and the script
+#     is invoked whenever that exact MAC turns up — no --describe
+#     required. Useful for one-off recovery scripts you don't want to
+#     teach the discovery contract.
+#
+# When dispatching, scripts are called as:
+#     <script> --iface <iface>
+# with NET_MGR_AUTOMATED=1 set in the environment so they can suppress
+# interactive bits (browser launch, prompts, etc.).
 
 use strict;
 use warnings;
@@ -45,24 +70,18 @@ my @CANDIDATES = (
     [ '10.0.1.0/24',      '10.0.1.99',     'Apple AirPort' ],
 );
 
-# Recovery handlers — each entry says: when a hit on this subnet, IP,
-# and OUI prefix shows up, run this script with --iface <found_iface>.
-# The script is located via $FindBin::Bin first, then $PATH.
-my @RECOVERY = (
-    {
-        name       => 'TL-SG2424',
-        on_subnet  => '192.168.0.0/24',
-        on_ip      => '192.168.0.1',         # default mgmt IP
-        oui_prefix => '14:cc:20',            # TP-Link Technologies
-        script     => 'net-recover-tlsg2424',
-    },
-);
+# Where recovery scripts live (off PATH). The Makefile rewrites this
+# string at install time to the absolute install location; here it
+# defaults to the dev-tree sibling dir so source-checkout runs work.
+my $RECOVERY_DIR = $ENV{NET_MGR_RECOVERY_DIR}
+                // "$FindBin::Bin/../recovery";
 
 my @ifaces;
 my $only_cidr;
 my $dry_run;
 my $recover;            # undef = off, '' or 'all' = any match, MAC = filter
 my $quiet;
+my $list;
 my $help;
 
 GetOptions(
@@ -71,9 +90,15 @@ GetOptions(
     'dry-run|n'   => \$dry_run,
     'recover:s'   => \$recover,
     'quiet|q'     => \$quiet,
+    'list'        => \$list,
     'help|h'      => \$help,
 ) or usage();
 usage() if $help;
+
+if ($list) {
+    print_recovery_list();
+    exit 0;
+}
 
 # Normalize --recover: bare flag or =all means "every match". Otherwise
 # treat it as a MAC filter (lowercased).
@@ -177,13 +202,9 @@ CANDIDATE: for my $c (@CANDIDATES) {
             print "    (no recovery handler registered)\n";
             next;
         }
-        my $script = locate_script($handler->{script});
-        if (!$script) {
-            warn "    recovery script '$handler->{script}' not found in PATH\n";
-            next;
-        }
-        print "    -> running $handler->{name} recovery: $script --iface $h->{iface}\n";
-        my @cmd = ($script, '--iface', $h->{iface}, '--no-browser');
+        print "    -> running $handler->{name} recovery: $handler->{script} --iface $h->{iface}\n";
+        local $ENV{NET_MGR_AUTOMATED} = 1;
+        my @cmd = ($handler->{script}, '--iface', $h->{iface});
         my $rc = system(@cmd);
         if ($rc != 0) {
             warn "    recovery script exited with status " . ($rc >> 8) . "\n";
@@ -193,31 +214,84 @@ CANDIDATE: for my $c (@CANDIDATES) {
 
 # --- helpers -------------------------------------------------------
 
-# First registered handler whose subnet, IP (if any), and OUI prefix
-# match the hit. Returns undef if nothing matches.
+# Discover recovery scripts in $RECOVERY_DIR. Two paths:
+#   1. Filenames matching net-recover-<MAC> auto-register for that MAC,
+#      no --describe required.
+#   2. Other executables are invoked with --describe and their key:value
+#      output is parsed.
+# Returns a list of hashrefs (each contains 'script' = full path).
+# Cached after first call.
+my @_DISCOVERED;
+my $_DISCOVERED = 0;
+sub discover_recovery {
+    return @_DISCOVERED if $_DISCOVERED;
+    $_DISCOVERED = 1;
+    return () unless -d $RECOVERY_DIR;
+    opendir my $dh, $RECOVERY_DIR or return ();
+    my @files = sort grep { !/^\./ } readdir $dh;
+    closedir $dh;
+    for my $f (@files) {
+        my $path = "$RECOVERY_DIR/$f";
+        next unless -f $path && -x $path;
+        my %meta = (script => $path);
+
+        # Filename-based MAC: net-recover-aabbccddeeff or
+        # net-recover-aa-bb-cc-dd-ee-ff (case insensitive).
+        if ($f =~ /^net-recover-([0-9a-fA-F]{2}([:-]?)(?:[0-9a-fA-F]{2}\2){4}[0-9a-fA-F]{2})$/) {
+            (my $mac = lc $1) =~ tr/-/:/;
+            $mac = join ':', unpack '(A2)*', $mac if $mac !~ /:/;
+            $meta{match_mac}   = $mac;
+            $meta{name}      //= "MAC $mac";
+            $meta{description} //= '(filename-discovered)';
+        }
+
+        # Optional --describe (overrides / supplements filename guess).
+        for my $line (`$path --describe 2>/dev/null`) {
+            chomp $line;
+            next unless $line =~ /^([a-z_]+)\s*:\s*(.*\S)/;
+            $meta{$1} = $2;
+        }
+        next unless $meta{name};
+        $meta{match_mac} = lc $meta{match_mac} if $meta{match_mac};
+        push @_DISCOVERED, \%meta;
+    }
+    return @_DISCOVERED;
+}
+
+# First registered handler whose constraints all match the hit. Each
+# of subnet / IP / OUI prefix / exact MAC is checked only if set.
 sub match_recovery {
     my ($cidr, $ip, $mac) = @_;
-    for my $h (@RECOVERY) {
+    for my $h (discover_recovery()) {
         next if $h->{on_subnet}  && $h->{on_subnet}  ne $cidr;
         next if $h->{on_ip}      && $h->{on_ip}      ne $ip;
         next if $h->{oui_prefix} && lc(substr($mac, 0, length $h->{oui_prefix}))
                                     ne lc $h->{oui_prefix};
+        next if $h->{match_mac}  && lc $h->{match_mac} ne lc $mac;
         return $h;
     }
     return undef;
 }
 
-# Find a sibling script: prefer the bin/ dir we live in (so a development
-# tree resolves correctly), then fall back to PATH.
-sub locate_script {
-    my ($name) = @_;
-    my $sib = "$FindBin::Bin/$name";
-    return $sib if -x $sib;
-    for my $d (split /:/, $ENV{PATH} // '') {
-        my $p = "$d/$name";
-        return $p if -x $p;
+sub print_recovery_list {
+    my @r = discover_recovery();
+    if (!@r) {
+        print "no recovery scripts found in $RECOVERY_DIR\n";
+        return;
     }
-    return undef;
+    print "recovery scripts in $RECOVERY_DIR:\n\n";
+    for my $h (@r) {
+        printf "  %s\n", $h->{name};
+        printf "    script:      %s\n", $h->{script};
+        printf "    description: %s\n", $h->{description} if $h->{description};
+        my @trig;
+        push @trig, "subnet $h->{on_subnet}" if $h->{on_subnet};
+        push @trig, "IP $h->{on_ip}"         if $h->{on_ip};
+        push @trig, "OUI $h->{oui_prefix}"   if $h->{oui_prefix};
+        push @trig, "MAC $h->{match_mac}"    if $h->{match_mac};
+        printf "    triggers on: %s\n", join(', ', @trig) if @trig;
+        print "\n";
+    }
 }
 
 sub ip_to_int {
@@ -303,6 +377,7 @@ net-find-lost — probe vendor-default subnets for stray devices on local L2.
 Usage:
   net-find-lost [--iface NAME]... [--cidr CIDR] [--dry-run]
                 [--recover[=MAC|all]] [--quiet]
+  net-find-lost --list
 
 Options:
   --iface, -i NAME   Interface to add temporary aliases on (repeatable;
@@ -312,9 +387,19 @@ Options:
   --recover[=ARG]    On a hit, run the matching recovery script. Bare
                      --recover or --recover=all triggers on every match;
                      --recover=AA:BB:... only triggers for that MAC.
+                     Recovery scripts are discovered from $RECOVERY_DIR.
   --quiet, -q        Suppress per-subnet output unless something was
                      found (cron-friendly).
+  --list             List the recovery scripts found in $RECOVERY_DIR
+                     (each script's --describe output) and exit.
   --help, -h         Print this help.
+
+Recovery script directory: $RECOVERY_DIR
+  (override with NET_MGR_RECOVERY_DIR=... in the environment)
+
+  Scripts there can either implement --describe, or be named
+  net-recover-<MAC> (12 hex chars, optionally dash-separated) to be
+  auto-registered for that exact MAC with no contract.
 
 Default candidate subnets:
 USAGE

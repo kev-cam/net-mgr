@@ -15,6 +15,7 @@ BINDIR     ?= $(PREFIX)/bin
 SBINDIR    ?= $(PREFIX)/sbin
 PERL5DIR   ?= $(PREFIX)/share/perl5
 SHAREDIR   ?= $(PREFIX)/share/net-mgr
+RECOVERYDIR?= $(PREFIX)/lib/net-mgr/recovery
 MANDIR     ?= $(PREFIX)/share/man
 SYSCONFDIR ?= /etc
 UNITDIR    ?= $(SYSCONFDIR)/systemd/system
@@ -22,8 +23,11 @@ CGIDIR     ?= /usr/lib/cgi-bin
 APACHE_CONF_DIR ?= $(SYSCONFDIR)/apache2/conf-available
 DESTDIR    ?=
 
-BINS  = net-alias net-poll-ap net-discover net-find-lost net-gen-dnsmasq net-import-dhcp net-fix net-name net-ping net-recover-tlsg2424 net-roam net-router net-scan net-report net-show net-tp-scan net-var net-watch
+BINS  = net-alias net-poll-ap net-discover net-find-lost net-gen-dnsmasq net-import-dhcp net-fix net-name net-ping net-roam net-router net-scan net-report net-show net-tp-scan net-var net-watch
 SBINS = net-mgr net-mgr-setup net-dns net-mgr-relay
+# Recovery scripts live off PATH so net-find-lost can enumerate them
+# without polluting BINDIR. Each script must support --describe.
+RECOVERYS = net-recover-tlsg2424
 UNITS = net-mgr.service net-dns.service net-mgr-relay.service
 MAN1S = net-alias.1 net-discover.1 net-fix.1 net-gen-dnsmasq.1 \
         net-import-dhcp.1 net-name.1 net-ping.1 net-poll-ap.1 \
@@ -112,6 +116,9 @@ list:
 	@echo "daemon → $(DESTDIR)$(SBINDIR):"
 	@for f in $(SBINS); do echo "  $$f"; done
 	@echo
+	@echo "recovery scripts (off PATH) → $(DESTDIR)$(RECOVERYDIR):"
+	@for f in $(RECOVERYS); do echo "  $$f"; done
+	@echo
 	@echo "perl modules → $(DESTDIR)$(PERL5DIR):"
 	@for f in $(LIBS); do echo "  $$f"; done
 	@echo
@@ -157,6 +164,7 @@ install:
 	fi
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(SBINDIR)
+	$(INSTALL) -d $(DESTDIR)$(RECOVERYDIR)
 	$(INSTALL) -d $(DESTDIR)$(PERL5DIR)/NetMgr/Producer
 	$(INSTALL) -d $(DESTDIR)$(SHAREDIR)/sql
 	$(INSTALL) -d $(DESTDIR)$(SYSCONFDIR)/net-mgr
@@ -164,9 +172,14 @@ install:
 	@for f in $(BINS); do \
 	  echo "  bin/$$f → $(DESTDIR)$(BINDIR)/$$f"; \
 	  sed -e 's|use lib .*FindBin.*|use lib "$(PERL5DIR)";|' \
+	      -e 's|"\$$FindBin::Bin/../recovery"|"$(RECOVERYDIR)"|' \
 	      bin/$$f > $(DESTDIR)$(BINDIR)/$$f.tmp && \
 	  mv $(DESTDIR)$(BINDIR)/$$f.tmp $(DESTDIR)$(BINDIR)/$$f && \
 	  chmod 755 $(DESTDIR)$(BINDIR)/$$f; \
+	done
+	@for f in $(RECOVERYS); do \
+	  echo "  recovery/$$f → $(DESTDIR)$(RECOVERYDIR)/$$f"; \
+	  $(INSTALL) -m 755 recovery/$$f $(DESTDIR)$(RECOVERYDIR)/$$f; \
 	done
 	@for f in $(SBINS); do \
 	  echo "  sbin/$$f → $(DESTDIR)$(SBINDIR)/$$f"; \
@@ -257,8 +270,11 @@ uninstall:
 	    systemctl disable --now "$$u" 2>/dev/null || true; \
 	  done; \
 	fi
-	@for f in $(BINS);  do rm -fv $(DESTDIR)$(BINDIR)/$$f;  done
-	@for f in $(SBINS); do rm -fv $(DESTDIR)$(SBINDIR)/$$f; done
+	@for f in $(BINS);      do rm -fv $(DESTDIR)$(BINDIR)/$$f;      done
+	@for f in $(SBINS);     do rm -fv $(DESTDIR)$(SBINDIR)/$$f;     done
+	@for f in $(RECOVERYS); do rm -fv $(DESTDIR)$(RECOVERYDIR)/$$f; done
+	-@rmdir $(DESTDIR)$(RECOVERYDIR) 2>/dev/null || true
+	-@rmdir $(DESTDIR)$(PREFIX)/lib/net-mgr 2>/dev/null || true
 	@for f in $(LIBS);  do rm -fv $(DESTDIR)$(PERL5DIR)/$$f; done
 	@for f in $(UNITS); do rm -fv $(DESTDIR)$(UNITDIR)/$$f; done
 	@for f in $(MAN1S); do rm -fv $(DESTDIR)$(MANDIR)/man1/$$f; done
@@ -281,9 +297,10 @@ test:
 	prove -Ilib t/
 
 check:
-	@for f in $(LIBS); do perl -Ilib -c lib/$$f || exit 1; done
-	@for f in $(BINS);  do perl -Ilib -c bin/$$f  || exit 1; done
-	@for f in $(SBINS); do perl -Ilib -c sbin/$$f || exit 1; done
+	@for f in $(LIBS);      do perl -Ilib -c lib/$$f      || exit 1; done
+	@for f in $(BINS);      do perl -Ilib -c bin/$$f      || exit 1; done
+	@for f in $(SBINS);     do perl -Ilib -c sbin/$$f     || exit 1; done
+	@for f in $(RECOVERYS); do perl -Ilib -c recovery/$$f || exit 1; done
 	@echo "compile: ok"
 
 clean:

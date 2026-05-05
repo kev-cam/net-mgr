@@ -25,6 +25,7 @@ my $expect_oui = '14:cc:20';            # TP-Link Technologies
 my $netrc_host = 'swtch15';
 my $cleanup;
 my $no_browser;
+my $describe;
 my $help;
 
 GetOptions(
@@ -34,9 +35,22 @@ GetOptions(
     'host=s'       => \$netrc_host,
     'cleanup'      => \$cleanup,
     'no-browser'   => \$no_browser,
+    'describe'     => \$describe,
     'help|h'       => \$help,
 ) or usage();
 usage() if $help;
+
+# --describe is the discovery contract net-find-lost uses: emit one
+# 'key: value' per line and exit 0. No root required.
+if ($describe) {
+    print "name: TL-SG2424\n";
+    print "description: TP-Link 24-port managed switch (factory recovery)\n";
+    print "on_subnet: 192.168.0.0/24\n";
+    print "on_ip: $factory_ip\n";
+    print "oui_prefix: $expect_oui\n";
+    exit 0;
+}
+
 die "must run as root (need 'ip addr add/del')\n" if $> != 0;
 die "need --iface\n" unless $iface;
 
@@ -93,7 +107,7 @@ print "Apply, then click       'Save Config' (top of UI), then 'Reboot'.\n";
 print "\nWhen the switch is back at " . ($target{ip} // 'its new IP') . ":\n";
 print "  net-recover-tlsg2424 --iface $iface --cleanup\n";
 
-if (!$no_browser) {
+if (!$no_browser && !$ENV{NET_MGR_AUTOMATED}) {
     for my $b (qw(xdg-open sensible-browser firefox chromium)) {
         my $path = "/usr/bin/$b";
         next unless -x $path;
