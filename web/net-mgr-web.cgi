@@ -9,6 +9,7 @@
 #   /net-mgr?view=flake         disconnect histogram (range=1h|4h|24h|1w|4w)
 #   /net-mgr?view=flakers       host ranking by disconnect count (same range=)
 #   /net-mgr?view=lost          devices found by net-find-lost
+#   /net-mgr?view=peers         configured peer net-mgr instances + reachability
 #
 # Connects to the manager socket (no DB credentials needed). Apache
 # handles auth + IP restriction via the matching net-mgr.conf snippet.
@@ -81,6 +82,11 @@ if (defined $q{view} && $q{view} eq 'dhcp') {
 }
 if (defined $q{view} && $q{view} eq 'lost') {
     print render_lost();
+    $cli->bye;
+    exit 0;
+}
+if (defined $q{view} && $q{view} eq 'peers') {
+    print render_peers();
     $cli->bye;
     exit 0;
 }
@@ -555,9 +561,115 @@ sub render_tools {
   <li><a href="?view=lost">Lost devices</a> — devices found by
       <code>net-find-lost</code> on a vendor-default subnet, with
       recovery status.</li>
+  <li><a href="?view=peers">Peers</a> — configured peer net-mgr
+      instances (from <code>[peers] sources</code> in the config) and
+      whether each is reachable right now.</li>
 </ul>
 HTML
     return wrap_page("Tools — net-mgr", $body, "Tools");
+}
+
+sub render_peers {
+    my @peers = configured_peers();
+    my $body  = '';
+    $body .= qq{<p class=meta>Peers are other net-mgr instances we replicate from }
+           . qq{(see <code>net-mgr-relay</code>). Configured in }
+           . qq{<code>[peers] sources = host1, host2</code> in }
+           . qq{<code>/etc/net-mgr/config</code>.</p>};
+
+    if (!@peers) {
+        $body .= qq{<p class=note>no peers configured.</p>};
+        return wrap_page("Peers — net-mgr", $body, "Peers");
+    }
+
+    $body .= '<table class=peers>';
+    $body .= '<tr><th>peer</th><th>address</th><th>status</th>'
+           . '<th>connect (ms)</th><th>machines</th><th>note</th></tr>';
+    for my $p (@peers) {
+        my $r = probe_peer($p);
+        my $cls = $r->{ok} ? 'ok' : 'down';
+        $body .= sprintf
+            '<tr class="peer-%s"><td class=name>%s</td><td><code>%s</code></td>'
+          . '<td class=status>%s</td><td class=meta>%s</td>'
+          . '<td class=meta>%s</td><td class=meta>%s</td></tr>',
+            $cls,
+            escapeHTML($p->{label}),
+            escapeHTML($p->{addr}),
+            ($r->{ok} ? 'reachable' : 'unreachable'),
+            (defined $r->{rtt_ms} ? sprintf('%.1f', $r->{rtt_ms}) : '—'),
+            (defined $r->{machines} ? $r->{machines} : '—'),
+            escapeHTML($r->{note} // '');
+    }
+    $body .= '</table>';
+    return wrap_page("Peers — net-mgr", $body, "Peers");
+}
+
+# Parse [peers] sources from /etc/net-mgr/config (world-readable).
+# Each entry is a hostname or host:port. Returns a list of
+# { label, addr } hashes; addr is normalized to host:port (default
+# port 7531).
+sub configured_peers {
+    my $path = '/etc/net-mgr/config';
+    open my $fh, '<', $path or return ();
+    my $section = '';
+    my $sources;
+    while (<$fh>) {
+        s/[\r\n]+\z//; s/^\s+//; s/\s+$//;
+        next if /^[#;]/ || $_ eq '';
+        if (/^\[([^\]]+)\]\s*$/) { $section = lc $1; next }
+        if ($section eq 'peers' && /^sources\s*=\s*(.*)$/) {
+            $sources = $1;
+            last;
+        }
+    }
+    close $fh;
+    return () unless $sources;
+
+    my @out;
+    for my $tok (grep { length } map { s/^\s+|\s+$//gr } split /,/, $sources) {
+        my ($host, $port) = $tok =~ /^(.+):(\d+)$/
+            ? ($1, $2 + 0)
+            : ($tok, 7531);
+        push @out, { label => $tok, addr => "$host:$port" };
+    }
+    return @out;
+}
+
+# Probe a peer by opening a NetMgr::Client, hello'ing, and pulling a
+# machines snapshot to confirm it speaks the protocol. Returns:
+#   { ok => 0|1, rtt_ms => N, machines => N, note => '' }
+sub probe_peer {
+    my ($p) = @_;
+    my $start = _now_ms();
+    my $client = eval {
+        require NetMgr::Client;
+        NetMgr::Client->new(listen => $p->{addr}, timeout => 3);
+    };
+    if (!$client || $@) {
+        return { ok => 0, note => "connect failed: " . ($@ || $!) };
+    }
+    eval { $client->hello(consumer => "web-peer-probe.$$") };
+    if ($@) {
+        return { ok => 0, note => "hello failed: $@" };
+    }
+    my $rtt = _now_ms() - $start;
+    my $rows = eval { $client->snapshot(1, 'machines') };
+    my $count = ($rows && ref $rows eq 'ARRAY') ? scalar @$rows : undef;
+    eval { $client->bye };
+    return {
+        ok       => 1,
+        rtt_ms   => $rtt,
+        machines => $count,
+        note     => $@ ? "snapshot failed: $@" : '',
+    };
+}
+
+sub _now_ms {
+    if (eval { require Time::HiRes; 1 }) {
+        my ($s, $us) = Time::HiRes::gettimeofday();
+        return $s * 1000 + $us / 1000;
+    }
+    return time() * 1000;
 }
 
 sub render_lost {
@@ -1082,6 +1194,9 @@ table.lost tr.status-attempted  td { background: rgba(60, 200, 100, 0.14); }
 .note .swatch.s-pending    { background: rgba(220, 200, 60, 0.6); }
 .note .swatch.s-no-handler { background: rgba(150, 150, 150, 0.6); }
 .note .swatch.s-attempted  { background: rgba(60, 200, 100, 0.6); }
+table.peers td.status { font-weight: bold; }
+table.peers tr.peer-ok   td { background: rgba(60, 200, 100, 0.14); }
+table.peers tr.peer-down td { background: rgba(220, 60, 60, 0.18); }
 </style>
 </head>
 <body>
