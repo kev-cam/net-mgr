@@ -1,0 +1,169 @@
+#!/usr/bin/perl
+# net-uplink-probe — ping each configured uplink to confirm it has
+# Internet reachability, and update the local uplinks DB row.
+#
+# Reads [uplinks] from /etc/net-mgr/config:
+#
+#   [uplinks]
+#   comcast = active 1.1.1.1 via eth0
+#   wifi    = backup 1.1.1.1 via wlan0
+#
+# Each row has its own interval ('active' defaults to 60s, 'backup' to
+# 3600s; both overridable). On every run the script:
+#   1. Reconciles the DB rows against the config (insert new rows,
+#      refresh role/target/interval/via on existing ones).
+#   2. Picks rows whose last_check is older than interval_s ago.
+#   3. Pings each: ping -c1 -W2 [-I via] <target>.
+#   4. Updates last_check / last_ok / last_status / last_rtt_ms /
+#      consecutive_failures.
+#
+# Designed to be run from cron once a minute:
+#
+#   * * * * *  /usr/local/bin/net-uplink-probe --quiet
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use Time::HiRes qw(gettimeofday tv_interval);
+
+use NetMgr::Config;
+use NetMgr::DB;
+
+my $conf_path  = $ENV{NET_MGR_CONF} // '/etc/net-mgr/config';
+my $force;
+my $quiet;
+my $help;
+GetOptions(
+    'config=s' => \$conf_path,
+    'force|f'  => \$force,        # probe every uplink, ignore last_check
+    'quiet|q'  => \$quiet,
+    'help|h'   => \$help,
+) or usage();
+usage() if $help;
+
+my $cfg = NetMgr::Config->load($conf_path);
+my $uplinks = $cfg->{uplinks} || {};
+unless (%$uplinks) {
+    warn "no [uplinks] configured in $conf_path — nothing to probe\n" unless $quiet;
+    exit 0;
+}
+
+# DB connection.
+my $mycnf = $cfg->{mysql}{defaults} // '/root/.my.cnf';
+die "no readable $mycnf — run net-mgr-setup first\n" unless -r $mycnf;
+my $db = NetMgr::DB->new(
+    defaults_file => $mycnf,
+    section       => $cfg->{mysql}{section},
+    db            => $cfg->{mysql}{db},
+);
+$db->connect;
+
+# Reconcile config -> DB. Inserting new uplinks with last_status='unknown'
+# so they show up in the page right away (and uplinks_due picks them up
+# because last_check IS NULL).
+for my $label (sort keys %$uplinks) {
+    my $u = $uplinks->{$label};
+    $db->upsert_uplink(
+        label       => $label,
+        target      => $u->{target},
+        via_iface   => $u->{via},
+        role        => $u->{role},
+        interval_s  => $u->{interval_s},
+    );
+}
+
+# Pick rows that need probing now.
+my @due = $force
+    ? @{ $db->{dbh}->selectall_arrayref("SELECT * FROM uplinks", { Slice => {} }) }
+    : @{ $db->uplinks_due };
+
+if (!@due) {
+    warn "no uplinks due for a probe right now\n" unless $quiet;
+    exit 0;
+}
+
+for my $row (@due) {
+    next unless exists $uplinks->{ $row->{label} };  # config no longer has it
+    my $r = probe(target => $row->{target}, via => $row->{via_iface});
+    my $now = sql_now();
+    my %fields = (
+        label       => $row->{label},
+        target      => $row->{target},
+        via_iface   => $row->{via_iface},
+        role        => $row->{role},
+        interval_s  => $row->{interval_s},
+        last_check  => $now,
+        last_status => $r->{ok} ? 'ok' : 'fail',
+        last_rtt_ms => $r->{rtt_ms},
+        last_ok     => $r->{ok} ? $now : $row->{last_ok},
+        consecutive_failures => $r->{ok}
+                             ? 0
+                             : (($row->{consecutive_failures} // 0) + 1),
+    );
+    $db->upsert_uplink(%fields);
+
+    unless ($quiet) {
+        printf "%-12s %-16s via=%-8s -> %s%s%s\n",
+            $row->{label}, $row->{target},
+            ($row->{via_iface} // '-'),
+            ($r->{ok} ? 'ok' : 'FAIL'),
+            (defined $r->{rtt_ms} ? sprintf(' (%.1f ms)', $r->{rtt_ms}) : ''),
+            ($r->{note} ? "  $r->{note}" : '');
+    }
+}
+
+exit 0;
+
+# --- helpers --------------------------------------------------------
+
+sub probe {
+    my (%a) = @_;
+    my $target = $a{target} // return { ok => 0, note => 'no target' };
+    my @cmd = ('ping', '-c', '1', '-W', '2', '-q');
+    push @cmd, '-I', $a{via} if $a{via};
+    push @cmd, $target;
+
+    my $t0  = [gettimeofday];
+    my $out = `@cmd 2>&1`;
+    my $rc  = $? >> 8;
+    my $rtt = tv_interval($t0) * 1000;
+
+    if ($rc == 0) {
+        # ping prints 'rtt min/avg/max/mdev = X/Y/Z/W ms' on success
+        my $real_rtt = $out =~ m{rtt[^=]*=\s*[\d.]+/([\d.]+)/} ? ($1 + 0) : $rtt;
+        return { ok => 1, rtt_ms => $real_rtt };
+    }
+    my $note = $out =~ /(unreachable|unknown host|invalid argument|network is)/i
+             ? lc $1 : "rc=$rc";
+    return { ok => 0, rtt_ms => undef, note => $note };
+}
+
+sub sql_now {
+    my @t = localtime;
+    return sprintf '%04d-%02d-%02d %02d:%02d:%02d',
+        $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0];
+}
+
+sub usage {
+    print <<USAGE;
+net-uplink-probe — ping each configured uplink, record state in DB.
+
+Usage:
+  net-uplink-probe [--config PATH] [--force] [--quiet]
+
+Reads [uplinks] from net-mgr's config, reconciles the uplinks table
+with it, then probes any rows whose last_check is older than their
+interval_s. Designed for cron every minute:
+
+  * * * * *  /usr/local/bin/net-uplink-probe --quiet
+
+Options:
+  --config, -c PATH  Override /etc/net-mgr/config.
+  --force,  -f       Probe every uplink, ignoring interval_s.
+  --quiet,  -q       Only print failures + warnings.
+  --help,   -h       This help.
+USAGE
+    exit 1;
+}

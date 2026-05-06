@@ -123,6 +123,42 @@ sub load {
                 croak "$path:$lineno: bad [bindings] line: $line";
             }
 
+            # [uplinks]
+            #   <label> = <role> <target> [via <iface>] [interval <duration>]
+            # role     : 'active' (default 60s) or 'backup' (default 1h)
+            # target   : ping target, e.g. 1.1.1.1
+            # via      : optional interface to bind ping source to
+            # interval : optional override (e.g. 30s, 5m, 1h)
+            if ($section eq 'uplinks') {
+                if ($line =~ /^([\w-]+)\s*=\s*(.*)$/) {
+                    my ($label, $rhs) = ($1, $2);
+                    my @t = grep { length } split /\s+/, $rhs;
+                    my $role   = (@t && $t[0] =~ /^(active|backup)$/i) ? lc shift @t
+                                                                       : 'active';
+                    my $target = shift @t;
+                    croak "$path:$lineno: [uplinks] $label needs a target"
+                        unless defined $target;
+                    my ($via, $interval);
+                    while (@t) {
+                        my $kw = shift @t;
+                        if    (lc $kw eq 'via')      { $via      = shift @t }
+                        elsif (lc $kw eq 'interval') { $interval = parse_duration(shift @t) }
+                        else {
+                            croak "$path:$lineno: [uplinks] $label: unknown token '$kw'";
+                        }
+                    }
+                    $interval //= ($role eq 'backup' ? 3600 : 60);
+                    $cfg->{uplinks}{$label} = {
+                        role       => $role,
+                        target     => $target,
+                        via        => $via,
+                        interval_s => $interval,
+                    };
+                    next;
+                }
+                croak "$path:$lineno: bad [uplinks] line: $line";
+            }
+
             if ($line =~ /^([A-Za-z_][\w-]*)\s*=\s*(.*)$/) {
                 my ($k, $v) = ($1, $2);
                 $v =~ s/^"(.*)"$/$1/;
@@ -178,6 +214,8 @@ my %ACTIVE = (
     paths      => '*',
     dns        => '*',
     bindings   => '*',                        # parsed for future use
+    peers      => '*',                        # consumed by net-mgr-relay
+    uplinks    => '*',                        # consumed by net-uplink-probe
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
 );
 

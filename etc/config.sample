@@ -80,6 +80,20 @@ domain   = grfx.com
 [peers]
 # sources = kc-qernel, nas3
 
+# Per-host uplink probes — only meaningful on a router/firewall.
+# Each line is one upstream path the host has. Format:
+#   <label> = <role> <target> [via <iface>] [interval <duration>]
+# role     : 'active' (default 60s) or 'backup' (default 1h)
+# target   : ping target, e.g. 1.1.1.1
+# via      : optional interface to bind ping source to (-I)
+# interval : override the role's default cadence
+# net-uplink-probe walks this list each minute and updates the
+# uplinks DB table; the web Peers page surfaces the latest state.
+[uplinks]
+# comcast = active 1.1.1.1 via eth0
+# wifi    = backup 1.1.1.1 via wlan0
+# tmobile = backup 1.1.1.1 via eth1
+
 # Periodic TRIGGERs fired by the daemon itself (each value = interval).
 # Opt-in: only enable on hosts that can actually run the producer.
 #   - scan-ap polls all known APs over SSH (only works where the

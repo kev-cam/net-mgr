@@ -207,6 +207,25 @@ CREATE TABLE IF NOT EXISTS subnet_routers (
         FOREIGN KEY (ap_mac) REFERENCES interfaces(mac) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Per-host uplink probe state. Each row is one upstream path this
+-- gateway has (e.g. 'comcast' via eth0, 'wifi' via wlan0). Populated
+-- by net-uplink-probe based on [uplinks] in /etc/net-mgr/config.
+CREATE TABLE IF NOT EXISTS uplinks (
+    label                VARCHAR(64)  NOT NULL PRIMARY KEY,
+    target               VARCHAR(64)  NOT NULL,
+    via_iface            VARCHAR(32)  NULL,
+    role                 VARCHAR(16)  NOT NULL DEFAULT 'active',
+    interval_s           INT          NOT NULL DEFAULT 60,
+    last_check           DATETIME     NULL,
+    last_ok              DATETIME     NULL,
+    last_status          VARCHAR(16)  NOT NULL DEFAULT 'unknown',
+    last_rtt_ms          FLOAT        NULL,
+    consecutive_failures INT          NOT NULL DEFAULT 0,
+    notes                TEXT,
+    KEY idx_role       (role),
+    KEY idx_last_check (last_check)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- Peer net-mgr instances discovered on the LAN by net-find-peers.
 -- Upserted on (host, port). schema_version, started_at and rtt_ms
 -- come from the peer's STATUS reply.
@@ -261,3 +280,4 @@ INSERT IGNORE INTO schema_version (version) VALUES (9);
 INSERT IGNORE INTO schema_version (version) VALUES (10);
 INSERT IGNORE INTO schema_version (version) VALUES (11);
 INSERT IGNORE INTO schema_version (version) VALUES (12);
+INSERT IGNORE INTO schema_version (version) VALUES (13);

@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 12;
+our $SCHEMA_VERSION = 13;
 
 sub new {
     my ($class, %args) = @_;
@@ -280,6 +280,32 @@ CREATE TABLE IF NOT EXISTS peers (
     notes          TEXT,
     PRIMARY KEY (host, port),
     KEY idx_last_seen (last_seen)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
+    if ($v == 13) {
+        # Per-host uplink probe state. Each row is one upstream path
+        # this gateway has (e.g. 'comcast' via eth0, 'wifi' via wlan0).
+        # Populated by net-uplink-probe; the daemon does NOT manage
+        # these — they're driven by [uplinks] in /etc/net-mgr/config.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS uplinks (
+    label                VARCHAR(64)  NOT NULL PRIMARY KEY,
+    target               VARCHAR(64)  NOT NULL,        -- ping target, e.g. 1.1.1.1
+    via_iface            VARCHAR(32)  NULL,            -- bind-to-iface (-I)
+    role                 VARCHAR(16)  NOT NULL DEFAULT 'active',
+                                                       -- 'active' | 'backup'
+    interval_s           INT          NOT NULL DEFAULT 60,
+    last_check           DATETIME     NULL,
+    last_ok              DATETIME     NULL,            -- last successful probe
+    last_status          VARCHAR(16)  NOT NULL DEFAULT 'unknown',
+                                                       -- 'ok' | 'fail' | 'unknown'
+    last_rtt_ms          FLOAT        NULL,
+    consecutive_failures INT          NOT NULL DEFAULT 0,
+    notes                TEXT,
+    KEY idx_role       (role),
+    KEY idx_last_check (last_check)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
         return;
@@ -999,6 +1025,51 @@ sub delete_lost_device {
     );
 }
 
+sub upsert_uplink {
+    my ($self, %f) = @_;
+    croak "label required" unless defined $f{label};
+    $f{role}       //= 'active';
+    $f{interval_s} //= ($f{role} eq 'backup' ? 3600 : 60);
+    $self->{dbh}->do(
+        "INSERT INTO uplinks
+            (label, target, via_iface, role, interval_s,
+             last_check, last_ok, last_status, last_rtt_ms,
+             consecutive_failures, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            target               = VALUES(target),
+            via_iface            = VALUES(via_iface),
+            role                 = VALUES(role),
+            interval_s           = VALUES(interval_s),
+            last_check           = COALESCE(VALUES(last_check),  last_check),
+            last_ok              = COALESCE(VALUES(last_ok),     last_ok),
+            last_status          = VALUES(last_status),
+            last_rtt_ms          = COALESCE(VALUES(last_rtt_ms), last_rtt_ms),
+            consecutive_failures = VALUES(consecutive_failures),
+            notes                = COALESCE(VALUES(notes),       notes)",
+        undef,
+        $f{label}, $f{target}, $f{via_iface}, $f{role}, $f{interval_s},
+        $f{last_check}, $f{last_ok}, $f{last_status} // 'unknown', $f{last_rtt_ms},
+        $f{consecutive_failures} // 0, $f{notes},
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM uplinks WHERE label = ?", undef, $f{label}
+    );
+}
+
+# Uplinks whose last_check is older than interval_s seconds ago (or
+# was never run). Used by net-uplink-probe to pick what to ping each
+# minute.
+sub uplinks_due {
+    my ($self) = @_;
+    return $self->{dbh}->selectall_arrayref(
+        "SELECT * FROM uplinks
+          WHERE last_check IS NULL
+             OR last_check < DATE_SUB(NOW(), INTERVAL interval_s SECOND)",
+        { Slice => {} }
+    );
+}
+
 sub upsert_peer {
     my ($self, %f) = @_;
     croak "host required" unless defined $f{host};
@@ -1037,7 +1108,8 @@ sub query_table {
     my %allowed = map { $_ => 1 } qw(
         machines hostnames interfaces addresses ports aps
         associations dhcp_leases events aliases dhcp_vars
-        subnet_routers friendly_names wifi_sockets lost_devices peers
+        subnet_routers friendly_names wifi_sockets lost_devices
+        peers uplinks
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};

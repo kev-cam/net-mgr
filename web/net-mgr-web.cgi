@@ -722,14 +722,23 @@ sub render_peers {
         return wrap_page("Peers — net-mgr", $body, "Peers");
     }
 
+    # Cache per-host probe results so we don't re-snapshot the same peer
+    # twice when it shows up in both 'configured' and 'discovered'.
+    my %probe_cache;
+    my $probe = sub {
+        my ($peer) = @_;
+        $probe_cache{ $peer->{addr} } //= probe_peer($peer);
+        return $probe_cache{ $peer->{addr} };
+    };
+
     if (@configured) {
         $body .= '<h2>configured</h2>';
         $body .= '<table class=peers>';
         $body .= '<tr><th>peer</th><th>machine</th><th>address</th>'
                . '<th>status</th><th>connect (ms)</th>'
-               . '<th>machines</th><th>note</th></tr>';
+               . '<th>uplinks</th><th>note</th></tr>';
         for my $p (@configured) {
-            my $r       = probe_peer($p);
+            my $r       = $probe->($p);
             my ($host)  = split /:/, $p->{addr}, 2;
             my $mid     = $ip_mid{$host};
             my $machine = $mid ? ($mid_label{$mid} // "machine $mid") : '';
@@ -741,14 +750,14 @@ sub render_peers {
                 '<tr class="%s"><td class=name>%s</td><td>%s</td>'
               . '<td><code>%s</code></td>'
               . '<td class=status>%s</td><td class=meta>%s</td>'
-              . '<td class=meta>%s</td><td class=meta>%s</td></tr>',
+              . '<td>%s</td><td class=meta>%s</td></tr>',
                 join(' ', @cls),
                 escapeHTML($p->{label}),
                 escapeHTML($machine),
                 escapeHTML($p->{addr}),
                 ($r->{ok} ? 'reachable' : 'unreachable'),
                 (defined $r->{rtt_ms} ? sprintf('%.1f', $r->{rtt_ms}) : '—'),
-                (defined $r->{machines} ? $r->{machines} : '—'),
+                _render_uplinks_inline($r->{uplinks}),
                 escapeHTML($r->{note} // '');
         }
         $body .= '</table>';
@@ -759,7 +768,8 @@ sub render_peers {
         $body .= '<h2>discovered</h2>';
         $body .= '<table class=peers>';
         $body .= '<tr><th>host</th><th>machine</th><th>port</th>'
-               . '<th>last status</th><th>schema</th><th>last RTT (ms)</th>'
+               . '<th>last status</th><th>uplinks</th>'
+               . '<th>schema</th><th>last RTT (ms)</th>'
                . '<th>peer uptime since</th><th>last seen</th></tr>';
         # Sort: same family stem clusters together; within a stem, by IP.
         my $stem_of = sub {
@@ -778,9 +788,11 @@ sub render_peers {
             if ($is_wan)            { push @cls, 'wan-router' }
             elsif ($mid && $slot{$mid}) { push @cls, "machine-$slot{$mid}" }
             my $tag = $skip{$addr} ? ' <span class=src>(also configured)</span>' : '';
+            my $r = $probe->({ addr => $addr });
             $body .= sprintf
                 '<tr class="%s"><td class=name><code>%s</code>%s</td>'
               . '<td>%s</td><td>%s</td><td class=status>%s</td>'
+              . '<td>%s</td>'
               . '<td>%s</td><td class=meta>%s</td>'
               . '<td class=meta>%s</td><td class=meta>%s</td></tr>',
                 join(' ', @cls),
@@ -788,6 +800,7 @@ sub render_peers {
                 escapeHTML($machine),
                 escapeHTML($p->{port} // ''),
                 escapeHTML($p->{last_status} // ''),
+                _render_uplinks_inline($r->{uplinks}),
                 escapeHTML($p->{schema_version} // '?'),
                 (defined $p->{rtt_ms} ? sprintf('%.1f', $p->{rtt_ms}) : '—'),
                 escapeHTML($p->{started_at} // '—'),
@@ -848,8 +861,10 @@ sub configured_peers {
 }
 
 # Probe a peer by opening a NetMgr::Client, hello'ing, and pulling a
-# machines snapshot to confirm it speaks the protocol. Returns:
-#   { ok => 0|1, rtt_ms => N, machines => N, note => '' }
+# machines snapshot to confirm it speaks the protocol. Also pulls the
+# peer's uplinks table so the page can show per-uplink status.
+# Returns:
+#   { ok => 0|1, rtt_ms => N, machines => N, uplinks => \@rows, note => '' }
 sub probe_peer {
     my ($p) = @_;
     my $start = _now_ms();
@@ -865,15 +880,44 @@ sub probe_peer {
         return { ok => 0, note => "hello failed: $@" };
     }
     my $rtt = _now_ms() - $start;
-    my $rows = eval { $client->snapshot(1, 'machines') };
+    my $rows  = eval { $client->snapshot(1, 'machines') };
     my $count = ($rows && ref $rows eq 'ARRAY') ? scalar @$rows : undef;
+    my $upl   = eval { $client->snapshot(2, 'uplinks') };
     eval { $client->bye };
     return {
         ok       => 1,
         rtt_ms   => $rtt,
         machines => $count,
+        uplinks  => (ref $upl eq 'ARRAY' ? $upl : []),
         note     => $@ ? "snapshot failed: $@" : '',
     };
+}
+
+# Render a peer's uplinks list as a small inline summary, e.g.
+#   comcast: ok 12.3ms · wifi: fail (5×)
+sub _render_uplinks_inline {
+    my ($uplinks) = @_;
+    return '<span class=note>—</span>' unless $uplinks && @$uplinks;
+    my @parts;
+    for my $u (sort { $a->{role} cmp $b->{role} || $a->{label} cmp $b->{label} }
+                @$uplinks) {
+        my $st  = $u->{last_status} // 'unknown';
+        my $cls = $st eq 'ok'   ? 'up-ok'
+                : $st eq 'fail' ? 'up-fail'
+                :                 'up-unknown';
+        my $tag = $st eq 'ok'   ? sprintf('%s%s', $st,
+                       (defined $u->{last_rtt_ms}
+                            ? sprintf(' %.1fms', $u->{last_rtt_ms}) : ''))
+                : $st eq 'fail' ? sprintf('fail%s',
+                       (($u->{consecutive_failures} // 0) > 1
+                            ? " (×$u->{consecutive_failures})" : ''))
+                : 'unknown';
+        push @parts, sprintf('<span class="up %s">%s: %s</span>',
+            $cls,
+            escapeHTML($u->{label}),
+            escapeHTML($tag));
+    }
+    return join(' · ', @parts);
 }
 
 sub _now_ms {
@@ -1419,6 +1463,11 @@ table.peers tr.machine-c4 td.name { box-shadow: inset 4px 0 0 #c6c; padding-left
 table.peers tr.machine-c5 td.name { box-shadow: inset 4px 0 0 #cc6; padding-left: 12px; }
 table.peers tr.machine-c6 td.name { box-shadow: inset 4px 0 0 #6cc; padding-left: 12px; }
 table.peers tr.wan-router td.name { box-shadow: inset 4px 0 0 #f44; padding-left: 12px; }
+.up { display: inline-block; padding: 0 6px; margin: 1px 1px;
+      border-radius: 3px; font-size: 0.85em; }
+.up.up-ok      { background: rgba(60, 200, 100, 0.18); color: #cfc; }
+.up.up-fail    { background: rgba(220, 60, 60, 0.22);  color: #fcc; }
+.up.up-unknown { background: rgba(150,150,150,0.18);   color: #ccc; }
 </style>
 </head>
 <body>
