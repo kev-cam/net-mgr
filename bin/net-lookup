@@ -1,0 +1,218 @@
+#!/usr/bin/perl
+# net-lookup — regex name → best IP, picked from this caller's POV.
+#
+# Usage:
+#   net-lookup [--all] [--family v4|v6] [--listen HOST:PORT] <name-regex>
+#
+# The pattern is a Perl regex; net-lookup wraps it as ^(?:...)$ before
+# matching, so 'nas3(|-.*)' matches nas3, nas3-up, nas3-down, nas3-dwn2.
+# Names searched: machines.primary_name, friendly_names, hostnames,
+# aliases.
+#
+# Each candidate IP is scored by routing closeness to this host:
+#   2  = same /24 as one of our interface addresses (direct L2)
+#   1  = otherwise reachable (the kernel returns a route to it)
+#   0  = no route — last resort
+# Aliases.prefer_subnet_cidr nudges score by +1 when the alias's name
+# matched and the IP is in that CIDR (the user's explicit hint).
+#
+# Default output is the single best IP. --all prints every matching
+# IP, highest-scored first, deduplicated.
+#
+# Exit codes: 0 = at least one match · 1 = no match · 2 = bad args.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+use NetMgr::Client;
+
+my $listen = $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
+my $all;
+my $family = 'v4';
+my $help;
+GetOptions(
+    'listen=s' => \$listen,
+    'all|a'    => \$all,
+    'family=s' => \$family,
+    'help|h'   => \$help,
+) or usage(2);
+usage(0) if $help;
+usage(2) if @ARGV != 1;
+
+my $pattern = $ARGV[0];
+my $rx = eval { qr/^(?:$pattern)$/ };
+die "bad regex '$pattern': $@\n" if $@;
+
+# --- caller's local /24s --------------------------------------------
+my @local_nets;     # list of [net_int, mask_int]
+for my $line (`ip -br -4 addr show 2>/dev/null`) {
+    chomp $line;
+    my ($iface, undef, @addrs) = split ' ', $line;
+    next if !$iface || $iface eq 'lo';
+    for my $a (@addrs) {
+        next unless $a =~ m{^(\d+\.\d+\.\d+\.\d+)/(\d+)$};
+        my ($ip, $pl) = ($1, $2);
+        my $ipi = _ip2int($ip) // next;
+        my $m   = $pl == 0 ? 0 : ((0xffffffff << (32 - $pl)) & 0xffffffff);
+        push @local_nets, [ $ipi & $m, $m ];
+    }
+}
+
+# --- snapshot the tables we need ------------------------------------
+my $cli = NetMgr::Client->new(listen => $listen, timeout => 5);
+$cli->hello(consumer => "net-lookup.$$");
+my $machines  = $cli->snapshot(1, 'machines');
+my $hostnames = $cli->snapshot(2, 'hostnames');
+my $friendly  = $cli->snapshot(3, 'friendly_names');
+my $aliases   = $cli->snapshot(4, 'aliases');
+my $ifaces    = $cli->snapshot(5, 'interfaces');
+my $addresses = $cli->snapshot(6, 'addresses',
+                               where => "family = '$family'");
+$cli->bye;
+
+# --- index ----------------------------------------------------------
+my %name2mids;        # name → arrayref of machine_id
+my %alias_pref;       # alias name → prefer_subnet_cidr (when set)
+
+for my $m (@$machines) {
+    push @{ $name2mids{ $m->{primary_name} } }, $m->{id}
+        if $m->{primary_name};
+}
+for my $f (@$friendly) {
+    push @{ $name2mids{ $f->{name} } }, $f->{machine_id};
+}
+for my $h (@$hostnames) {
+    push @{ $name2mids{ $h->{name} } }, $h->{machine_id};
+}
+for my $a (@$aliases) {
+    push @{ $name2mids{ $a->{name} } }, $a->{machine_id};
+    $alias_pref{ $a->{name} } = $a->{prefer_subnet_cidr}
+        if $a->{prefer_subnet_cidr};
+}
+
+# Find machines whose name matches the regex, plus the prefer_subnet_cidr
+# hint when it came in via an alias row.
+my %matched_mids;             # mid => 1
+my @prefer_cidrs;             # explicit hints from matched aliases
+for my $name (keys %name2mids) {
+    next unless $name =~ $rx;
+    $matched_mids{$_} = 1 for @{ $name2mids{$name} };
+    push @prefer_cidrs, $alias_pref{$name} if $alias_pref{$name};
+}
+
+if (!%matched_mids) {
+    exit 1;
+}
+
+my %macs_by_mid;
+push @{ $macs_by_mid{ $_->{machine_id} } }, $_->{mac}
+    for grep { defined $_->{machine_id} && $_->{machine_id} } @$ifaces;
+my %addrs_by_mac;
+push @{ $addrs_by_mac{ $_->{mac} } }, $_->{addr} for @$addresses;
+
+my %seen;
+my @candidates;       # list of [score, ip]
+for my $mid (keys %matched_mids) {
+    for my $mac (@{ $macs_by_mid{$mid} || [] }) {
+        for my $ip (@{ $addrs_by_mac{$mac} || [] }) {
+            next if $seen{$ip}++;
+            push @candidates, [ _score($ip, \@prefer_cidrs), $ip ];
+        }
+    }
+}
+
+if (!@candidates) {
+    exit 1;
+}
+
+@candidates = sort { $b->[0] <=> $a->[0] || _ipkey($a->[1]) cmp _ipkey($b->[1]) }
+              @candidates;
+
+if ($all) {
+    print "$_->[1]\n" for @candidates;
+} else {
+    print "$candidates[0][1]\n";
+}
+exit 0;
+
+# --- helpers --------------------------------------------------------
+
+sub _ip2int {
+    my ($ip) = @_;
+    return undef unless defined $ip
+                    && $ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+    return ($1 << 24) | ($2 << 16) | ($3 << 8) | $4;
+}
+
+sub _ipkey {
+    my $ip = shift // '';
+    return '999.999.999.999' unless $ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+    return sprintf '%03d.%03d.%03d.%03d', $1, $2, $3, $4;
+}
+
+sub _score {
+    my ($ip, $prefer) = @_;
+    my $ipi = _ip2int($ip);
+    return 0 unless defined $ipi;
+
+    my $score = 0;
+    # Same /24 as one of our local addresses → direct L2.
+    for my $n (@local_nets) {
+        if (($ipi & $n->[1]) == $n->[0]) { $score = 2; last }
+    }
+    # Otherwise, kernel-reachable (default route handles it) → 1.
+    if ($score == 0 && _has_route($ip)) {
+        $score = 1;
+    }
+    # Bump if an alias on the matched name pinned a preferred subnet.
+    for my $cidr (@$prefer) {
+        next unless $cidr =~ m{^(\d+\.\d+\.\d+\.\d+)/(\d+)$};
+        my $ni = _ip2int($1) // next;
+        my $m  = $2 == 0 ? 0 : ((0xffffffff << (32 - $2)) & 0xffffffff);
+        if (($ipi & $m) == ($ni & $m)) { $score++; last }
+    }
+    return $score;
+}
+
+# Best-effort: does the kernel know how to send a packet to $ip ?
+# `ip route get` returns non-zero (and the line 'unreachable …') when
+# there's no route. Cached per process.
+my %_route_cache;
+sub _has_route {
+    my ($ip) = @_;
+    return $_route_cache{$ip} if exists $_route_cache{$ip};
+    my $out = `ip route get $ip 2>&1`;
+    my $rc  = $? >> 8;
+    return $_route_cache{$ip} = ($rc == 0 && $out !~ /unreachable/) ? 1 : 0;
+}
+
+sub usage {
+    my ($code) = @_;
+    print <<USAGE;
+net-lookup — resolve a regex name to the best IP for this caller.
+
+Usage:
+  net-lookup [--all] [--family v4|v6] [--listen HOST:PORT] <name-regex>
+
+Examples:
+  net-lookup nas3                      # exact name
+  net-lookup 'nas3(|-.*)'              # nas3, nas3-up, nas3-down, nas3-dwn2
+  net-lookup --all 'wndr.*'            # every IP for every wndr-* host
+
+The pattern is a Perl regex; net-lookup wraps it as ^(?:...)\$ before
+matching against machines.primary_name, friendly_names, hostnames,
+and aliases.
+
+Scoring (highest wins):
+  +2  same /24 as one of this host's interfaces (direct L2)
+  +1  otherwise kernel-reachable
+  +1  IP is inside an alias's prefer_subnet_cidr (when the alias matched)
+
+Default prints one IP. --all prints every match, best-scored first.
+Exit 0 = found · 1 = no match · 2 = bad args.
+USAGE
+    exit($code // 0);
+}
