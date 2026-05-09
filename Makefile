@@ -42,7 +42,7 @@ LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \
 
 INSTALL ?= install
 
-.PHONY: list install install-on setup deps uninstall test check clean help
+.PHONY: list install install-on setup deps uninstall test check clean help .version
 
 # --- dependency check (Debian/Ubuntu apt names) ----------------------
 # Required deps must be present; optional deps print a hint but don't
@@ -150,16 +150,42 @@ list:
 	@$(MAKE) -s deps || true
 
 # --- install ----------------------------------------------------------
-install:
-	@VERSION=$$(git -C $(CURDIR) describe --tags --always --dirty 2>/dev/null \
-	            || git -C $(CURDIR) rev-parse --short HEAD 2>/dev/null \
-	            || echo '(no git)'); \
-	  CDATE=$$(git -C $(CURDIR) log -1 --format=%cd --date=short 2>/dev/null); \
-	  printf '==> Installing net-mgr %s%s on %s from %s\n' \
-	      "$$VERSION" \
-	      "$${CDATE:+ ($$CDATE)}" \
-	      "$$(hostname)" \
-	      "$(CURDIR)"
+# .version is regenerated from git on every invocation when run from a
+# git checkout; on a host without .git/ (e.g. after install-on rsync'd
+# us into /tmp) we leave whatever .version was rsync'd in place. The
+# install banner reads from this file rather than calling git directly,
+# so remote installs see the source tree's version, not '(no git)'.
+#
+# When 'sudo make install' is run on a build dir owned by a regular
+# user, recent git refuses to operate ('detected dubious ownership in
+# repository'). Drop to the build dir's owner via su for the git
+# queries, then chown .version back so the user can rewrite it on the
+# next build.
+.version:
+	@if [ -d .git ] && command -v git >/dev/null 2>&1; then \
+	  OWNER=$$(stat -c %U .git); \
+	  if [ "$$(id -un)" = "root" ] && [ "$$OWNER" != "root" ]; then \
+	    AS="su -s /bin/sh $$OWNER -c"; \
+	  else \
+	    AS="sh -c"; \
+	  fi; \
+	  V=$$($$AS "git -C '$(CURDIR)' describe --tags --always --dirty" 2>/dev/null \
+	       || $$AS "git -C '$(CURDIR)' rev-parse --short HEAD" 2>/dev/null \
+	       || echo unknown); \
+	  D=$$($$AS "git -C '$(CURDIR)' log -1 --format=%cd --date=short" 2>/dev/null); \
+	  printf '%s%s\n' "$$V" "$${D:+ ($$D)}" > .version; \
+	  if [ "$$(id -un)" = "root" ] && [ "$$OWNER" != "root" ]; then \
+	    chown "$$OWNER" .version 2>/dev/null || true; \
+	  fi; \
+	elif [ ! -f .version ]; then \
+	  echo 'unknown' > .version; \
+	fi
+
+install: .version
+	@printf '==> Installing net-mgr %s on %s from %s\n' \
+	    "$$(cat .version)" \
+	    "$$(hostname)" \
+	    "$(CURDIR)"
 	@$(DEPS_CHECK_SH); \
 	if [ -n "$$miss" ]; then \
 	  echo; echo "Missing required: $$miss"; \
@@ -316,7 +342,7 @@ SUDO       ?=
 SSHOPTS    ?=
 MAKEARGS   ?=
 
-install-on:
+install-on: .version
 	@if [ -z "$(TARGET)" ]; then \
 	  echo "Usage: make install-on TARGET=host  [KEEP=1] [SUDO=sudo] [SSHOPTS='-p 2222'] [MAKEARGS='FORCE=1']"; \
 	  exit 2; \
@@ -391,6 +417,6 @@ check:
 	@echo "compile: ok"
 
 clean:
-	@true
+	@rm -f .version
 
 help: list
