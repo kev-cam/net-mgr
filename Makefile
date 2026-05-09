@@ -258,15 +258,6 @@ install: .version
 	else \
 	  echo "  skip web/* (no apache at $(APACHE_CONF_DIR))"; \
 	fi
-	@if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then \
-	  systemctl daemon-reload; \
-	  for u in $(UNITS); do \
-	    if systemctl is-active --quiet "$$u"; then \
-	      echo "  restarting $$u (was running with the previous binaries)"; \
-	      systemctl restart "$$u" || echo "    *** restart $$u failed; check 'systemctl status $$u'"; \
-	    fi; \
-	  done; \
-	fi
 	@if [ -f $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf ] \
 	     && [ ! -e $(DESTDIR)$(SYSCONFDIR)/net-mgr/config ]; then \
 	  echo "  migrating $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf → $(DESTDIR)$(SYSCONFDIR)/net-mgr/config"; \
@@ -312,10 +303,21 @@ install: .version
 	  else \
 	    echo "(/root/.my.cnf already has [net-mgr] section — skipping setup)"; \
 	  fi; \
-	  echo; \
-	  echo "Enable + start the services:"; \
-	  echo "  systemctl enable --now net-mgr.service"; \
-	  echo "  systemctl enable --now net-dns.service     # optional: DNS frontend"; \
+	  if command -v systemctl >/dev/null 2>&1; then \
+	    echo; \
+	    systemctl daemon-reload; \
+	    for u in $(UNITS); do \
+	      if systemctl is-active --quiet "$$u"; then \
+	        printf '  %-25s restarting (was running with previous binaries)\n' "$$u"; \
+	        systemctl restart "$$u" \
+	          || printf '  *** restart %s failed; check: systemctl status %s\n' "$$u" "$$u"; \
+	      elif systemctl is-enabled --quiet "$$u" 2>/dev/null; then \
+	        printf '  %-25s enabled but stopped — start with: systemctl start %s\n' "$$u" "$$u"; \
+	      else \
+	        printf '  %-25s not enabled  — enable with: systemctl enable --now %s\n' "$$u" "$$u"; \
+	      fi; \
+	    done; \
+	  fi; \
 	else \
 	  echo; \
 	  echo "Next: sudo make setup           (or: sudo $(SBINDIR)/net-mgr-setup)"; \
