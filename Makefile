@@ -42,7 +42,7 @@ LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \
 
 INSTALL ?= install
 
-.PHONY: list install setup deps uninstall test check clean help
+.PHONY: list install install-on setup deps uninstall test check clean help
 
 # --- dependency check (Debian/Ubuntu apt names) ----------------------
 # Required deps must be present; optional deps print a hint but don't
@@ -141,6 +141,10 @@ list:
 	@echo "  (run 'make setup' standalone to do just this step)"
 	@echo
 	@echo "vars: PREFIX=$(PREFIX)  DESTDIR=$(DESTDIR)  SYSCONFDIR=$(SYSCONFDIR)"
+	@echo
+	@echo "remote install: make install-on TARGET=host [KEEP=1] [SUDO=sudo]"
+	@echo "  rsyncs this tree to /tmp/$$USER/net-mgr on the target,"
+	@echo "  runs 'make install' there, then removes the tmp dir."
 	@echo
 	@echo "--- dependency check ---"
 	@$(MAKE) -s deps || true
@@ -276,6 +280,49 @@ install:
 	  echo "Next: sudo make setup           (or: sudo $(SBINDIR)/net-mgr-setup)"; \
 	  echo "Then: sudo systemctl enable --now net-mgr.service"; \
 	fi
+
+# --- install on a remote host via rsync + ssh ------------------------
+# Examples:
+#   make install-on TARGET=gateway3
+#   make install-on TARGET=root@gateway3 KEEP=1
+#   make install-on TARGET=gateway3 SUDO=sudo
+#   make install-on TARGET=gateway3 SSHOPTS='-p 2222 -i ~/.ssh/firewall'
+#   make install-on TARGET=gateway3 MAKEARGS='FORCE=1'
+#
+# Variables:
+#   TARGET    [required] ssh-style target (host or user@host)
+#   SSHOPTS   extra args passed to ssh and rsync (e.g. '-p 2222')
+#   SUDO      command to prefix the remote 'make install' with
+#             (e.g. SUDO=sudo for hosts where you don't ssh as root)
+#   KEEP      set to 1 to leave /tmp/<user>/net-mgr in place
+#   MAKEARGS  extra args appended to the remote 'make install'
+REMOTE_TMP ?= /tmp/$(USER)/net-mgr
+SUDO       ?=
+SSHOPTS    ?=
+MAKEARGS   ?=
+
+install-on:
+	@if [ -z "$(TARGET)" ]; then \
+	  echo "Usage: make install-on TARGET=host  [KEEP=1] [SUDO=sudo] [SSHOPTS='-p 2222'] [MAKEARGS='FORCE=1']"; \
+	  exit 2; \
+	fi
+	@echo "==> $(TARGET): preparing $(REMOTE_TMP)"
+	@ssh $(SSHOPTS) $(TARGET) "mkdir -p $(REMOTE_TMP)"
+	@echo "==> $(TARGET): rsync working tree"
+	@rsync -az --delete \
+	  --exclude='.git/' --exclude='*.swp' --exclude='*~' \
+	  --exclude='/tmp' --exclude='blib/' \
+	  -e "ssh $(SSHOPTS)" \
+	  ./ $(TARGET):$(REMOTE_TMP)/
+	@echo "==> $(TARGET): $(SUDO) make -C $(REMOTE_TMP) install $(MAKEARGS)"
+	@ssh $(SSHOPTS) $(TARGET) "$(SUDO) make -C $(REMOTE_TMP) install $(MAKEARGS)"
+	@if [ "$(KEEP)" = "1" ]; then \
+	  echo "==> $(TARGET): leaving $(REMOTE_TMP) in place (KEEP=1)"; \
+	else \
+	  echo "==> $(TARGET): cleaning up $(REMOTE_TMP)"; \
+	  ssh $(SSHOPTS) $(TARGET) "rm -rf $(REMOTE_TMP)"; \
+	fi
+	@echo "==> $(TARGET): install-on done"
 
 # --- setup (interactive DB + creds bootstrap) ------------------------
 setup:
