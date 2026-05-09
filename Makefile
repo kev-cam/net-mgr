@@ -225,6 +225,12 @@ install:
 	fi
 	@if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then \
 	  systemctl daemon-reload; \
+	  for u in $(UNITS); do \
+	    if systemctl is-active --quiet "$$u"; then \
+	      echo "  restarting $$u (was running with the previous binaries)"; \
+	      systemctl restart "$$u" || echo "    *** restart $$u failed; check 'systemctl status $$u'"; \
+	    fi; \
+	  done; \
 	fi
 	@if [ -f $(DESTDIR)$(SYSCONFDIR)/net-mgr.conf ] \
 	     && [ ! -e $(DESTDIR)$(SYSCONFDIR)/net-mgr/config ]; then \
