@@ -32,12 +32,16 @@ use NetMgr::Client;
 my $listen = $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
 my $all;
 my $family = 'v4';
+my $verify;
+my $include_stale;
 my $help;
 GetOptions(
-    'listen=s' => \$listen,
-    'all|a'    => \$all,
-    'family=s' => \$family,
-    'help|h'   => \$help,
+    'listen=s'      => \$listen,
+    'all|a'         => \$all,
+    'family=s'      => \$family,
+    'verify|v'      => \$verify,
+    'include-stale' => \$include_stale,
+    'help|h'        => \$help,
 ) or usage(2);
 usage(0) if $help;
 usage(2) if @ARGV != 1;
@@ -69,8 +73,14 @@ my $hostnames = $cli->snapshot(2, 'hostnames');
 my $friendly  = $cli->snapshot(3, 'friendly_names');
 my $aliases   = $cli->snapshot(4, 'aliases');
 my $ifaces    = $cli->snapshot(5, 'interfaces');
-my $addresses = $cli->snapshot(6, 'addresses',
-                               where => "family = '$family'");
+# Skip addresses that net-mgr has only ever heard about from
+# dhcp.master / config imports (last_observed IS NULL). Those are
+# "paper-only" entries — the IP exists in config but no producer has
+# ever actually seen the device respond on it, so they're usually
+# stale. --include-stale brings them back into the candidate pool.
+my $where = "family = '$family'"
+          . ($include_stale ? '' : ' AND last_observed IS NOT NULL');
+my $addresses = $cli->snapshot(6, 'addresses', where => $where);
 $cli->bye;
 
 # --- index ----------------------------------------------------------
@@ -131,12 +141,31 @@ if (!@candidates) {
 @candidates = sort { $b->[0] <=> $a->[0] || _ipkey($a->[1]) cmp _ipkey($b->[1]) }
               @candidates;
 
+# --verify: keep only IPs that respond to a 1s ping. Stops at the
+# first responder when --all isn't set, so the common case is one
+# extra ping; --all checks every candidate.
+if ($verify) {
+    my @alive;
+    for my $c (@candidates) {
+        next unless _ping_ok($c->[1]);
+        push @alive, $c;
+        last unless $all;
+    }
+    @candidates = @alive;
+    exit 1 unless @candidates;
+}
+
 if ($all) {
     print "$_->[1]\n" for @candidates;
 } else {
     print "$candidates[0][1]\n";
 }
 exit 0;
+
+sub _ping_ok {
+    my ($ip) = @_;
+    return system("ping -c 1 -W 1 -q -n $ip >/dev/null 2>&1") == 0;
+}
 
 # --- helpers --------------------------------------------------------
 
@@ -195,12 +224,14 @@ sub usage {
 net-lookup — resolve a regex name to the best IP for this caller.
 
 Usage:
-  net-lookup [--all] [--family v4|v6] [--listen HOST:PORT] <name-regex>
+  net-lookup [--all] [--verify] [--include-stale]
+             [--family v4|v6] [--listen HOST:PORT] <name-regex>
 
 Examples:
   net-lookup nas3                      # exact name
   net-lookup 'nas3(|-.*)'              # nas3, nas3-up, nas3-down, nas3-dwn2
   net-lookup --all 'wndr.*'            # every IP for every wndr-* host
+  net-lookup --verify 'gateway3.*'     # ping each candidate before picking
 
 The pattern is a Perl regex; net-lookup wraps it as ^(?:...)\$ before
 matching against machines.primary_name, friendly_names, hostnames,
@@ -210,6 +241,13 @@ Scoring (highest wins):
   +2  same /24 as one of this host's interfaces (direct L2)
   +1  otherwise kernel-reachable
   +1  IP is inside an alias's prefer_subnet_cidr (when the alias matched)
+
+By default, paper-only addresses (last_observed IS NULL — known from
+dhcp.master config but never actually seen on the wire) are excluded.
+--include-stale brings them back into the pool.
+
+--verify pings each candidate (1 packet, 1 s timeout) and keeps only
+those that respond. Without --all, it stops at the first responder.
 
 Default prints one IP. --all prints every match, best-scored first.
 Exit 0 = found · 1 = no match · 2 = bad args.
