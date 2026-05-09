@@ -312,6 +312,10 @@ install-on:
 	  echo "Usage: make install-on TARGET=host  [KEEP=1] [SUDO=sudo] [SSHOPTS='-p 2222'] [MAKEARGS='FORCE=1']"; \
 	  exit 2; \
 	fi
+	@# When SUDO=sudo, force a remote TTY so sudo can prompt for a
+	@# password from the user's terminal; rsync still uses the bare
+	@# SSHOPTS so it doesn't get confused by the -t.
+	$(eval RUNOPTS := $(if $(SUDO),-t $(SSHOPTS),$(SSHOPTS)))
 	@echo "==> $(TARGET): preparing $(REMOTE_TMP)"
 	@ssh $(SSHOPTS) $(TARGET) "mkdir -p $(REMOTE_TMP)"
 	@echo "==> $(TARGET): rsync working tree"
@@ -321,7 +325,7 @@ install-on:
 	  -e "ssh $(SSHOPTS)" \
 	  ./ $(TARGET):$(REMOTE_TMP)/
 	@echo "==> $(TARGET): $(SUDO) make -C $(REMOTE_TMP) install $(MAKEARGS)"
-	@ssh $(SSHOPTS) $(TARGET) "$(SUDO) make -C $(REMOTE_TMP) install $(MAKEARGS)"
+	@ssh $(RUNOPTS) $(TARGET) "$(SUDO) make -C $(REMOTE_TMP) install $(MAKEARGS)"
 	@if [ "$(KEEP)" = "1" ]; then \
 	  echo "==> $(TARGET): leaving $(REMOTE_TMP) in place (KEEP=1)"; \
 	else \
