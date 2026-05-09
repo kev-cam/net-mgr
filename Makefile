@@ -151,6 +151,15 @@ list:
 
 # --- install ----------------------------------------------------------
 install:
+	@VERSION=$$(git -C $(CURDIR) describe --tags --always --dirty 2>/dev/null \
+	            || git -C $(CURDIR) rev-parse --short HEAD 2>/dev/null \
+	            || echo '(no git)'); \
+	  CDATE=$$(git -C $(CURDIR) log -1 --format=%cd --date=short 2>/dev/null); \
+	  printf '==> Installing net-mgr %s%s on %s from %s\n' \
+	      "$$VERSION" \
+	      "$${CDATE:+ ($$CDATE)}" \
+	      "$$(hostname)" \
+	      "$(CURDIR)"
 	@$(DEPS_CHECK_SH); \
 	if [ -n "$$miss" ]; then \
 	  echo; echo "Missing required: $$miss"; \
