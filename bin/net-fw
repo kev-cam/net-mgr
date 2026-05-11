@@ -27,6 +27,7 @@ use Getopt::Long qw(:config no_ignore_case bundling pass_through);
 use Sys::Hostname qw(hostname);
 use NetMgr::Config;
 use NetMgr::DB;
+use NetMgr::Client;
 
 # Remote script the live poller runs over ssh.  One round-trip per host;
 # === markers let the parser split sections without quoting headaches.
@@ -162,8 +163,46 @@ SQL
     return @out;
 }
 
-# -- live ssh poll --------------------------------------------------------
+# -- live poll: peer net-mgr first, then ssh -------------------------------
+#
+# Try POLL fw_state on the target host's own net-mgr daemon (resolved
+# via net-lookup).  If that fails — no daemon, wrong version, refused —
+# fall back to ssh.  Peer-poll wins when ssh from the caller can't
+# reach the target (split-horizon, firewalled outbound) but a LAN
+# net-mgr instance is reachable from somewhere on the path.
 sub ssh_poll {
+    my ($host) = @_;
+    my $via;
+    my $raw = peer_poll($host, \$via);
+    if (!defined $raw) {
+        $raw = ssh_poll_direct($host);
+        $via = 'ssh' if defined $raw;
+    }
+    return undef unless defined $raw && length $raw;
+    my $s = parse_remote($raw);
+    $s->{via} = $via if $s;
+    return $s;
+}
+
+sub peer_poll {
+    my ($host, $via_ref) = @_;
+    my $ip = net_lookup_ip($host);
+    return undef unless defined $ip;
+    my $out;
+    eval {
+        my $cli = NetMgr::Client->new(listen => "$ip:7531", timeout => 4);
+        $cli->hello(consumer => "net-fw.$$");
+        $out = $cli->poll('fw_state');
+        $cli->bye;
+    };
+    if ($@ || !defined $out || !length $out) {
+        return undef;
+    }
+    $$via_ref = "peer net-mgr @ $ip" if $via_ref;
+    return $out;
+}
+
+sub ssh_poll_direct {
     my ($host) = @_;
     # Prefer net-ssh next to us (it does the net-lookup-based hostname
     # rewrite), fall back to plain ssh if it isn't installed yet.
@@ -180,7 +219,19 @@ sub ssh_poll {
         or do { warn "ssh $host: $!\n"; return undef };
     local $/; my $raw = <$fh>; close $fh;
     return undef unless defined $raw && length $raw;
-    return parse_remote($raw);
+    return $raw;
+}
+
+sub net_lookup_ip {
+    my ($host) = @_;
+    open my $fh, '-|', 'net-lookup', "$host.*" or return undef;
+    my $ip;
+    while (my $ln = <$fh>) {
+        chomp $ln;
+        if ($ln =~ /^(\d+\.\d+\.\d+\.\d+)\z/) { $ip = $1; last }
+    }
+    close $fh;
+    return $ip;
 }
 
 sub parse_remote {
@@ -219,7 +270,9 @@ sub dump_host {
     # split.  Trim for cosmetics before composing the header.
     my $kind     = $s->{kind};     $kind     =~ s/\s+$//; $kind     ||= 'linux';
     my $hostname = $s->{hostname}; $hostname =~ s/\s+$//; $hostname ||= $host;
-    print "  $hostname  [$kind]\n";
+    print "  $hostname  [$kind]"
+        . (defined $s->{via} ? "  (via $s->{via})" : '')
+        . "\n";
 
     print "  Routes:\n";
     my $zones = zone_lookup_for_host($hostname);

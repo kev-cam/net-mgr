@@ -6,7 +6,10 @@ package NetMgr::Protocol;
 #   HELLO     consumer=<n> [pid=N]          -- subscriber identification
 #   OBSERVE   k=v ...                       -- producer observation
 #   GONE      k=v ...                       -- producer explicit disappearance
-#   TRIGGER   <name> [k=v ...] [WAIT]       -- RPC, optional synchronous
+#   TRIGGER   <name> [k=v ...] [WAIT]       -- async, kicks off a producer
+#   POLL      <name> [k=v ...]              -- sync RPC: server runs a
+#                                              whitelisted local probe,
+#                                              returns OK output=<b64>
 #   SUBSCRIBE sub=N mode=<m> FROM <table> [WHERE <expr>]
 #   UNSUB     sub=N
 #   BYE
@@ -77,6 +80,11 @@ sub parse_line {
             if (uc $t eq 'WAIT') { $cmd->{wait} = 1 } else { push @rest, $t }
         }
         $cmd->{kv} = _parse_kv_only(\@rest);
+    }
+    elsif ($verb eq 'POLL') {
+        croak "POLL requires a name" unless @toks;
+        $cmd->{name} = shift @toks;
+        $cmd->{kv}   = _parse_kv_only(\@toks);
     }
     elsif ($verb eq 'SUBSCRIBE') {
         # Expect: id=N mode=<m> FROM <table>

@@ -102,6 +102,24 @@ sub trigger {
     return $self->recv_line(60);   # generous timeout for WAIT
 }
 
+# POLL — synchronous RPC.  The daemon runs a server-whitelisted local
+# script and returns its stdout as base64 in the OK reply; this
+# decodes it for the caller.  Returns undef if the daemon rejected the
+# verb (older build) or the name isn't whitelisted on that daemon.
+sub poll {
+    my ($self, $name, %args) = @_;
+    my $line = "POLL $name";
+    $line .= " " . format_kv(%args) if %args;
+    my $r = $self->send_recv($line);
+    return undef unless defined $r;
+    my $cmd = eval { parse_line($r) } or return undef;
+    return undef unless $cmd->{verb} eq 'OK';
+    my $b64 = ($cmd->{kv} || {})->{output};
+    return '' unless defined $b64;
+    require MIME::Base64;
+    return MIME::Base64::decode_base64($b64);
+}
+
 # Ask the daemon for one-line state. Returns a hashref of the kv
 # fields from its OK reply, or undef if the daemon doesn't recognise
 # the verb (older builds).

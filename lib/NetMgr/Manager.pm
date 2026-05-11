@@ -281,6 +281,7 @@ sub _handle_line {
     elsif ($verb eq 'SUBSCRIBE') { $self->_handle_subscribe($cli, $cmd) }
     elsif ($verb eq 'UNSUB')     { $self->_handle_unsub($cli, $cmd) }
     elsif ($verb eq 'TRIGGER')   { $self->_handle_trigger($cli, $cmd) }
+    elsif ($verb eq 'POLL')      { $self->_handle_poll($cli, $cmd) }
     elsif ($verb eq 'BYE')       { $self->_drop_client(fileno($cli->{sock}), 'bye') }
     elsif ($verb eq 'STATUS')    { $self->_handle_status($cli) }
     else {
@@ -707,6 +708,65 @@ sub _reap_triggers {
         $self->_send($cli, format_ready(name => $t->{name}, pid => $pid,
                                         exit => $exit));
     }
+}
+
+# ---- POLL ----------------------------------------------------------------
+#
+# Synchronous RPC: peer asks the daemon to run a whitelisted local probe
+# and ship the captured stdout back in the OK reply.  Output is base64-
+# encoded so newlines/quotes survive the kv wire format.  No client-
+# supplied shell — the name argument indexes into %POLL_SCRIPTS only.
+#
+# Runs as the daemon user (typically root, which is what iptables-save
+# needs).  Same trust boundary as the rest of the protocol: anyone who
+# can reach :7531 can already drive producers via TRIGGER, so POLL
+# isn't widening the attack surface — just exposing read-only probes
+# of host state that the daemon can already see.
+my %POLL_SCRIPTS = (
+    fw_state => <<'SH',
+echo ===KIND===
+if [ -f /tmp/.rc_started ] || [ -e /jffs ]; then echo dd-wrt
+elif [ -f /etc/openwrt_release ]; then echo openwrt
+elif [ -e /usr/bin/cygpath ]; then echo cygwin
+else echo linux; fi
+echo ===HOSTNAME===
+hostname 2>/dev/null
+echo ===ROUTES===
+ip -4 route show 2>/dev/null || route -n 2>/dev/null
+echo ===NAT===
+iptables-save -t nat 2>/dev/null
+echo ===FILTER===
+iptables-save -t filter 2>/dev/null
+echo ===END===
+SH
+);
+
+sub _handle_poll {
+    my ($self, $cli, $cmd) = @_;
+    my $name = $cmd->{name} // '';
+    my $script = $POLL_SCRIPTS{$name};
+    if (!defined $script) {
+        my @ok = sort keys %POLL_SCRIPTS;
+        return $self->_send($cli,
+            format_err("unknown POLL '$name' (allowed: @ok)"));
+    }
+    my $output = '';
+    eval {
+        open(my $fh, '-|', '/bin/sh', '-c', $script)
+            or die "fork /bin/sh: $!\n";
+        local $/;
+        $output = <$fh> // '';
+        close $fh;
+    };
+    if ($@) {
+        my $e = $@; chomp $e;
+        return $self->_send($cli, format_err("POLL $name: $e"));
+    }
+    require MIME::Base64;
+    my $b64 = MIME::Base64::encode_base64($output, '');   # no newlines
+    $self->_send($cli, format_ok(name => $name, output => $b64));
+    $self->_log("poll $name from $cli->{ident} ("
+              . length($output) . " bytes)");
 }
 
 # Returns sorted unique v4 addresses for known APs.
