@@ -451,12 +451,14 @@ sub parse_query {
     };
 }
 
-# Live trace: walk the candidate-host inventory, ssh-poll the ones
-# matching HOST_PATTERN, and print PREROUTING DNAT rules that match
-# the requested port.  No recursion across DNAT targets yet — once the
-# target_host is another known machine we *could* trace there next,
-# but for the first cut a single-hop view is enough to see what
-# happens at the firewall in question.
+# Live trace: walk the candidate-host inventory, poll the ones matching
+# HOST_PATTERN, and print PREROUTING DNAT rules that match the requested
+# port.  Forwarding can be implemented two ways — kernel-level iptables
+# DNAT (visible in `iptables-save -t nat`) and user-space ssh tunnels
+# (`ssh -L`), which the daemon DOES NOT see in iptables.  ssh tunnels
+# are visible in the forwarding_rules table that net-import-ssh-forwards
+# populates, so we display both: live iptables for the kernel view, plus
+# any matching forwarding_rules rows tagged with the same source_host.
 sub do_trace_live {
     my ($q) = @_;
     my $p = parse_query($q);
@@ -473,30 +475,63 @@ sub do_trace_live {
             . "ignores it for now.\n";
     }
 
+    # Pre-load forwarding_rules once so we can cross-reference per host
+    # without N round-trips to the DB.  Empty array on older schemas.
+    my $fwd = eval { $db->query_table('forwarding_rules') } || [];
+
     printf "trace %s — %d host(s) to poll:\n", $q, scalar @hosts;
     my $total = 0;
     for my $h (@hosts) {
-        my $s = ssh_poll($h) or do {
-            print "  $h: (unreachable)\n";
-            next;
-        };
-        my @dnats = parse_iptables_dnat($s->{nat});
-        my @hit = $p->{port}
-                ? grep { ($_->{dport} // '') eq $p->{port} } @dnats
-                : @dnats;
-        if (!@hit) {
-            print "  $h: (no matching DNAT)\n";
+        my $s = ssh_poll($h);
+
+        # Kernel-level DNAT view.
+        my @dnats;
+        if ($s) {
+            @dnats = parse_iptables_dnat($s->{nat});
+            @dnats = grep { ($_->{dport} // '') eq $p->{port} } @dnats
+                if defined $p->{port};
+        } else {
+            print "  $h: (unreachable for live poll)\n";
+        }
+
+        # User-space ssh-tunnel view.
+        my @tunnels = grep {
+            ($_->{source_host} // '') eq $h
+         && (!defined $p->{port} || ($_->{bind_port} // 0) == $p->{port})
+        } @$fwd;
+
+        if (!@dnats && !@tunnels) {
+            print "  $h: (no matching DNAT or ssh tunnel)\n";
             next;
         }
-        for my $r (@hit) {
-            printf "  %-22s %-22s -> %-22s%s\n",
-                $h, bind_str($r),
-                "$r->{to_host}:$r->{to_port}",
+        my $via = $s && $s->{via} ? $s->{via} : '-';
+        for my $r (@dnats) {
+            printf "  %-22s [iptables/%s]\n", $h, $via;
+            printf "    %-22s -> %-22s%s\n",
+                bind_str($r), "$r->{to_host}:$r->{to_port}",
                 ($r->{comment} ? "  # $r->{comment}" : '');
             $total++;
         }
+        for my $r (@tunnels) {
+            my $listen = sprintf '%s:%s', $r->{bind_addr} // '*',
+                                          $r->{bind_port};
+            my $tgt    = $r->{target_host}
+                       ? sprintf '%s:%s', $r->{target_host},
+                                          $r->{target_port} // '?'
+                       : '(SOCKS)';
+            my $via_ssh = $r->{ssh_host}
+                        ? sprintf ' via ssh %s%s%s',
+                            ($r->{ssh_user} ? "$r->{ssh_user}\@" : ''),
+                            $r->{ssh_host},
+                            ($r->{ssh_port} ? ":$r->{ssh_port}" : '')
+                        : '';
+            printf "  %-22s [ssh -%s tunnel pid=%s]\n",
+                $h, $r->{direction}, $r->{source_pid} // '-';
+            printf "    %-22s -> %-22s%s\n", $listen, $tgt, $via_ssh;
+            $total++;
+        }
     }
-    printf "(%d DNAT match%s)\n", $total, $total == 1 ? '' : 'es';
+    printf "(%d match%s)\n", $total, $total == 1 ? '' : 'es';
 }
 
 # Intent trace: same query, against forwarding_rules in the DB.  This
