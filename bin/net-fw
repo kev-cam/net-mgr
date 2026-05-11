@@ -1,0 +1,491 @@
+#!/usr/bin/perl
+# net-fw — packet-routing visibility for machines net-mgr knows about.
+#
+# Two modes:
+#
+#   net-fw [HOST ...]              # default: dump per-host routes +
+#                                  # iptables NAT/FORWARD as a tree
+#   net-fw --all                   # dump for every candidate host
+#                                  # (Linux + DD-WRT, port 22 open)
+#   net-fw --hosts                 # just list the candidates
+#
+#   net-fw --trace QUERY           # DB-driven trace.  QUERY shape:
+#                                  #   HOST_PATTERN[/CLASS[/ZONE]][:PORT]
+#                                  # HOST_PATTERN is a shell glob over
+#                                  # forwarding_rules.source_host.
+#                                  # PORT may be a number or a service
+#                                  # name resolvable by /etc/services.
+#
+# Live ssh, no caching for now.  Future: push polled output into new
+# net-mgr tables so net-fw becomes a daemon consumer.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling pass_through);
+use Sys::Hostname qw(hostname);
+use NetMgr::Config;
+use NetMgr::DB;
+
+# Remote script the live poller runs over ssh.  One round-trip per host;
+# === markers let the parser split sections without quoting headaches.
+# ip route + iptables-save are available on both stock Linux and DD-WRT
+# (busybox).  The kind check is best-effort and informational.
+my $REMOTE_SCRIPT = <<'SH';
+echo ===KIND===
+if [ -f /tmp/.rc_started ] || [ -e /jffs ]; then echo dd-wrt
+elif [ -f /etc/openwrt_release ]; then echo openwrt
+elif [ -e /usr/bin/cygpath ]; then echo cygwin
+else echo linux; fi
+echo ===HOSTNAME===
+hostname 2>/dev/null
+echo ===ROUTES===
+ip -4 route show 2>/dev/null || route -n 2>/dev/null
+echo ===NAT===
+iptables-save -t nat 2>/dev/null
+echo ===FILTER===
+iptables-save -t filter 2>/dev/null
+echo ===END===
+SH
+
+my $all;
+my $list_hosts;
+my $trace;
+my $intent;
+my $ssh_user    = 'root';
+my $ssh_timeout = 8;
+my $help;
+GetOptions(
+    'all|a'         => \$all,
+    'hosts'         => \$list_hosts,
+    'trace=s'       => \$trace,
+    'intent=s'      => \$intent,
+    'ssh-user=s'    => \$ssh_user,
+    'ssh-timeout=i' => \$ssh_timeout,
+    'help|h'        => \$help,
+) or usage(2);
+
+sub usage {
+    my ($rc) = @_;
+    print <<'EOT';
+net-fw — show packet routing on net-mgr-known machines.
+
+  net-fw HOST [HOST ...]   dump per-host routes + iptables NAT/FORWARD
+  net-fw --all             dump for every candidate (port 22 + Linux/DD-WRT)
+  net-fw --hosts           list candidate hosts and exit
+  net-fw --trace QUERY     trace a request through live iptables on
+                           matching hosts.  QUERY =
+                             HOST_PATTERN[/CLASS[/ZONE]][:PORT]
+                           HOST_PATTERN: Perl regex over candidate hosts
+                           (e.g. 'gateway3.*' — note the dot)
+                           PORT: number or service name (e.g. https)
+  net-fw --intent QUERY    same query against the DB (forwarding_rules)
+                           — shows what *should* be deployed, useful
+                           for diffing intent vs reality
+
+Options:
+  --ssh-user USER          ssh username for live poll (default root)
+  --ssh-timeout N          ssh ConnectTimeout (default 8)
+  -h, --help               this message
+EOT
+    exit $rc;
+}
+usage(0) if $help;
+
+my $cfg = NetMgr::Config->load(
+    $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
+my $mycnf = (-r "$ENV{HOME}/.my.cnf") ? "$ENV{HOME}/.my.cnf"
+          : (-r '/root/.my.cnf')      ? '/root/.my.cnf'
+          : die "no readable .my.cnf for the [net-mgr] section\n";
+my $db = NetMgr::DB->new(
+    defaults_file => $mycnf,
+    section       => $cfg->{mysql}{section},
+    db            => $cfg->{mysql}{db},
+);
+$db->connect;
+
+if (defined $trace) {
+    do_trace_live($trace);
+    exit 0;
+}
+if (defined $intent) {
+    do_trace_db($intent);
+    exit 0;
+}
+
+if ($list_hosts) {
+    my @hosts = candidate_hosts();
+    print "$_\n" for @hosts;
+    exit 0;
+}
+
+my @targets = @ARGV;
+if ($all) {
+    push @targets, candidate_hosts();
+}
+@targets or usage(2);
+
+# De-dup while preserving order — repeats happen when --all and an
+# explicit HOST collide.
+my %seen;
+@targets = grep { !$seen{$_}++ } @targets;
+
+for my $h (@targets) {
+    dump_host($h);
+    print "\n";
+}
+exit 0;
+
+# -- candidate-host discovery ---------------------------------------------
+#
+# Pull every machine that has TCP/22 open from net-mgr.  Cross-reference
+# with addresses to get one address per machine (prefer primary_name as
+# the display name).  No live ssh-fingerprinting here — that's what the
+# dump itself does.
+sub candidate_hosts {
+    my $rows = $db->dbh->selectall_arrayref(<<'SQL', { Slice => {} });
+SELECT m.id, m.primary_name, a.addr
+  FROM machines m
+  JOIN interfaces i ON i.machine_id = m.id
+  JOIN ports     p ON p.mac = i.mac AND p.port = 22 AND p.proto = 'tcp'
+  JOIN addresses a ON a.mac = i.mac AND a.family = 'v4'
+ WHERE m.online = 1
+ GROUP BY m.id
+ ORDER BY m.primary_name, a.addr
+SQL
+    my @out;
+    for my $r (@$rows) {
+        my $h = $r->{primary_name} // $r->{addr};
+        push @out, $h if defined $h && length $h;
+    }
+    return @out;
+}
+
+# -- live ssh poll --------------------------------------------------------
+sub ssh_poll {
+    my ($host) = @_;
+    # Prefer net-ssh next to us (it does the net-lookup-based hostname
+    # rewrite), fall back to plain ssh if it isn't installed yet.
+    my $net_ssh = "$FindBin::Bin/net-ssh";
+    my $tool    = (-x $net_ssh) ? $net_ssh : 'net-ssh';
+    my @cmd = ($tool,
+        '-o', 'BatchMode=yes',
+        '-o', "ConnectTimeout=$ssh_timeout",
+        '-o', 'StrictHostKeyChecking=accept-new',
+        '-n', "$ssh_user\@$host",
+        $REMOTE_SCRIPT,
+    );
+    open my $fh, '-|', @cmd
+        or do { warn "ssh $host: $!\n"; return undef };
+    local $/; my $raw = <$fh>; close $fh;
+    return undef unless defined $raw && length $raw;
+    return parse_remote($raw);
+}
+
+sub parse_remote {
+    my ($raw) = @_;
+    my %s = (routes => '', nat => '', filter => '', kind => '', hostname => '');
+    my $section;
+    for my $line (split /\n/, $raw) {
+        if ($line =~ /^===([A-Z]+)===\s*$/) {
+            my $tag = lc $1;
+            $section = $tag eq 'end' ? undef : $tag;
+            next;
+        }
+        next unless defined $section;
+        $s{$section} .= "$line\n";
+    }
+    chomp $s{kind};
+    chomp $s{hostname};
+    return \%s;
+}
+
+# -- dump tree (default mode) ---------------------------------------------
+#
+# Lay out one host per section: header line, then Routes (classified
+# default / direct / static), then NAT PREROUTING DNAT rules, then
+# FORWARD ACCEPT rules.  Annotate routes with zone info from
+# interface_zones when the CIDR matches.
+sub dump_host {
+    my ($host) = @_;
+    print "==== $host ====\n";
+    my $s = ssh_poll($host);
+    unless ($s) {
+        print "  (unreachable or empty reply)\n";
+        return;
+    }
+    # The remote echoes write a trailing newline that survives section
+    # split.  Trim for cosmetics before composing the header.
+    my $kind     = $s->{kind};     $kind     =~ s/\s+$//; $kind     ||= 'linux';
+    my $hostname = $s->{hostname}; $hostname =~ s/\s+$//; $hostname ||= $host;
+    print "  $hostname  [$kind]\n";
+
+    print "  Routes:\n";
+    my $zones = zone_lookup_for_host($hostname);
+    print_routes($s->{routes}, $zones);
+
+    print "  NAT PREROUTING DNAT:\n";
+    my @dnats = parse_iptables_dnat($s->{nat});
+    if (@dnats) {
+        for my $r (@dnats) {
+            printf "    %-22s -> %-22s%s\n",
+                bind_str($r),
+                "$r->{to_host}:$r->{to_port}",
+                ($r->{comment} ? "  # $r->{comment}" : '');
+        }
+    } else {
+        print "    (none)\n";
+    }
+
+    print "  FORWARD ACCEPT:\n";
+    my @fwd = parse_iptables_forward($s->{filter});
+    if (@fwd) {
+        for my $r (@fwd) {
+            printf "    %s\n", $r;
+        }
+    } else {
+        print "    (none — default policy applies)\n";
+    }
+}
+
+sub bind_str {
+    my ($r) = @_;
+    my $b = $r->{dst} // '*';
+    return sprintf '%s:%s', $b, $r->{dport};
+}
+
+# Return [ { cidr, zone_class, zone_name } ] for this host's
+# interface_zones rows.  Used to colour routes.  Matches on hostname()
+# strictly — different aliases for the same box will need an alias-
+# resolution step later (probably via the existing aliases table).
+sub zone_lookup_for_host {
+    my ($host) = @_;
+    # interface_zones is a v15 addition; on an older DB this returns
+    # nothing rather than blowing up.  The display just loses zone
+    # annotations until the schema migration runs.
+    my $rows = eval { $db->query_table('interface_zones') } || [];
+    return [ grep { $_->{host} eq $host } @$rows ];
+}
+
+sub print_routes {
+    my ($txt, $zones) = @_;
+    my @lines = split /\n/, $txt;
+    @lines or do { print "    (none)\n"; return };
+    for my $ln (@lines) {
+        $ln =~ s/^\s+//;
+        next unless length $ln;
+        # default via X dev Y                  → 'default'
+        # CIDR dev Y proto kernel scope link…  → direct
+        # CIDR via X dev Y                     → indirect
+        my ($dest) = $ln =~ /^(\S+)/;
+        $dest //= '?';
+        my $zone = '';
+        if ($dest =~ m{^\d+\.\d+\.\d+\.\d+/\d+\z}) {
+            for my $z (@$zones) {
+                if ($z->{cidr} eq $dest) {
+                    $zone = sprintf ' [%s/%s]', $z->{zone_class},
+                                                ($z->{zone_name} // '');
+                    last;
+                }
+            }
+        }
+        print "    $ln$zone\n";
+    }
+}
+
+# -- iptables parsing ------------------------------------------------------
+#
+# Just the two question we care about from iptables-save:
+#   - NAT PREROUTING -j DNAT rules (where do incoming packets get sent?)
+#   - FILTER FORWARD -j ACCEPT rules (what's let through?)
+# Parse `iptables-save` output line-by-line; it's stable across versions.
+sub parse_iptables_dnat {
+    my ($txt) = @_;
+    return () unless defined $txt && length $txt;
+    my @out;
+    my $in_chain = '';
+    for my $ln (split /\n/, $txt) {
+        $ln =~ s/^\s+|\s+$//g;
+        if ($ln =~ /^:PREROUTING\b/)            { $in_chain = 'PREROUTING'; next }
+        if ($ln =~ /^:[A-Z]/)                    { $in_chain = '';          next }
+        next unless $in_chain eq 'PREROUTING';
+        # eg: -A PREROUTING -d 24.6.37.247/32 -p tcp -m tcp --dport 80
+        #         -j DNAT --to-destination 192.168.15.104:22
+        next unless $ln =~ /^-A\s+PREROUTING\b/ && $ln =~ /-j\s+DNAT\b/;
+        my $r = { raw => $ln };
+        ($r->{dst})  = $ln =~ /-d\s+(\S+)/;
+        ($r->{proto})= $ln =~ /-p\s+(\S+)/;
+        ($r->{dport})= $ln =~ /--dport\s+(\S+)/;
+        ($r->{iif})  = $ln =~ /-i\s+(\S+)/;
+        ($r->{src})  = $ln =~ /-s\s+(\S+)/;
+        my ($to) = $ln =~ /--to-destination\s+(\S+)/;
+        if (defined $to) {
+            if ($to =~ /^(\[?[^\]]+\]?):(\d+(?:-\d+)?)$/) {
+                ($r->{to_host}, $r->{to_port}) = ($1, $2);
+            } else {
+                $r->{to_host} = $to;
+                $r->{to_port} = $r->{dport} // '?';
+            }
+        }
+        # iptables-save preserves -m comment --comment "..."
+        ($r->{comment}) = $ln =~ /--comment\s+"([^"]*)"/;
+        push @out, $r;
+    }
+    return @out;
+}
+
+sub parse_iptables_forward {
+    my ($txt) = @_;
+    return () unless defined $txt && length $txt;
+    my @out;
+    my $in_chain = '';
+    for my $ln (split /\n/, $txt) {
+        $ln =~ s/^\s+|\s+$//g;
+        if ($ln =~ /^:FORWARD\b/)  { $in_chain = 'FORWARD'; next }
+        if ($ln =~ /^:[A-Z]/)      { $in_chain = '';        next }
+        next unless $in_chain eq 'FORWARD';
+        next unless $ln =~ /^-A\s+FORWARD\b/;
+        # Heuristic: only show explicit -j ACCEPT (the policy line says
+        # what happens otherwise).  Skip RELATED,ESTABLISHED conntrack
+        # rules — they're noise; show NEW or unconditional ACCEPTs.
+        next unless $ln =~ /-j\s+ACCEPT\b/;
+        next if $ln =~ /--ctstate\s+(?:RELATED|ESTABLISHED)/i;
+        push @out, $ln;
+    }
+    return @out;
+}
+
+# -- trace ----------------------------------------------------------------
+#
+# Two flavours: --trace (live, ssh + iptables) and --intent (DB read of
+# forwarding_rules).  Both share the QUERY parser.  HOST_PATTERN is a
+# shell glob; CLASS / ZONE remain placeholders until forwarding_rules
+# grows zone columns and ssh poll can map iptables hits back to zones.
+# PORT accepts a service name via getservbyname.
+
+sub parse_query {
+    my ($q) = @_;
+    my ($host_pat, $rest) = $q =~ m{^([^/:]+)(.*)$}
+        or die "trace: can't parse '$q' "
+             . "(expected HOST[/CLASS[/ZONE]][:PORT])\n";
+    my ($class, $zone, $port);
+    if ($rest =~ s{^/([^/:]+)}{}) { $class = $1 }
+    if ($rest =~ s{^/([^:]+)}{})  { $zone  = $1 }
+    if ($rest =~ s{^:(.+)$}{})    { $port  = $1 }
+    $rest eq '' or die "trace: trailing junk '$rest' in '$q'\n";
+
+    my $portnum;
+    if (defined $port) {
+        if    ($port =~ /^\d+$/) { $portnum = $port + 0 }
+        else {
+            my @serv = getservbyname($port, 'tcp');
+            die "trace: unknown service '$port'\n" unless @serv;
+            $portnum = $serv[2];
+        }
+    }
+
+    # HOST_PATTERN is a Perl regex (anchored).  No glob translation —
+    # write 'gateway3.*' (dot-star), not 'gateway3*'.
+    my $host_re = eval { qr/^$host_pat$/ }
+        or die "trace: HOST_PATTERN '$host_pat' isn't a valid regex: $@";
+    return {
+        host_pat => $host_pat,
+        host_re  => $host_re,
+        class    => $class,
+        zone     => $zone,
+        port     => $portnum,
+    };
+}
+
+# Live trace: walk the candidate-host inventory, ssh-poll the ones
+# matching HOST_PATTERN, and print PREROUTING DNAT rules that match
+# the requested port.  No recursion across DNAT targets yet — once the
+# target_host is another known machine we *could* trace there next,
+# but for the first cut a single-hop view is enough to see what
+# happens at the firewall in question.
+sub do_trace_live {
+    my ($q) = @_;
+    my $p = parse_query($q);
+
+    my @candidates = candidate_hosts();
+    my @hosts = grep { $_ =~ $p->{host_re} } @candidates;
+    if (!@hosts) {
+        print "no candidate hosts match '$p->{host_pat}' "
+            . "(net-fw --hosts to see what's known)\n";
+        return;
+    }
+    if ($p->{class} || $p->{zone}) {
+        print "# class/zone filter is a placeholder — live trace "
+            . "ignores it for now.\n";
+    }
+
+    printf "trace %s — %d host(s) to poll:\n", $q, scalar @hosts;
+    my $total = 0;
+    for my $h (@hosts) {
+        my $s = ssh_poll($h) or do {
+            print "  $h: (unreachable)\n";
+            next;
+        };
+        my @dnats = parse_iptables_dnat($s->{nat});
+        my @hit = $p->{port}
+                ? grep { ($_->{dport} // '') eq $p->{port} } @dnats
+                : @dnats;
+        if (!@hit) {
+            print "  $h: (no matching DNAT)\n";
+            next;
+        }
+        for my $r (@hit) {
+            printf "  %-22s %-22s -> %-22s%s\n",
+                $h, bind_str($r),
+                "$r->{to_host}:$r->{to_port}",
+                ($r->{comment} ? "  # $r->{comment}" : '');
+            $total++;
+        }
+    }
+    printf "(%d DNAT match%s)\n", $total, $total == 1 ? '' : 'es';
+}
+
+# Intent trace: same query, against forwarding_rules in the DB.  This
+# is "what should be deployed" — useful for diffing against the live
+# output above and for previewing iptables changes before they ship.
+sub do_trace_db {
+    my ($q) = @_;
+    my $p = parse_query($q);
+
+    my $rows = $db->query_table('forwarding_rules');
+    my @match = grep {
+        $_->{source_host} =~ $p->{host_re}
+     && (!defined $p->{port} || ($_->{bind_port} // 0) == $p->{port})
+    } @$rows;
+
+    if (!@match) {
+        print "no forwarding_rules match '$q'\n";
+        if ($p->{class} || $p->{zone}) {
+            print "  (class/zone filter ignored — forwarding_rules has "
+                . "no zone columns yet)\n";
+        }
+        return;
+    }
+    if ($p->{class} || $p->{zone}) {
+        print "# class/zone filter is a placeholder — forwarding_rules "
+            . "has no zone columns yet, showing all matches.\n";
+    }
+    printf "intent %s — %d match(es):\n", $q, scalar @match;
+    for my $r (sort { $a->{source_host} cmp $b->{source_host}
+                  ||  $a->{bind_port}   <=> $b->{bind_port} } @match) {
+        my $listen = sprintf '%s:%s', $r->{bind_addr} // '*', $r->{bind_port};
+        my $tgt    = $r->{target_host}
+                    ? sprintf '%s:%s', $r->{target_host}, $r->{target_port} // '?'
+                    : '(SOCKS)';
+        my $via    = $r->{ssh_host}
+                    ? sprintf ' via ssh %s%s%s',
+                        ($r->{ssh_user} ? "$r->{ssh_user}\@" : ''),
+                        $r->{ssh_host},
+                        ($r->{ssh_port} ? ":$r->{ssh_port}" : '')
+                    : '';
+        printf "  %-22s %-22s -> %-22s (pid %s, %s)%s\n",
+            $r->{source_host}, $listen, $tgt,
+            $r->{source_pid} // '-', $r->{direction}, $via;
+    }
+}
