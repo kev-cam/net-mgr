@@ -475,16 +475,12 @@ sub do_trace_live {
             . "ignores it for now.\n";
     }
 
-    # Pre-load forwarding_rules once so we can cross-reference per host
-    # without N round-trips to the DB.  Empty array on older schemas.
-    my $fwd = eval { $db->query_table('forwarding_rules') } || [];
-
     printf "trace %s — %d host(s) to poll:\n", $q, scalar @hosts;
     my $total = 0;
     for my $h (@hosts) {
         my $s = ssh_poll($h);
 
-        # Kernel-level DNAT view.
+        # Kernel-level DNAT view (from iptables-save in fw_state).
         my @dnats;
         if ($s) {
             @dnats = parse_iptables_dnat($s->{nat});
@@ -494,11 +490,14 @@ sub do_trace_live {
             print "  $h: (unreachable for live poll)\n";
         }
 
-        # User-space ssh-tunnel view.
-        my @tunnels = grep {
-            ($_->{source_host} // '') eq $h
-         && (!defined $p->{port} || ($_->{bind_port} // 0) == $p->{port})
-        } @$fwd;
+        # User-space ssh-tunnel view.  Live scan via the sibling tool —
+        # net-import-ssh-forwards --print does the pgrep + parse + emit
+        # kv lines without writing to the DB.  Same peer-poll-first
+        # chain we use for fw_state, so unreachable-over-ssh firewalls
+        # still answer if their daemon does.
+        my @tunnels = scan_live_tunnels($h);
+        @tunnels = grep { ($_->{bind_port} // 0) == $p->{port} } @tunnels
+            if defined $p->{port};
 
         if (!@dnats && !@tunnels) {
             print "  $h: (no matching DNAT or ssh tunnel)\n";
@@ -532,6 +531,32 @@ sub do_trace_live {
         }
     }
     printf "(%d match%s)\n", $total, $total == 1 ? '' : 'es';
+}
+
+# Shell out to the sibling tool in --print mode.  Each stdout line is
+# 'kind=forward k=v k=v ...'; parse back into hashes.  Stderr is
+# diagnostic and discarded.  No DB writes happen.
+sub scan_live_tunnels {
+    my ($h) = @_;
+    my $tool = "$FindBin::Bin/net-import-ssh-forwards";
+    $tool = 'net-import-ssh-forwards' unless -x $tool;
+    # Shell form (no list-form here) so 2>/dev/null suppresses the
+    # informational stderr line in --print mode.
+    my $cmd = sprintf '%s --host %s --print --no-ui 2>/dev/null',
+        quotemeta($tool), quotemeta($h);
+    open my $fh, '-|', $cmd or return ();
+    my @rules;
+    while (my $ln = <$fh>) {
+        chomp $ln;
+        next unless $ln =~ /^kind=forward\b/;
+        my %kv;
+        while ($ln =~ /(\w+)=("([^"]*)"|(\S+))/g) {
+            $kv{$1} = defined $3 ? $3 : $4;
+        }
+        push @rules, \%kv;
+    }
+    close $fh;
+    return @rules;
 }
 
 # Intent trace: same query, against forwarding_rules in the DB.  This

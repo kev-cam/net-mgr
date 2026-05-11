@@ -23,6 +23,7 @@ use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
 use Sys::Hostname qw(hostname);
+use FindBin;
 use NetMgr::Client;
 
 my $host;
@@ -33,6 +34,7 @@ my $ssh_user   = 'root';
 my $ssh_timeout = 10;
 my $no_ui;
 my $dry_run;
+my $print_only;     # --print: emit kv lines on stdout, no DB write
 my $help;
 
 GetOptions(
@@ -44,6 +46,7 @@ GetOptions(
     'ssh-timeout=i' => \$ssh_timeout,
     'no-ui'         => \$no_ui,
     'dry-run|n'     => \$dry_run,
+    'print'         => \$print_only,
     'help|h'        => \$help,
 ) or usage();
 usage() if $help;
@@ -64,6 +67,9 @@ usage: net-import-ssh-forwards [opts]                  # scan local host
   --ssh-timeout N      ConnectTimeout for ssh (default 10)
   --no-ui              skip the Tk picker; import every parsed rule
   --dry-run, -n        parse + display the picker, but don't talk to net-mgr
+  --print              emit one kv line per parsed rule on stdout, no
+                       UI, no DB write — for tools (e.g. net-fw) that
+                       want the current state without committing it
   -h, --help           this message
 
 Output of `pgrep -lfa ssh` on a firewall typically looks like:
@@ -101,8 +107,22 @@ sub slurp_local {
     return $s // '';
 }
 
+# Try peer net-mgr (POLL ssh_forwards) first, then fall back to ssh.
+# Same chain net-fw uses — keeps us working against firewalls that
+# we can't ssh to but have a reachable daemon.
 sub slurp_via_ssh {
     my ($h, $u, $t) = @_;
+    my $ip = net_lookup_ip($h);
+    if (defined $ip) {
+        my $out;
+        eval {
+            my $cli = NetMgr::Client->new(listen => "$ip:7531", timeout => 5);
+            $cli->hello(consumer => "import-ssh-forwards.$$");
+            $out = $cli->poll('ssh_forwards');
+            $cli->bye;
+        };
+        return $out if !$@ && defined $out && length $out;
+    }
     my @cmd = ('ssh',
         '-o', 'BatchMode=yes',
         '-o', "ConnectTimeout=$t",
@@ -110,8 +130,21 @@ sub slurp_via_ssh {
         '-n', "$u\@$h", 'pgrep -lfa ssh');
     open my $fh, '-|', @cmd or die "exec ssh: $!\n";
     local $/; my $s = <$fh>; close $fh;
-    die "ssh $h: pgrep returned no output\n" unless defined $s && length $s;
+    die "$h: pgrep returned no output (ssh + peer net-mgr both failed)\n"
+        unless defined $s && length $s;
     return $s;
+}
+
+sub net_lookup_ip {
+    my ($h) = @_;
+    open my $fh, '-|', 'net-lookup', "$h.*" or return undef;
+    my $ip;
+    while (my $ln = <$fh>) {
+        chomp $ln;
+        if ($ln =~ /^(\d+\.\d+\.\d+\.\d+)\z/) { $ip = $1; last }
+    }
+    close $fh;
+    return $ip;
 }
 
 # --- parse ----------------------------------------------------------------
@@ -124,9 +157,25 @@ unless (@rules) {
 my $origin = $file ? $file
            : $host ? "ssh://$host"
            :         "local:$source_host";
-printf "Parsed %d forward rule(s) from %s\n", scalar(@rules), $origin;
+# --print mode is consumed by other tools; keep stdout to the rule
+# lines only.  Diagnostic goes to stderr.
+if ($print_only) {
+    printf STDERR "Parsed %d forward rule(s) from %s\n",
+        scalar(@rules), $origin;
+} else {
+    printf "Parsed %d forward rule(s) from %s\n", scalar(@rules), $origin;
+}
 
 # --- pick (optional) ------------------------------------------------------
+
+# --print is a non-interactive, non-committing mode for downstream
+# tools (net-fw etc.): emit every parsed rule as a kv line on stdout
+# and exit.  No picker, no daemon talk.  Stable contract: each line
+# starts with 'kind=forward' followed by space-separated k=v pairs.
+if ($print_only) {
+    print format_obs($_), "\n" for @rules;
+    exit 0;
+}
 
 my @selected;
 if ($no_ui) {

@@ -739,6 +739,7 @@ echo ===FILTER===
 iptables-save -t filter 2>/dev/null
 echo ===END===
 SH
+    ssh_forwards => 'pgrep -lfa ssh 2>/dev/null',
 );
 
 sub _handle_poll {
