@@ -1,0 +1,569 @@
+#!/usr/bin/perl
+# net-zones — manage the zone_classes / interface_zones / wifi_zones
+# tables.  Used to tag each host interface (and each SSID) with a
+# (class, zone_name) tuple so the iptables emitter can later interpret
+# rules expressed in zone terms.
+#
+# Usage:
+#   net-zones list-classes
+#   net-zones add-class NAME [--sort-order N] [--notes 'text']
+#   net-zones remove-class NAME
+#
+#   net-zones list-interfaces [--host HOST]
+#   net-zones set-interface --host HOST --iface IF --cidr CIDR \
+#                           --class CLASS [--zone NAME] [--notes 'text']
+#   net-zones remove-interface --host HOST --iface IF --cidr CIDR
+#
+#   net-zones list-wifi
+#   net-zones set-wifi --ssid SSID --class CLASS [--zone NAME] [--notes 'text']
+#   net-zones remove-wifi --ssid SSID
+#
+#   net-zones edit [--host HOST]   # Tk picker for the local (or remote)
+#                                  # host's interfaces, one row each.
+#
+#   net-zones import-from-forwards [--host HOST] [--no-ui | --dry-run]
+#       Mine forwarding_rules for distinct (source_host, bind_addr)
+#       pairs, propose interface_zones rows for each (RFC1918 → Private,
+#       public → Internet; /24 network).  Tk picker lets you set the
+#       iface name + tweak class/zone before saving.
+#
+# Direct DBI (matches net-var / net-alias) — run on the host with the
+# net-mgr [.my.cnf] section.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling pass_through);
+use Sys::Hostname qw(hostname);
+use NetMgr::Config;
+use NetMgr::DB;
+
+my %opt;
+my $help;
+my $no_ui;
+my $dry_run;
+GetOptions(
+    'host=s'       => \$opt{host},
+    'iface=s'      => \$opt{iface},
+    'cidr=s'       => \$opt{cidr},
+    'class=s'      => \$opt{class},
+    'zone=s'       => \$opt{zone},
+    'ssid=s'       => \$opt{ssid},
+    'sort-order=i' => \$opt{sort_order},
+    'notes=s'      => \$opt{notes},
+    'no-ui'        => \$no_ui,
+    'dry-run|n'    => \$dry_run,
+    'help|h'       => \$help,
+) or usage(2);
+
+if ($help || !@ARGV) { usage($help ? 0 : 2) }
+
+sub usage {
+    my ($rc) = @_;
+    print <<'EOT';
+net-zones — manage zone_classes / interface_zones / wifi_zones.
+
+  list-classes
+  add-class NAME [--sort-order N] [--notes "…"]
+  remove-class NAME
+
+  list-interfaces [--host HOST]
+  set-interface --host HOST --iface IF --cidr CIDR \
+                --class CLASS [--zone NAME] [--notes "…"]
+  remove-interface --host HOST --iface IF --cidr CIDR
+
+  list-wifi
+  set-wifi --ssid SSID --class CLASS [--zone NAME] [--notes "…"]
+  remove-wifi --ssid SSID
+
+  edit [--host HOST]
+        Tk picker — reads the local host's interfaces (or `ssh HOST ip
+        -4 -o addr show` if --host given) and lets you assign each one
+        a (class, zone_name) tuple.  Existing rows are pre-filled.
+
+  import-from-forwards [--host HOST] [--no-ui] [--dry-run]
+        Scan forwarding_rules for distinct (source_host, bind_addr)
+        pairs and propose interface_zones rows (one per /24 network).
+        Class is guessed from the address: RFC1918 → Private, else
+        Internet.  Picker lets you set the iface name and tweak the
+        guess before saving.  --no-ui skips the picker and saves all
+        proposals; --dry-run prints them without writing.
+EOT
+    exit $rc;
+}
+
+my $cmd = shift @ARGV;
+
+my $cfg = NetMgr::Config->load(
+    $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
+my $mycnf = (-r "$ENV{HOME}/.my.cnf") ? "$ENV{HOME}/.my.cnf"
+          : (-r '/root/.my.cnf')      ? '/root/.my.cnf'
+          : die "no readable .my.cnf for the [net-mgr] section\n";
+my $db = NetMgr::DB->new(
+    defaults_file => $mycnf,
+    section       => $cfg->{mysql}{section},
+    db            => $cfg->{mysql}{db},
+);
+$db->connect;
+
+my %dispatch = (
+    'list-classes'     => \&cmd_list_classes,
+    'add-class'        => \&cmd_add_class,
+    'remove-class'     => \&cmd_remove_class,
+    'list-interfaces'  => \&cmd_list_interfaces,
+    'set-interface'    => \&cmd_set_interface,
+    'remove-interface' => \&cmd_remove_interface,
+    'list-wifi'        => \&cmd_list_wifi,
+    'set-wifi'         => \&cmd_set_wifi,
+    'remove-wifi'      => \&cmd_remove_wifi,
+    'edit'                  => \&cmd_edit,
+    'import-from-forwards'  => \&cmd_import_from_forwards,
+);
+
+my $fn = $dispatch{$cmd}
+    or die "net-zones: unknown subcommand '$cmd'\n  see --help\n";
+$fn->();
+exit 0;
+
+# -- classes --------------------------------------------------------------
+
+sub cmd_list_classes {
+    my $rows = $db->query_table('zone_classes');
+    printf "%-16s %-6s %s\n", 'CLASS', 'ORDER', 'NOTES';
+    for my $r (sort { ($a->{sort_order} // 0) <=> ($b->{sort_order} // 0)
+                  ||  $a->{name} cmp $b->{name} } @$rows) {
+        printf "%-16s %-6s %s\n",
+            $r->{name}, $r->{sort_order} // 0, $r->{notes} // '';
+    }
+}
+
+sub cmd_add_class {
+    my $name = shift @ARGV or die "add-class: missing NAME\n";
+    my $r = $db->upsert_zone_class(
+        name       => $name,
+        sort_order => $opt{sort_order},
+        notes      => $opt{notes},
+    );
+    print "Saved class '$r->{name}' (sort=$r->{sort_order})\n";
+}
+
+sub cmd_remove_class {
+    my $name = shift @ARGV or die "remove-class: missing NAME\n";
+    my $n = $db->delete_zone_class($name);
+    print $n ? "Removed class '$name'\n" : "No such class '$name'\n";
+}
+
+# -- interfaces -----------------------------------------------------------
+
+sub cmd_list_interfaces {
+    my $rows = $db->query_table('interface_zones');
+    if ($opt{host}) {
+        $rows = [ grep { $_->{host} eq $opt{host} } @$rows ];
+    }
+    printf "%-20s %-8s %-20s %-10s %s\n",
+        'HOST', 'IFACE', 'CIDR', 'CLASS', 'ZONE';
+    for my $r (sort { $a->{host}  cmp $b->{host}
+                  ||  $a->{iface} cmp $b->{iface}
+                  ||  $a->{cidr}  cmp $b->{cidr} } @$rows) {
+        printf "%-20s %-8s %-20s %-10s %s\n",
+            $r->{host}, $r->{iface}, $r->{cidr},
+            $r->{zone_class}, $r->{zone_name} // '';
+    }
+}
+
+sub cmd_set_interface {
+    for my $k (qw(host iface cidr class)) {
+        die "set-interface: missing --$k\n" unless defined $opt{$k};
+    }
+    my $r = $db->upsert_interface_zone(
+        host       => $opt{host},
+        iface      => $opt{iface},
+        cidr       => $opt{cidr},
+        zone_class => $opt{class},
+        zone_name  => $opt{zone} // '',
+        notes      => $opt{notes},
+    );
+    print "Saved $r->{host}/$r->{iface}/$r->{cidr} -> "
+        . "{$r->{zone_class},\"$r->{zone_name}\"}\n";
+}
+
+sub cmd_remove_interface {
+    for my $k (qw(host iface cidr)) {
+        die "remove-interface: missing --$k\n" unless defined $opt{$k};
+    }
+    my $n = $db->delete_interface_zone(
+        host => $opt{host}, iface => $opt{iface}, cidr => $opt{cidr});
+    print $n ? "Removed\n" : "No such mapping\n";
+}
+
+# -- wifi -----------------------------------------------------------------
+
+sub cmd_list_wifi {
+    my $rows = $db->query_table('wifi_zones');
+    printf "%-32s %-10s %s\n", 'SSID', 'CLASS', 'ZONE';
+    for my $r (sort { $a->{ssid} cmp $b->{ssid} } @$rows) {
+        printf "%-32s %-10s %s\n",
+            $r->{ssid}, $r->{zone_class}, $r->{zone_name} // '';
+    }
+}
+
+sub cmd_set_wifi {
+    for my $k (qw(ssid class)) {
+        die "set-wifi: missing --$k\n" unless defined $opt{$k};
+    }
+    my $r = $db->upsert_wifi_zone(
+        ssid       => $opt{ssid},
+        zone_class => $opt{class},
+        zone_name  => $opt{zone} // '',
+        notes      => $opt{notes},
+    );
+    print "Saved SSID '$r->{ssid}' -> "
+        . "{$r->{zone_class},\"$r->{zone_name}\"}\n";
+}
+
+sub cmd_remove_wifi {
+    my $ssid = $opt{ssid} || shift @ARGV
+        or die "remove-wifi: missing --ssid or SSID arg\n";
+    my $n = $db->delete_wifi_zone($ssid);
+    print $n ? "Removed SSID '$ssid'\n" : "No such SSID '$ssid'\n";
+}
+
+# -- Tk picker -------------------------------------------------------------
+#
+# Reads the live interface list from `ip -4 -o addr show` (locally
+# or via ssh) and presents one row per (host, iface, cidr) with a
+# Class dropdown + Zone-name entry, pre-filled from interface_zones.
+# Save writes the whole batch in one go.
+
+sub cmd_edit {
+    my $host = $opt{host} // hostname();
+    eval { require Tk; require Tk::BrowseEntry; 1 }
+        or die "net-zones edit: Perl/Tk required "
+             . "(apt install libtk-perl)\n";
+
+    my @ifaces = collect_interfaces($host);
+    @ifaces or die "net-zones edit: no IPv4 interfaces found on $host\n";
+
+    my @classes = map { $_->{name} }
+                  sort { ($a->{sort_order} // 0) <=> ($b->{sort_order} // 0)
+                     ||  $a->{name} cmp $b->{name} }
+                  @{ $db->query_table('zone_classes') };
+    @classes or die "net-zones edit: no zone_classes defined; "
+                  . "run 'net-zones add-class' first\n";
+
+    # Pre-fill from interface_zones for this host.
+    my $existing = $db->query_table('interface_zones');
+    my %prev;
+    for my $r (@$existing) {
+        next unless $r->{host} eq $host;
+        $prev{ "$r->{iface}|$r->{cidr}" } =
+            [ $r->{zone_class}, $r->{zone_name} // '' ];
+    }
+
+    my @entries;
+    for my $i (@ifaces) {
+        my $key = "$i->{iface}|$i->{cidr}";
+        my ($cls, $zone) = @{ $prev{$key} // [$classes[0], ''] };
+        push @entries, {
+            iface => $i->{iface},
+            cidr  => $i->{cidr},
+            addr  => $i->{addr},
+            class => $cls,
+            zone  => $zone,
+        };
+    }
+
+    my $mw = MainWindow->new(-title => "net-zones: $host");
+    $mw->geometry('720x420');
+    $mw->Label(-text => "Assign a (class, zone_name) tuple to each "
+                      . "interface on $host. Empty zone_name means "
+                      . "'the class itself, no refinement'.",
+               -justify => 'left', -wraplength => 680)
+       ->pack(-anchor => 'w', -padx => 6, -pady => 4);
+
+    my $tbl = $mw->Frame->pack(-fill => 'both', -expand => 1,
+                                -padx => 6, -pady => 2);
+    my @cols = ('Iface', 'Address (CIDR)', 'Class', 'Zone name');
+    for my $c (0 .. $#cols) {
+        $tbl->Label(-text => $cols[$c], -font => 'bold',
+            -relief => 'groove', -padx => 4)
+            ->grid(-row => 0, -column => $c, -sticky => 'ew');
+    }
+    my $r = 1;
+    for my $e (@entries) {
+        $tbl->Label(-text => $e->{iface}, -anchor => 'w')
+            ->grid(-row => $r, -column => 0, -sticky => 'w', -padx => 4);
+        $tbl->Label(-text => "$e->{addr}  ($e->{cidr})", -anchor => 'w')
+            ->grid(-row => $r, -column => 1, -sticky => 'w', -padx => 4);
+        my $be = $tbl->BrowseEntry(
+            -variable => \$e->{class}, -choices => \@classes,
+            -state    => 'readonly', -width => 14,
+        );
+        $be->grid(-row => $r, -column => 2, -sticky => 'w', -padx => 4);
+        $tbl->Entry(-textvariable => \$e->{zone}, -width => 24)
+            ->grid(-row => $r, -column => 3, -sticky => 'we', -padx => 4);
+        $r++;
+    }
+    $tbl->gridColumnconfigure(3, -weight => 1);
+
+    my $saved = 0;
+    my $bf = $mw->Frame->pack(-side => 'bottom', -fill => 'x',
+                              -padx => 6, -pady => 6);
+    $bf->Button(-text => 'Cancel', -command => sub { $mw->destroy })
+       ->pack(-side => 'right');
+    $bf->Button(-text => 'Save',
+        -command => sub {
+            for my $e (@entries) {
+                $db->upsert_interface_zone(
+                    host       => $host,
+                    iface      => $e->{iface},
+                    cidr       => $e->{cidr},
+                    zone_class => $e->{class},
+                    zone_name  => $e->{zone} // '',
+                );
+                $saved++;
+            }
+            $mw->destroy;
+        })->pack(-side => 'right', -padx => 4);
+
+    Tk::MainLoop();
+    print "Saved $saved interface mappings for $host.\n" if $saved;
+}
+
+# Returns ({iface, addr, cidr}, …) for IPv4 addresses on $host.  Skips
+# loopback by default; the picker can still see it if you really want
+# it tagged (zone_class for lo is normally Private/"" — but it's noise).
+sub collect_interfaces {
+    my ($host) = @_;
+    my @cmd = ('ip', '-4', '-o', 'addr', 'show');
+    if ($host && $host ne hostname()) {
+        @cmd = ('ssh', '-o', 'BatchMode=yes',
+                '-o', 'StrictHostKeyChecking=accept-new',
+                $host, 'ip -4 -o addr show');
+    }
+    open my $fh, '-|', @cmd or die "@cmd: $!\n";
+    my @out;
+    while (my $line = <$fh>) {
+        chomp $line;
+        # eg: '3: eth1    inet 192.168.223.104/24 brd ... scope global eth1'
+        my ($iface, $cidr) = $line =~ /^\d+:\s+(\S+)\s+inet\s+(\S+)\s/
+            or next;
+        next if $iface eq 'lo';
+        my ($addr) = $cidr =~ /^([^\/]+)/;
+        # Reduce the host part to network/CIDR (so 192.168.223.104/24
+        # → 192.168.223.0/24).  The interface IP is shown alongside
+        # for visual confirmation, but the row keys on the network.
+        my $network = network_for_cidr($cidr);
+        push @out, { iface => $iface, addr => $addr, cidr => $network };
+    }
+    close $fh;
+    return @out;
+}
+
+# -- import-from-forwards --------------------------------------------------
+#
+# Each forwarding_rules row implies an IP held by source_host (the
+# bind_addr) and a target reachable from it.  Only bind_addr maps
+# cleanly to "an interface on the firewall" — target_host is somewhere
+# else.  So we mine bind_addrs, group them per (source_host, /24), and
+# propose one interface_zones row per group with a class guessed from
+# the address itself.  Skips '*' / 'localhost' / non-IP entries since
+# they don't pin to one network.
+sub cmd_import_from_forwards {
+    my $rows     = $db->query_table('forwarding_rules');
+    my $existing = $db->query_table('interface_zones');
+
+    # Build a cross-host CIDR → (class, zone_name) hint from existing
+    # interface_zones rows.  Once any host has tagged 192.168.15.0/24
+    # as DMZ, the same subnet on a different firewall inherits DMZ
+    # instead of falling back to the (too coarse) RFC1918 heuristic.
+    # If two hosts disagree, the lexicographically-first class wins —
+    # rare in practice, and surfaced in the picker for review anyway.
+    my %hint_by_cidr;
+    for my $r (@$existing) {
+        my $h = $hint_by_cidr{ $r->{cidr} };
+        if (!$h || $r->{zone_class} lt $h->{zone_class}) {
+            $hint_by_cidr{ $r->{cidr} } = {
+                zone_class => $r->{zone_class},
+                zone_name  => $r->{zone_name} // '',
+            };
+        }
+    }
+
+    my %seen;        # (host, cidr) → { proposal }
+    for my $r (@$rows) {
+        next if $opt{host} && $r->{source_host} ne $opt{host};
+        my $addr = $r->{bind_addr};
+        next unless defined $addr;
+        next if $addr eq '*' || $addr eq 'localhost' || $addr eq '';
+        next unless $addr =~ /^\d+\.\d+\.\d+\.\d+\z/;
+        my $cidr = network_for_cidr("$addr/24");
+        my $key  = "$r->{source_host}|$cidr";
+        my $hint = $hint_by_cidr{$cidr};
+        $seen{$key} ||= {
+            host       => $r->{source_host},
+            cidr       => $cidr,
+            sample_ip  => $addr,
+            zone_class => $hint ? $hint->{zone_class} : guess_class($addr),
+            iface      => '',
+            zone_name  => $hint ? $hint->{zone_name}  : '',
+            via_pids   => {},
+        };
+        $seen{$key}{via_pids}{ $r->{source_pid} } = 1
+            if defined $r->{source_pid};
+    }
+
+    # Drop proposals that interface_zones already covers (same host +
+    # CIDR), regardless of iface name — the user has already classified
+    # that subnet on that host.  Don't fight existing config.
+    my %have;
+    for my $r (@$existing) {
+        $have{ "$r->{host}|$r->{cidr}" } = 1;
+    }
+    my @proposals;
+    for my $k (sort keys %seen) {
+        next if $have{$k};
+        push @proposals, $seen{$k};
+    }
+    unless (@proposals) {
+        print "Nothing new to propose (every (host, /24) is already in "
+            . "interface_zones).\n";
+        return;
+    }
+    printf "%d proposal(s) from forwarding_rules:\n", scalar @proposals;
+    for my $p (@proposals) {
+        my @pids = sort { $a <=> $b } keys %{ $p->{via_pids} };
+        printf "  %-22s %-20s %-10s  (seen on pids: %s)\n",
+            $p->{host}, $p->{cidr}, $p->{zone_class},
+            (@pids ? join(',', @pids) : '-');
+    }
+
+    if ($dry_run) { return }
+
+    my @chosen;
+    if ($no_ui) {
+        @chosen = @proposals;
+    } else {
+        @chosen = pick_proposals(@proposals)
+            or do { print "No proposals selected.\n"; return };
+    }
+
+    my $n = 0;
+    for my $p (@chosen) {
+        # iface stays "?" when the user didn't supply one — they can
+        # fill it in later via `net-zones edit`, or set-interface.
+        my $iface = length $p->{iface} ? $p->{iface} : '?';
+        $db->upsert_interface_zone(
+            host       => $p->{host},
+            iface      => $iface,
+            cidr       => $p->{cidr},
+            zone_class => $p->{zone_class},
+            zone_name  => $p->{zone_name} // '',
+            notes      => "auto-imported from forwarding_rules",
+        );
+        $n++;
+    }
+    print "Saved $n interface_zones row(s).\n";
+}
+
+# RFC1918 ranges → Private, everything else → Internet.  The other
+# default class (DMZ) needs context this routine can't have, so we
+# leave it to the user to override in the picker.
+sub guess_class {
+    my ($ip) = @_;
+    my @o = split /\./, $ip;
+    return 'Private' if $o[0] == 10;
+    return 'Private' if $o[0] == 192 && $o[1] == 168;
+    return 'Private' if $o[0] == 172 && $o[1] >= 16 && $o[1] <= 31;
+    return 'Private' if $o[0] == 127;
+    return 'Internet';
+}
+
+sub pick_proposals {
+    my @items = @_;
+    eval { require Tk; require Tk::BrowseEntry; 1 }
+        or die "net-zones: Perl/Tk required (apt install libtk-perl) "
+             . "or pass --no-ui\n";
+
+    my @classes = map { $_->{name} }
+                  sort { ($a->{sort_order} // 0) <=> ($b->{sort_order} // 0)
+                     ||  $a->{name} cmp $b->{name} }
+                  @{ $db->query_table('zone_classes') };
+    @classes or die "no zone_classes defined; add some first\n";
+
+    my @entries = map { { %$_, selected => 1 } } @items;
+
+    my $mw = MainWindow->new(-title => 'net-zones: import from forwards');
+    $mw->geometry('960x500');
+    $mw->Label(-text =>
+        "Each row is a (host, /24) network observed in forwarding_rules.\n"
+      . "Set the iface name (e.g. eth0) and adjust class/zone before saving.",
+        -justify => 'left', -wraplength => 920)
+       ->pack(-anchor => 'w', -padx => 6, -pady => 4);
+
+    my $tbl = $mw->Frame->pack(-fill => 'both', -expand => 1,
+                                -padx => 6, -pady => 2);
+    my @cols = ('Sel', 'Host', 'Network', 'Iface', 'Class', 'Zone name');
+    for my $c (0 .. $#cols) {
+        $tbl->Label(-text => $cols[$c], -font => 'bold',
+            -relief => 'groove', -padx => 4)
+            ->grid(-row => 0, -column => $c, -sticky => 'ew');
+    }
+    my $r = 1;
+    for my $e (@entries) {
+        $tbl->Checkbutton(-variable => \$e->{selected})
+            ->grid(-row => $r, -column => 0);
+        $tbl->Label(-text => $e->{host}, -anchor => 'w')
+            ->grid(-row => $r, -column => 1, -sticky => 'w', -padx => 4);
+        $tbl->Label(-text => $e->{cidr}, -anchor => 'w')
+            ->grid(-row => $r, -column => 2, -sticky => 'w', -padx => 4);
+        $tbl->Entry(-textvariable => \$e->{iface}, -width => 10)
+            ->grid(-row => $r, -column => 3, -sticky => 'w', -padx => 4);
+        $tbl->BrowseEntry(
+            -variable => \$e->{zone_class}, -choices => \@classes,
+            -state    => 'readonly', -width => 12)
+           ->grid(-row => $r, -column => 4, -sticky => 'w', -padx => 4);
+        $tbl->Entry(-textvariable => \$e->{zone_name}, -width => 20)
+           ->grid(-row => $r, -column => 5, -sticky => 'we', -padx => 4);
+        $r++;
+    }
+    $tbl->gridColumnconfigure(5, -weight => 1);
+
+    my $picked;
+    my $bf = $mw->Frame->pack(-side => 'bottom', -fill => 'x',
+                              -padx => 6, -pady => 6);
+    $bf->Button(-text => 'Select all',
+        -command => sub { $_->{selected} = 1 for @entries })
+       ->pack(-side => 'left');
+    $bf->Button(-text => 'Select none',
+        -command => sub { $_->{selected} = 0 for @entries })
+       ->pack(-side => 'left', -padx => 4);
+    $bf->Button(-text => 'Cancel',
+        -command => sub { $picked = []; $mw->destroy })
+       ->pack(-side => 'right');
+    $bf->Button(-text => 'Save selected',
+        -command => sub {
+            $picked = [ grep { $_->{selected} } @entries ];
+            $mw->destroy;
+        })->pack(-side => 'right', -padx => 4);
+
+    Tk::MainLoop();
+    return @{ $picked // [] };
+}
+
+# Trivial IPv4 network masking — enough for the picker.  Anything that
+# isn't a clean a.b.c.d/N falls back to the raw input.
+sub network_for_cidr {
+    my ($cidr) = @_;
+    my ($ip, $bits) = $cidr =~ m{^(\d+\.\d+\.\d+\.\d+)/(\d+)$}
+        or return $cidr;
+    my @oct = split /\./, $ip;
+    my $packed = (($oct[0] << 24) | ($oct[1] << 16)
+                | ($oct[2] <<  8) |  $oct[3]) & 0xFFFFFFFF;
+    my $mask = $bits == 0 ? 0 : (0xFFFFFFFF << (32 - $bits)) & 0xFFFFFFFF;
+    my $net  = $packed & $mask;
+    return sprintf '%d.%d.%d.%d/%d',
+        ($net >> 24) & 0xFF, ($net >> 16) & 0xFF,
+        ($net >>  8) & 0xFF,  $net        & 0xFF, $bits;
+}

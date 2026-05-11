@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 14;
+our $SCHEMA_VERSION = 15;
 
 sub new {
     my ($class, %args) = @_;
@@ -335,6 +335,56 @@ CREATE TABLE IF NOT EXISTS forwarding_rules (
     UNIQUE KEY uniq_rule (source_host, direction, bind_addr, bind_port),
     KEY idx_source_host (source_host),
     KEY idx_target      (target_host, target_port)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
+    if ($v == 15) {
+        # Zone classification.  zone_classes is the flat enumeration;
+        # interface_zones / wifi_zones derive concrete (class, name)
+        # tuples from network signals.  Manual rule-zone tagging and
+        # iptables emission both land in later migrations.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS zone_classes (
+    name        VARCHAR(32) NOT NULL PRIMARY KEY,
+    sort_order  INT         NOT NULL DEFAULT 0,
+    notes       TEXT,
+    created_at  DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        $self->{dbh}->do(<<'SQL');
+INSERT IGNORE INTO zone_classes (name, sort_order) VALUES
+    ('Internet',  0),
+    ('DMZ',      10),
+    ('Private',  20)
+SQL
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS interface_zones (
+    host        VARCHAR(64) NOT NULL,
+    iface       VARCHAR(32) NOT NULL,
+    cidr        VARCHAR(45) NOT NULL,
+    zone_class  VARCHAR(32) NOT NULL,
+    zone_name   VARCHAR(64) NOT NULL DEFAULT '',
+    notes       TEXT,
+    updated_at  DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                            ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (host, iface, cidr),
+    KEY idx_zone (zone_class, zone_name),
+    CONSTRAINT fk_iz_class FOREIGN KEY (zone_class)
+        REFERENCES zone_classes(name) ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS wifi_zones (
+    ssid        VARCHAR(64) NOT NULL PRIMARY KEY,
+    zone_class  VARCHAR(32) NOT NULL,
+    zone_name   VARCHAR(64) NOT NULL DEFAULT '',
+    notes       TEXT,
+    updated_at  DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                            ON UPDATE CURRENT_TIMESTAMP,
+    KEY idx_zone (zone_class, zone_name),
+    CONSTRAINT fk_wz_class FOREIGN KEY (zone_class)
+        REFERENCES zone_classes(name) ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
         return;
@@ -1187,6 +1237,85 @@ sub delete_subnet_router {
     );
 }
 
+sub upsert_zone_class {
+    my ($self, %f) = @_;
+    croak "name required" unless defined $f{name} && length $f{name};
+    $self->{dbh}->do(
+        "INSERT INTO zone_classes (name, sort_order, notes) VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            sort_order = VALUES(sort_order),
+            notes      = COALESCE(VALUES(notes), notes)",
+        undef, $f{name}, ($f{sort_order} // 0), $f{notes}
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM zone_classes WHERE name = ?", undef, $f{name}
+    );
+}
+
+sub delete_zone_class {
+    my ($self, $name) = @_;
+    return $self->{dbh}->do("DELETE FROM zone_classes WHERE name = ?",
+        undef, $name);
+}
+
+sub upsert_interface_zone {
+    my ($self, %f) = @_;
+    croak "host, iface, cidr, zone_class required"
+        unless defined $f{host} && defined $f{iface}
+            && defined $f{cidr} && defined $f{zone_class};
+    $f{zone_name} //= '';
+    $self->{dbh}->do(
+        "INSERT INTO interface_zones
+            (host, iface, cidr, zone_class, zone_name, notes)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            zone_class = VALUES(zone_class),
+            zone_name  = VALUES(zone_name),
+            notes      = COALESCE(VALUES(notes), notes)",
+        undef, $f{host}, $f{iface}, $f{cidr},
+        $f{zone_class}, $f{zone_name}, $f{notes}
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM interface_zones
+          WHERE host = ? AND iface = ? AND cidr = ?",
+        undef, $f{host}, $f{iface}, $f{cidr}
+    );
+}
+
+sub delete_interface_zone {
+    my ($self, %f) = @_;
+    return $self->{dbh}->do(
+        "DELETE FROM interface_zones
+          WHERE host = ? AND iface = ? AND cidr = ?",
+        undef, $f{host}, $f{iface}, $f{cidr}
+    );
+}
+
+sub upsert_wifi_zone {
+    my ($self, %f) = @_;
+    croak "ssid, zone_class required"
+        unless defined $f{ssid} && defined $f{zone_class};
+    $f{zone_name} //= '';
+    $self->{dbh}->do(
+        "INSERT INTO wifi_zones (ssid, zone_class, zone_name, notes)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            zone_class = VALUES(zone_class),
+            zone_name  = VALUES(zone_name),
+            notes      = COALESCE(VALUES(notes), notes)",
+        undef, $f{ssid}, $f{zone_class}, $f{zone_name}, $f{notes}
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM wifi_zones WHERE ssid = ?", undef, $f{ssid}
+    );
+}
+
+sub delete_wifi_zone {
+    my ($self, $ssid) = @_;
+    return $self->{dbh}->do("DELETE FROM wifi_zones WHERE ssid = ?",
+        undef, $ssid);
+}
+
 sub query_table {
     my ($self, $table, %opts) = @_;
     my %allowed = map { $_ => 1 } qw(
@@ -1194,6 +1323,7 @@ sub query_table {
         associations dhcp_leases events aliases dhcp_vars
         subnet_routers friendly_names wifi_sockets lost_devices
         peers uplinks forwarding_rules
+        zone_classes interface_zones wifi_zones
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};

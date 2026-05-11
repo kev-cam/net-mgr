@@ -300,6 +300,55 @@ CREATE TABLE IF NOT EXISTS forwarding_rules (
     KEY idx_target      (target_host, target_port)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Zone classification.  zone_classes is the flat enumeration of broad
+-- categories (Internet, DMZ, Private, future: VLAN-tagged ones, …).
+-- Concrete (class, zone_name) tuples — '{DMZ,"scorpius"}', '{Private,""}'
+-- — are derived from network signals: interface_zones for ip-on-iface,
+-- wifi_zones for ssid-on-association.  An empty zone_name means
+-- 'belongs to the class but no further refinement' (e.g. the wired
+-- Private network is just '{Private,""}').
+--
+-- Future derivation tables (vlan_zones etc.) will hang off the same
+-- zone_classes registry.
+CREATE TABLE IF NOT EXISTS zone_classes (
+    name        VARCHAR(32) NOT NULL PRIMARY KEY,
+    sort_order  INT         NOT NULL DEFAULT 0,
+    notes       TEXT,
+    created_at  DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO zone_classes (name, sort_order) VALUES
+    ('Internet',  0),
+    ('DMZ',      10),
+    ('Private',  20);
+
+CREATE TABLE IF NOT EXISTS interface_zones (
+    host        VARCHAR(64) NOT NULL,
+    iface       VARCHAR(32) NOT NULL,
+    cidr        VARCHAR(45) NOT NULL,     -- e.g. 192.168.223.0/24
+    zone_class  VARCHAR(32) NOT NULL,
+    zone_name   VARCHAR(64) NOT NULL DEFAULT '',
+    notes       TEXT,
+    updated_at  DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                            ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (host, iface, cidr),
+    KEY idx_zone (zone_class, zone_name),
+    CONSTRAINT fk_iz_class FOREIGN KEY (zone_class)
+        REFERENCES zone_classes(name) ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS wifi_zones (
+    ssid        VARCHAR(64) NOT NULL PRIMARY KEY,
+    zone_class  VARCHAR(32) NOT NULL,
+    zone_name   VARCHAR(64) NOT NULL DEFAULT '',
+    notes       TEXT,
+    updated_at  DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                            ON UPDATE CURRENT_TIMESTAMP,
+    KEY idx_zone (zone_class, zone_name),
+    CONSTRAINT fk_wz_class FOREIGN KEY (zone_class)
+        REFERENCES zone_classes(name) ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 INSERT IGNORE INTO schema_version (version) VALUES (1);
 INSERT IGNORE INTO schema_version (version) VALUES (2);
 INSERT IGNORE INTO schema_version (version) VALUES (3);
@@ -314,3 +363,4 @@ INSERT IGNORE INTO schema_version (version) VALUES (11);
 INSERT IGNORE INTO schema_version (version) VALUES (12);
 INSERT IGNORE INTO schema_version (version) VALUES (13);
 INSERT IGNORE INTO schema_version (version) VALUES (14);
+INSERT IGNORE INTO schema_version (version) VALUES (15);
