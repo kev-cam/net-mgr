@@ -22,6 +22,7 @@ use warnings;
 use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
+use Sys::Hostname qw(hostname);
 use NetMgr::Client;
 
 my $host;
@@ -46,16 +47,18 @@ GetOptions(
     'help|h'        => \$help,
 ) or usage();
 usage() if $help;
-usage() unless $host || $file;
 
 sub usage {
     print <<'EOF';
-usage: net-import-ssh-forwards --host HOST [opts]
-       net-import-ssh-forwards --file PATH --source-host NAME [opts]
+usage: net-import-ssh-forwards [opts]                  # scan local host
+       net-import-ssh-forwards --host HOST [opts]      # scan remote via ssh
+       net-import-ssh-forwards --file PATH [opts]      # read saved output
   --host HOST          ssh to HOST and run `pgrep -lfa ssh`
   --file PATH          read pgrep-style output from PATH instead
-                       (requires --source-host so rows have an origin)
-  --source-host NAME   override source-host tag (default: --host value)
+                       (requires --source-host unless the output
+                       already names the host)
+  --source-host NAME   override source-host tag (default: --host value,
+                       or local hostname when neither --host nor --file)
   --listen H[:P]       net-mgr daemon address (default 127.0.0.1:7531)
   --ssh-user USER      ssh as USER@HOST (default root)
   --ssh-timeout N      ConnectTimeout for ssh (default 10)
@@ -70,19 +73,32 @@ EOF
     exit($help ? 0 : 1);
 }
 
-$source_host //= $host;
+$source_host //= ($host // ($file ? undef : hostname()));
 die "net-import-ssh-forwards: --file requires --source-host\n"
     if $file && !$source_host;
 
 # --- collect the pgrep output ---------------------------------------------
 
-my $raw = $file ? slurp_file($file) : slurp_via_ssh($host, $ssh_user, $ssh_timeout);
+my $raw =
+    $file ? slurp_file($file)
+  : $host ? slurp_via_ssh($host, $ssh_user, $ssh_timeout)
+  :         slurp_local();
 
 sub slurp_file {
     my ($p) = @_;
     open my $fh, '<', $p or die "open $p: $!\n";
     local $/; my $s = <$fh>; close $fh;
     return $s;
+}
+
+sub slurp_local {
+    open my $fh, '-|', 'pgrep', '-lfa', 'ssh'
+        or die "exec pgrep: $!\n";
+    local $/; my $s = <$fh>; close $fh;
+    # pgrep -lfa exits non-zero if no matches; on a quiet box there
+    # could just be no ssh clients running.  Treat empty output as
+    # "no forwards" not an error.
+    return $s // '';
 }
 
 sub slurp_via_ssh {
@@ -105,8 +121,10 @@ unless (@rules) {
     print "No -L/-R/-D forwards found in input.\n";
     exit 0;
 }
-printf "Parsed %d forward rule(s) from %s\n",
-    scalar(@rules), $file // "ssh://$source_host";
+my $origin = $file ? $file
+           : $host ? "ssh://$host"
+           :         "local:$source_host";
+printf "Parsed %d forward rule(s) from %s\n", scalar(@rules), $origin;
 
 # --- pick (optional) ------------------------------------------------------
 
