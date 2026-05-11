@@ -1,0 +1,419 @@
+#!/usr/bin/perl
+# net-import-ssh-forwards — harvest -L / -R / -D port-forwards from
+# running ssh processes on a firewall (or any host) and save them to
+# the net-mgr `forwarding_rules` table via OBSERVE kind=forward.
+#
+# Usage:
+#   net-import-ssh-forwards --host HOST [--listen daemon[:port]]
+#   net-import-ssh-forwards --file PATH                 # read pgrep -lfa ssh
+#                                                       # output from a file
+#                                                       # (testing/replay)
+#   net-import-ssh-forwards --host HOST --no-ui         # skip the Tk picker;
+#                                                       # import every rule
+#   net-import-ssh-forwards --host HOST --dry-run       # parse + show picker
+#                                                       # but don't send anything
+#
+# Source-host: with --host, the firewall's name (whatever you passed).
+# With --file, it's required as --source-host NAME so the rows carry
+# the right origin tag.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use NetMgr::Client;
+
+my $host;
+my $file;
+my $source_host;
+my $listen     = $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
+my $ssh_user   = 'root';
+my $ssh_timeout = 10;
+my $no_ui;
+my $dry_run;
+my $help;
+
+GetOptions(
+    'host=s'        => \$host,
+    'file=s'        => \$file,
+    'source-host=s' => \$source_host,
+    'listen=s'      => \$listen,
+    'ssh-user=s'    => \$ssh_user,
+    'ssh-timeout=i' => \$ssh_timeout,
+    'no-ui'         => \$no_ui,
+    'dry-run|n'     => \$dry_run,
+    'help|h'        => \$help,
+) or usage();
+usage() if $help;
+usage() unless $host || $file;
+
+sub usage {
+    print <<'EOF';
+usage: net-import-ssh-forwards --host HOST [opts]
+       net-import-ssh-forwards --file PATH --source-host NAME [opts]
+  --host HOST          ssh to HOST and run `pgrep -lfa ssh`
+  --file PATH          read pgrep-style output from PATH instead
+                       (requires --source-host so rows have an origin)
+  --source-host NAME   override source-host tag (default: --host value)
+  --listen H[:P]       net-mgr daemon address (default 127.0.0.1:7531)
+  --ssh-user USER      ssh as USER@HOST (default root)
+  --ssh-timeout N      ConnectTimeout for ssh (default 10)
+  --no-ui              skip the Tk picker; import every parsed rule
+  --dry-run, -n        parse + display the picker, but don't talk to net-mgr
+  -h, --help           this message
+
+Output of `pgrep -lfa ssh` on a firewall typically looks like:
+    1875 ssh -p332 -L:10000:solarmon.grfx.com:10000 192.168.15.252 ...
+The parser pulls out -L / -R / -D forward specs plus the ssh endpoint.
+EOF
+    exit($help ? 0 : 1);
+}
+
+$source_host //= $host;
+die "net-import-ssh-forwards: --file requires --source-host\n"
+    if $file && !$source_host;
+
+# --- collect the pgrep output ---------------------------------------------
+
+my $raw = $file ? slurp_file($file) : slurp_via_ssh($host, $ssh_user, $ssh_timeout);
+
+sub slurp_file {
+    my ($p) = @_;
+    open my $fh, '<', $p or die "open $p: $!\n";
+    local $/; my $s = <$fh>; close $fh;
+    return $s;
+}
+
+sub slurp_via_ssh {
+    my ($h, $u, $t) = @_;
+    my @cmd = ('ssh',
+        '-o', 'BatchMode=yes',
+        '-o', "ConnectTimeout=$t",
+        '-o', 'StrictHostKeyChecking=accept-new',
+        '-n', "$u\@$h", 'pgrep -lfa ssh');
+    open my $fh, '-|', @cmd or die "exec ssh: $!\n";
+    local $/; my $s = <$fh>; close $fh;
+    die "ssh $h: pgrep returned no output\n" unless defined $s && length $s;
+    return $s;
+}
+
+# --- parse ----------------------------------------------------------------
+
+my @rules = parse_pgrep($raw, $source_host);
+unless (@rules) {
+    print "No -L/-R/-D forwards found in input.\n";
+    exit 0;
+}
+printf "Parsed %d forward rule(s) from %s\n",
+    scalar(@rules), $file // "ssh://$source_host";
+
+# --- pick (optional) ------------------------------------------------------
+
+my @selected;
+if ($no_ui) {
+    @selected = @rules;
+} else {
+    @selected = run_picker(@rules);
+    if (!@selected) {
+        print "No rules selected; nothing to do.\n";
+        exit 0;
+    }
+}
+
+# --- ship -----------------------------------------------------------------
+
+if ($dry_run) {
+    print "Dry-run: would send these OBSERVEs to $listen:\n";
+    print "  " . format_obs($_), "\n" for @selected;
+    exit 0;
+}
+
+my $cli = NetMgr::Client->new(listen => $listen, timeout => 5);
+$cli->hello(source => "import-ssh-forwards.$$", pid => $$);
+my $n = 0;
+for my $r (@selected) {
+    my $reply = $cli->observe(kind => 'forward', %$r);
+    if (defined $reply && $reply =~ /^OK\b/) {
+        $n++;
+    } else {
+        warn "OBSERVE rejected for "
+           . join(',', map { "$_=" . ($r->{$_} // '-') }
+                       qw(direction bind_addr bind_port target_host target_port))
+           . ": " . ($reply // '(no reply)') . "\n";
+    }
+}
+$cli->bye;
+print "Imported $n / " . scalar(@selected) . " rule(s) into net-mgr.\n";
+
+# -- parsing ----------------------------------------------------------------
+
+sub parse_pgrep {
+    my ($text, $src_host) = @_;
+    my @out;
+    for my $line (split /\n/, $text) {
+        $line =~ s/\s+$//;
+        next unless length $line;
+        # `pgrep -lfa` lines start with PID then the command line.  We only
+        # want client `ssh` invocations — `sshd:` accept/listener lines
+        # have flags too but they're not interesting and would parse
+        # garbage with our heuristic.
+        my ($pid, $rest) = $line =~ /^(\d+)\s+(.*)$/ or next;
+        next unless $rest =~ /^ssh\s/;
+        my @args = split /\s+/, $rest;
+        shift @args;   # discard the 'ssh' itself
+
+        my %ssh = (source_host => $src_host, source_pid => $pid + 0);
+        my @forwards;
+        my $i = 0;
+        while ($i < @args) {
+            my $a = $args[$i];
+            # -p PORT  or  -pPORT
+            if ($a =~ /^-p(\d+)$/) { $ssh{ssh_port} = $1 + 0; $i++; next }
+            if ($a eq '-p' && $i + 1 < @args) {
+                $ssh{ssh_port} = $args[++$i] + 0; $i++; next;
+            }
+            # -L SPEC  or  -LSPEC  (same for -R, -D)
+            if ($a =~ /^-([LRD])(.+)$/) {
+                my $spec = parse_forward_spec($1, $2);
+                push @forwards, $spec if $spec;
+                $i++; next;
+            }
+            if ($a =~ /^-([LRD])$/ && $i + 1 < @args) {
+                my $spec = parse_forward_spec($1, $args[++$i]);
+                push @forwards, $spec if $spec;
+                $i++; next;
+            }
+            # Skip any other flag — assume non-arg-bearing.  -i / -F / -E
+            # etc. take an arg but our typical firewall ssh cmds don't
+            # have them; if they do, the destination heuristic below will
+            # still work because we treat the *last* non-flag token before
+            # the dest as the arg-bearing flag's value.  Good enough for now.
+            if ($a =~ /^-/) { $i++; next }
+            # First plain token is the destination ([user@]host); anything
+            # after it is the remote command (e.g. /usr/local/bin/doze ...).
+            if ($a =~ /^([^@]+)\@(.+)$/) {
+                $ssh{ssh_user} = $1; $ssh{ssh_host} = $2;
+            } else {
+                $ssh{ssh_host} = $a;
+            }
+            last;
+        }
+        for my $f (@forwards) {
+            push @out, { %ssh, %$f, source => 'ssh' };
+        }
+    }
+    return @out;
+}
+
+# -L / -R: 'port:host:hostport'  or  'bind:port:host:hostport'
+# -D:      'port'                or  'bind:port'
+sub parse_forward_spec {
+    my ($dir, $spec) = @_;
+    my @p = split /:/, $spec, -1;     # -1 keeps trailing empties
+    if ($dir eq 'D') {
+        return { direction => 'D', bind_addr => '*', bind_port => $p[0] + 0 }
+            if @p == 1 && $p[0] =~ /^\d+$/;
+        return { direction => 'D',
+                 bind_addr => ($p[0] eq '' ? '*' : $p[0]),
+                 bind_port => $p[1] + 0 }
+            if @p == 2 && $p[1] =~ /^\d+$/;
+        return undef;
+    }
+    # L / R: 3 parts (port:host:hostport) or 4 (bind:port:host:hostport)
+    if (@p == 3 && $p[0] =~ /^\d+$/ && $p[2] =~ /^\d+$/) {
+        return { direction => $dir, bind_addr => '*',
+                 bind_port => $p[0] + 0,
+                 target_host => $p[1], target_port => $p[2] + 0 };
+    }
+    if (@p == 4 && $p[1] =~ /^\d+$/ && $p[3] =~ /^\d+$/) {
+        return { direction => $dir,
+                 bind_addr => ($p[0] eq '' ? '*' : $p[0]),
+                 bind_port => $p[1] + 0,
+                 target_host => $p[2], target_port => $p[3] + 0 };
+    }
+    warn "skipping unparsable -$dir spec '$spec'\n";
+    return undef;
+}
+
+# -- output helpers --------------------------------------------------------
+
+sub format_obs {
+    my ($r) = @_;
+    return "kind=forward " . join(' ',
+        map { "$_=" . ($r->{$_} // '') }
+        grep { defined $r->{$_} }
+        qw(source source_host source_pid direction bind_addr bind_port
+           target_host target_port ssh_user ssh_host ssh_port));
+}
+
+# -- Tk picker -------------------------------------------------------------
+#
+# Two-column visual: a scrollable list of rules with per-row checkbox,
+# plus an "Add manual rule" form that pops in an edit dialog and
+# appends a new row.  Bottom: Cancel + Import.
+
+sub run_picker {
+    my @initial = @_;
+    eval { require Tk; require Tk::Pane; 1 }
+        or die "net-import-ssh-forwards: Perl/Tk required for the picker "
+             . "(apt install libtk-perl) or pass --no-ui\n";
+
+    my @rows  = map { { rule => $_, selected => 1 } } @initial;
+    my $picked;
+
+    my $mw = MainWindow->new(-title => 'net-import-ssh-forwards');
+    $mw->geometry('960x500');
+
+    $mw->Label(
+        -text => "Pick rules to import into net-mgr forwarding_rules.\n"
+               . "Source host: " . ($initial[0]{source_host} // '?'),
+        -justify => 'left',
+    )->pack(-anchor => 'w', -padx => 6, -pady => 4);
+
+    my $pane = $mw->Scrolled('Pane',
+        -scrollbars => 'oe', -sticky => 'nsew',
+    );
+    $pane->pack(-fill => 'both', -expand => 1, -padx => 6);
+
+    # Header row.
+    my @cols = qw(Sel PID Dir Listen Target SSH);
+    for my $c (0 .. $#cols) {
+        $pane->Label(-text => $cols[$c], -font => 'bold',
+            -relief => 'groove', -padx => 4)
+            ->grid(-row => 0, -column => $c, -sticky => 'ew');
+    }
+    my $next_row = 1;          # closure-shared counter for append-on-add
+    for my $entry (@rows) {
+        place_row($pane, $next_row++, $entry);
+    }
+
+    my $btn = $mw->Frame;
+    $btn->pack(-side => 'bottom', -fill => 'x', -padx => 6, -pady => 6);
+
+    $btn->Button(-text => 'Add row...',
+        -command => sub {
+            my $r = add_row_dialog($mw);
+            if ($r) {
+                my $entry = { rule => $r, selected => 1 };
+                push @rows, $entry;
+                place_row($pane, $next_row++, $entry);
+            }
+        })->pack(-side => 'left');
+
+    $btn->Button(-text => 'Select all',
+        -command => sub { $_->{selected} = 1 for @rows; })
+       ->pack(-side => 'left', -padx => 4);
+    $btn->Button(-text => 'Select none',
+        -command => sub { $_->{selected} = 0 for @rows; })
+       ->pack(-side => 'left');
+
+    $btn->Button(-text => 'Cancel',
+        -command => sub { $picked = []; $mw->destroy })
+        ->pack(-side => 'right');
+    $btn->Button(-text => 'Import selected',
+        -command => sub {
+            $picked = [ map { $_->{rule} } grep { $_->{selected} } @rows ];
+            $mw->destroy;
+        })->pack(-side => 'right', -padx => 4);
+
+    Tk::MainLoop();
+    return @{ $picked // [] };
+}
+
+sub place_row {
+    my ($pane, $r, $entry) = @_;
+    my $rule = $entry->{rule};
+    $pane->Checkbutton(-variable => \$entry->{selected})
+        ->grid(-row => $r, -column => 0);
+    $pane->Label(-text => $rule->{source_pid} // '-', -anchor => 'w')
+        ->grid(-row => $r, -column => 1, -sticky => 'w', -padx => 4);
+    $pane->Label(-text => $rule->{direction}, -anchor => 'w')
+        ->grid(-row => $r, -column => 2, -sticky => 'w', -padx => 4);
+    $pane->Label(
+        -text => sprintf('%s:%s', $rule->{bind_addr} // '*',
+                                   $rule->{bind_port}),
+        -anchor => 'w')
+        ->grid(-row => $r, -column => 3, -sticky => 'w', -padx => 4);
+    $pane->Label(
+        -text => $rule->{direction} eq 'D'
+            ? '(SOCKS)'
+            : sprintf('%s:%s', $rule->{target_host} // '-',
+                                $rule->{target_port} // '-'),
+        -anchor => 'w')
+        ->grid(-row => $r, -column => 4, -sticky => 'w', -padx => 4);
+    $pane->Label(
+        -text => sprintf('%s%s%s',
+            $rule->{ssh_user} ? "$rule->{ssh_user}\@" : '',
+            $rule->{ssh_host} // '-',
+            $rule->{ssh_port} ? ":$rule->{ssh_port}" : ''),
+        -anchor => 'w')
+        ->grid(-row => $r, -column => 5, -sticky => 'w', -padx => 4);
+}
+
+sub add_row_dialog {
+    my ($parent) = @_;
+    my $d = $parent->Toplevel(-title => 'Add forwarding rule');
+    $d->transient($parent);
+    $d->grab;
+
+    my %v = (direction => 'L', bind_addr => '*', source => 'manual',
+             source_host => '');
+    my @fields = (
+        ['Direction (L/R/D)', \$v{direction}],
+        ['Bind addr',         \$v{bind_addr}],
+        ['Bind port',         \$v{bind_port}],
+        ['Target host',       \$v{target_host}],
+        ['Target port',       \$v{target_port}],
+        ['SSH user',          \$v{ssh_user}],
+        ['SSH host',          \$v{ssh_host}],
+        ['SSH port',          \$v{ssh_port}],
+        ['Source host',       \$v{source_host}],
+        ['Notes',             \$v{notes}],
+    );
+    for my $i (0 .. $#fields) {
+        my ($label, $ref) = @{ $fields[$i] };
+        $d->Label(-text => "$label:", -anchor => 'e')
+            ->grid(-row => $i, -column => 0, -sticky => 'e', -padx => 4,
+                   -pady => 2);
+        $d->Entry(-textvariable => $ref, -width => 32)
+            ->grid(-row => $i, -column => 1, -sticky => 'we', -padx => 4,
+                   -pady => 2);
+    }
+
+    my $result;
+    my $bf = $d->Frame;
+    $bf->grid(-row => scalar(@fields), -column => 0, -columnspan => 2,
+              -sticky => 'e', -padx => 4, -pady => 4);
+    $bf->Button(-text => 'Cancel', -command => sub { $d->destroy })
+       ->pack(-side => 'right', -padx => 2);
+    $bf->Button(-text => 'Add', -command => sub {
+        $v{direction} = uc $v{direction};
+        if ($v{direction} !~ /^[LRD]$/) {
+            $d->messageBox(-type => 'ok', -icon => 'error',
+                -message => "Direction must be L, R, or D");
+            return;
+        }
+        if (!$v{bind_port} || $v{bind_port} !~ /^\d+$/) {
+            $d->messageBox(-type => 'ok', -icon => 'error',
+                -message => "Bind port required (integer)");
+            return;
+        }
+        if (!$v{source_host}) {
+            $d->messageBox(-type => 'ok', -icon => 'error',
+                -message => "Source host required");
+            return;
+        }
+        # Strip empties so the wire form is tidy.
+        for my $k (keys %v) {
+            delete $v{$k} if !defined $v{$k} || $v{$k} eq '';
+        }
+        $v{bind_addr} //= '*';
+        $v{source}    //= 'manual';
+        $result = { %v };
+        $d->destroy;
+    })->pack(-side => 'right', -padx => 2);
+
+    $d->waitWindow;
+    return $result;
+}

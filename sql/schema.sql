@@ -268,6 +268,38 @@ CREATE TABLE IF NOT EXISTS lost_devices (
     KEY idx_last_seen (last_seen)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Port-forwarding rules harvested from running ssh processes (and
+-- manual additions).  Each row describes one -L / -R / -D forward as
+-- it would appear on the ssh command line.  source_host names the
+-- machine running the ssh process (a firewall, gateway, etc.) so the
+-- same rule discovered on two boxes shows up as two rows.
+--
+-- Uniqueness on (source_host, direction, bind_addr, bind_port) means
+-- restarting the ssh process updates the existing row rather than
+-- piling on duplicates; bind_addr defaults to '*' so the wildcard case
+-- (-L:port:host:port) doesn't NULL out the unique check.
+CREATE TABLE IF NOT EXISTS forwarding_rules (
+    id           INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    source       VARCHAR(32)  NOT NULL,         -- 'ssh' | 'manual'
+    source_host  VARCHAR(64)  NOT NULL,         -- host running the ssh
+    source_pid   INT          NULL,             -- ssh pid (NULL for manual)
+    direction    CHAR(1)      NOT NULL,         -- 'L' | 'R' | 'D'
+    bind_addr    VARCHAR(64)  NOT NULL DEFAULT '*',
+    bind_port    INT          NOT NULL,
+    target_host  VARCHAR(64)  NULL,             -- NULL for direction='D'
+    target_port  INT          NULL,
+    ssh_user     VARCHAR(64)  NULL,             -- user@host of the ssh cmd
+    ssh_host     VARCHAR(64)  NULL,             -- ssh destination host
+    ssh_port     INT          NULL,             -- ssh -p value
+    notes        TEXT,
+    first_seen   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                              ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uniq_rule (source_host, direction, bind_addr, bind_port),
+    KEY idx_source_host (source_host),
+    KEY idx_target      (target_host, target_port)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 INSERT IGNORE INTO schema_version (version) VALUES (1);
 INSERT IGNORE INTO schema_version (version) VALUES (2);
 INSERT IGNORE INTO schema_version (version) VALUES (3);
@@ -281,3 +313,4 @@ INSERT IGNORE INTO schema_version (version) VALUES (10);
 INSERT IGNORE INTO schema_version (version) VALUES (11);
 INSERT IGNORE INTO schema_version (version) VALUES (12);
 INSERT IGNORE INTO schema_version (version) VALUES (13);
+INSERT IGNORE INTO schema_version (version) VALUES (14);

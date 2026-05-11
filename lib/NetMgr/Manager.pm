@@ -782,6 +782,7 @@ sub _handle_observe {
         elsif ($kind eq 'port')        { @events = $self->_obs_port($cli, $kv) }
         elsif ($kind eq 'ping')        { @events = $self->_obs_ping($cli, $kv) }
         elsif ($kind eq 'event')       { @events = $self->_obs_event($cli, $kv) }
+        elsif ($kind eq 'forward')     { @events = $self->_obs_forward($cli, $kv) }
         else {
             die "unknown observation kind '$kind'\n";
         }
@@ -1013,6 +1014,48 @@ sub _obs_host {
         }
     }
     return @ev;
+}
+
+sub _obs_forward {
+    my ($self, $cli, $kv) = @_;
+    my $direction = uc($kv->{direction} // '');
+    die "forward: direction must be L/R/D\n" unless $direction =~ /^[LRD]$/;
+    die "forward: source_host required\n"    unless $kv->{source_host};
+    die "forward: bind_port required\n"      unless defined $kv->{bind_port};
+
+    my $bind_addr = $kv->{bind_addr};
+    $bind_addr = '*' if !defined $bind_addr || $bind_addr eq '';
+
+    # Check for existence to pick the right op for downstream subscribers.
+    # upsert_forwarding_rule uses INSERT ... ON DUPLICATE KEY UPDATE and
+    # returns the post-write row; we just need was-or-wasn't here.
+    my $existed = $self->{db}->dbh->selectrow_array(
+        "SELECT 1 FROM forwarding_rules
+          WHERE source_host = ? AND direction = ?
+            AND bind_addr   = ? AND bind_port = ?",
+        undef, $kv->{source_host}, $direction, $bind_addr, $kv->{bind_port}
+    );
+
+    my $row = $self->{db}->upsert_forwarding_rule(
+        source      => $kv->{source}      // 'ssh',
+        source_host => $kv->{source_host},
+        source_pid  => $kv->{source_pid},
+        direction   => $direction,
+        bind_addr   => $bind_addr,
+        bind_port   => $kv->{bind_port},
+        target_host => $kv->{target_host},
+        target_port => $kv->{target_port},
+        ssh_user    => $kv->{ssh_user},
+        ssh_host    => $kv->{ssh_host},
+        ssh_port    => $kv->{ssh_port},
+        notes       => $kv->{notes},
+    );
+    $self->_emit_change(
+        table => 'forwarding_rules',
+        op    => $existed ? 'update' : 'insert',
+        row   => $row,
+    ) if $row;
+    return;
 }
 
 sub _obs_port {

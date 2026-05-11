@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 13;
+our $SCHEMA_VERSION = 14;
 
 sub new {
     my ($class, %args) = @_;
@@ -306,6 +306,35 @@ CREATE TABLE IF NOT EXISTS uplinks (
     notes                TEXT,
     KEY idx_role       (role),
     KEY idx_last_check (last_check)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
+    if ($v == 14) {
+        # Port-forwarding rules.  Populated by net-import-ssh-forwards
+        # from `pgrep -lfa ssh` output on firewalls/gateways, plus any
+        # manually-added rules.  Future consumer: iptables generator.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS forwarding_rules (
+    id           INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    source       VARCHAR(32)  NOT NULL,
+    source_host  VARCHAR(64)  NOT NULL,
+    source_pid   INT          NULL,
+    direction    CHAR(1)      NOT NULL,
+    bind_addr    VARCHAR(64)  NOT NULL DEFAULT '*',
+    bind_port    INT          NOT NULL,
+    target_host  VARCHAR(64)  NULL,
+    target_port  INT          NULL,
+    ssh_user     VARCHAR(64)  NULL,
+    ssh_host     VARCHAR(64)  NULL,
+    ssh_port     INT          NULL,
+    notes        TEXT,
+    first_seen   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                              ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uniq_rule (source_host, direction, bind_addr, bind_port),
+    KEY idx_source_host (source_host),
+    KEY idx_target      (target_host, target_port)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
         return;
@@ -1070,6 +1099,61 @@ sub uplinks_due {
     );
 }
 
+sub upsert_forwarding_rule {
+    my ($self, %f) = @_;
+    croak "source required"      unless defined $f{source};
+    croak "source_host required" unless defined $f{source_host};
+    croak "direction required (L/R/D)"
+        unless defined $f{direction} && $f{direction} =~ /^[LRD]$/;
+    croak "bind_port required" unless defined $f{bind_port};
+    $f{bind_addr} //= '*';
+    $f{bind_addr}  =  '*' if $f{bind_addr} eq '';
+
+    # All NULL handling delegated to MySQL; we just pass undef through.
+    # ON DUPLICATE updates everything that might have changed plus the
+    # auto-touched last_seen.  source_pid moves around between restarts
+    # of the same ssh process, so we accept the latest reading.
+    $self->{dbh}->do(
+        "INSERT INTO forwarding_rules
+            (source, source_host, source_pid, direction, bind_addr, bind_port,
+             target_host, target_port, ssh_user, ssh_host, ssh_port, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            source       = VALUES(source),
+            source_pid   = VALUES(source_pid),
+            target_host  = VALUES(target_host),
+            target_port  = VALUES(target_port),
+            ssh_user     = COALESCE(VALUES(ssh_user),  ssh_user),
+            ssh_host     = COALESCE(VALUES(ssh_host),  ssh_host),
+            ssh_port     = COALESCE(VALUES(ssh_port),  ssh_port),
+            notes        = COALESCE(VALUES(notes),     notes),
+            last_seen    = CURRENT_TIMESTAMP",
+        undef,
+        $f{source}, $f{source_host}, $f{source_pid}, $f{direction},
+        $f{bind_addr}, $f{bind_port}, $f{target_host}, $f{target_port},
+        $f{ssh_user}, $f{ssh_host}, $f{ssh_port}, $f{notes},
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM forwarding_rules
+          WHERE source_host = ? AND direction = ?
+            AND bind_addr   = ? AND bind_port = ?",
+        undef, $f{source_host}, $f{direction}, $f{bind_addr}, $f{bind_port}
+    );
+}
+
+sub delete_forwarding_rule {
+    my ($self, %f) = @_;
+    return $self->{dbh}->do("DELETE FROM forwarding_rules WHERE id = ?",
+        undef, $f{id}) if defined $f{id};
+    return $self->{dbh}->do(
+        "DELETE FROM forwarding_rules
+          WHERE source_host = ? AND direction = ?
+            AND bind_addr   = ? AND bind_port = ?",
+        undef, $f{source_host}, $f{direction},
+        ($f{bind_addr} // '*'), $f{bind_port}
+    );
+}
+
 sub upsert_peer {
     my ($self, %f) = @_;
     croak "host required" unless defined $f{host};
@@ -1109,7 +1193,7 @@ sub query_table {
         machines hostnames interfaces addresses ports aps
         associations dhcp_leases events aliases dhcp_vars
         subnet_routers friendly_names wifi_sockets lost_devices
-        peers uplinks
+        peers uplinks forwarding_rules
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};
