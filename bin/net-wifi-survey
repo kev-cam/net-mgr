@@ -87,14 +87,19 @@ $db->connect;
 # Pull every AP from net-mgr's aps table, joined with addresses for the
 # ssh-able IP.  --ap HOST scopes to one (name or IP).
 sub list_aps {
+    # GROUP BY mac to coalesce APs with multiple v4 addresses on the
+    # same MAC — otherwise an AP that has both eth0 and a bridge
+    # address recorded would show up (and get scanned) twice.  MIN(addr)
+    # gives a stable pick across runs.
     my $rows = $db->dbh->selectall_arrayref(<<'SQL', { Slice => {} });
-SELECT a.mac, a.ssid, ad.addr,
+SELECT a.mac, MIN(a.ssid) AS ssid, MIN(ad.addr) AS addr,
        (SELECT primary_name FROM machines m
           JOIN interfaces i ON i.machine_id = m.id
          WHERE i.mac = a.mac LIMIT 1) AS name
   FROM aps a
   JOIN addresses ad ON ad.mac = a.mac AND ad.family = 'v4'
- ORDER BY ad.addr
+ GROUP BY a.mac
+ ORDER BY MIN(ad.addr)
 SQL
     return $rows;
 }
@@ -137,14 +142,24 @@ for d in /sys/class/net/wl*; do
     fi
 done
 echo ===METHOD_SS===
-for w in wl0 wl1; do
-    out=$(site_survey $w 2>/dev/null)
-    if [ -n "$out" ] && [ "${out#buflen=*count=[0]}" = "$out" ]; then
-        echo IFACE $w
-        echo "$out"
-        echo ENDRESULTS
-    fi
-done
+# DD-WRT's site_survey with NO interface argument dumps the scan
+# cache for every radio in one structured listing:
+#   [ N] SSID[ name] BSSID[xx:xx:...] channel[ N] frequency[NNNN] ...
+# Quirks to handle:
+#   * the binary writes its output to STDERR, not stdout — capture 2>&1
+#   * per-iface invocations ('site_survey wl0') often return count=0
+#     even when results exist, so always use the bare form
+#   * 'count=[0]' header means no results; skip in that case
+out=$(site_survey 2>&1)
+case "$out" in
+  *"count=[0]"*) : ;;       # empty cache — nothing to report
+  "") : ;;                  # nothing came back at all
+  *)
+    echo IFACE all
+    echo "$out"
+    echo ENDRESULTS
+    ;;
+esac
 echo ===END===
 SH
 
@@ -156,15 +171,26 @@ sub ssh_scan {
     my $tool    = (-x $net_ssh) ? $net_ssh : 'net-ssh';
     my @cmd = ($tool,
         '-o', 'BatchMode=yes',
+        '-o', 'LogLevel=ERROR',                # quiets the ssh client
         '-o', "ConnectTimeout=$ssh_timeout",
         '-o', 'StrictHostKeyChecking=accept-new',
         '-n', "$ssh_user\@$host",
         $REMOTE_SCRIPT,
     );
-    open my $fh, '-|', @cmd or do {
-        warn "ssh $host: $!\n"; return undef;
-    };
-    local $/; my $raw = <$fh>; close $fh;
+    # Fork-exec form so we can drop stderr — DD-WRT prints its motd
+    # banner ('DD-WRT v3.0-r... / Release: ... / Board: ...') on stderr
+    # of the remote shell and it leaks straight into the user's terminal
+    # otherwise.  We don't need stderr from the scan itself either.
+    my $pid = open(my $fh, '-|');
+    return undef unless defined $pid;
+    if ($pid == 0) {
+        open STDERR, '>', '/dev/null';
+        exec { $cmd[0] } @cmd;
+        exit 127;
+    }
+    local $/;
+    my $raw = <$fh>;
+    close $fh;
     return $raw;
 }
 
@@ -213,14 +239,30 @@ sub parse_scan {
 
     # Prefer methods in order: WL > IW > SS (matches the remote script's
     # detection order; the earliest that produced results is most
-    # specific to the hardware).
+    # specific to the hardware).  For the site_survey path the iface
+    # is recorded as 'all' since the bare invocation returns every
+    # radio's results in one listing — split into wl0 / wl1 by band
+    # so the per-radio report blocks remain meaningful.
     my @results;
     for my $iface (sort keys %by_iface_method) {
         my $m = $by_iface_method{$iface};
-        my $pick = $m->{METHOD_WL} || $m->{METHOD_IW} || $m->{METHOD_SS};
-        next unless $pick && @$pick;
+        my ($pick, $picked_method);
+        for my $name (qw(METHOD_WL METHOD_IW METHOD_SS)) {
+            if ($m->{$name} && @{ $m->{$name} }) {
+                $pick = $m->{$name}; $picked_method = $name; last;
+            }
+        }
+        next unless $pick;
         for my $r (@$pick) {
-            $r->{scanner_iface} = $iface;
+            my $assigned_iface = $iface;
+            if ($iface eq 'all' && $picked_method eq 'METHOD_SS') {
+                my $b = $r->{band} // '';
+                $assigned_iface = $b eq '2.4GHz' ? 'wl0'
+                                : $b eq '5GHz'   ? 'wl1'
+                                : $b eq '6GHz'   ? 'wl2'
+                                :                  'wl?';
+            }
+            $r->{scanner_iface} = $assigned_iface;
             $r->{scanner_mac}   = $scanner_mac;
             push @results, $r;
         }
@@ -298,26 +340,37 @@ sub parse_iw_scan {
     return @out;
 }
 
-# Older DD-WRT site_survey output (text table):
-#   ' '$<#>' '$<bssid>' '$<channel>' '$<freq>' '$<rssi>' ...
+# DD-WRT site_survey (bracketed-fields format).  One result per line:
+#   [ N] SSID[ name ] BSSID[xx:xx:xx:xx:xx:xx] channel[ N] frequency[NNNN]
+#        numsta[N] rssi[-NN] noise[-NN] beacon[NNN] cap[XXXX] dtim[N]
+#        rate[NNN] enc[Group-... PSK2 ...]
+# Each [ ... ] field can have leading/trailing whitespace inside the
+# brackets; we strip it.  Band is derived from frequency, not channel —
+# both 2.4GHz and 5GHz scan results come back in the same call.
 sub parse_site_survey {
     my ($lines) = @_;
     my @out;
     for my $ln (@$lines) {
-        next if $ln =~ /buflen=/ || $ln =~ /^\s*$/;
-        # Columns are space/quote separated; pull whatever quoted
-        # tokens look like bssid + numbers.
-        my ($bssid)   = $ln =~ /([0-9A-Fa-f:]{17})/;
-        my ($channel) = $ln =~ /'(\d+)'\s+'\d{4}'\s+'/;
-        my ($rssi)    = $ln =~ /'(-?\d+)'\s+'-?\d+'\s+'\d+'\s+'/;
-        my ($ssid)    = $ln =~ /'([^']+)'\s*$/;
-        next unless $bssid;
+        next unless $ln =~ /^\s*\[\s*\d+\]\s/;
+        my %f;
+        while ($ln =~ /(\w+)\[\s*([^\]]*?)\s*\]/g) {
+            $f{$1} = $2;
+        }
+        next unless $f{BSSID} && $f{BSSID} =~ /^[0-9A-Fa-f:]{17}$/;
+        my $freq = $f{frequency};
+        my $band;
+        if (defined $freq && $freq =~ /^\d+$/) {
+            $band = $freq < 3000 ? '2.4GHz'
+                  : $freq < 6000 ? '5GHz'
+                  :                '6GHz';
+        }
         push @out, {
-            bssid    => lc $bssid,
-            channel  => $channel ? $channel + 0 : undef,
-            rssi_dbm => defined $rssi ? $rssi + 0 : undef,
-            ssid     => $ssid,
-            band     => guess_band($channel),
+            bssid      => lc $f{BSSID},
+            ssid       => $f{SSID},
+            channel    => defined $f{channel}   ? $f{channel}   + 0 : undef,
+            rssi_dbm   => defined $f{rssi}      ? $f{rssi}      + 0 : undef,
+            band       => $band,
+            encryption => $f{enc},
         };
     }
     return @out;
