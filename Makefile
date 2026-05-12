@@ -23,7 +23,7 @@ CGIDIR     ?= /usr/lib/cgi-bin
 APACHE_CONF_DIR ?= $(SYSCONFDIR)/apache2/conf-available
 DESTDIR    ?=
 
-BINS  = net-alias net-poll-ap net-discover net-find-lost net-find-peers net-fw net-gen-dnsmasq net-import-dhcp net-import-ssh-forwards net-fix net-lookup net-name net-ping net-roam net-router net-scan net-report net-show net-ssh net-tp-scan net-uplink-probe net-var net-watch net-zones
+BINS  = net-alias net-poll-ap net-audit net-discover net-find-lost net-find-peers net-fw net-gen-dnsmasq net-import-dhcp net-import-ssh-forwards net-fix net-lookup net-name net-ping net-roam net-router net-scan net-report net-show net-ssh net-tp-scan net-uplink-probe net-var net-watch net-zones
 SBINS = net-mgr net-mgr-setup net-dns net-mgr-relay
 # Recovery scripts live off PATH so net-find-lost can enumerate them
 # without polluting BINDIR. Each script must support --describe.

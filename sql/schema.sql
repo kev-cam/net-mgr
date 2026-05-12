@@ -363,4 +363,25 @@ INSERT IGNORE INTO schema_version (version) VALUES (11);
 INSERT IGNORE INTO schema_version (version) VALUES (12);
 INSERT IGNORE INTO schema_version (version) VALUES (13);
 INSERT IGNORE INTO schema_version (version) VALUES (14);
+-- Audit annotations.  Mark a forward observed by net-audit as a known
+-- sink (target_host:target_port absorbs stray traffic, e.g. an SMTP
+-- catcher on a dead-end host) or as an intentional Internet-facing
+-- forward (so it's not re-flagged on each audit run).  Keyed on
+-- (kind, host, addr, port); host='' means "any host" — useful for
+-- sink-target where the sink is a property of the destination IP
+-- regardless of which firewall is pointing at it.
+CREATE TABLE IF NOT EXISTS audit_annotations (
+    kind       VARCHAR(32) NOT NULL,           -- 'sink-target' | 'intentional-forward'
+    host       VARCHAR(64) NOT NULL DEFAULT '',
+    addr       VARCHAR(64) NOT NULL DEFAULT '*',
+    port       INT         NOT NULL,
+    reason     TEXT,
+    created_at DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                           ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (kind, host, addr, port),
+    KEY idx_target (addr, port)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 INSERT IGNORE INTO schema_version (version) VALUES (15);
+INSERT IGNORE INTO schema_version (version) VALUES (16);

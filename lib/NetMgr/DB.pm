@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 15;
+our $SCHEMA_VERSION = 16;
 
 sub new {
     my ($class, %args) = @_;
@@ -385,6 +385,27 @@ CREATE TABLE IF NOT EXISTS wifi_zones (
     KEY idx_zone (zone_class, zone_name),
     CONSTRAINT fk_wz_class FOREIGN KEY (zone_class)
         REFERENCES zone_classes(name) ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
+    if ($v == 16) {
+        # audit_annotations: mark sinks (target host:port absorbs stray
+        # traffic) or intentional Internet-facing forwards so net-audit
+        # doesn't re-flag them.  host='' means "any host" — useful for
+        # sink-target where the property attaches to the destination.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS audit_annotations (
+    kind       VARCHAR(32) NOT NULL,
+    host       VARCHAR(64) NOT NULL DEFAULT '',
+    addr       VARCHAR(64) NOT NULL DEFAULT '*',
+    port       INT         NOT NULL,
+    reason     TEXT,
+    created_at DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                           ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (kind, host, addr, port),
+    KEY idx_target (addr, port)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
         return;
@@ -1316,6 +1337,39 @@ sub delete_wifi_zone {
         undef, $ssid);
 }
 
+sub upsert_audit_annotation {
+    my ($self, %f) = @_;
+    croak "kind required" unless defined $f{kind} && length $f{kind};
+    croak "port required" unless defined $f{port};
+    $f{host} //= '';
+    $f{addr} //= '*';
+    $f{addr}   = '*' if $f{addr} eq '';
+    $self->{dbh}->do(
+        "INSERT INTO audit_annotations (kind, host, addr, port, reason)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            reason = COALESCE(VALUES(reason), reason)",
+        undef, $f{kind}, $f{host}, $f{addr}, $f{port}, $f{reason}
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM audit_annotations
+          WHERE kind = ? AND host = ? AND addr = ? AND port = ?",
+        undef, $f{kind}, $f{host}, $f{addr}, $f{port}
+    );
+}
+
+sub delete_audit_annotation {
+    my ($self, %f) = @_;
+    croak "kind, port required" unless defined $f{kind} && defined $f{port};
+    $f{host} //= '';
+    $f{addr} //= '*';
+    return $self->{dbh}->do(
+        "DELETE FROM audit_annotations
+          WHERE kind = ? AND host = ? AND addr = ? AND port = ?",
+        undef, $f{kind}, $f{host}, $f{addr}, $f{port}
+    );
+}
+
 sub query_table {
     my ($self, $table, %opts) = @_;
     my %allowed = map { $_ => 1 } qw(
@@ -1324,6 +1378,7 @@ sub query_table {
         subnet_routers friendly_names wifi_sockets lost_devices
         peers uplinks forwarding_rules
         zone_classes interface_zones wifi_zones
+        audit_annotations
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};

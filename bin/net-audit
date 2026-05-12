@@ -1,0 +1,617 @@
+#!/usr/bin/perl
+# net-audit — flag Internet-facing forwarding that exposes risky services.
+#
+# Walks candidate firewalls (live state, via peer-poll / ssh), collects
+# iptables PREROUTING DNAT rules and ssh -L tunnels, classifies each by
+# bind-side exposure (Internet / DMZ / Private) and target-side service
+# severity, then prints findings sorted by severity.
+#
+# Annotations stored in audit_annotations let you mark known sinks
+# (target_host:target_port that absorbs stray traffic — e.g. a deliberate
+# SMTP sink) or intentional Internet-facing forwards so they don't get
+# re-flagged on each audit.  Annotated rules are downgraded to severity
+# 'info' with the reason printed alongside.
+#
+# Usage:
+#   net-audit                       audit every candidate firewall
+#   net-audit HOST [HOST ...]       scope to specific firewalls
+#   net-audit --severity LEVEL      filter (critical/high/medium/low/info)
+#   net-audit --json                machine-readable output
+#
+#   net-audit --mark-sink ADDR:PORT [--reason TXT]
+#   net-audit --mark-intentional HOST:BIND_ADDR:PORT [--reason TXT]
+#   net-audit --unmark KIND ARG     remove an annotation
+#                                   (KIND = sink|intentional)
+#   net-audit --list-exceptions     show every audit_annotations row
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling pass_through);
+use Sys::Hostname qw(hostname);
+use NetMgr::Config;
+use NetMgr::DB;
+
+# Sibling binaries we shell out to (net-ssh for live ssh, and
+# net-import-ssh-forwards --print for the user-space ssh-tunnel view).
+# Declared at the top so functions invoked during the audit walk see it.
+my $BIN = $FindBin::Bin;
+
+# Severity rubric.  Same lexical-order rule as $BIN — declare before
+# do_audit() runs.  Severities, high → low: critical / high / medium /
+# low / info.  Anything not in the table falls through to ranges in
+# classify_port() (VNC 5900-5999 etc.) and finally to ('info','unknown').
+my %SEVERITY_BY_PORT = (
+    # critical: never face the Internet
+    21    => ['critical', 'ftp'],
+    23    => ['critical', 'telnet'],
+    69    => ['critical', 'tftp'],
+    111   => ['critical', 'sunrpc'],
+    135   => ['critical', 'msrpc'],
+    137   => ['critical', 'netbios-name'],
+    138   => ['critical', 'netbios-dgm'],
+    139   => ['critical', 'netbios-ssn'],
+    445   => ['critical', 'smb'],
+    1080  => ['critical', 'socks-proxy'],
+    1433  => ['critical', 'mssql'],
+    1521  => ['critical', 'oracle'],
+    2049  => ['critical', 'nfs'],
+    2375  => ['critical', 'docker-api'],
+    2379  => ['critical', 'etcd'],
+    3306  => ['critical', 'mysql'],
+    3389  => ['critical', 'rdp'],
+    5432  => ['critical', 'postgres'],
+    5601  => ['critical', 'kibana'],
+    6379  => ['critical', 'redis'],
+    9200  => ['critical', 'elasticsearch'],
+    11211 => ['critical', 'memcached'],
+    27017 => ['critical', 'mongodb'],
+    # high: exposed but often intentional
+    22    => ['high',     'ssh'],
+    25    => ['medium',   'smtp'],
+    53    => ['medium',   'dns'],
+    8080  => ['medium',   'http-alt'],
+    8888  => ['medium',   'http-alt'],
+    # medium: cleartext
+    80    => ['medium',   'http'],
+    143   => ['medium',   'imap'],
+    110   => ['medium',   'pop3'],
+    # low: TLS / well-known encrypted
+    443   => ['low',      'https'],
+    563   => ['low',      'nntps'],
+    993   => ['low',      'imaps'],
+    995   => ['low',      'pop3s'],
+);
+my @SEV_ORDER = qw(critical high medium low info);
+my %SEV_RANK  = map { $SEV_ORDER[$_] => $_ } 0..$#SEV_ORDER;
+
+my %opt;
+my $help;
+GetOptions(
+    'severity=s'        => \$opt{severity},
+    'json'              => \$opt{json},
+    'reason=s'          => \$opt{reason},
+    'mark-sink=s'       => \$opt{mark_sink},
+    'mark-intentional=s'=> \$opt{mark_intentional},
+    'unmark=s'          => \$opt{unmark},
+    'list-exceptions'   => \$opt{list_exceptions},
+    'ssh-user=s'        => \$opt{ssh_user},
+    'ssh-timeout=i'     => \$opt{ssh_timeout},
+    'help|h'            => \$help,
+) or usage(2);
+
+sub usage {
+    my ($rc) = @_;
+    print <<'EOT';
+net-audit — Internet-facing forwarding audit.
+
+  net-audit [HOST ...]              audit every (or specified) firewall
+  net-audit --severity LEVEL        filter (critical/high/medium/low/info)
+  net-audit --json                  machine-readable output
+
+  net-audit --mark-sink ADDR:PORT [--reason TXT]
+        Mark a target as a sink — forwards pointing at it get
+        downgraded to 'info' across all firewalls.
+
+  net-audit --mark-intentional HOST:BIND:PORT [--reason TXT]
+        Mark a specific Internet-facing forward as intentional on HOST.
+        BIND is the listen address ('*' for any).
+
+  net-audit --unmark KIND ARG       remove an annotation
+        KIND = sink:           ARG = ADDR:PORT
+        KIND = intentional:    ARG = HOST:BIND:PORT
+
+  net-audit --list-exceptions       dump audit_annotations
+
+Options:
+  --ssh-user USER                   ssh username (default root)
+  --ssh-timeout N                   ssh ConnectTimeout (default 8)
+  -h, --help                        this message
+EOT
+    exit $rc;
+}
+usage(0) if $help;
+
+my $cfg = NetMgr::Config->load(
+    $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
+my $mycnf = (-r "$ENV{HOME}/.my.cnf") ? "$ENV{HOME}/.my.cnf"
+          : (-r '/root/.my.cnf')      ? '/root/.my.cnf'
+          : die "no readable .my.cnf for the [net-mgr] section\n";
+my $db = NetMgr::DB->new(
+    defaults_file => $mycnf,
+    section       => $cfg->{mysql}{section},
+    db            => $cfg->{mysql}{db},
+);
+$db->connect;
+
+# Annotation management subcommands — handled before the audit walk so
+# you can mark + immediately re-run without two invocations.
+if ($opt{list_exceptions}) { cmd_list_exceptions(); exit 0 }
+if ($opt{mark_sink})       { cmd_mark_sink($opt{mark_sink}); exit 0 }
+if ($opt{mark_intentional}){ cmd_mark_intentional($opt{mark_intentional}); exit 0 }
+if ($opt{unmark}) {
+    my $arg = shift @ARGV
+        or die "--unmark needs a target arg after the kind\n";
+    cmd_unmark($opt{unmark}, $arg);
+    exit 0;
+}
+
+do_audit(@ARGV);
+exit 0;
+
+# -- severity helpers ----------------------------------------------------
+sub classify_port {
+    my ($port) = @_;
+    return @{ $SEVERITY_BY_PORT{$port} } if exists $SEVERITY_BY_PORT{$port};
+    return ('high',  'vnc')   if $port >= 5900 && $port <= 5999;
+    return ('high',  'xpra')  if $port >= 14500 && $port <= 14600;
+    return ('high',  'wsman') if $port == 5985 || $port == 5986;
+    return ('info',  'unknown');
+}
+
+# -- candidate hosts (same shape as net-fw) -------------------------------
+sub candidate_hosts {
+    my $rows = $db->dbh->selectall_arrayref(<<'SQL', { Slice => {} });
+SELECT m.id, m.primary_name, a.addr
+  FROM machines m
+  JOIN interfaces i ON i.machine_id = m.id
+  JOIN ports     p ON p.mac = i.mac AND p.port = 22 AND p.proto = 'tcp'
+  JOIN addresses a ON a.mac = i.mac AND a.family = 'v4'
+ WHERE m.online = 1
+ GROUP BY m.id
+ ORDER BY m.primary_name, a.addr
+SQL
+    my @out;
+    for my $r (@$rows) {
+        my $h = $r->{primary_name} // $r->{addr};
+        push @out, $h if defined $h && length $h;
+    }
+    return @out;
+}
+
+# -- live poll (delegates to net-fw via shared canon) ---------------------
+#
+# Reuse the net-fw helpers by spawning a tiny shell that runs them.
+# Simpler than duplicating: net-fw already has the peer-poll-first /
+# ssh-fallback chain, and net-import-ssh-forwards --print emits the
+# ssh-tunnel side in a parseable format.  Both binaries are in $BIN
+# (declared near the top of the script).
+sub live_iptables_for_host {
+    my ($host) = @_;
+    # Use net-fw's poll path via NetMgr::Client directly (same as it
+    # does internally).  Falls back to ssh if peer-poll fails.  This
+    # keeps net-audit independent of net-fw's CLI shape.
+    require NetMgr::Client;
+    my $output;
+    my $ip = net_lookup_ip($host);
+    if (defined $ip) {
+        eval {
+            my $cli = NetMgr::Client->new(listen => "$ip:7531", timeout => 5);
+            $cli->hello(consumer => "net-audit.$$");
+            $output = $cli->poll('fw_state');
+            $cli->bye;
+        };
+    }
+    if (!defined $output || !length $output) {
+        # SSH fallback via net-ssh if present (so ssh-config aliases
+        # are still honoured).  Shell out instead of re-implementing
+        # the script in this tool.
+        my $ssh = (-x "$BIN/net-ssh") ? "$BIN/net-ssh" : 'net-ssh';
+        my $sshto = $opt{ssh_user} // 'root';
+        my $timeout = $opt{ssh_timeout} // 8;
+        my $cmd = sprintf(
+            '%s -o BatchMode=yes -o ConnectTimeout=%d '
+          . '-o StrictHostKeyChecking=accept-new -n %s@%s '
+          . 'iptables-save -t nat 2>/dev/null',
+            quotemeta($ssh), $timeout, quotemeta($sshto), quotemeta($host));
+        if (open my $fh, '-|', $cmd) {
+            local $/; $output = <$fh>; close $fh;
+        }
+    }
+    return $output;
+}
+
+sub net_lookup_ip {
+    my ($h) = @_;
+    open my $fh, '-|', 'net-lookup', "$h.*" or return undef;
+    my $ip;
+    while (my $ln = <$fh>) {
+        chomp $ln;
+        if ($ln =~ /^(\d+\.\d+\.\d+\.\d+)\z/) { $ip = $1; last }
+    }
+    close $fh;
+    return $ip;
+}
+
+# Re-uses net-fw's parser by shelling out — keeps a single source of
+# truth for iptables interpretation.  Cheap (one fork per host) and
+# tolerant of older formats since net-fw already handles them.
+sub parse_dnat {
+    my ($raw) = @_;
+    return () unless defined $raw && length $raw;
+    # Bail out to a stripped copy of net-fw's parser (we can't easily
+    # require net-fw as a module since it has its own main).  This is
+    # the same regex set net-fw uses; revisit by factoring into a
+    # module if it grows.
+    my @out;
+    my $in_chain = '';
+    for my $ln (split /\n/, $raw) {
+        $ln =~ s/^\s+|\s+$//g;
+        if ($ln =~ /^:PREROUTING\b/)            { $in_chain = 'PREROUTING'; next }
+        if ($ln =~ /^:[A-Z]/)                    { $in_chain = '';          next }
+        next unless $in_chain eq 'PREROUTING';
+        next unless $ln =~ /^-A\s+PREROUTING\b/ && $ln =~ /-j\s+DNAT\b/;
+        my %r = (raw => $ln);
+        ($r{dst})   = $ln =~ /-d\s+(\S+)/;
+        ($r{proto}) = $ln =~ /-p\s+(\S+)/;
+        ($r{dport}) = $ln =~ /--dport\s+(\S+)/;
+        ($r{iif})   = $ln =~ /-i\s+(\S+)/;
+        ($r{src})   = $ln =~ /-s\s+(\S+)/;
+        my ($to) = $ln =~ /--to-destination\s+(\S+)/;
+        if (defined $to) {
+            if ($to =~ /^(\[?[^\]]+\]?):(\d+(?:-\d+)?)$/) {
+                ($r{to_host}, $r{to_port}) = ($1, $2);
+            } else {
+                $r{to_host} = $to; $r{to_port} = $r{dport};
+            }
+        }
+        ($r{comment}) = $ln =~ /--comment\s+"([^"]*)"/;
+        push @out, \%r;
+    }
+    return @out;
+}
+
+sub live_tunnels_for_host {
+    my ($host) = @_;
+    my $tool = (-x "$BIN/net-import-ssh-forwards")
+             ? "$BIN/net-import-ssh-forwards"
+             : 'net-import-ssh-forwards';
+    my $cmd = sprintf '%s --host %s --print --no-ui 2>/dev/null',
+        quotemeta($tool), quotemeta($host);
+    open my $fh, '-|', $cmd or return ();
+    my @rules;
+    while (my $ln = <$fh>) {
+        chomp $ln;
+        next unless $ln =~ /^kind=forward\b/;
+        my %kv;
+        while ($ln =~ /(\w+)=("([^"]*)"|(\S+))/g) {
+            $kv{$1} = defined $3 ? $3 : $4;
+        }
+        push @rules, \%kv;
+    }
+    close $fh;
+    return @rules;
+}
+
+# -- Internet-facing classification ---------------------------------------
+#
+# Order of evidence:
+#   1. interface_zones row whose CIDR contains bind_addr → use its class
+#   2. bind_addr is RFC1918 / loopback / link-local → 'Private'
+#   3. bind_addr is '*' (wildcard listen) → 'Internet' (worst-case)
+#   4. otherwise → 'Internet'
+sub zone_for_addr {
+    my ($host, $addr, $iface_zones) = @_;
+    return 'Loopback' if $addr eq 'localhost' || $addr =~ /^127\./;
+    return 'Link'     if $addr =~ /^169\.254\./;
+    # interface_zones lookup
+    for my $z (@$iface_zones) {
+        next unless ($z->{host} // '') eq $host || ($z->{host} // '') eq '';
+        next unless $addr =~ /^\d+\.\d+\.\d+\.\d+\z/;
+        if (cidr_contains($z->{cidr}, $addr)) {
+            return $z->{zone_class};
+        }
+    }
+    return 'Private' if rfc1918($addr);
+    return 'Internet';   # includes '*' and any non-RFC1918 literal
+}
+
+sub rfc1918 {
+    my ($a) = @_;
+    return 0 unless $a =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)\z/;
+    my ($o1, $o2) = ($1, $2);
+    return 1 if $o1 == 10;
+    return 1 if $o1 == 192 && $o2 == 168;
+    return 1 if $o1 == 172 && $o2 >= 16 && $o2 <= 31;
+    return 0;
+}
+
+sub cidr_contains {
+    my ($cidr, $ip) = @_;
+    my ($net, $bits) = $cidr =~ m{^(\d+\.\d+\.\d+\.\d+)/(\d+)$} or return 0;
+    return 0 unless $ip =~ /^\d+\.\d+\.\d+\.\d+\z/;
+    my $n = ipv4_to_int($net);
+    my $a = ipv4_to_int($ip);
+    my $mask = $bits == 0 ? 0 : (0xFFFFFFFF << (32 - $bits)) & 0xFFFFFFFF;
+    return ($n & $mask) == ($a & $mask);
+}
+
+sub ipv4_to_int {
+    my ($s) = @_;
+    my @o = split /\./, $s;
+    return (($o[0]<<24)|($o[1]<<16)|($o[2]<<8)|$o[3]) & 0xFFFFFFFF;
+}
+
+# -- audit walk -----------------------------------------------------------
+sub do_audit {
+    my @scope = @_;
+    my @hosts = @scope ? @scope : candidate_hosts();
+    @hosts or die "net-audit: no hosts to audit (use --hosts to override)\n";
+
+    my $iface_zones = eval { $db->query_table('interface_zones') } || [];
+    my $annotations = eval { $db->query_table('audit_annotations') } || [];
+
+    # Two lookups: sink-targets keyed by (addr, port), intentional
+    # forwards keyed by (host, bind_addr, bind_port).  host='' in a
+    # sink-target means it applies to any forwarding firewall.
+    my (%sink, %intentional);
+    for my $a (@$annotations) {
+        if ($a->{kind} eq 'sink-target') {
+            $sink{ "$a->{addr}|$a->{port}" } = $a;
+        }
+        elsif ($a->{kind} eq 'intentional-forward') {
+            $intentional{ "$a->{host}|$a->{addr}|$a->{port}" } = $a;
+        }
+    }
+
+    my @findings;
+    for my $h (@hosts) {
+        push @findings, audit_host($h, $iface_zones, \%sink, \%intentional);
+    }
+
+    # Filter + sort.
+    my $min = $opt{severity};
+    if (defined $min) {
+        die "unknown severity '$min'\n" unless exists $SEV_RANK{$min};
+        my $max_rank = $SEV_RANK{$min};
+        @findings = grep { $SEV_RANK{ $_->{severity} } <= $max_rank } @findings;
+    }
+    # Sort by severity then host then bind_port.  Compute the numeric
+    # keys up-front so <=> can't see any stringy ports or unmapped
+    # severities (both would trigger warnings even if functionally OK).
+    for my $f (@findings) {
+        $f->{_sev_rank}     = $SEV_RANK{ $f->{severity} // 'info' } // 99;
+        $f->{_bind_port_num}= ($f->{bind_port} && $f->{bind_port} =~ /^\d+$/)
+                              ? $f->{bind_port} + 0 : 0;
+    }
+    @findings = sort {
+        $a->{_sev_rank}      <=> $b->{_sev_rank}
+        || $a->{host}         cmp $b->{host}
+        || $a->{_bind_port_num} <=> $b->{_bind_port_num}
+    } @findings;
+    # Strip the sort keys; they're not part of the public finding shape.
+    delete @{$_}{qw(_sev_rank _bind_port_num)} for @findings;
+
+    if ($opt{json}) {
+        require JSON::PP;
+        print JSON::PP::encode_json(\@findings), "\n";
+        return;
+    }
+
+    if (!@findings) {
+        print "no findings (use --severity info to see everything)\n";
+        return;
+    }
+    my $last_host = '';
+    for my $f (@findings) {
+        if ($f->{host} ne $last_host) {
+            print "==== $f->{host} ====\n";
+            $last_host = $f->{host};
+        }
+        my $listen = sprintf '%s:%s', $f->{bind_addr} // '*',
+                                       $f->{bind_port};
+        my $tgt    = $f->{target_host}
+                   ? sprintf '%s:%s', $f->{target_host},
+                                       $f->{target_port} // '?'
+                   : '-';
+        printf "  [%-8s] %-10s %-12s %-22s -> %-22s  %s\n",
+            $f->{severity}, $f->{mechanism},
+            $f->{boundary} // '',
+            $listen, $tgt,
+            $f->{note} // $f->{service} // '';
+    }
+}
+
+sub audit_host {
+    my ($host, $iface_zones, $sink, $intentional) = @_;
+    my @out;
+
+    # iptables PREROUTING DNAT.
+    my $raw = live_iptables_for_host($host);
+    for my $r (parse_dnat($raw)) {
+        my $bind_addr = $r->{dst};
+        if (defined $bind_addr && $bind_addr =~ s{/32$}{}) { } # strip /32
+        $bind_addr //= '*';
+        my $bind_port = $r->{dport} // '?';
+        my $tgt_h = $r->{to_host};
+        my $tgt_p = $r->{to_port};
+        my $f = make_finding(
+            host        => $host,
+            mechanism   => 'iptables',
+            bind_addr   => $bind_addr,
+            bind_port   => $bind_port,
+            target_host => $tgt_h,
+            target_port => $tgt_p,
+            iface_zones => $iface_zones,
+            sink        => $sink,
+            intentional => $intentional,
+        );
+        push @out, $f if $f;
+    }
+
+    # ssh -L tunnels (live, via net-import-ssh-forwards --print).
+    for my $r (live_tunnels_for_host($host)) {
+        next unless ($r->{direction} // '') eq 'L';   # -R / -D handled later
+        my $f = make_finding(
+            host        => $host,
+            mechanism   => 'ssh-tunnel',
+            bind_addr   => $r->{bind_addr} // '*',
+            bind_port   => $r->{bind_port},
+            target_host => $r->{target_host},
+            target_port => $r->{target_port},
+            iface_zones => $iface_zones,
+            sink        => $sink,
+            intentional => $intentional,
+        );
+        push @out, $f if $f;
+    }
+    return @out;
+}
+
+sub make_finding {
+    my %a = @_;
+    return undef unless defined $a{bind_port}
+                     && $a{bind_port} =~ /^\d+\z/;
+
+    my $bind_zone   = zone_for_addr($a{host}, $a{bind_addr},
+                                    $a{iface_zones});
+
+    # Target zone: only when target is an IPv4 literal can we look it
+    # up in interface_zones; hostnames stay 'Unknown' (a future DNS
+    # resolution step could fix that).  'Unknown' is treated as
+    # non-Private for the DMZ→Private check below — better to under-
+    # flag than spam.
+    my $target_zone = 'Unknown';
+    if (defined $a{target_host}
+     && $a{target_host} =~ /^\d+\.\d+\.\d+\.\d+\z/) {
+        $target_zone = zone_for_addr($a{host}, $a{target_host},
+                                     $a{iface_zones});
+    }
+
+    # Cross-trust-boundary check.  Two cases are interesting for the
+    # audit; everything else (Private→Private, Private→Internet, …)
+    # is benign by default and skipped.
+    my $boundary;
+    if    ($bind_zone eq 'Internet')                  { $boundary = "Internet>$target_zone" }
+    elsif ($bind_zone eq 'DMZ' && $target_zone eq 'Private') {
+                                                        $boundary = 'DMZ>Private' }
+    else                                              { return undef }
+
+    my ($sev, $service) = classify_port($a{bind_port} + 0);
+
+    # DMZ→Private forwards bypass the policy boundary even if the port
+    # is unremarkable on its own.  Bump to at least medium so they
+    # surface in the default view.
+    if ($boundary eq 'DMZ>Private'
+     && $SEV_RANK{$sev} > $SEV_RANK{'medium'}) {
+        $sev = 'medium';
+    }
+
+    my $note;
+    if (my $hit = $a{sink}{ ($a{target_host} // '') . '|'
+                          . ($a{target_port} // '') }) {
+        $sev  = 'info';
+        $note = "sink-target: " . ($hit->{reason} // '(no reason)');
+    }
+    if (my $hit = $a{intentional}{
+            "$a{host}|" . ($a{bind_addr} // '*') . "|"
+          . ($a{bind_port} // '') }) {
+        $sev  = 'info';
+        $note = "intentional: " . ($hit->{reason} // '(no reason)');
+    }
+    return {
+        host        => $a{host},
+        mechanism   => $a{mechanism},
+        bind_addr   => $a{bind_addr},
+        bind_port   => $a{bind_port},
+        target_host => $a{target_host},
+        target_port => $a{target_port},
+        bind_zone   => $bind_zone,
+        target_zone => $target_zone,
+        boundary    => $boundary,
+        severity    => $sev,
+        service     => $service,
+        note        => $note,
+    };
+}
+
+# -- annotation subcommands ----------------------------------------------
+sub cmd_list_exceptions {
+    my $rows = $db->query_table('audit_annotations');
+    if (!@$rows) {
+        print "(no annotations)\n";
+        return;
+    }
+    printf "%-22s %-16s %-22s %-6s  %s\n",
+        'KIND', 'HOST', 'ADDR', 'PORT', 'REASON';
+    for my $r (sort { $a->{kind} cmp $b->{kind}
+                  ||  $a->{addr} cmp $b->{addr}
+                  ||  $a->{port} <=> $b->{port} } @$rows) {
+        printf "%-22s %-16s %-22s %-6s  %s\n",
+            $r->{kind}, $r->{host} || '*', $r->{addr},
+            $r->{port}, $r->{reason} // '';
+    }
+}
+
+sub cmd_mark_sink {
+    my ($spec) = @_;
+    my ($addr, $port) = $spec =~ /^([^:]+):(\d+)$/
+        or die "--mark-sink: expected ADDR:PORT, got '$spec'\n";
+    my $r = $db->upsert_audit_annotation(
+        kind   => 'sink-target',
+        host   => '',
+        addr   => $addr,
+        port   => $port,
+        reason => $opt{reason},
+    );
+    print "Marked sink-target $r->{addr}:$r->{port}"
+        . ($r->{reason} ? " ($r->{reason})" : "") . "\n";
+}
+
+sub cmd_mark_intentional {
+    my ($spec) = @_;
+    my ($host, $bind, $port) = $spec =~ /^([^:]+):([^:]+):(\d+)$/
+        or die "--mark-intentional: expected HOST:BIND:PORT, got '$spec'\n";
+    my $r = $db->upsert_audit_annotation(
+        kind   => 'intentional-forward',
+        host   => $host,
+        addr   => $bind,
+        port   => $port,
+        reason => $opt{reason},
+    );
+    print "Marked intentional-forward $r->{host} $r->{addr}:$r->{port}"
+        . ($r->{reason} ? " ($r->{reason})" : "") . "\n";
+}
+
+sub cmd_unmark {
+    my ($kind, $arg) = @_;
+    if ($kind eq 'sink') {
+        my ($addr, $port) = $arg =~ /^([^:]+):(\d+)$/
+            or die "--unmark sink: expected ADDR:PORT\n";
+        my $n = $db->delete_audit_annotation(
+            kind => 'sink-target', host => '', addr => $addr, port => $port);
+        print $n ? "Removed sink-target $addr:$port\n" : "No such annotation\n";
+    }
+    elsif ($kind eq 'intentional') {
+        my ($host, $bind, $port) = $arg =~ /^([^:]+):([^:]+):(\d+)$/
+            or die "--unmark intentional: expected HOST:BIND:PORT\n";
+        my $n = $db->delete_audit_annotation(
+            kind => 'intentional-forward',
+            host => $host, addr => $bind, port => $port);
+        print $n ? "Removed intentional-forward\n" : "No such annotation\n";
+    }
+    else {
+        die "--unmark: unknown kind '$kind' (use 'sink' or 'intentional')\n";
+    }
+}
