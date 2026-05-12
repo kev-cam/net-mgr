@@ -34,6 +34,7 @@ my $only_ap;
 my $no_save;
 my $from_db;
 my $json;
+my $verbose;
 my $ssh_user    = 'root';
 my $ssh_timeout = 8;
 my $rssi_strong   = -70;
@@ -44,6 +45,7 @@ GetOptions(
     'no-save'        => \$no_save,
     'from-db'        => \$from_db,
     'json'           => \$json,
+    'verbose|v'      => \$verbose,
     'ssh-user=s'     => \$ssh_user,
     'ssh-timeout=i'  => \$ssh_timeout,
     'rssi-strong=i'  => \$rssi_strong,
@@ -61,6 +63,7 @@ net-wifi-survey — scan each known AP for neighbours; report channel conflicts.
   net-wifi-survey --no-save      don't update wifi_scan_results
   net-wifi-survey --from-db      skip live scan; report from DB cache
   net-wifi-survey --json         machine-readable output
+  net-wifi-survey -v, --verbose  also list each individual neighbour
 
   --rssi-strong N   conflict if neighbour signal >= N dBm (default -70)
   --rssi-moderate N moderate threshold (default -80)
@@ -419,9 +422,61 @@ sub save_results {
     }
 }
 
-# Build the conflict report for one AP given its (live or DB) results.
-# %own_bssids identifies the scanner's own BSSIDs across all radios so
-# we can split foreign vs own neighbours.
+# Build the report for one AP.  Two views per radio:
+#   * busyness  — score per channel sorted busiest→quietest, with a
+#                 simple bar chart so 'where to move' is obvious
+#   * neighbours — individual visible APs (printed only with --verbose)
+#
+# Busyness score per channel:  sum over visible foreign APs of
+#   max(0, rssi_dbm - NOISE_FLOOR)   where NOISE_FLOOR = -95
+# Then for 2.4GHz, half-weight is added to channels within ±2 of each
+# observed channel and quarter-weight to channels within ±4, modelling
+# the carrier overlap.  5GHz channels are treated as non-overlapping
+# (true for 20MHz; wider channels would need refinement).
+my $NOISE_FLOOR  = -95;
+my @CH_24G       = (1..14);
+my @CH_24G_BEST  = (1, 6, 11);          # canonical non-overlapping set
+my @CH_5G_COMMON = (36, 40, 44, 48, 149, 153, 157, 161, 165);
+
+sub busyness_for_neighbours {
+    my ($neighbours, $band) = @_;
+    my %score;     # channel → score
+    my %count;     # channel → AP count
+    my %strongest; # channel → rssi_dbm of strongest neighbour
+    # Valid channel range for adjacency spill (drop spill outside the
+    # band's usable channels — otherwise the chart sprouts ghosts at
+    # ch -1, ch 15, etc.).
+    my ($lo, $hi);
+    if (($band // '') eq '2.4GHz') { ($lo, $hi) = (1, 13) }
+    else                            { ($lo, $hi) = (1, 999) }
+    my $add = sub {
+        my ($ch, $w) = @_;
+        return if $ch < $lo || $ch > $hi;
+        $score{$ch} += $w;
+    };
+    for my $n (@$neighbours) {
+        my $ch = $n->{channel} or next;
+        my $r  = defined $n->{rssi_dbm} ? $n->{rssi_dbm} : $NOISE_FLOOR;
+        my $w  = $r - $NOISE_FLOOR;
+        $w = 0 if $w < 0;
+        # Direct hit (always counted, even if it falls outside the
+        # canonical range — neighbours genuinely observed on ch 14
+        # are valid in some regulatory domains).
+        $score{$ch} += $w;
+        $count{$ch}++;
+        $strongest{$ch} = $r
+            if !defined $strongest{$ch} || $r > $strongest{$ch};
+        # 2.4GHz adjacency spill, clamped to 1..13.
+        if (($band // '') eq '2.4GHz') {
+            for my $d (1, 2) { $add->($ch + $d, $w * 0.5);
+                               $add->($ch - $d, $w * 0.5); }
+            for my $d (3, 4) { $add->($ch + $d, $w * 0.25);
+                               $add->($ch - $d, $w * 0.25); }
+        }
+    }
+    return (\%score, \%count, \%strongest);
+}
+
 sub report_for_ap {
     my ($ap, $results, $own_bssids) = @_;
     my %by_iface;
@@ -431,27 +486,49 @@ sub report_for_ap {
     for my $iface (sort keys %by_iface) {
         my @neighbours = grep { !$own_bssids->{ $_->{bssid} } }
                               @{ $by_iface{$iface} };
-        my %by_chan;
-        for my $n (@neighbours) {
-            push @{ $by_chan{ $n->{channel} // 0 } }, $n;
+        # Pick the band: take whichever band most foreign APs reported,
+        # fall back to inferring from any neighbour's channel.
+        my %band_votes;
+        $band_votes{ $_->{band} // '' }++ for @neighbours;
+        my ($band) = sort { $band_votes{$b} <=> $band_votes{$a} }
+                          grep { length } keys %band_votes;
+
+        my ($score, $count, $strongest)
+            = busyness_for_neighbours(\@neighbours, $band);
+        # Channels we care about for sorting + recommendation.  Include
+        # any channel we observed *and* the canonical sets for the band
+        # so quiet recommendations still show.
+        my %ch_set = map { $_ => 1 } keys %$score;
+        $ch_set{$_} = 1 for ($band && $band eq '5GHz' ? @CH_5G_COMMON
+                                                       : @CH_24G);
+        my @channels = sort { ($score->{$b} // 0) <=> ($score->{$a} // 0)
+                           || $a <=> $b } keys %ch_set;
+
+        # Recommendation:
+        #   2.4GHz → quietest of {1,6,11}, ties broken low-channel-first
+        #   5GHz   → quietest channel with score==0 if any, else
+        #            quietest of CH_5G_COMMON
+        my $reco;
+        if (($band // '') eq '2.4GHz') {
+            ($reco) = sort { ($score->{$a} // 0) <=> ($score->{$b} // 0)
+                          || $a <=> $b } @CH_24G_BEST;
+        } else {
+            my @cands = grep { !($score->{$_} // 0) } @CH_5G_COMMON;
+            ($reco) = @cands ? sort { $a <=> $b } @cands
+                             : sort { ($score->{$a} // 0)
+                                     <=> ($score->{$b} // 0) } @CH_5G_COMMON;
         }
-        my @rows;
-        for my $chan (sort { $a <=> $b } keys %by_chan) {
-            for my $n (sort { ($b->{rssi_dbm} // -200)
-                              <=> ($a->{rssi_dbm} // -200) }
-                       @{ $by_chan{$chan} }) {
-                my $sev = 'noise';
-                if (defined $n->{rssi_dbm}) {
-                    $sev = $n->{rssi_dbm} >= $rssi_strong   ? 'strong'
-                         : $n->{rssi_dbm} >= $rssi_moderate ? 'moderate'
-                         : 'noise';
-                }
-                push @rows, {
-                    %$n, severity => $sev, scanner_iface => $iface,
-                };
-            }
-        }
-        push @blocks, { iface => $iface, rows => \@rows };
+
+        push @blocks, {
+            iface       => $iface,
+            band        => $band,
+            channels    => \@channels,
+            score       => $score,
+            count       => $count,
+            strongest   => $strongest,
+            recommended => $reco,
+            neighbours  => \@neighbours,
+        };
     }
     return \@blocks;
 }
@@ -493,7 +570,9 @@ if ($json) {
     exit 0;
 }
 
-# Text output.
+# Text output.  Per-AP per-radio: sorted channel-busyness chart, plus
+# the recommended channel.  --verbose adds a neighbour-by-neighbour
+# listing under each block.
 my $any = 0;
 for my $r (@report) {
     my $ap = $r->{ap};
@@ -502,27 +581,59 @@ for my $r (@report) {
     $any = 1;
     print "== $name ($ap->{addr}) ==\n";
     for my $b (@{ $r->{blocks} }) {
-        my @strong   = grep { $_->{severity} eq 'strong'   } @{ $b->{rows} };
-        my @moderate = grep { $_->{severity} eq 'moderate' } @{ $b->{rows} };
-        my $total    = scalar @{ $b->{rows} };
-        printf "  %s: %d foreign AP%s visible\n",
-            $b->{iface}, $total, $total == 1 ? '' : 's';
-        for my $n (@strong) {
-            printf "    [strong  ] ch %-3s %-30s %4d dBm  %s\n",
-                $n->{channel} // '?', $n->{ssid} // '(hidden)',
-                $n->{rssi_dbm} // 0, $n->{bssid};
+        my $total = scalar @{ $b->{neighbours} };
+        printf "  %s (%s): %d foreign AP%s visible\n",
+            $b->{iface}, $b->{band} // '?', $total,
+            $total == 1 ? '' : 's';
+
+        # Find max score for bar-chart scaling.  Skip channels with
+        # zero score except for those in the recommendation context.
+        my $max = 0;
+        for my $c (@{ $b->{channels} }) {
+            my $s = $b->{score}{$c} // 0;
+            $max = $s if $s > $max;
         }
-        for my $n (@moderate) {
-            printf "    [moderate] ch %-3s %-30s %4d dBm  %s\n",
-                $n->{channel} // '?', $n->{ssid} // '(hidden)',
-                $n->{rssi_dbm} // 0, $n->{bssid};
+        if ($max > 0) {
+            print "    channel busyness (most → least):\n";
+            for my $c (@{ $b->{channels} }) {
+                my $s = $b->{score}{$c} // 0;
+                next if $s == 0;
+                my $bars = int(($s / $max) * 24 + 0.5);
+                my $bar  = '#' x $bars;
+                my $cnt  = $b->{count}{$c} // 0;
+                my $rmax = $b->{strongest}{$c};
+                my $tail;
+                if ($cnt > 0 && defined $rmax) {
+                    $tail = sprintf '%d AP%s on ch, strongest %d dBm',
+                                    $cnt, $cnt == 1 ? '' : 's', $rmax;
+                } else {
+                    $tail = 'adjacent spill';
+                }
+                printf "      ch %3d  %-24s  %4d  (%s)\n",
+                    $c, $bar, $s, $tail;
+            }
+        } else {
+            print "    channel busyness: (nothing measurable)\n";
         }
-        # Channel summary: count neighbours per channel.
-        my %ch;
-        $ch{ $_->{channel} // 0 }++ for @{ $b->{rows} };
-        my @hot = sort { $ch{$b} <=> $ch{$a} || $a <=> $b } keys %ch;
-        printf "    channel population: %s\n",
-            join(', ', map { "ch$_:$ch{$_}" } @hot[0..($#hot < 5 ? $#hot : 5)]);
+        printf "    recommended: ch %d%s\n",
+            $b->{recommended} // 0,
+            (($b->{band} // '') eq '2.4GHz'
+                ? ' (quietest of 1/6/11)'
+                : '');
+
+        if ($verbose) {
+            my @sorted = sort {
+                ($b->{strongest}{ $b->{channel} // 0 } // -200)
+                <=> ($a->{strongest}{ $a->{channel} // 0 } // -200)
+            } @{ $b->{neighbours} };
+            for my $n (sort { ($b->{rssi_dbm} // -200)
+                              <=> ($a->{rssi_dbm} // -200) }
+                       @{ $b->{neighbours} }) {
+                printf "      ch %-3s %4d dBm  %-30s  %s\n",
+                    $n->{channel} // '?', $n->{rssi_dbm} // 0,
+                    $n->{ssid} // '(hidden)', $n->{bssid};
+            }
+        }
     }
 }
 print "(no scan data — APs may not support the survey tools available)\n"
