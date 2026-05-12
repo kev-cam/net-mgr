@@ -27,6 +27,8 @@ use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
 use NetMgr::Config;
 use NetMgr::DB;
+use IO::Select;
+use Storable qw(nfreeze thaw);
 
 my $only_ap;
 my $no_save;
@@ -337,34 +339,84 @@ sub freq_to_channel {
 }
 
 # -- scan + persist + report ----------------------------------------------
-sub scan_one_ap {
+sub scan_one_ap_live {
     my ($ap) = @_;
     my $host = $ap->{name} || $ap->{addr};
-    print STDERR "scanning $host ($ap->{mac}) ...\n" unless $json;
+    my $raw  = ssh_scan($host) or return [];
+    return parse_scan($raw, $ap->{mac});
+}
 
-    my $raw     = ssh_scan($host) or return [];
-    my $results = parse_scan($raw, $ap->{mac});
-    if (!@$results) {
-        print STDERR "  (no scan results — survey command may not be "
-                   . "supported on this firmware)\n" unless $json;
-        return $results;
+# Fork-and-collect: spawn one child per AP, each does its own ssh +
+# scan + parse, ships parsed results back through a pipe.  Parent
+# multiplexes the pipes via IO::Select, then writes everything to
+# the DB once all children have answered.  Each AP scan is dominated
+# by the ~4-second wl-scan sleep, so wall-clock time stays roughly
+# constant regardless of fleet size.
+sub scan_all_aps_parallel {
+    my ($aps) = @_;
+    my $sel = IO::Select->new;
+    my %fh_to_ap;
+    my %pid_to_fh;
+    for my $ap (@$aps) {
+        pipe(my $rfh, my $wfh) or die "pipe: $!";
+        my $pid = fork;
+        die "fork: $!" unless defined $pid;
+        if ($pid == 0) {
+            close $rfh;
+            # Re-open DB in the child would be required for upsert, but
+            # we batch writes in the parent — child only does the slow
+            # I/O work.  Don't let inherited handles leak.
+            my $results = eval { scan_one_ap_live($ap) } // [];
+            my $blob    = nfreeze($results);
+            syswrite($wfh, $blob);
+            close $wfh;
+            exit 0;
+        }
+        close $wfh;
+        $sel->add($rfh);
+        $fh_to_ap{ fileno($rfh) }   = $ap;
+        $pid_to_fh{ $pid }          = $rfh;
+        print STDERR "scanning " . ($ap->{name} || $ap->{addr})
+                   . " ($ap->{mac}, pid $pid) ...\n" unless $json;
     }
-    unless ($no_save) {
-        for my $r (@$results) {
-            $db->upsert_wifi_scan_result(
-                scanner_mac   => $r->{scanner_mac},
-                scanner_iface => $r->{scanner_iface},
-                bssid         => $r->{bssid},
-                ssid          => $r->{ssid},
-                channel       => $r->{channel},
-                band          => $r->{band},
-                rssi_dbm      => $r->{rssi_dbm},
-                encryption    => $r->{encryption},
-                bandwidth_mhz => $r->{bandwidth_mhz},
-            );
+    my %results;
+    my %buf;
+    while ($sel->count) {
+        for my $fh ($sel->can_read(0.5)) {
+            my $fd = fileno($fh);     # capture before close() invalidates it
+            my $n  = sysread($fh, my $chunk, 65536);
+            if (!defined $n || $n == 0) {
+                $sel->remove($fh);
+                my $ap     = $fh_to_ap{$fd};
+                my $blob   = $buf{$fd} // '';
+                close $fh;
+                my $parsed = eval { thaw($blob) } || [];
+                $results{ $ap->{mac} } = $parsed;
+                next;
+            }
+            $buf{$fd} .= $chunk;
         }
     }
-    return $results;
+    waitpid($_, 0) for keys %pid_to_fh;
+    return \%results;
+}
+
+sub save_results {
+    my ($results) = @_;
+    return if $no_save;
+    for my $r (@$results) {
+        $db->upsert_wifi_scan_result(
+            scanner_mac   => $r->{scanner_mac},
+            scanner_iface => $r->{scanner_iface},
+            bssid         => $r->{bssid},
+            ssid          => $r->{ssid},
+            channel       => $r->{channel},
+            band          => $r->{band},
+            rssi_dbm      => $r->{rssi_dbm},
+            encryption    => $r->{encryption},
+            bandwidth_mhz => $r->{bandwidth_mhz},
+        );
+    }
 }
 
 # Build the conflict report for one AP given its (live or DB) results.
@@ -405,29 +457,33 @@ sub report_for_ap {
 }
 
 # -- driver ---------------------------------------------------------------
-my @report;
-for my $ap (@$aps) {
-    my $results;
-    if ($from_db) {
-        $results = $db->dbh->selectall_arrayref(
+my %results_by_mac;
+if ($from_db) {
+    for my $ap (@$aps) {
+        $results_by_mac{ lc $ap->{mac} } = $db->dbh->selectall_arrayref(
             "SELECT * FROM wifi_scan_results WHERE scanner_mac = ?",
             { Slice => {} }, lc $ap->{mac}
         );
-    } else {
-        $results = scan_one_ap($ap);
     }
+} else {
+    %results_by_mac = %{ scan_all_aps_parallel($aps) };
+    # Persist after all children come back.
+    for my $mac (keys %results_by_mac) {
+        save_results($results_by_mac{$mac});
+    }
+}
 
-    # Build own-BSSID set for filtering.  An AP's MAC plus its VAPs are
-    # offsets in the OUI — we don't know the exact VAP MACs without
-    # ifconfig, so for first cut we just filter by the scanner_mac+1 / +2
-    # / etc.  Better: build the set from the aps table snap-shot of all
-    # known MACs across our APs.
-    my %own;
-    $own{ lc $_->{mac} } = 1 for @$aps;
+# Build own-BSSID set once — every MAC across the AP fleet counts as
+# 'us', so foreign-AP filtering doesn't double-count siblings.
+my %own;
+$own{ lc $_->{mac} } = 1 for @$aps;
 
+my @report;
+for my $ap (@$aps) {
+    my $r = $results_by_mac{ lc $ap->{mac} } // [];
     push @report, {
-        ap      => $ap,
-        blocks  => report_for_ap($ap, $results, \%own),
+        ap     => $ap,
+        blocks => report_for_ap($ap, $r, \%own),
     };
 }
 
