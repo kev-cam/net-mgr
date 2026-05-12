@@ -121,17 +121,34 @@ hostname 2>/dev/null
 echo ===WL_IFACES===
 nvram show 2>/dev/null | grep -E '^wl[0-9]+_ifname=' || true
 echo ===METHOD_WL===
-for w in wl0 wl1; do
-    bssid=$(wl -i $w bssid 2>/dev/null)
-    if [ -n "$bssid" ] && [ "${bssid#wl:}" = "$bssid" ]; then
+# Broadcom-style scan binary lives under different names across DD-WRT
+# forks and chipsets:
+#   wl              canonical Broadcom tool
+#   wlctl           Asus / some forks (same flags as wl)
+#   wl_atheros      Atheros chipsets on DD-WRT
+#   nas4not         very old builds
+# Try each; whichever returns a valid bssid (not an error like
+# 'wl: driver adapter not found') wins.
+for wlbin in wl wlctl wl_atheros nas4not; do
+    command -v $wlbin >/dev/null 2>&1 || continue
+    for w in wl0 wl1 wl2; do
+        bssid=$($wlbin -i $w bssid 2>/dev/null)
+        # Error replies tend to start with the binary's name + ':'.
+        # Empty or 'No such device' replies also skip.
+        case "$bssid" in
+            *":"*"not"*)   continue ;;
+            *":"*"error"*) continue ;;
+            "")            continue ;;
+        esac
         echo IFACE $w
-        wl -i $w scan >/dev/null 2>&1
+        $wlbin -i $w scan >/dev/null 2>&1
         sleep 4
-        wl -i $w scanresults 2>/dev/null
+        $wlbin -i $w scanresults 2>/dev/null
         echo ENDRESULTS
-    fi
+    done
 done
 echo ===METHOD_IW===
+# mac80211 path — newer kernels / non-Broadcom routers.
 for d in /sys/class/net/wl*; do
     [ -e "$d" ] || continue
     name=$(basename "$d")
@@ -140,6 +157,17 @@ for d in /sys/class/net/wl*; do
         iw dev "$name" scan 2>/dev/null
         echo ENDRESULTS
     fi
+done
+echo ===METHOD_IWLIST===
+# Legacy wireless-extensions path — present on many DD-WRT builds
+# that have neither a working `wl` nor `iw`.
+for name in wl0 wl1 wl2 ath0 ath1; do
+    [ -e /sys/class/net/$name ] || continue
+    out=$(iwlist $name scanning 2>/dev/null)
+    [ -n "$out" ] || continue
+    echo IFACE $name
+    echo "$out"
+    echo ENDRESULTS
 done
 echo ===METHOD_SS===
 # DD-WRT's site_survey with NO interface argument dumps the scan
@@ -209,9 +237,10 @@ sub parse_scan {
     my $flush = sub {
         return unless defined $cur_iface;
         my @parsed;
-        if    ($section eq 'METHOD_WL') { @parsed = parse_wl_results(\@block) }
-        elsif ($section eq 'METHOD_IW') { @parsed = parse_iw_scan(\@block)    }
-        elsif ($section eq 'METHOD_SS') { @parsed = parse_site_survey(\@block)}
+        if    ($section eq 'METHOD_WL')     { @parsed = parse_wl_results(\@block) }
+        elsif ($section eq 'METHOD_IW')     { @parsed = parse_iw_scan(\@block)    }
+        elsif ($section eq 'METHOD_IWLIST') { @parsed = parse_iwlist(\@block)     }
+        elsif ($section eq 'METHOD_SS')     { @parsed = parse_site_survey(\@block)}
         $by_iface_method{$cur_iface}{$section} = \@parsed if @parsed;
         @block      = ();
         $cur_iface  = undef;
@@ -247,7 +276,7 @@ sub parse_scan {
     for my $iface (sort keys %by_iface_method) {
         my $m = $by_iface_method{$iface};
         my ($pick, $picked_method);
-        for my $name (qw(METHOD_WL METHOD_IW METHOD_SS)) {
+        for my $name (qw(METHOD_WL METHOD_IW METHOD_IWLIST METHOD_SS)) {
             if ($m->{$name} && @{ $m->{$name} }) {
                 $pick = $m->{$name}; $picked_method = $name; last;
             }
@@ -347,6 +376,52 @@ sub parse_iw_scan {
 # Each [ ... ] field can have leading/trailing whitespace inside the
 # brackets; we strip it.  Band is derived from frequency, not channel —
 # both 2.4GHz and 5GHz scan results come back in the same call.
+# `iwlist IFACE scanning` output:
+#   IFACE  Scan completed :
+#       Cell 01 - Address: xx:xx:xx:xx:xx:xx
+#                 Channel:6
+#                 Frequency:2.437 GHz (Channel 6)
+#                 Quality=58/70  Signal level=-52 dBm
+#                 ESSID:"name"
+#                 Encryption key:on
+#                 IE: IEEE 802.11i/WPA2 ...
+sub parse_iwlist {
+    my ($lines) = @_;
+    my @out;
+    my %cur;
+    my $flush = sub {
+        push @out, { %cur } if $cur{bssid};
+        %cur = ();
+    };
+    for my $ln (@$lines) {
+        if ($ln =~ /Cell\s+\d+\s*-\s*Address:\s*([0-9A-Fa-f:]{17})/) {
+            $flush->();
+            $cur{bssid} = lc $1;
+        }
+        elsif ($ln =~ /Channel:\s*(\d+)/) {
+            $cur{channel} //= $1 + 0;
+        }
+        elsif ($ln =~ /Signal level=\s*(-?\d+)/) {
+            $cur{rssi_dbm} = $1 + 0;
+        }
+        elsif ($ln =~ /ESSID:\s*"(.*?)"/) {
+            $cur{ssid} = $1;
+        }
+        elsif ($ln =~ /Frequency:\s*([\d.]+)\s*GHz/) {
+            my $g = $1 + 0;
+            $cur{band} = $g < 3 ? '2.4GHz' : $g < 6 ? '5GHz' : '6GHz';
+        }
+        elsif ($ln =~ /IEEE 802\.11(i|.WPA)/i) {
+            $cur{encryption} //= 'WPA2';
+        }
+    }
+    $flush->();
+    for my $r (@out) {
+        $r->{band} //= guess_band($r->{channel});
+    }
+    return @out;
+}
+
 sub parse_site_survey {
     my ($lines) = @_;
     my @out;
