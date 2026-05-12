@@ -1,0 +1,262 @@
+#!/usr/bin/perl
+# net-kill-rogue-dhcp — install an ebtables rule on a DD-WRT AP that
+# stops dnsmasq from answering DHCP requests arriving on its wired
+# bridge slaves. Wired slaves are the eth*/vlan* members of br0; any
+# wifi slaves (ath*/wl*) are left alone (their behavior is incidental —
+# the goal is just to silence DHCP on Ethernet).
+#
+# Why this works: when eth1 + ath0/ath1 are bridged into br0, dnsmasq
+# only sees `br0` as the receive interface, so its own filters can't
+# tell wired from wifi. The rule below is applied in the bridge INPUT
+# chain, which only matches the *local-delivery* copy of broadcast
+# frames. Bridge forwarding (the copy that propagates to other br0
+# members and the upstream LAN) is untouched, so a wired client's
+# DHCP DISCOVER still reaches the real DHCP server via the AP's
+# uplink port.
+#
+# Per IP given on the command line, the script:
+#   1. ssh root@<ip>, confirm DD-WRT, list br0 slaves.
+#   2. Classify each slave: anything starting with eth* or vlan* is
+#      treated as wired; ath*/wl*/wlan*/ra* are radios.
+#   3. Build the proposed ebtables rule(s) — idempotent: skip rules
+#      already present in `ebtables -L INPUT`.
+#   4. Build the proposed nvram rc_firewall entry (DD-WRT's
+#      "Administration > Commands > Save Firewall" slot), preserving
+#      whatever's already in there.
+#   5. Print the diff and prompt y/n (unless --yes).
+#   6. On yes: apply runtime, set+commit nvram.
+#
+# Usage:
+#   net-kill-rogue-dhcp [--yes] [--dry-run] [--user USER] IP [IP ...]
+#
+# --user defaults to root. --dry-run shows what would happen and exits
+# without applying or prompting.
+
+use strict;
+use warnings;
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+my $yes;
+my $dry_run;
+my $user = 'root';
+my $help;
+
+GetOptions(
+    'yes|y'     => \$yes,
+    'dry-run|n' => \$dry_run,
+    'user|u=s'  => \$user,
+    'help|h'    => \$help,
+) or usage(2);
+usage(0) if $help;
+usage(2) unless @ARGV;
+
+my $rc = 0;
+for my $ip (@ARGV) {
+    $ip =~ /^\d+\.\d+\.\d+\.\d+$/
+        or do { warn "skipping '$ip' — not a dotted-quad\n"; $rc = 2; next };
+    $rc = 1 unless process_ap($ip);
+    print "\n";
+}
+exit $rc;
+
+# -------------------------------------------------------------------
+
+sub usage {
+    my ($code) = @_;
+    print STDERR <<"EOF";
+Usage: net-kill-rogue-dhcp [--yes] [--dry-run] [--user USER] IP [IP ...]
+
+For each IP (a DD-WRT AP that's answering DHCP on its wired bridge
+slaves), propose and optionally apply an ebtables rule that drops the
+local-delivery copy of incoming DHCP requests on each wired slave.
+WiFi DHCP is unaffected.
+
+Options:
+  --yes        apply without prompting
+  --dry-run    show the proposed change and exit (no prompt, no apply)
+  --user USER  ssh user (default: root)
+EOF
+    exit($code // 2);
+}
+
+sub process_ap {
+    my ($ip) = @_;
+    print "=== $ip ===\n";
+
+    # Run a single ssh that gathers everything we need. Quoted with
+    # heredoc so brace/quote handling stays sane.
+    my $remote_script = <<'REMOTE';
+echo "===UNAME==="
+uname -a 2>/dev/null
+echo "===BOARD==="
+( nvram get DD_BOARD 2>/dev/null || cat /etc/motd 2>/dev/null ) | head -n 3
+echo "===BRCTL==="
+brctl show br0 2>/dev/null || echo "no br0"
+echo "===EBTABLES==="
+ebtables -L INPUT --Lc 2>/dev/null || ebtables -L INPUT 2>/dev/null
+echo "===RC_FIREWALL==="
+nvram get rc_firewall 2>/dev/null
+echo "===END==="
+REMOTE
+
+    my @cmd = ('ssh', '-T', '-q', '-o', 'ConnectTimeout=5',
+               '-o', 'BatchMode=yes', "$user\@$ip", $remote_script);
+    open my $fh, '-|', @cmd or do { warn "ssh: $!\n"; return 0 };
+    my %sect; my $cur = '';
+    while (<$fh>) {
+        if (/^===(\w+)===\s*$/) { $cur = $1; next }
+        next if $cur eq 'END' || $cur eq '';
+        $sect{$cur} .= $_;
+    }
+    close $fh;
+    unless ($? == 0 && $sect{UNAME}) {
+        warn "ssh to $user\@$ip failed (rc=$?)\n";
+        return 0;
+    }
+    chomp(my $uname = $sect{UNAME} // '');
+    print "  host:  $uname\n";
+    if (my $b = $sect{BOARD}) { $b =~ s/\s+\z//; print "  board: $b\n" if $b }
+
+    # Parse br0 slaves out of brctl output. Format:
+    #   bridge name     bridge id               STP enabled     interfaces
+    #   br0             8000.305a3aa450de       no              eth1
+    #                                                           ath0
+    #                                                           ath1
+    my @slaves;
+    if (my $b = $sect{BRCTL}) {
+        my @lines = split /\n/, $b;
+        for my $i (0..$#lines) {
+            my $l = $lines[$i];
+            next if $l =~ /^bridge name/;
+            if ($l =~ /^br0\b/) {
+                # tail of header line
+                my @tail = split ' ', $l;
+                push @slaves, $tail[-1] if @tail >= 4;
+                # subsequent fully-indented lines are more slaves
+                for (my $j = $i+1; $j < @lines; $j++) {
+                    last unless $lines[$j] =~ /^\s+\S/;
+                    my ($iface) = $lines[$j] =~ /^\s+(\S+)/;
+                    push @slaves, $iface if $iface;
+                }
+                last;
+            }
+        }
+    }
+    unless (@slaves) {
+        warn "  no br0 slaves found — refusing to act\n";
+        return 0;
+    }
+
+    my (@wired, @radio, @other);
+    for my $s (@slaves) {
+        if    ($s =~ /^(?:eth|vlan)\d/) { push @wired, $s }
+        elsif ($s =~ /^(?:ath|wl|wlan|ra)\d/) { push @radio, $s }
+        else                                  { push @other, $s }
+    }
+    printf "  br0 slaves: wired=[%s] radio=[%s]%s\n",
+        join(' ', @wired) || '-',
+        join(' ', @radio) || '-',
+        (@other ? " other=[".join(' ', @other)."]" : '');
+
+    unless (@wired) {
+        print "  no wired slaves on br0 — nothing to quench\n";
+        return 1;
+    }
+
+    # Build proposed rules; check existing INPUT chain for idempotency.
+    my $eb = $sect{EBTABLES} // '';
+    my @to_add;
+    for my $w (@wired) {
+        my $present = 0;
+        for my $line (split /\n/, $eb) {
+            # Match a rule that drops UDP/67 on this iface
+            if ($line =~ /-i\s+\Q$w\E\b/ && $line =~ /--ip-dport\s+67/
+                && $line =~ /-j\s+DROP/i) {
+                $present = 1; last;
+            }
+        }
+        if ($present) {
+            print "  already filtered: $w\n";
+        } else {
+            push @to_add, "ebtables -A INPUT -i $w -p IPv4 --ip-proto udp --ip-dport 67 -j DROP";
+        }
+    }
+    unless (@to_add) {
+        print "  nothing to do — all wired slaves already filtered\n";
+        return 1;
+    }
+
+    # Build proposed rc_firewall (preserve existing, append our marker block).
+    # We always write the current marker name. We *recognise* the prior
+    # name (net-quench-rogue-dhcp) too, so re-running against APs that
+    # were quenched under the old name replaces the block in place
+    # rather than adding a parallel duplicate.
+    my $existing_rc = $sect{RC_FIREWALL} // '';
+    chomp $existing_rc;
+    my $marker = '# net-kill-rogue-dhcp BEGIN';
+    my $end    = '# net-kill-rogue-dhcp END';
+    my $block  = join("\n", $marker, @to_add, $end);
+    my $old_re = qr/# net-(?:kill|quench)-rogue-dhcp BEGIN.*?# net-(?:kill|quench)-rogue-dhcp END/s;
+    my $new_rc;
+    if ($existing_rc =~ $old_re) {
+        ($new_rc = $existing_rc) =~ s/$old_re/$block/;
+    } elsif (length $existing_rc) {
+        $new_rc = "$existing_rc\n$block";
+    } else {
+        $new_rc = $block;
+    }
+
+    print "\n  Proposed runtime commands:\n";
+    print "    $_\n" for @to_add;
+    print "\n  Proposed rc_firewall NVRAM (persists across reboots):\n";
+    for my $line (split /\n/, $new_rc) { print "    $line\n" }
+
+    if ($dry_run) {
+        print "\n  --dry-run: not applying\n";
+        return 1;
+    }
+    unless ($yes) {
+        local $| = 1;
+        print "\nApply to $ip? [y/N] ";
+        my $ans = <STDIN> // '';
+        unless ($ans =~ /^\s*y(es)?\s*$/i) {
+            print "  skipped\n";
+            return 1;
+        }
+    }
+
+    # Apply: runtime ebtables, then nvram. Use heredoc to ssh, with
+    # the new rc_firewall passed via stdin to avoid quoting hell.
+    my $apply = join("\n",
+        @to_add,
+        'cat > /tmp/.netk.rc',
+        'nvram set rc_firewall="$(cat /tmp/.netk.rc)"',
+        'nvram commit',
+        'rm -f /tmp/.netk.rc',
+        'echo APPLIED',
+    );
+    # Wrap so the heredoc payload (the new rc_firewall) goes after the
+    # script itself. The remote shell reads the script body via -s, so
+    # we send: <ebtables cmds>; cat > /tmp/.netk.rc <<MARK\n$new_rc\nMARK\n...
+    my $payload = join("\n",
+        @to_add,
+        "cat > /tmp/.netk.rc <<'NETK_MARK'",
+        $new_rc,
+        'NETK_MARK',
+        'nvram set rc_firewall="$(cat /tmp/.netk.rc)"',
+        'nvram commit',
+        'rm -f /tmp/.netk.rc',
+        'echo APPLIED',
+    );
+    open my $sh, '|-', 'ssh', "$user\@$ip", 'sh' or do {
+        warn "ssh apply: $!\n"; return 0;
+    };
+    print $sh $payload, "\n";
+    close $sh;
+    if ($? != 0) {
+        warn "  apply failed (rc=$?)\n";
+        return 0;
+    }
+    print "  applied + persisted\n";
+    return 1;
+}

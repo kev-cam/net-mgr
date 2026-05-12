@@ -1,0 +1,259 @@
+#!/usr/bin/perl
+# net-find-rogue-dhcp — broadcast a DHCP DISCOVER on each LAN interface
+# and report every server that answered, grouped by responder.
+#
+# An AP that's been flipped from bridge mode into router/gateway mode
+# will hand out leases on its Ethernet side and advertise itself as the
+# default router. Clients that accept the lease then route everything
+# through the AP — extra hop, NAT, halved throughput. This script makes
+# those visible by listing all DHCP responders per interface and
+# cross-referencing each one against the net-mgr `aps` table.
+#
+# Usage:
+#   net-find-rogue-dhcp [--iface eth0]... [--listen host:port] [--quiet]
+#
+# Default interfaces: every UP non-loopback iface with a 192.168.*.*
+# address (mirrors manager.listen=auto). Needs root for raw-socket DHCP.
+#
+# Exit: 0 = nothing answered or only known non-APs answered.
+#       1 = at least one responder is in the `aps` table (rogue).
+#       2 = usage / runtime error.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+my @ifaces;
+my $listen;
+my $quiet;
+my $help;
+
+GetOptions(
+    'iface|i=s' => \@ifaces,
+    'listen=s'  => \$listen,
+    'quiet|q'   => \$quiet,
+    'help|h'    => \$help,
+) or usage(2);
+usage(0) if $help;
+
+if ($> != 0) {
+    die "net-find-rogue-dhcp: must run as root (raw-socket DHCP DISCOVER)\n";
+}
+
+@ifaces = discover_ifaces() unless @ifaces;
+unless (@ifaces) {
+    print STDERR "no candidate interfaces (need UP iface with 192.168.*.* addr)\n";
+    exit 2;
+}
+
+# Best-effort lookup of MAC→AP-membership and MAC→hostname from the
+# daemon. If the daemon isn't reachable we still produce useful
+# output, just without the AP / hostname annotations.
+my ($ap_macs, $mac_to_name) = load_netmgr_context();
+
+# server_ip => {
+#   ifaces   => { iface => 1 },
+#   routers  => { router_ip => 1 },
+#   offered  => [ ip, ip, ... ],
+#   mac      => '..:..:..',  # filled later
+# }
+my %by_server;
+
+for my $if (@ifaces) {
+    my @offers = scan_iface($if);
+    for my $o (@offers) {
+        my $sid = $o->{server} or next;
+        my $r = $by_server{$sid} ||= {
+            ifaces  => {}, routers => {}, offered => [],
+        };
+        $r->{ifaces}{$if} = 1;
+        $r->{routers}{ $o->{router} } = 1 if defined $o->{router};
+        push @{ $r->{offered} }, $o->{offered} if defined $o->{offered};
+    }
+}
+
+# Resolve each server IP → MAC. ARP cache is populated as a side-effect
+# of the nmap scan if the host is on-link, but on-link DHCP servers
+# may have only sent unicast OFFER → kernel ARP not always populated.
+# A single ping primes it.
+for my $sid (keys %by_server) {
+    my @ifs = sort keys %{ $by_server{$sid}{ifaces} };
+    $by_server{$sid}{mac} = resolve_mac($sid, \@ifs);
+}
+
+unless (%by_server) {
+    print "no DHCP responses on @ifaces\n" unless $quiet;
+    exit 0;
+}
+
+my $rogue = 0;
+my $first = 1;
+for my $sid (sort by_ip keys %by_server) {
+    my $r = $by_server{$sid};
+    my $mac = $r->{mac} // '?';
+    my $is_ap = $mac ne '?' && $ap_macs->{ lc $mac };
+    my $host  = $mac ne '?' ? $mac_to_name->{ lc $mac } : undef;
+    my @routers  = sort by_ip keys %{ $r->{routers} };
+    my @ifs      = sort keys %{ $r->{ifaces} };
+    my @offered  = uniq(@{ $r->{offered} });
+
+    my $tag = $is_ap ? 'AP — ROGUE' : 'not in `aps`';
+    my $host_label = defined $host ? sprintf('%-15s %-20s', $sid, $host)
+                                   : sprintf('%-15s %-20s', $sid, '');
+
+    print "\n" unless $first; $first = 0;
+    printf "Server %s  %s  [%s]\n", $host_label, $mac, $tag;
+    printf "  answered on:    %s\n", join(', ', @ifs);
+    if (@routers) {
+        my @ann = map {
+            my $self = $_ eq $sid;
+            my $note = $self ? '(self)' : '';
+            $note ? "$_ $note" : $_;
+        } @routers;
+        printf "  offered router: %s\n", join(', ', @ann);
+    }
+    printf "  offered IPs:    %s\n", join(', ', @offered) if @offered;
+
+    $rogue = 1 if $is_ap;
+}
+
+exit($rogue ? 1 : 0);
+
+# -------------------------------------------------------------------
+
+sub usage {
+    my ($rc) = @_;
+    print STDERR <<"EOF";
+Usage: net-find-rogue-dhcp [--iface IF]... [--listen HOST[:PORT]] [--quiet]
+
+Sends a DHCP DISCOVER on each given (or autodetected) interface and
+reports every server that answered, grouped by responder. APs that
+appear in the responder list are flagged as rogue (exit 1).
+EOF
+    exit($rc // 2);
+}
+
+sub discover_ifaces {
+    my @out;
+    open my $fh, '-|', 'ip', '-br', '-4', 'addr', 'show'
+        or die "ip addr: $!\n";
+    while (<$fh>) {
+        my @f = split ' ', $_;
+        next unless @f >= 3;
+        next if $f[0] eq 'lo';
+        next unless $f[1] eq 'UP';
+        next unless $f[2] =~ m{^192\.168\.\d+\.\d+/};
+        push @out, $f[0];
+    }
+    close $fh;
+    return @out;
+}
+
+sub scan_iface {
+    my ($if) = @_;
+    my @offers;
+    print STDERR "scanning $if ...\n" unless $quiet;
+    # nmap emits 'WARNING: No targets were specified' to stdout — that's
+    # fine, we asked for a pre-scan script. Stderr is junk we don't want.
+    my $pid = open my $fh, '-|';
+    defined $pid or do { warn "fork: $!\n"; return; };
+    if ($pid == 0) {
+        open STDERR, '>', '/dev/null';
+        exec 'nmap', '--script', 'broadcast-dhcp-discover', '-e', $if;
+        die "exec nmap: $!";
+    }
+    my %cur;
+    my $in_offer = 0;
+    while (<$fh>) {
+        if (/^\|\s*Response \d+ of \d+:/) {
+            push @offers, { %cur } if $in_offer && $cur{server};
+            %cur = (); $in_offer = 1;
+            next;
+        }
+        next unless $in_offer;
+        if (/^\|\s*Server Identifier:\s*(\S+)/)         { $cur{server}  = $1 }
+        elsif (/^\|\s*Router:\s*(\S+)/)                  { $cur{router}  = $1 }
+        elsif (/^\|\s*IP Offered:\s*(\S+)/)              { $cur{offered} = $1 }
+        elsif (/^\|_?\s*$/)                              { } # blank
+        elsif (/^[^|]/)                                  {
+            # left the script-output block (no leading pipe)
+            push @offers, { %cur } if $cur{server};
+            %cur = (); $in_offer = 0;
+        }
+    }
+    close $fh;
+    push @offers, { %cur } if $in_offer && $cur{server};
+    return @offers;
+}
+
+sub resolve_mac {
+    my ($ip, $ifs) = @_;
+    # Prime ARP for each candidate iface (DHCP server may be on-link
+    # but not yet in the cache).
+    for my $if (@$ifs) {
+        # Discard ping output — we only want the ARP entry as a side-effect.
+        my $pid = fork // next;
+        if ($pid == 0) {
+            open STDOUT, '>', '/dev/null';
+            open STDERR, '>', '/dev/null';
+            exec 'ping', '-c', '1', '-W', '1', '-I', $if, $ip;
+            exit 1;
+        }
+        waitpid $pid, 0;
+    }
+    open my $fh, '-|', 'ip', 'neigh', 'show', $ip or return undef;
+    while (<$fh>) {
+        return lc $1 if /lladdr\s+([0-9a-f:]{17})/i;
+    }
+    return undef;
+}
+
+sub load_netmgr_context {
+    my (%aps, %mac_to_name);
+    eval {
+        require NetMgr::Client;
+        my %args;
+        $args{listen} = $listen if defined $listen;
+        my $c = NetMgr::Client->new(%args);
+        $c->hello(consumer => 'net-find-rogue-dhcp');
+        for my $row (@{ $c->snapshot('rdhcp1', 'aps') || [] }) {
+            $aps{ lc $row->{mac} } = 1 if $row->{mac};
+        }
+        # Chain mac → machine_id → primary_name so we can label each
+        # responder with its hostname on the Server line.
+        my %mac_to_mid;
+        for my $row (@{ $c->snapshot('rdhcp2', 'interfaces') || [] }) {
+            next unless $row->{mac} && defined $row->{machine_id}
+                                    && length $row->{machine_id};
+            $mac_to_mid{ lc $row->{mac} } = $row->{machine_id};
+        }
+        my %mid_to_name;
+        for my $row (@{ $c->snapshot('rdhcp3', 'machines') || [] }) {
+            next unless defined $row->{id}
+                     && defined $row->{primary_name}
+                     && length $row->{primary_name};
+            $mid_to_name{ $row->{id} } = $row->{primary_name};
+        }
+        for my $mac (keys %mac_to_mid) {
+            my $n = $mid_to_name{ $mac_to_mid{$mac} };
+            $mac_to_name{$mac} = $n if defined $n;
+        }
+        $c->bye;
+    };
+    if ($@ && !$quiet) {
+        my $msg = $@; $msg =~ s/\s+at\s.*//s;
+        print STDERR "warn: net-mgr lookup failed ($msg) — AP names unavailable\n";
+    }
+    return (\%aps, \%mac_to_name);
+}
+
+sub by_ip {
+    my @a = split /\./, $a;
+    my @b = split /\./, $b;
+    for (0..3) { return $a[$_] <=> $b[$_] if $a[$_] != $b[$_] }
+    return 0;
+}
+
+sub uniq { my %s; grep { !$s{$_}++ } @_ }
