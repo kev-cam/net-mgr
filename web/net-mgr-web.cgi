@@ -1017,6 +1017,8 @@ sub render_wifi_survey {
     }
 
     my @body;
+    my @reco_summary;     # collected recommendation lines for the
+                          # 'all recommendations' block at the bottom
     push @body, qq{<p class=meta>}
               . qq{<a href="?view=wifi-survey&refresh=1">[Re-scan now]</a>}
               . qq{ — triggers <code>net-wifi-survey</code> on the }
@@ -1168,12 +1170,41 @@ sub render_wifi_survey {
                     $cur, $cur_score, $cls, escapeHTML($verdict);
             }
 
-            push @body, sprintf '<p class=reco>%s: %s '
-                              . '(score %d)%s%s</p>',
+            my $reco_line = sprintf '%s: %s (score %d)%s%s',
                 $reco_label, $reco_html, $reco_score,
                 (($band // '') eq '2.4GHz' ? ' [quietest of 1/6/11]' : ''),
                 $verdict_html;
+            push @body, "<p class=reco>$reco_line</p>";
+
+            # Keep a per-AP copy of the same line for the summary
+            # block at the bottom of the page — easier to compare
+            # recommendations across APs without scrolling back
+            # through each busyness chart.
+            push @reco_summary, {
+                ap_name => $name,
+                iface   => $iface,
+                band    => $band,
+                line    => $reco_line,
+            };
         }
+    }
+
+    # Summary at the bottom — one row per (AP, radio) with the same
+    # recommendation line that appeared in-context above.
+    if (@reco_summary) {
+        push @body, '<h2>All recommendations</h2>';
+        push @body, '<table class=reco-summary>';
+        push @body, '<tr><th>AP</th><th>radio</th><th>recommendation</th></tr>';
+        for my $r (@reco_summary) {
+            push @body, sprintf
+                '<tr><td>%s</td><td>%s <span class=src>%s</span></td>'
+              . '<td>%s</td></tr>',
+                escapeHTML($r->{ap_name}),
+                escapeHTML($r->{iface}),
+                escapeHTML($r->{band} // ''),
+                $r->{line};
+        }
+        push @body, '</table>';
     }
 
     return wrap_page("WiFi survey — net-mgr", join("\n", @body),
@@ -1765,6 +1796,9 @@ span.verdict.strong   { background: rgba(220, 60, 60, 0.22);   color: #fcc; }
 span.verdict.moderate { background: rgba(220, 200, 60, 0.18);  color: #ffc; }
 span.verdict.marginal { background: rgba(150, 150, 150, 0.18); color: #ccc; }
 span.verdict.ok       { background: rgba(60, 200, 100, 0.18);  color: #cfc; }
+table.reco-summary { max-width: 900px; font-size: 0.9em; }
+table.reco-summary td { vertical-align: top; }
+table.reco-summary td:first-child { font-weight: bold; color: #eee; }
 </style>
 </head>
 <body>
