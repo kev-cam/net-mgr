@@ -384,4 +384,29 @@ CREATE TABLE IF NOT EXISTS audit_annotations (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 INSERT IGNORE INTO schema_version (version) VALUES (15);
+-- WiFi survey snapshots — one row per (scanner, scanner_iface, bssid).
+-- Populated by net-wifi-survey, which ssh's to each known AP and runs
+-- `wl scan` + `wl scanresults`.  Upsert-style: latest observation per
+-- (scanner, foreign-bssid) tuple wins.  last_seen lets stale neighbours
+-- age out (or be purged) over time.
+CREATE TABLE IF NOT EXISTS wifi_scan_results (
+    scanner_mac    CHAR(17)    NOT NULL,
+    scanner_iface  VARCHAR(16) NOT NULL,
+    bssid          CHAR(17)    NOT NULL,
+    ssid           VARCHAR(64),
+    channel        INT,
+    band           VARCHAR(8),       -- '2.4GHz' | '5GHz' | '6GHz'
+    rssi_dbm       INT,
+    encryption     VARCHAR(64),
+    bandwidth_mhz  INT,              -- 20 / 40 / 80 / 160
+    first_seen     DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen      DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                               ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (scanner_mac, scanner_iface, bssid),
+    KEY idx_bssid     (bssid),
+    KEY idx_channel   (channel),
+    KEY idx_last_seen (last_seen)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 INSERT IGNORE INTO schema_version (version) VALUES (16);
+INSERT IGNORE INTO schema_version (version) VALUES (17);

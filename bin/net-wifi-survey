@@ -1,0 +1,474 @@
+#!/usr/bin/perl
+# net-wifi-survey — ssh into each known AP, run an RF survey, store
+# the visible neighbours in wifi_scan_results, and print a channel-
+# conflict report.
+#
+# Tries scan tools in order until one returns results:
+#   1. wl -i wlN scan + sleep + wl -i wlN scanresults    (Broadcom/DD-WRT)
+#   2. iw dev IFACE scan                                  (mac80211/Linux)
+#   3. site_survey wlN                                    (older DD-WRT)
+#
+# APs whose firmware doesn't support any of those are skipped with a
+# notice but don't fail the whole run.
+#
+# Usage:
+#   net-wifi-survey [--ap HOST]   scan all (or one) AP; save to DB
+#                                 and print conflict report
+#   net-wifi-survey --no-save     skip the DB write
+#   net-wifi-survey --from-db     don't re-scan; report from cached rows
+#   net-wifi-survey --json        machine-readable output
+#   net-wifi-survey --rssi-strong N    threshold for 'strong' (default -70)
+#   net-wifi-survey --rssi-moderate N  threshold for 'moderate' (default -80)
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use NetMgr::Config;
+use NetMgr::DB;
+
+my $only_ap;
+my $no_save;
+my $from_db;
+my $json;
+my $ssh_user    = 'root';
+my $ssh_timeout = 8;
+my $rssi_strong   = -70;
+my $rssi_moderate = -80;
+my $help;
+GetOptions(
+    'ap=s'           => \$only_ap,
+    'no-save'        => \$no_save,
+    'from-db'        => \$from_db,
+    'json'           => \$json,
+    'ssh-user=s'     => \$ssh_user,
+    'ssh-timeout=i'  => \$ssh_timeout,
+    'rssi-strong=i'  => \$rssi_strong,
+    'rssi-moderate=i'=> \$rssi_moderate,
+    'help|h'         => \$help,
+) or usage(2);
+usage(0) if $help;
+
+sub usage {
+    my ($rc) = @_;
+    print <<'EOT';
+net-wifi-survey — scan each known AP for neighbours; report channel conflicts.
+
+  net-wifi-survey [--ap HOST]
+  net-wifi-survey --no-save      don't update wifi_scan_results
+  net-wifi-survey --from-db      skip live scan; report from DB cache
+  net-wifi-survey --json         machine-readable output
+
+  --rssi-strong N   conflict if neighbour signal >= N dBm (default -70)
+  --rssi-moderate N moderate threshold (default -80)
+EOT
+    exit $rc;
+}
+
+my $cfg = NetMgr::Config->load(
+    $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
+my $mycnf = (-r "$ENV{HOME}/.my.cnf") ? "$ENV{HOME}/.my.cnf"
+          : (-r '/root/.my.cnf')      ? '/root/.my.cnf'
+          : die "no readable .my.cnf for the [net-mgr] section\n";
+my $db = NetMgr::DB->new(
+    defaults_file => $mycnf,
+    section       => $cfg->{mysql}{section},
+    db            => $cfg->{mysql}{db},
+);
+$db->connect;
+
+# -- AP inventory ---------------------------------------------------------
+# Pull every AP from net-mgr's aps table, joined with addresses for the
+# ssh-able IP.  --ap HOST scopes to one (name or IP).
+sub list_aps {
+    my $rows = $db->dbh->selectall_arrayref(<<'SQL', { Slice => {} });
+SELECT a.mac, a.ssid, ad.addr,
+       (SELECT primary_name FROM machines m
+          JOIN interfaces i ON i.machine_id = m.id
+         WHERE i.mac = a.mac LIMIT 1) AS name
+  FROM aps a
+  JOIN addresses ad ON ad.mac = a.mac AND ad.family = 'v4'
+ ORDER BY ad.addr
+SQL
+    return $rows;
+}
+
+my $aps = list_aps();
+if (defined $only_ap) {
+    $aps = [ grep {
+        ($_->{name} // '') eq $only_ap
+     || $_->{addr}             eq $only_ap
+     || ($_->{mac} // '')      eq lc $only_ap
+    } @$aps ];
+    @$aps or die "net-wifi-survey: no AP matches '$only_ap'\n";
+}
+
+# -- live scan ------------------------------------------------------------
+my $REMOTE_SCRIPT = <<'SH';
+echo ===META===
+hostname 2>/dev/null
+echo ===WL_IFACES===
+nvram show 2>/dev/null | grep -E '^wl[0-9]+_ifname=' || true
+echo ===METHOD_WL===
+for w in wl0 wl1; do
+    bssid=$(wl -i $w bssid 2>/dev/null)
+    if [ -n "$bssid" ] && [ "${bssid#wl:}" = "$bssid" ]; then
+        echo IFACE $w
+        wl -i $w scan >/dev/null 2>&1
+        sleep 4
+        wl -i $w scanresults 2>/dev/null
+        echo ENDRESULTS
+    fi
+done
+echo ===METHOD_IW===
+for d in /sys/class/net/wl*; do
+    [ -e "$d" ] || continue
+    name=$(basename "$d")
+    if iw dev "$name" info >/dev/null 2>&1; then
+        echo IFACE $name
+        iw dev "$name" scan 2>/dev/null
+        echo ENDRESULTS
+    fi
+done
+echo ===METHOD_SS===
+for w in wl0 wl1; do
+    out=$(site_survey $w 2>/dev/null)
+    if [ -n "$out" ] && [ "${out#buflen=*count=[0]}" = "$out" ]; then
+        echo IFACE $w
+        echo "$out"
+        echo ENDRESULTS
+    fi
+done
+echo ===END===
+SH
+
+sub ssh_scan {
+    my ($host) = @_;
+    # Use net-ssh if installed alongside (rewrites the destination via
+    # net-lookup so primary_name → live IP); plain ssh otherwise.
+    my $net_ssh = "$FindBin::Bin/net-ssh";
+    my $tool    = (-x $net_ssh) ? $net_ssh : 'net-ssh';
+    my @cmd = ($tool,
+        '-o', 'BatchMode=yes',
+        '-o', "ConnectTimeout=$ssh_timeout",
+        '-o', 'StrictHostKeyChecking=accept-new',
+        '-n', "$ssh_user\@$host",
+        $REMOTE_SCRIPT,
+    );
+    open my $fh, '-|', @cmd or do {
+        warn "ssh $host: $!\n"; return undef;
+    };
+    local $/; my $raw = <$fh>; close $fh;
+    return $raw;
+}
+
+# Section-based dispatcher.  Each METHOD_* section emits one or more
+# 'IFACE <name>' blocks followed by raw output, ended by ENDRESULTS.
+# Whichever method produces non-empty parsed results wins per-iface.
+sub parse_scan {
+    my ($raw, $scanner_mac) = @_;
+    return [] unless defined $raw;
+    my @lines = split /\n/, $raw;
+
+    my %by_iface_method;     # iface → method → [ {bssid,...}, ... ]
+    my $section;
+    my $cur_iface;
+    my @block;
+    my $flush = sub {
+        return unless defined $cur_iface;
+        my @parsed;
+        if    ($section eq 'METHOD_WL') { @parsed = parse_wl_results(\@block) }
+        elsif ($section eq 'METHOD_IW') { @parsed = parse_iw_scan(\@block)    }
+        elsif ($section eq 'METHOD_SS') { @parsed = parse_site_survey(\@block)}
+        $by_iface_method{$cur_iface}{$section} = \@parsed if @parsed;
+        @block      = ();
+        $cur_iface  = undef;
+    };
+
+    for my $ln (@lines) {
+        if ($ln =~ /^===([A-Z_]+)===\s*$/) {
+            $flush->();
+            $section = $1;
+            next;
+        }
+        next unless defined $section;
+        if ($section =~ /^METHOD_/ && $ln =~ /^IFACE\s+(\S+)/) {
+            $flush->();
+            $cur_iface = $1;
+            next;
+        }
+        if ($section =~ /^METHOD_/ && $ln eq 'ENDRESULTS') {
+            $flush->();
+            next;
+        }
+        push @block, $ln if defined $cur_iface;
+    }
+    $flush->();
+
+    # Prefer methods in order: WL > IW > SS (matches the remote script's
+    # detection order; the earliest that produced results is most
+    # specific to the hardware).
+    my @results;
+    for my $iface (sort keys %by_iface_method) {
+        my $m = $by_iface_method{$iface};
+        my $pick = $m->{METHOD_WL} || $m->{METHOD_IW} || $m->{METHOD_SS};
+        next unless $pick && @$pick;
+        for my $r (@$pick) {
+            $r->{scanner_iface} = $iface;
+            $r->{scanner_mac}   = $scanner_mac;
+            push @results, $r;
+        }
+    }
+    return \@results;
+}
+
+# Broadcom wl scanresults format:
+#   SSID: "foo"
+#   Mode: Managed    RSSI: -75 dBm   ...   Channel: 6
+#   BSSID: 00:11:22:33:44:55    Capability: ESS WEP
+#   ... (multi-line block)
+sub parse_wl_results {
+    my ($lines) = @_;
+    my @out;
+    my %cur;
+    my $flush = sub {
+        push @out, { %cur } if $cur{bssid};
+        %cur = ();
+    };
+    for my $ln (@$lines) {
+        if ($ln =~ /^SSID:\s*"(.*?)"/) {
+            $flush->();
+            $cur{ssid} = $1;
+        }
+        elsif ($ln =~ /RSSI:\s*(-?\d+)/) { $cur{rssi_dbm} = $1 + 0 }
+        if ($ln =~ /Channel:\s*(\d+)/)   { $cur{channel}  = $1 + 0 }
+        if ($ln =~ /BSSID:\s*([0-9A-Fa-f:]{17})/) { $cur{bssid} = lc $1 }
+        if ($ln =~ /Capability:.*\b(WPA2|WPA3|WPA|WEP)\b/) {
+            $cur{encryption} //= $1;
+        }
+        if ($ln =~ /Channel width:\s*(\d+)/) { $cur{bandwidth_mhz} = $1 + 0 }
+    }
+    $flush->();
+    for my $r (@out) {
+        $r->{band} = guess_band($r->{channel});
+    }
+    return @out;
+}
+
+# `iw dev IFACE scan` format:
+#   BSS xx:xx:xx:xx:xx:xx(on IFACE)
+#       freq: 2412
+#       signal: -75.00 dBm
+#       SSID: foo
+#       ... HT capabilities mark 2.4 or 5
+sub parse_iw_scan {
+    my ($lines) = @_;
+    my @out;
+    my %cur;
+    my $flush = sub {
+        push @out, { %cur } if $cur{bssid};
+        %cur = ();
+    };
+    for my $ln (@$lines) {
+        if ($ln =~ /^BSS\s+([0-9A-Fa-f:]{17})/) {
+            $flush->();
+            $cur{bssid} = lc $1;
+        }
+        elsif ($ln =~ /^\s+freq:\s+(\d+)/) {
+            $cur{channel} = freq_to_channel($1 + 0);
+            $cur{band}    = $cur{channel} && $cur{channel} <= 14
+                            ? '2.4GHz' : '5GHz';
+        }
+        elsif ($ln =~ /^\s+signal:\s+(-?\d+(?:\.\d+)?)/) {
+            $cur{rssi_dbm} = int($1);
+        }
+        elsif ($ln =~ /^\s+SSID:\s+(.*)$/) {
+            $cur{ssid} = $1;
+        }
+        elsif ($ln =~ /\bRSN:|WPA2/) { $cur{encryption} //= 'WPA2' }
+        elsif ($ln =~ /\bWPA:/)      { $cur{encryption} //= 'WPA'  }
+    }
+    $flush->();
+    return @out;
+}
+
+# Older DD-WRT site_survey output (text table):
+#   ' '$<#>' '$<bssid>' '$<channel>' '$<freq>' '$<rssi>' ...
+sub parse_site_survey {
+    my ($lines) = @_;
+    my @out;
+    for my $ln (@$lines) {
+        next if $ln =~ /buflen=/ || $ln =~ /^\s*$/;
+        # Columns are space/quote separated; pull whatever quoted
+        # tokens look like bssid + numbers.
+        my ($bssid)   = $ln =~ /([0-9A-Fa-f:]{17})/;
+        my ($channel) = $ln =~ /'(\d+)'\s+'\d{4}'\s+'/;
+        my ($rssi)    = $ln =~ /'(-?\d+)'\s+'-?\d+'\s+'\d+'\s+'/;
+        my ($ssid)    = $ln =~ /'([^']+)'\s*$/;
+        next unless $bssid;
+        push @out, {
+            bssid    => lc $bssid,
+            channel  => $channel ? $channel + 0 : undef,
+            rssi_dbm => defined $rssi ? $rssi + 0 : undef,
+            ssid     => $ssid,
+            band     => guess_band($channel),
+        };
+    }
+    return @out;
+}
+
+sub guess_band {
+    my ($c) = @_;
+    return undef unless defined $c;
+    return '2.4GHz' if $c >= 1   && $c <= 14;
+    return '5GHz'   if $c >= 32  && $c <= 177;
+    return '6GHz'   if $c >= 200;
+    return undef;
+}
+
+sub freq_to_channel {
+    my ($f) = @_;
+    return int(($f - 2407) / 5)           if $f >= 2412 && $f <= 2484;
+    return 14                              if $f == 2484;
+    return int(($f - 5000) / 5)            if $f >= 5160 && $f <= 5885;
+    return int(($f - 5950) / 5)            if $f >= 5955 && $f <= 7115;
+    return undef;
+}
+
+# -- scan + persist + report ----------------------------------------------
+sub scan_one_ap {
+    my ($ap) = @_;
+    my $host = $ap->{name} || $ap->{addr};
+    print STDERR "scanning $host ($ap->{mac}) ...\n" unless $json;
+
+    my $raw     = ssh_scan($host) or return [];
+    my $results = parse_scan($raw, $ap->{mac});
+    if (!@$results) {
+        print STDERR "  (no scan results — survey command may not be "
+                   . "supported on this firmware)\n" unless $json;
+        return $results;
+    }
+    unless ($no_save) {
+        for my $r (@$results) {
+            $db->upsert_wifi_scan_result(
+                scanner_mac   => $r->{scanner_mac},
+                scanner_iface => $r->{scanner_iface},
+                bssid         => $r->{bssid},
+                ssid          => $r->{ssid},
+                channel       => $r->{channel},
+                band          => $r->{band},
+                rssi_dbm      => $r->{rssi_dbm},
+                encryption    => $r->{encryption},
+                bandwidth_mhz => $r->{bandwidth_mhz},
+            );
+        }
+    }
+    return $results;
+}
+
+# Build the conflict report for one AP given its (live or DB) results.
+# %own_bssids identifies the scanner's own BSSIDs across all radios so
+# we can split foreign vs own neighbours.
+sub report_for_ap {
+    my ($ap, $results, $own_bssids) = @_;
+    my %by_iface;
+    push @{ $by_iface{ $_->{scanner_iface} } }, $_ for @$results;
+
+    my @blocks;
+    for my $iface (sort keys %by_iface) {
+        my @neighbours = grep { !$own_bssids->{ $_->{bssid} } }
+                              @{ $by_iface{$iface} };
+        my %by_chan;
+        for my $n (@neighbours) {
+            push @{ $by_chan{ $n->{channel} // 0 } }, $n;
+        }
+        my @rows;
+        for my $chan (sort { $a <=> $b } keys %by_chan) {
+            for my $n (sort { ($b->{rssi_dbm} // -200)
+                              <=> ($a->{rssi_dbm} // -200) }
+                       @{ $by_chan{$chan} }) {
+                my $sev = 'noise';
+                if (defined $n->{rssi_dbm}) {
+                    $sev = $n->{rssi_dbm} >= $rssi_strong   ? 'strong'
+                         : $n->{rssi_dbm} >= $rssi_moderate ? 'moderate'
+                         : 'noise';
+                }
+                push @rows, {
+                    %$n, severity => $sev, scanner_iface => $iface,
+                };
+            }
+        }
+        push @blocks, { iface => $iface, rows => \@rows };
+    }
+    return \@blocks;
+}
+
+# -- driver ---------------------------------------------------------------
+my @report;
+for my $ap (@$aps) {
+    my $results;
+    if ($from_db) {
+        $results = $db->dbh->selectall_arrayref(
+            "SELECT * FROM wifi_scan_results WHERE scanner_mac = ?",
+            { Slice => {} }, lc $ap->{mac}
+        );
+    } else {
+        $results = scan_one_ap($ap);
+    }
+
+    # Build own-BSSID set for filtering.  An AP's MAC plus its VAPs are
+    # offsets in the OUI — we don't know the exact VAP MACs without
+    # ifconfig, so for first cut we just filter by the scanner_mac+1 / +2
+    # / etc.  Better: build the set from the aps table snap-shot of all
+    # known MACs across our APs.
+    my %own;
+    $own{ lc $_->{mac} } = 1 for @$aps;
+
+    push @report, {
+        ap      => $ap,
+        blocks  => report_for_ap($ap, $results, \%own),
+    };
+}
+
+if ($json) {
+    require JSON::PP;
+    print JSON::PP::encode_json(\@report), "\n";
+    exit 0;
+}
+
+# Text output.
+my $any = 0;
+for my $r (@report) {
+    my $ap = $r->{ap};
+    my $name = $ap->{name} || $ap->{addr};
+    next unless @{ $r->{blocks} };
+    $any = 1;
+    print "== $name ($ap->{addr}) ==\n";
+    for my $b (@{ $r->{blocks} }) {
+        my @strong   = grep { $_->{severity} eq 'strong'   } @{ $b->{rows} };
+        my @moderate = grep { $_->{severity} eq 'moderate' } @{ $b->{rows} };
+        my $total    = scalar @{ $b->{rows} };
+        printf "  %s: %d foreign AP%s visible\n",
+            $b->{iface}, $total, $total == 1 ? '' : 's';
+        for my $n (@strong) {
+            printf "    [strong  ] ch %-3s %-30s %4d dBm  %s\n",
+                $n->{channel} // '?', $n->{ssid} // '(hidden)',
+                $n->{rssi_dbm} // 0, $n->{bssid};
+        }
+        for my $n (@moderate) {
+            printf "    [moderate] ch %-3s %-30s %4d dBm  %s\n",
+                $n->{channel} // '?', $n->{ssid} // '(hidden)',
+                $n->{rssi_dbm} // 0, $n->{bssid};
+        }
+        # Channel summary: count neighbours per channel.
+        my %ch;
+        $ch{ $_->{channel} // 0 }++ for @{ $b->{rows} };
+        my @hot = sort { $ch{$b} <=> $ch{$a} || $a <=> $b } keys %ch;
+        printf "    channel population: %s\n",
+            join(', ', map { "ch$_:$ch{$_}" } @hot[0..($#hot < 5 ? $#hot : 5)]);
+    }
+}
+print "(no scan data — APs may not support the survey tools available)\n"
+    unless $any;
+exit 0;

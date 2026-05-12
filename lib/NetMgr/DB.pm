@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 16;
+our $SCHEMA_VERSION = 17;
 
 sub new {
     my ($class, %args) = @_;
@@ -406,6 +406,32 @@ CREATE TABLE IF NOT EXISTS audit_annotations (
                            ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (kind, host, addr, port),
     KEY idx_target (addr, port)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
+    if ($v == 17) {
+        # wifi_scan_results: latest 'wl scanresults' observation per
+        # (scanner_mac, scanner_iface, bssid).  Populated by
+        # net-wifi-survey.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS wifi_scan_results (
+    scanner_mac    CHAR(17)    NOT NULL,
+    scanner_iface  VARCHAR(16) NOT NULL,
+    bssid          CHAR(17)    NOT NULL,
+    ssid           VARCHAR(64),
+    channel        INT,
+    band           VARCHAR(8),
+    rssi_dbm       INT,
+    encryption     VARCHAR(64),
+    bandwidth_mhz  INT,
+    first_seen     DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen      DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                               ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (scanner_mac, scanner_iface, bssid),
+    KEY idx_bssid     (bssid),
+    KEY idx_channel   (channel),
+    KEY idx_last_seen (last_seen)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
         return;
@@ -1370,6 +1396,38 @@ sub delete_audit_annotation {
     );
 }
 
+sub upsert_wifi_scan_result {
+    my ($self, %f) = @_;
+    croak "scanner_mac, scanner_iface, bssid required"
+        unless defined $f{scanner_mac}
+            && defined $f{scanner_iface}
+            && defined $f{bssid};
+    $f{scanner_mac} = lc $f{scanner_mac};
+    $f{bssid}       = lc $f{bssid};
+    $self->{dbh}->do(
+        "INSERT INTO wifi_scan_results
+            (scanner_mac, scanner_iface, bssid, ssid, channel, band,
+             rssi_dbm, encryption, bandwidth_mhz)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            ssid          = COALESCE(VALUES(ssid),          ssid),
+            channel       = COALESCE(VALUES(channel),       channel),
+            band          = COALESCE(VALUES(band),          band),
+            rssi_dbm      = COALESCE(VALUES(rssi_dbm),      rssi_dbm),
+            encryption    = COALESCE(VALUES(encryption),    encryption),
+            bandwidth_mhz = COALESCE(VALUES(bandwidth_mhz), bandwidth_mhz)",
+        undef,
+        $f{scanner_mac}, $f{scanner_iface}, $f{bssid},
+        $f{ssid}, $f{channel}, $f{band}, $f{rssi_dbm},
+        $f{encryption}, $f{bandwidth_mhz},
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM wifi_scan_results
+          WHERE scanner_mac = ? AND scanner_iface = ? AND bssid = ?",
+        undef, $f{scanner_mac}, $f{scanner_iface}, $f{bssid}
+    );
+}
+
 sub query_table {
     my ($self, $table, %opts) = @_;
     my %allowed = map { $_ => 1 } qw(
@@ -1378,7 +1436,7 @@ sub query_table {
         subnet_routers friendly_names wifi_sockets lost_devices
         peers uplinks forwarding_rules
         zone_classes interface_zones wifi_zones
-        audit_annotations
+        audit_annotations wifi_scan_results
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};
