@@ -1798,6 +1798,17 @@ span.verdict.ok       { background: rgba(60, 200, 100, 0.18);  color: #cfc; }
 table.reco-summary { max-width: 900px; font-size: 0.9em; }
 table.reco-summary td { vertical-align: top; }
 table.reco-summary td:first-child { font-weight: bold; color: #eee; }
+/* WiFi-survey page: brighter link colours so 'recommended' /
+   're-scan' stand out next to the verdict badges and bar chart. */
+p.reco a, table.reco-summary a, p.meta a {
+    color: #0ff;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+p.reco a:hover, table.reco-summary a:hover, p.meta a:hover {
+    color: #ff8;
+    background: rgba(255, 255, 0, 0.12);
+}
 </style>
 </head>
 <body>
