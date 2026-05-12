@@ -15,7 +15,9 @@ nvram get DD_BOARD 2>/dev/null
 nvram get lan_ipaddr 2>/dev/null
 nvram get model 2>/dev/null
 echo ===SSIDS===
-nvram show 2>/dev/null | grep -E '^wl[0-9]+(\.[0-9]+)?_ssid='
+# Pull SSID strings, main-radio enable, and per-VAP bss_enable.
+# Filtering happens in the Perl side so the wire format stays simple.
+nvram show 2>/dev/null | grep -E '^wl[0-9]+(\.[0-9]+)?_(ssid|radio|bss_enabled)='
 echo ===INTERFACES===
 ifconfig 2>/dev/null
 echo ===ASSOC===
@@ -92,6 +94,8 @@ sub parse_remote {
     my $meta_idx = 0;
     my @meta_keys = qw(router_name board lan_ipaddr model);
     my %ssids;
+    my %radio_enabled;     # wl0 → 1 if main radio is up
+    my %bss_enabled;       # wl0.1 → 1 if VAP is up
     my @interfaces;
     my $cur_iface;
     my @assoc;
@@ -115,8 +119,17 @@ sub parse_remote {
             $meta{$k} = $line if length $line;
         }
         elsif ($section eq 'SSIDS') {
+            # Collect raw signals; we filter once the section closes
+            # so radio/bss enable rows can appear in any order
+            # relative to the ssid row they gate.
             if ($line =~ /^(wl[0-9]+(?:\.[0-9]+)?)_ssid=(.*)$/) {
                 $ssids{$1} = $2 if length $2;
+            }
+            elsif ($line =~ /^(wl[0-9]+)_radio=(\d+)/) {
+                $radio_enabled{$1} = $2;
+            }
+            elsif ($line =~ /^(wl[0-9]+\.[0-9]+)_bss_enabled=(\d+)/) {
+                $bss_enabled{$1} = $2;
             }
         }
         elsif ($section eq 'INTERFACES') {
@@ -172,6 +185,25 @@ sub parse_remote {
                     hostname => ($host eq '*') ? undef : $host,
                 };
             }
+        }
+    }
+
+    # Drop SSIDs whose underlying radio / VAP isn't actually up.
+    # DD-WRT keeps the nvram ssid value around even when the BSS is
+    # disabled (you'll see 'dd-wrt_vap' on a fresh AP that's never
+    # enabled its second VAP).  Filter:
+    #   wl0    →  wl0_radio must be 1
+    #   wl0.1  →  iface must appear in ifconfig
+    # ifconfig is the authoritative "this BSS is actually broadcasting"
+    # signal — wl0.N_bss_enabled isn't exposed on every DD-WRT build,
+    # but a disabled VAP never instantiates the interface.
+    my %live_iface = map { $_->{name} => 1 } @interfaces;
+    for my $iface (keys %ssids) {
+        if ($iface =~ /\./) {
+            delete $ssids{$iface} unless $live_iface{$iface};
+        } else {
+            my $r = $radio_enabled{$iface};
+            delete $ssids{$iface} if defined $r && $r ne '1';
         }
     }
 
