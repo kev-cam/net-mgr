@@ -974,6 +974,16 @@ sub render_wifi_survey {
     }
     my %own_bssid = map { lc $_->{mac} => 1 } @$aps;
 
+    # Per-AP v4 address — used to build deep links into the DD-WRT
+    # admin UI on the recommendation line.  First v4 address per MAC
+    # wins (usually the LAN side).
+    my $addresses = eval { $cli->snapshot(22, 'addresses',
+                                          where => "family = 'v4'") } || [];
+    my %ap_ip;
+    for my $a (@$addresses) {
+        $ap_ip{ lc $a->{mac} } //= $a->{addr};
+    }
+
     # Group results by (scanner_mac, scanner_iface).
     my %by_scanner;
     for my $r (@$rows) {
@@ -1064,9 +1074,22 @@ sub render_wifi_survey {
                     $c, $pct, $s, $cell, escapeHTML($sig);
             }
             push @body, '</table>';
-            push @body, sprintf '<p class=reco>recommended: <b>ch %d</b> '
+            # Recommended channel — hyperlink to the DD-WRT
+            # Wireless_Basic.asp page on the AP so a click takes you
+            # straight to the channel dropdown.  Opens in a new tab
+            # since the admin UI prompts for basic-auth and lives on
+            # the AP's own IP (not the net-mgr web host).
+            my $ip = $ap_ip{$mac};
+            my $reco_html = sprintf '<b>ch %d</b>', $reco // 0;
+            if (defined $ip && length $ip) {
+                $reco_html = sprintf
+                    '<a href="http://%s/Wireless_Basic.asp" target="_blank" '
+                  . 'rel="noopener">%s</a>',
+                    escapeHTML($ip), $reco_html;
+            }
+            push @body, sprintf '<p class=reco>recommended: %s '
                               . '(score %d)%s</p>',
-                $reco // 0, $score->{$reco} // 0,
+                $reco_html, $score->{$reco} // 0,
                 (($band // '') eq '2.4GHz' ? ' — quietest of 1/6/11' : '');
         }
     }
