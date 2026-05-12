@@ -28,6 +28,8 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
     associations dhcp_leases events aliases dhcp_vars
     subnet_routers friendly_names wifi_sockets lost_devices
     peers uplinks
+    forwarding_rules zone_classes interface_zones wifi_zones
+    audit_annotations wifi_scan_results
 );
 
 sub new {
