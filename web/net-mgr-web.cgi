@@ -1110,10 +1110,12 @@ sub render_wifi_survey {
             # has no reachable admin UI, or we just haven't scanned
             # it for ports yet).
             #
-            # window.open with a fixed name + size opens the admin
-            # UI in a dedicated popup window the first time and
-            # reuses it on subsequent clicks; falls back to the
-            # plain href (new tab) if JS is off.
+            # target=_blank for a new tab/window; rel="noopener
+            # noreferrer" strips the Referer header — DD-WRT's tiny
+            # httpd returns 400 Bad Request on the first request when
+            # we send a JS-popup origin as Referer (the reload from a
+            # bare URL works because there's no Referer).  Drop it
+            # and the first hit succeeds.
             my $ip     = $ap_ip{$mac};
             my $scheme = $has_https{$mac} ? 'https'
                        : $has_http{$mac}  ? 'http'
@@ -1123,12 +1125,9 @@ sub render_wifi_survey {
                 my $url = sprintf '%s://%s/Wireless_Basic.asp',
                                    $scheme, $ip;
                 $reco_label = sprintf
-                    '<a href="%s" target="ap-admin" rel="noopener" '
-                  . 'onclick="window.open(this.href, %s, %s); '
-                  . 'return false;">recommended</a>',
-                    escapeHTML($url),
-                    q{'ap-admin'},
-                    q{'width=1200,height=900,resizable=yes,scrollbars=yes'};
+                    '<a href="%s" target="_blank" rel="noopener noreferrer">'
+                  . 'recommended</a>',
+                    escapeHTML($url);
             }
             my $reco_html  = sprintf '<b>ch %d</b>', $reco // 0;
 
