@@ -995,6 +995,20 @@ sub render_wifi_survey {
             = $r->{current_channel};
     }
 
+    # Web-UI port snapshot — only build a deep link to an AP's admin
+    # page when it's actually reachable.  Prefer https (443); fall
+    # back to http (80) if no TLS is exposed; otherwise no link.
+    my $web_ports = eval {
+        $cli->snapshot(24, 'ports',
+                       where => "proto = 'tcp' AND (port = 80 OR port = 443)")
+    } || [];
+    my (%has_http, %has_https);
+    for my $p (@$web_ports) {
+        my $m = lc $p->{mac};
+        $has_http{$m}  = 1 if $p->{port} == 80;
+        $has_https{$m} = 1 if $p->{port} == 443;
+    }
+
     # Group results by (scanner_mac, scanner_iface).
     my %by_scanner;
     for my $r (@$rows) {
@@ -1087,15 +1101,32 @@ sub render_wifi_survey {
             push @body, '</table>';
             # Hyperlink lives on the word 'recommended' (not on the
             # channel number) so the bolded channel value stays in
-            # the body-text colour and is easy to read.  DD-WRT
-            # admin UI on https; opens in a new tab.
-            my $ip = $ap_ip{$mac};
+            # the body-text colour and stays readable.
+            #
+            # Pick https only when the AP's ports row shows 443 open,
+            # else http if 80 is open, else no link at all (the AP
+            # has no reachable admin UI, or we just haven't scanned
+            # it for ports yet).
+            #
+            # window.open with a fixed name + size opens the admin
+            # UI in a dedicated popup window the first time and
+            # reuses it on subsequent clicks; falls back to the
+            # plain href (new tab) if JS is off.
+            my $ip     = $ap_ip{$mac};
+            my $scheme = $has_https{$mac} ? 'https'
+                       : $has_http{$mac}  ? 'http'
+                       :                    undef;
             my $reco_label = 'recommended';
-            if (defined $ip && length $ip) {
+            if (defined $ip && length $ip && defined $scheme) {
+                my $url = sprintf '%s://%s/Wireless_Basic.asp',
+                                   $scheme, $ip;
                 $reco_label = sprintf
-                    '<a href="https://%s/Wireless_Basic.asp" target="_blank" '
-                  . 'rel="noopener">recommended</a>',
-                    escapeHTML($ip);
+                    '<a href="%s" target="ap-admin" rel="noopener" '
+                  . 'onclick="window.open(this.href, %s, %s); '
+                  . 'return false;">recommended</a>',
+                    escapeHTML($url),
+                    q{'ap-admin'},
+                    q{'width=1200,height=900,resizable=yes,scrollbars=yes'};
             }
             my $reco_html  = sprintf '<b>ch %d</b>', $reco // 0;
 
