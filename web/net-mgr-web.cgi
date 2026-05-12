@@ -1085,20 +1085,19 @@ sub render_wifi_survey {
                     $c, $pct, $s, $cell, escapeHTML($sig);
             }
             push @body, '</table>';
-            # Recommended channel — hyperlink to the DD-WRT
-            # Wireless_Basic.asp page on the AP so a click takes you
-            # straight to the channel dropdown.  HTTPS only (DD-WRT
-            # accepts a self-signed cert; the browser prompt is one
-            # click).  Opens in a new tab — the admin UI is on the
-            # AP's own IP and has its own basic-auth.
+            # Hyperlink lives on the word 'recommended' (not on the
+            # channel number) so the bolded channel value stays in
+            # the body-text colour and is easy to read.  DD-WRT
+            # admin UI on https; opens in a new tab.
             my $ip = $ap_ip{$mac};
-            my $reco_html = sprintf '<b>ch %d</b>', $reco // 0;
+            my $reco_label = 'recommended';
             if (defined $ip && length $ip) {
-                $reco_html = sprintf
+                $reco_label = sprintf
                     '<a href="https://%s/Wireless_Basic.asp" target="_blank" '
-                  . 'rel="noopener">%s</a>',
-                    escapeHTML($ip), $reco_html;
+                  . 'rel="noopener">recommended</a>',
+                    escapeHTML($ip);
             }
+            my $reco_html  = sprintf '<b>ch %d</b>', $reco // 0;
 
             # Verdict on whether moving is worth it.  Same rubric as
             # the CLI: strong / moderate / marginal / no benefit /
@@ -1138,9 +1137,9 @@ sub render_wifi_survey {
                     $cur, $cur_score, $cls, escapeHTML($verdict);
             }
 
-            push @body, sprintf '<p class=reco>recommended: %s '
+            push @body, sprintf '<p class=reco>%s: %s '
                               . '(score %d)%s%s</p>',
-                $reco_html, $reco_score,
+                $reco_label, $reco_html, $reco_score,
                 (($band // '') eq '2.4GHz' ? ' [quietest of 1/6/11]' : ''),
                 $verdict_html;
         }
