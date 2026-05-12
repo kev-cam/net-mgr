@@ -118,6 +118,10 @@ if (defined $only_ap) {
 my $REMOTE_SCRIPT = <<'SH';
 echo ===META===
 hostname 2>/dev/null
+echo ===CURRENT===
+# Current channel per radio.  nvram is the cheap, always-available
+# answer; wl/iw/iwlist would also work but cost more round-trips.
+nvram show 2>/dev/null | grep -E '^wl[0-9]+_channel=' || true
 echo ===WL_IFACES===
 nvram show 2>/dev/null | grep -E '^wl[0-9]+_ifname=' || true
 echo ===METHOD_WL===
@@ -231,6 +235,7 @@ sub parse_scan {
     my @lines = split /\n/, $raw;
 
     my %by_iface_method;     # iface → method → [ {bssid,...}, ... ]
+    my %current_chan;        # band → current channel on that radio
     my $section;
     my $cur_iface;
     my @block;
@@ -253,6 +258,20 @@ sub parse_scan {
             next;
         }
         next unless defined $section;
+        if ($section eq 'CURRENT') {
+            # wl0_channel=N → bucket by band so the render can find
+            # 'currently on ch X' from a (band)-keyed lookup without
+            # caring which physical wl[0|1] holds which radio.
+            if ($ln =~ /^wl[0-9]+_channel=(\d+)/) {
+                my $c = $1 + 0;
+                my $band = $c >= 1   && $c <= 14   ? '2.4GHz'
+                         : $c >= 32  && $c <= 196  ? '5GHz'
+                         : $c >= 200                ? '6GHz'
+                         :                            undef;
+                $current_chan{$band} = $c if defined $band;
+            }
+            next;
+        }
         if ($section =~ /^METHOD_/ && $ln =~ /^IFACE\s+(\S+)/) {
             $flush->();
             $cur_iface = $1;
@@ -296,7 +315,7 @@ sub parse_scan {
             push @results, $r;
         }
     }
-    return \@results;
+    return { results => \@results, current_chan => \%current_chan };
 }
 
 # Broadcom wl scanresults format:
@@ -473,7 +492,7 @@ sub freq_to_channel {
 sub scan_one_ap_live {
     my ($ap) = @_;
     my $host = $ap->{name} || $ap->{addr};
-    my $raw  = ssh_scan($host) or return [];
+    my $raw  = ssh_scan($host) or return { results => [], current_chan => {} };
     return parse_scan($raw, $ap->{mac});
 }
 
@@ -521,7 +540,8 @@ sub scan_all_aps_parallel {
                 my $ap     = $fh_to_ap{$fd};
                 my $blob   = $buf{$fd} // '';
                 close $fh;
-                my $parsed = eval { thaw($blob) } || [];
+                my $parsed = eval { thaw($blob) }
+                          || { results => [], current_chan => {} };
                 $results{ $ap->{mac} } = $parsed;
                 next;
             }
@@ -606,7 +626,8 @@ sub busyness_for_neighbours {
 }
 
 sub report_for_ap {
-    my ($ap, $results, $own_bssids) = @_;
+    my ($ap, $results, $current_chan, $own_bssids) = @_;
+    $current_chan //= {};
     my %by_iface;
     push @{ $by_iface{ $_->{scanner_iface} } }, $_ for @$results;
 
@@ -648,33 +669,38 @@ sub report_for_ap {
         }
 
         push @blocks, {
-            iface       => $iface,
-            band        => $band,
-            channels    => \@channels,
-            score       => $score,
-            count       => $count,
-            strongest   => $strongest,
-            recommended => $reco,
-            neighbours  => \@neighbours,
+            iface           => $iface,
+            band            => $band,
+            channels        => \@channels,
+            score           => $score,
+            count           => $count,
+            strongest       => $strongest,
+            recommended     => $reco,
+            current_channel => $current_chan->{$band},
+            neighbours      => \@neighbours,
         };
     }
     return \@blocks;
 }
 
 # -- driver ---------------------------------------------------------------
-my %results_by_mac;
+my %results_by_mac;     # mac → { results => [...], current_chan => {...} }
 if ($from_db) {
     for my $ap (@$aps) {
-        $results_by_mac{ lc $ap->{mac} } = $db->dbh->selectall_arrayref(
+        my $rows = $db->dbh->selectall_arrayref(
             "SELECT * FROM wifi_scan_results WHERE scanner_mac = ?",
             { Slice => {} }, lc $ap->{mac}
         );
+        $results_by_mac{ lc $ap->{mac} } = {
+            results      => $rows,
+            current_chan => {},   # DB has no notion of 'currently on'
+        };
     }
 } else {
     %results_by_mac = %{ scan_all_aps_parallel($aps) };
     # Persist after all children come back.
     for my $mac (keys %results_by_mac) {
-        save_results($results_by_mac{$mac});
+        save_results($results_by_mac{$mac}{results});
     }
 }
 
@@ -685,10 +711,12 @@ $own{ lc $_->{mac} } = 1 for @$aps;
 
 my @report;
 for my $ap (@$aps) {
-    my $r = $results_by_mac{ lc $ap->{mac} } // [];
+    my $payload = $results_by_mac{ lc $ap->{mac} }
+                  || { results => [], current_chan => {} };
     push @report, {
         ap     => $ap,
-        blocks => report_for_ap($ap, $r, \%own),
+        blocks => report_for_ap($ap, $payload->{results},
+                                $payload->{current_chan}, \%own),
     };
 }
 
@@ -743,11 +771,41 @@ for my $r (@report) {
         } else {
             print "    channel busyness: (nothing measurable)\n";
         }
-        printf "    recommended: ch %d%s\n",
-            $b->{recommended} // 0,
-            (($b->{band} // '') eq '2.4GHz'
-                ? ' (quietest of 1/6/11)'
-                : '');
+        # Recommendation line.  When we know the current channel,
+        # show both scores and a verdict on how much a move would help:
+        #   already optimal       (current is the recommended channel)
+        #   strong  improvement   ≥ 50% score drop
+        #   moderate improvement  25-50%
+        #   marginal              < 25%
+        #   no benefit            current is already at or below recommended
+        my $reco_score = $b->{score}{ $b->{recommended} } // 0;
+        my $cur        = $b->{current_channel};
+        my $reco_line  = sprintf 'recommended: ch %d (score %d)',
+                                  $b->{recommended} // 0, $reco_score;
+        $reco_line .= ' [quietest of 1/6/11]'
+            if ($b->{band} // '') eq '2.4GHz';
+        if (defined $cur) {
+            my $cur_score = $b->{score}{$cur} // 0;
+            my $verdict;
+            if ($cur == ($b->{recommended} // -1)) {
+                $verdict = 'already on it';
+            }
+            elsif ($cur_score <= $reco_score) {
+                $verdict = 'no benefit';
+            } else {
+                my $drop = ($cur_score - $reco_score) / $cur_score;
+                $verdict = $drop >= 0.5  ? sprintf('strong improvement -%d%%',
+                                                   $drop * 100)
+                         : $drop >= 0.25 ? sprintf('moderate -%d%%',
+                                                   $drop * 100)
+                         :                 sprintf('marginal -%d%%',
+                                                   $drop * 100);
+            }
+            printf "    %s; currently ch %d (score %d) — %s\n",
+                $reco_line, $cur, $cur_score, $verdict;
+        } else {
+            print "    $reco_line (current channel unknown)\n";
+        }
 
         if ($verbose) {
             my @sorted = sort {
