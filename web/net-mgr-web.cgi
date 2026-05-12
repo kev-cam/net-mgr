@@ -11,6 +11,8 @@
 #   /net-mgr?view=lost          devices found by net-find-lost
 #   /net-mgr?view=peers         configured peer net-mgr instances + reachability
 #   /net-mgr?view=status        daemon status: listeners, uptime, clients
+#   /net-mgr?view=wifi-survey   wifi channel-busyness per AP (cached scan)
+#                               (&refresh=1 triggers a fresh scan first)
 #
 # Connects to the manager socket (no DB credentials needed). Apache
 # handles auth + IP restriction via the matching net-mgr.conf snippet.
@@ -93,6 +95,11 @@ if (defined $q{view} && $q{view} eq 'peers') {
 }
 if (defined $q{view} && $q{view} eq 'status') {
     print render_status();
+    $cli->bye;
+    exit 0;
+}
+if (defined $q{view} && $q{view} eq 'wifi-survey') {
+    print render_wifi_survey();
     $cli->bye;
     exit 0;
 }
@@ -572,6 +579,10 @@ sub render_tools {
       whether each is reachable right now.</li>
   <li><a href="?view=status">Status</a> — daemon listeners, uptime,
       connected clients, schema version.</li>
+  <li><a href="?view=wifi-survey">WiFi survey</a> — channel-busyness
+      chart per AP and a recommended channel.  Cached
+      <code>wifi_scan_results</code> by default; click
+      <em>Re-scan</em> on the page to ssh into every AP and refresh.</li>
 </ul>
 HTML
     return wrap_page("Tools — net-mgr", $body, "Tools");
@@ -926,6 +937,172 @@ sub _now_ms {
         return $s * 1000 + $us / 1000;
     }
     return time() * 1000;
+}
+
+sub render_wifi_survey {
+    # Mirror of net-wifi-survey's busyness/recommendation logic so the
+    # web view doesn't need DB credentials — everything comes from
+    # snapshots over the daemon socket.  Refactoring into a shared
+    # module is a TODO once a third consumer shows up.
+
+    # &refresh=1 → ask the daemon to fire net-wifi-survey synchronously,
+    # then re-render with the fresh table.  Old data shows immediately
+    # otherwise.
+    my $refresh_msg;
+    if (($q{refresh} // '') eq '1') {
+        my $reply = eval { $cli->trigger('wifi-survey', wait => 1) };
+        $refresh_msg = $@ ? "trigger failed: $@"
+                          : "scan triggered ($reply)";
+    }
+
+    my $rows = eval { $cli->snapshot(20, 'wifi_scan_results') };
+    my $err  = $@;
+    if ($err) {
+        return wrap_page("WiFi survey — net-mgr",
+            qq{<p style="color:#f55;">snapshot failed: }
+          . escapeHTML($err)
+          . qq{</p><p>Restart the net-mgr daemon after upgrading so the }
+          . qq{<code>wifi_scan_results</code> table is snapshot-able.</p>},
+            "WiFi survey");
+    }
+    $rows ||= [];
+
+    my $aps = eval { $cli->snapshot(21, 'aps') } || [];
+    my %ap_name;
+    for my $a (@$aps) {
+        $ap_name{ lc $a->{mac} } = $a->{ssid} // $a->{mac};
+    }
+    my %own_bssid = map { lc $_->{mac} => 1 } @$aps;
+
+    # Group results by (scanner_mac, scanner_iface).
+    my %by_scanner;
+    for my $r (@$rows) {
+        my $k = lc $r->{scanner_mac} // '?';
+        push @{ $by_scanner{$k}{ $r->{scanner_iface} // '?' } }, $r;
+    }
+
+    my @body;
+    push @body, qq{<p class=meta>}
+              . qq{<a href="?view=wifi-survey&refresh=1">[Re-scan now]</a>}
+              . qq{ — triggers <code>net-wifi-survey</code> on the }
+              . qq{daemon (ssh's to every AP, ~10–20s).  Cached results }
+              . qq{below unless you click that.}
+              . qq{</p>};
+    push @body, qq{<p class=meta>$refresh_msg</p>} if defined $refresh_msg;
+
+    if (!%by_scanner) {
+        push @body, '<p class=note>No wifi_scan_results yet — run a '
+                  . 'scan first.</p>';
+        return wrap_page("WiFi survey — net-mgr",
+                         join("\n", @body), "WiFi survey");
+    }
+
+    for my $mac (sort keys %by_scanner) {
+        my $name = $ap_name{$mac} // $mac;
+        push @body, "<h2>" . escapeHTML($name) . " "
+                  . qq{<span class=src>$mac</span></h2>};
+        for my $iface (sort keys %{ $by_scanner{$mac} }) {
+            my @neighbours = grep { !$own_bssid{ lc $_->{bssid} } }
+                                  @{ $by_scanner{$mac}{$iface} };
+            my %band_votes;
+            $band_votes{ $_->{band} // '' }++ for @neighbours;
+            my ($band) = sort { $band_votes{$b} <=> $band_votes{$a} }
+                              grep { length } keys %band_votes;
+            my ($score, $count, $strongest)
+                = _wifi_busyness(\@neighbours, $band);
+            my @canon = ($band // '') eq '5GHz'
+                ? (36, 40, 44, 48, 149, 153, 157, 161, 165)
+                : (1..13);
+            my %seen = map { $_ => 1 } keys %$score;
+            $seen{$_} = 1 for @canon;
+            my @channels = sort {
+                ($score->{$b} // 0) <=> ($score->{$a} // 0)
+                || $a <=> $b
+            } keys %seen;
+
+            my $reco;
+            if (($band // '') eq '2.4GHz') {
+                ($reco) = sort {
+                    ($score->{$a} // 0) <=> ($score->{$b} // 0)
+                    || $a <=> $b
+                } (1, 6, 11);
+            } else {
+                ($reco) = sort {
+                    ($score->{$a} // 0) <=> ($score->{$b} // 0)
+                } @canon;
+            }
+
+            push @body, qq{<h3>}
+                      . escapeHTML($iface) . " "
+                      . qq{<span class=src>}
+                      . escapeHTML($band // 'unknown band')
+                      . qq{ · } . scalar(@neighbours) . qq{ foreign APs</span></h3>};
+
+            my $max = 0;
+            for my $c (@channels) {
+                my $s = $score->{$c} // 0;
+                $max = $s if $s > $max;
+            }
+            push @body, '<table class=wifi-busy>';
+            push @body, '<tr><th>ch</th><th>busyness</th><th>'
+                      . 'foreign APs</th><th>strongest</th></tr>';
+            for my $c (@channels) {
+                my $s = $score->{$c} // 0;
+                next if $s == 0;
+                my $pct = $max ? int(($s / $max) * 100 + 0.5) : 0;
+                my $cnt = $count->{$c} // 0;
+                my $rmax = $strongest->{$c};
+                my $cell = $cnt > 0
+                    ? sprintf '%d on ch', $cnt
+                    : '<span class=spill>spill</span>';
+                my $sig  = defined $rmax ? "${rmax} dBm" : '—';
+                push @body, sprintf
+                    '<tr><td>%d</td>'
+                  . '<td class=bar><div style="width:%d%%"></div>'
+                  . '<span class=num>%d</span></td>'
+                  . '<td>%s</td><td>%s</td></tr>',
+                    $c, $pct, $s, $cell, escapeHTML($sig);
+            }
+            push @body, '</table>';
+            push @body, sprintf '<p class=reco>recommended: <b>ch %d</b> '
+                              . '(score %d)%s</p>',
+                $reco // 0, $score->{$reco} // 0,
+                (($band // '') eq '2.4GHz' ? ' — quietest of 1/6/11' : '');
+        }
+    }
+
+    return wrap_page("WiFi survey — net-mgr", join("\n", @body),
+                     "WiFi survey");
+}
+
+# Same overlap-weighted busyness model net-wifi-survey uses.  Pure
+# function so the math is testable.
+sub _wifi_busyness {
+    my ($neighbours, $band) = @_;
+    my (%score, %count, %strongest);
+    my ($lo, $hi) = (($band // '') eq '2.4GHz') ? (1, 13) : (1, 999);
+    my $add = sub {
+        my ($c, $w) = @_;
+        return if $c < $lo || $c > $hi;
+        $score{$c} += $w;
+    };
+    for my $n (@$neighbours) {
+        my $ch = $n->{channel} or next;
+        my $r  = defined $n->{rssi_dbm} ? $n->{rssi_dbm} : -95;
+        my $w  = $r - (-95);
+        $w = 0 if $w < 0;
+        $score{$ch} += $w;
+        $count{$ch}++;
+        $strongest{$ch} = $r
+            if !defined $strongest{$ch} || $r > $strongest{$ch};
+        if (($band // '') eq '2.4GHz') {
+            for my $d (1, 2) { $add->($ch + $d, $w * 0.5);
+                               $add->($ch - $d, $w * 0.5); }
+            for my $d (3, 4) { $add->($ch + $d, $w * 0.25);
+                               $add->($ch - $d, $w * 0.25); }
+        }
+    }
+    return (\%score, \%count, \%strongest);
 }
 
 sub render_lost {
@@ -1468,6 +1645,16 @@ table.peers tr.wan-router td.name { box-shadow: inset 4px 0 0 #f44; padding-left
 .up.up-ok      { background: rgba(60, 200, 100, 0.18); color: #cfc; }
 .up.up-fail    { background: rgba(220, 60, 60, 0.22);  color: #fcc; }
 .up.up-unknown { background: rgba(150,150,150,0.18);   color: #ccc; }
+table.wifi-busy { max-width: 720px; font-size: 0.9em; }
+table.wifi-busy td.bar { position: relative; min-width: 220px;
+                         background: #181818; padding: 0; }
+table.wifi-busy td.bar div { background: #2a5a8a; height: 100%;
+                             padding: 4px 0; }
+table.wifi-busy td.bar span.num { position: absolute; right: 6px;
+                                  top: 2px; color: #aaa;
+                                  font-size: 0.85em; }
+.wifi-busy .spill { color: #666; font-style: italic; }
+p.reco { margin: 0.3em 0 1em; color: #6cf; }
 </style>
 </head>
 <body>

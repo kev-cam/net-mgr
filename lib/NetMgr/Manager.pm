@@ -475,6 +475,39 @@ sub _handle_trigger {
         return;
     }
 
+    if ($name eq 'wifi-survey') {
+        # net-wifi-survey ssh's to every AP and runs the channel scan.
+        # The web CGI runs as www-data and has no ssh keys, so it
+        # delegates here — the daemon runs as root with keys available.
+        my $bin = $self->_producer_path('net-wifi-survey');
+        return $self->_send($cli, format_err("net-wifi-survey not found at $bin"))
+            unless -x $bin;
+        my $pid = fork();
+        return $self->_send($cli, format_err("fork: $!"))
+            unless defined $pid;
+        if ($pid == 0) {
+            for my $c (values %{ $self->{clients} }) {
+                close $c->{sock} if $c->{sock};
+            }
+            for my $l (values %{ $self->{listeners} }) {
+                close $l->{sock} if $l->{sock};
+            }
+            $ENV{NET_MGR_LISTEN} = $self->_child_connect_addr;
+            exec $bin;
+            exit 127;
+        }
+        $self->_log("trigger wifi-survey pid=$pid"
+                  . ($wait ? ' (WAIT)' : ''));
+        $self->{triggers}{$pid} = {
+            cli_fd     => ($wait ? fileno($cli->{sock}) : undef),
+            name       => $name,
+            started_at => time(),
+        };
+        $self->_send($cli, format_ok(name => $name, pid => $pid))
+            unless $wait;
+        return;
+    }
+
     if ($name eq 'discover') {
         my $bin = $self->_producer_path('net-discover');
         return $self->_send($cli, format_err("net-discover not found at $bin"))
