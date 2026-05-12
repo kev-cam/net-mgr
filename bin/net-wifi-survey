@@ -570,6 +570,28 @@ sub save_results {
     }
 }
 
+# Persist per-radio current channel.  current_chan is band-keyed; map
+# 2.4GHz→wl0 / 5GHz→wl1 / 6GHz→wl2 to match the same convention
+# parse_scan uses for scanner_iface attribution.
+sub save_radio_state {
+    my ($mac, $current_chan) = @_;
+    return if $no_save;
+    return unless $current_chan && ref $current_chan eq 'HASH';
+    for my $band (keys %$current_chan) {
+        my $iface = $band eq '2.4GHz' ? 'wl0'
+                  : $band eq '5GHz'   ? 'wl1'
+                  : $band eq '6GHz'   ? 'wl2'
+                  :                     undef;
+        next unless defined $iface;
+        $db->upsert_wifi_radio_state(
+            scanner_mac     => $mac,
+            scanner_iface   => $iface,
+            band            => $band,
+            current_channel => $current_chan->{$band},
+        );
+    }
+}
+
 # Build the report for one AP.  Two views per radio:
 #   * busyness  — score per channel sorted busiest→quietest, with a
 #                 simple bar chart so 'where to move' is obvious
@@ -701,6 +723,7 @@ if ($from_db) {
     # Persist after all children come back.
     for my $mac (keys %results_by_mac) {
         save_results($results_by_mac{$mac}{results});
+        save_radio_state($mac, $results_by_mac{$mac}{current_chan});
     }
 }
 

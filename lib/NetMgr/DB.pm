@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 17;
+our $SCHEMA_VERSION = 18;
 
 sub new {
     my ($class, %args) = @_;
@@ -432,6 +432,22 @@ CREATE TABLE IF NOT EXISTS wifi_scan_results (
     KEY idx_bssid     (bssid),
     KEY idx_channel   (channel),
     KEY idx_last_seen (last_seen)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
+    if ($v == 18) {
+        # wifi_radio_state: current channel per (scanner_mac, scanner_iface).
+        # Populated by net-wifi-survey alongside the foreign-AP scan.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS wifi_radio_state (
+    scanner_mac     CHAR(17)    NOT NULL,
+    scanner_iface   VARCHAR(16) NOT NULL,
+    band            VARCHAR(8),
+    current_channel INT,
+    updated_at      DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (scanner_mac, scanner_iface)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
         return;
@@ -1396,6 +1412,29 @@ sub delete_audit_annotation {
     );
 }
 
+sub upsert_wifi_radio_state {
+    my ($self, %f) = @_;
+    croak "scanner_mac, scanner_iface required"
+        unless defined $f{scanner_mac} && defined $f{scanner_iface};
+    $f{scanner_mac} = lc $f{scanner_mac};
+    $self->{dbh}->do(
+        "INSERT INTO wifi_radio_state
+            (scanner_mac, scanner_iface, band, current_channel)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            band            = COALESCE(VALUES(band),            band),
+            current_channel = COALESCE(VALUES(current_channel), current_channel)",
+        undef,
+        $f{scanner_mac}, $f{scanner_iface},
+        $f{band}, $f{current_channel},
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM wifi_radio_state
+          WHERE scanner_mac = ? AND scanner_iface = ?",
+        undef, $f{scanner_mac}, $f{scanner_iface}
+    );
+}
+
 sub upsert_wifi_scan_result {
     my ($self, %f) = @_;
     croak "scanner_mac, scanner_iface, bssid required"
@@ -1436,7 +1475,7 @@ sub query_table {
         subnet_routers friendly_names wifi_sockets lost_devices
         peers uplinks forwarding_rules
         zone_classes interface_zones wifi_zones
-        audit_annotations wifi_scan_results
+        audit_annotations wifi_scan_results wifi_radio_state
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};

@@ -984,6 +984,17 @@ sub render_wifi_survey {
         $ap_ip{ lc $a->{mac} } //= $a->{addr};
     }
 
+    # Current radio channel per (scanner_mac, scanner_iface) — populated
+    # by net-wifi-survey at scan time.  Lets the recommendation line
+    # show the same 'currently ch X — strong improvement -NN%' verdict
+    # the CLI prints.  Empty hash if the daemon is older than schema v18.
+    my $radio_state = eval { $cli->snapshot(23, 'wifi_radio_state') } || [];
+    my %current_ch;     # (mac, iface) → channel
+    for my $r (@$radio_state) {
+        $current_ch{ lc $r->{scanner_mac} }{ $r->{scanner_iface} }
+            = $r->{current_channel};
+    }
+
     # Group results by (scanner_mac, scanner_iface).
     my %by_scanner;
     for my $r (@$rows) {
@@ -1076,21 +1087,62 @@ sub render_wifi_survey {
             push @body, '</table>';
             # Recommended channel — hyperlink to the DD-WRT
             # Wireless_Basic.asp page on the AP so a click takes you
-            # straight to the channel dropdown.  Opens in a new tab
-            # since the admin UI prompts for basic-auth and lives on
-            # the AP's own IP (not the net-mgr web host).
+            # straight to the channel dropdown.  HTTPS only (DD-WRT
+            # accepts a self-signed cert; the browser prompt is one
+            # click).  Opens in a new tab — the admin UI is on the
+            # AP's own IP and has its own basic-auth.
             my $ip = $ap_ip{$mac};
             my $reco_html = sprintf '<b>ch %d</b>', $reco // 0;
             if (defined $ip && length $ip) {
                 $reco_html = sprintf
-                    '<a href="http://%s/Wireless_Basic.asp" target="_blank" '
+                    '<a href="https://%s/Wireless_Basic.asp" target="_blank" '
                   . 'rel="noopener">%s</a>',
                     escapeHTML($ip), $reco_html;
             }
+
+            # Verdict on whether moving is worth it.  Same rubric as
+            # the CLI: strong / moderate / marginal / no benefit /
+            # already on it.  Computed from current vs recommended
+            # score where 'current' comes from wifi_radio_state.
+            my $cur = $current_ch{$mac}{$iface};
+            my $reco_score = $score->{$reco // 0} // 0;
+            my $verdict_html = '';
+            if (defined $cur) {
+                my $cur_score = $score->{$cur} // 0;
+                my ($verdict, $cls);
+                if ($cur == ($reco // -1)) {
+                    $verdict = 'already on it';     $cls = 'ok';
+                }
+                elsif ($cur_score <= $reco_score) {
+                    $verdict = 'no benefit';        $cls = 'ok';
+                } else {
+                    my $drop = ($cur_score - $reco_score) / $cur_score;
+                    if ($drop >= 0.5) {
+                        $verdict = sprintf 'strong improvement −%d%%',
+                                            $drop * 100;
+                        $cls = 'strong';
+                    } elsif ($drop >= 0.25) {
+                        $verdict = sprintf 'moderate −%d%%', $drop * 100;
+                        $cls = 'moderate';
+                    } else {
+                        $verdict = sprintf 'marginal −%d%%', $drop * 100;
+                        $cls = 'marginal';
+                    }
+                }
+                # Render — minus sign as a real Unicode − for the
+                # non-ascii ones above.
+                $verdict =~ s/\\u2212/\x{2212}/g;
+                $verdict_html = sprintf
+                    '; currently <b>ch %d</b> (score %d) '
+                  . '— <span class="verdict %s">%s</span>',
+                    $cur, $cur_score, $cls, escapeHTML($verdict);
+            }
+
             push @body, sprintf '<p class=reco>recommended: %s '
-                              . '(score %d)%s</p>',
-                $reco_html, $score->{$reco} // 0,
-                (($band // '') eq '2.4GHz' ? ' — quietest of 1/6/11' : '');
+                              . '(score %d)%s%s</p>',
+                $reco_html, $reco_score,
+                (($band // '') eq '2.4GHz' ? ' [quietest of 1/6/11]' : ''),
+                $verdict_html;
         }
     }
 
@@ -1678,6 +1730,11 @@ table.wifi-busy td.bar span.num { position: absolute; right: 6px;
                                   font-size: 0.85em; }
 .wifi-busy .spill { color: #666; font-style: italic; }
 p.reco { margin: 0.3em 0 1em; color: #6cf; }
+span.verdict { padding: 0 6px; border-radius: 3px; font-size: 0.9em; }
+span.verdict.strong   { background: rgba(220, 60, 60, 0.22);   color: #fcc; }
+span.verdict.moderate { background: rgba(220, 200, 60, 0.18);  color: #ffc; }
+span.verdict.marginal { background: rgba(150, 150, 150, 0.18); color: #ccc; }
+span.verdict.ok       { background: rgba(60, 200, 100, 0.18);  color: #cfc; }
 </style>
 </head>
 <body>

@@ -409,4 +409,19 @@ CREATE TABLE IF NOT EXISTS wifi_scan_results (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 INSERT IGNORE INTO schema_version (version) VALUES (16);
+-- Current radio-channel state per AP / per radio.  Populated by
+-- net-wifi-survey alongside the foreign-AP scan results.  Lets the
+-- web view (and any other consumer) compute 'current ch X vs
+-- recommended ch Y' verdicts without reading nvram live.
+CREATE TABLE IF NOT EXISTS wifi_radio_state (
+    scanner_mac     CHAR(17)    NOT NULL,
+    scanner_iface   VARCHAR(16) NOT NULL,
+    band            VARCHAR(8),
+    current_channel INT,
+    updated_at      DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (scanner_mac, scanner_iface)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 INSERT IGNORE INTO schema_version (version) VALUES (17);
+INSERT IGNORE INTO schema_version (version) VALUES (18);
