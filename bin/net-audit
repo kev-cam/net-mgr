@@ -315,14 +315,21 @@ sub zone_for_addr {
     my ($host, $addr, $iface_zones) = @_;
     return 'Loopback' if $addr eq 'localhost' || $addr =~ /^127\./;
     return 'Link'     if $addr =~ /^169\.254\./;
-    # interface_zones lookup
+    return 'Internet' unless $addr =~ /^\d+\.\d+\.\d+\.\d+\z/;
+
+    # A CIDR's class is a property of the CIDR, not of which firewall
+    # mentioned it first.  Walk every interface_zones row and accept
+    # the first cidr-contains match; prefer rows scoped to this host
+    # over generic ones when both exist for the same CIDR, but don't
+    # require a host match — a DMZ tag on gateway3 should make every
+    # firewall report 192.168.15.0/24 as DMZ.
+    my $any_match;
     for my $z (@$iface_zones) {
-        next unless ($z->{host} // '') eq $host || ($z->{host} // '') eq '';
-        next unless $addr =~ /^\d+\.\d+\.\d+\.\d+\z/;
-        if (cidr_contains($z->{cidr}, $addr)) {
-            return $z->{zone_class};
-        }
+        next unless cidr_contains($z->{cidr}, $addr);
+        return $z->{zone_class} if ($z->{host} // '') eq $host;
+        $any_match //= $z->{zone_class};
     }
+    return $any_match if defined $any_match;
     return 'Private' if rfc1918($addr);
     return 'Internet';   # includes '*' and any non-RFC1918 literal
 }
