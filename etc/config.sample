@@ -13,7 +13,12 @@
 #   listen = 192.168.15.1, 127.0.0.1       # multiple, default port 7531
 #   listen = 0.0.0.0:7531                  # legacy "everything" bind
 listen = auto
-log    = /var/log/net-mgr.log
+# log = /var/log/net-mgr.log
+#   Honored only when the daemon runs WITHOUT --foreground. The
+#   shipped systemd unit always passes --foreground and routes
+#   STDERR to the journal (StandardError=journal), so under systemd
+#   this option is ignored. Set it when running by hand without a
+#   service manager.
 # Mark an interface offline if last_seen is older than this. Combine
 # with [scheduling] presence / scan-ap to keep `online` honest.
 offline_after = 300s
@@ -24,28 +29,12 @@ defaults = /root/.my.cnf
 section  = net-mgr
 
 [scanner]
-# 'auto' = walk UP wired/wifi interfaces (eth*, en*, wl*) and include
-# any 192.168.x.0/24 they sit on. Or comma-separated CIDRs.
-networks          = auto
-
-# fping/ip-neigh sweep of known IPs:
+# fping/ip-neigh sweep of known IPs (the periodic 'presence' trigger
+# in [scheduling] uses this).
 presence_interval = 90s
-# Full nmap discovery sweep (once we know things are there, infrequent):
-discover_interval = 24h
-# Re-probe ports of known hosts to catch newly opened services:
-reprobe_ports     = 7d
-
-[ap_poll]
-interval    = 60s
-ssh_timeout = 10s
-
-[timeouts]
-# How long since the last observation from a given source before the
-# manager considers the device offline w.r.t. that source.
-ap    = 120s
-fping = 180s
-nmap  = 24h
-dhcp  = lease     # special: use the lease's own expiry
+# dnsmasq event-socket auto-discovery (Manager._check_dnsmasq_listeners):
+# dnsmasq_event_port           = 7532
+# dnsmasq_event_check_interval = 60
 
 [paths]
 dnsmasq_conf_glob = /usr/local/sgy/conf.d/dnsmasq-*
@@ -105,3 +94,15 @@ domain   = grfx.com
 # scan-ap  = 60s
 # presence = 90s
 # discover = 24h
+
+# Backend + authorisation for the FORWARD/UNFORWARD verbs used by
+# net-connect. By default only loopback peers (127.0.0.1) may install
+# port forwards — that's right when the laptop's ssh tunnel terminates
+# on the daemon host. When the daemon lives on a different host than
+# the ssh entry-point (e.g. log into zmc1, daemon is on nas3, the
+# laptop's tunnel is `-L 7531:nas3:7531 user@zmc1`), connections to
+# the daemon come from the entry-point's LAN IP, not loopback. Permit
+# them with allow_peers (CSV/whitespace, CIDR or bare IP).
+[forward]
+# method      = auto              # auto | iptables | socat
+# allow_peers = 192.168.0.0/16
