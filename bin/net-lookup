@@ -1,13 +1,22 @@
 #!/usr/bin/perl
-# net-lookup — regex name → best IP, picked from this caller's POV.
+# net-lookup — regex name → best IP, picked from this caller's POV;
+# also reverse: if the argument parses as an IPv4 or IPv6 address,
+# returns the host's name(s).
 #
 # Usage:
-#   net-lookup [--all] [--family v4|v6] [--listen HOST:PORT] <name-regex>
+#   net-lookup [--all] [--family v4|v6] [--listen HOST:PORT] <name-regex|IP>
 #
-# The pattern is a Perl regex; net-lookup wraps it as ^(?:...)$ before
-# matching, so 'nas3(|-.*)' matches nas3, nas3-up, nas3-down, nas3-dwn2.
-# Names searched: machines.primary_name, friendly_names, hostnames,
-# aliases.
+# Forward (name → IP): the pattern is a Perl regex; net-lookup wraps
+# it as ^(?:...)$ before matching, so 'nas3(|-.*)' matches nas3,
+# nas3-up, nas3-down, nas3-dwn2. Names searched:
+# machines.primary_name, friendly_names, hostnames, aliases.
+#
+# Reverse (IP → name): when the argument is a valid v4 or v6 address,
+# net-lookup looks it up in the addresses table, follows the MAC into
+# interfaces.machine_id, and prints machines.primary_name (default)
+# or every name we know for that machine (with --all). --family is
+# inferred from the input. Paper-only addresses are honored on
+# reverse — the user typed the IP explicitly.
 #
 # Each candidate IP is scored by routing closeness to this host:
 #   2  = same /24 as one of our interface addresses (direct L2)
@@ -26,6 +35,7 @@ use warnings;
 use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
+use Socket qw(inet_pton inet_ntop AF_INET AF_INET6);
 
 use NetMgr::Client;
 
@@ -47,6 +57,14 @@ usage(0) if $help;
 usage(2) if @ARGV != 1;
 
 my $pattern = $ARGV[0];
+
+# If the argument parses as a v4 or v6 address, switch to the reverse
+# branch: addresses → interfaces → machines → name(s). Returns and
+# exits from inside; never falls through.
+if (my ($fam, $canon) = _parse_ip($pattern)) {
+    do_reverse($fam, $canon);
+}
+
 my $rx = eval { qr/^(?:$pattern)$/ };
 die "bad regex '$pattern': $@\n" if $@;
 
@@ -167,6 +185,95 @@ sub _ping_ok {
     return system("ping -c 1 -W 1 -q -n $ip >/dev/null 2>&1") == 0;
 }
 
+# --- reverse lookup -------------------------------------------------
+
+# Returns (family, canonical-string) for v4 or v6, or empty list if
+# the input isn't an IP address. Canonicalising via inet_ntop lets us
+# compare across cosmetic differences ('::1' vs '0:0:...:1', upper vs
+# lower hex, leading zeros).
+sub _parse_ip {
+    my ($s) = @_;
+    return unless defined $s && length $s;
+    if (my $bin = inet_pton(AF_INET, $s)) {
+        return ('v4', inet_ntop(AF_INET, $bin));
+    }
+    if (my $bin = inet_pton(AF_INET6, $s)) {
+        return ('v6', inet_ntop(AF_INET6, $bin));
+    }
+    return;
+}
+
+sub do_reverse {
+    my ($fam, $canon) = @_;
+    my $af = $fam eq 'v4' ? AF_INET : AF_INET6;
+
+    my $cli = NetMgr::Client->new(listen => $listen, timeout => 5);
+    $cli->hello(consumer => "net-lookup.$$");
+    my $addresses = $cli->snapshot(1, 'addresses', where => "family = '$fam'");
+    my $ifaces    = $cli->snapshot(2, 'interfaces');
+    my $machines  = $cli->snapshot(3, 'machines');
+    my ($hostnames, $friendly, $aliases);
+    if ($all) {
+        $hostnames = $cli->snapshot(4, 'hostnames');
+        $friendly  = $cli->snapshot(5, 'friendly_names');
+        $aliases   = $cli->snapshot(6, 'aliases');
+    }
+    $cli->bye;
+
+    # MACs that own this address.
+    my %macs;
+    for my $a (@$addresses) {
+        next unless defined $a->{addr} && defined $a->{mac};
+        my $bin = inet_pton($af, $a->{addr}) or next;
+        $macs{ $a->{mac} } = 1
+            if inet_ntop($af, $bin) eq $canon;
+    }
+    exit 1 unless %macs;
+
+    # Machine ids those MACs belong to.
+    my %mids;
+    for my $i (@$ifaces) {
+        next unless defined $i->{mac} && defined $i->{machine_id}
+                                      && length $i->{machine_id};
+        $mids{ $i->{machine_id} } = 1 if $macs{ $i->{mac} };
+    }
+    exit 1 unless %mids;
+
+    if (!$all) {
+        # Default: one canonical name. Prefer machines.primary_name;
+        # fall back to nothing else (machines.primary_name is the
+        # canonical-name field; if it's empty the host doesn't have
+        # one and the caller should use --all to see alternates).
+        for my $m (@$machines) {
+            next unless defined $m->{id} && $mids{ $m->{id} };
+            next unless defined $m->{primary_name} && length $m->{primary_name};
+            print "$m->{primary_name}\n";
+            exit 0;
+        }
+        exit 1;
+    }
+
+    # --all: every name we know for any matching machine, deduped,
+    # primary_names first, then hostnames/friendly/aliases.
+    my @names;
+    for my $m (@$machines) {
+        next unless defined $m->{id} && $mids{ $m->{id} };
+        push @names, $m->{primary_name}
+            if defined $m->{primary_name} && length $m->{primary_name};
+    }
+    for my $row (@$hostnames, @$friendly, @$aliases) {
+        my $mid = $row->{machine_id};
+        next unless defined $mid && $mids{$mid};
+        push @names, $row->{name}
+            if defined $row->{name} && length $row->{name};
+    }
+    my %seen;
+    @names = grep { !$seen{$_}++ } @names;
+    exit 1 unless @names;
+    print "$_\n" for @names;
+    exit 0;
+}
+
 # --- helpers --------------------------------------------------------
 
 sub _ip2int {
@@ -221,13 +328,14 @@ sub _has_route {
 sub usage {
     my ($code) = @_;
     print <<USAGE;
-net-lookup — resolve a regex name to the best IP for this caller.
+net-lookup — resolve a regex name to the best IP for this caller, or
+            an IP to its host name.
 
 Usage:
   net-lookup [--all] [--verify] [--include-stale]
-             [--family v4|v6] [--listen HOST:PORT] <name-regex>
+             [--family v4|v6] [--listen HOST:PORT] <name-regex|IP>
 
-Examples:
+Forward (name → IP):
   net-lookup nas3                      # exact name
   net-lookup 'nas3(|-.*)'              # nas3, nas3-up, nas3-down, nas3-dwn2
   net-lookup --all 'wndr.*'            # every IP for every wndr-* host
@@ -250,6 +358,17 @@ dhcp.master config but never actually seen on the wire) are excluded.
 those that respond. Without --all, it stops at the first responder.
 
 Default prints one IP. --all prints every match, best-scored first.
+
+Reverse (IP → name):
+  net-lookup 192.168.15.104            # primary_name for that machine
+  net-lookup --all 192.168.15.104      # every name we know for it
+  net-lookup 2001:db8::1               # IPv6 works the same way
+
+Family is inferred from the input. The address is canonicalised with
+inet_pton/inet_ntop so '::1' and '0:0:...:1' compare equal. Reverse
+ignores --include-stale and --verify (the user typed the IP directly,
+so we resolve regardless of liveness signal).
+
 Exit 0 = found · 1 = no match · 2 = bad args.
 USAGE
     exit($code // 0);
