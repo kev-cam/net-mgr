@@ -70,6 +70,12 @@ use Getopt::Long qw(:config no_ignore_case bundling);
 use IO::Socket::INET;
 use POSIX qw(:sys_wait_h);
 
+# Autoflush so the picker prompt is visible immediately even when
+# STDOUT/STDERR are piped (e.g. into 'tee', or just under Cygwin's
+# console layer where fully-buffered output otherwise stalls).
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+
 use NetMgr::Client;
 
 # ---- args -----------------------------------------------------------
