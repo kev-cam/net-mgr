@@ -106,6 +106,59 @@ net-roam --dry-run --verbose    # what would be kicked
 net-roam                        # do it
 .RE
 .fi
+.SH PROTOCOL VERBS
+The daemon speaks a line-based protocol on its TCP socket. Verbs
+clients can send:
+.TP
+.B HELLO source=NAME | consumer=NAME
+Register the kind of client (producer or consumer) before any other
+verb.
+.TP
+.B OBSERVE \fIk=v ...\fR
+Producer pushes one observation. The daemon UPSERTs the row and
+emits a stream event.
+.TP
+.B GONE \fIk=v ...\fR
+Producer signals a known item disappeared.
+.TP
+.B SUBSCRIBE sub=N mode=\fIM\fR FROM \fItable\fR [WHERE \fIexpr\fR]
+Consumer subscribes (snapshot, stream, or both) to a table.
+.TP
+.B UNSUB sub=N
+Cancel a subscription early; otherwise it ends when the connection
+closes.
+.TP
+.B TRIGGER \fIname\fR [WAIT]
+Async kick of a named producer (e.g.
+.IR scan-ap ", " presence ).
+.TP
+.B POLL \fIname\fR [\fIk=v ...\fR]
+Sync RPC: server runs a whitelisted local probe and returns its
+output base64-encoded.
+.TP
+.B STATUS
+Daemon state: started_at, listeners, client counts, schema version.
+.TP
+.B FORWARD slot=PORT target=IP:PORT
+Install a port forward from the daemon-host's loopback:PORT to the
+LAN target. Backend is iptables OUTPUT-chain DNAT (default when
+running as root) or
+.B socat
+(non-root fallback).
+.B [forward] method
+in the config pins the choice.
+The forward lives for the duration of this connection \(em the
+daemon GCs it on disconnect. Authorisation defaults to loopback
+peers (127.0.0.1) only; for off-host clients add CIDRs to
+.BR "[forward] allow_peers" .
+Used by
+.BR net-connect (1).
+.TP
+.B UNFORWARD slot=PORT
+Release a forward early.
+.TP
+.B BYE
+Clean disconnect.
 .SH WEB UI
 .B net-mgr-web.cgi
 is an Apache CGI that renders the machine inventory as an HTML table
@@ -146,6 +199,7 @@ Daemon log.
 Per-tool state caches (AP poll backoff, fingerprint results).
 .SH SEE ALSO
 .BR net-alias (1),
+.BR net-connect (1),
 .BR net-discover (1),
 .BR net-fix (1),
 .BR net-import-dhcp (1),
