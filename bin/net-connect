@@ -109,11 +109,21 @@ usage(0) if $help;
 
 @forward_names = split /,/, join(',', @forward_names);
 
-# Filter and (optionally) user@host are positional.
+# Filter and (optionally) login are positional. The login can be any
+# of these forms:
+#   - user@host         (always recognised by the literal '@')
+#   - Host alias        (matches a Host entry in ~/.ssh/config; ssh
+#                         then handles User/Port/ProxyJump itself)
+# Anything that doesn't look like a login becomes the filter regex.
+# Existing alias names take precedence over filters that happen to
+# share the same string — to disambiguate, pass --login explicitly.
 my ($filter_arg, $cli_login);
+my %ssh_aliases = ssh_config_hosts();
 for my $arg (@ARGV) {
-    if ($arg =~ /\@/) { $cli_login = $arg }
-    else              { $filter_arg = $arg }
+    if    ($arg =~ /\@/)          { $cli_login = $arg }
+    elsif (!defined $cli_login
+        && $ssh_aliases{$arg})    { $cli_login = $arg }
+    else                          { $filter_arg = $arg }
 }
 $login = $cli_login if defined $cli_login;
 
@@ -646,6 +656,32 @@ sub which {
         return $p if -x $p;
     }
     return undef;
+}
+
+# Best-effort parse of ssh_config Host entries. Returns a hash of
+# concrete (non-wildcard) aliases the user has defined, so the
+# positional-arg parser can recognise `net-connect gateway` as a
+# login when 'gateway' is in ~/.ssh/config. Doesn't follow Include
+# directives — that's a known limitation; pass --login if you need
+# an alias from an included file.
+sub ssh_config_hosts {
+    my %hosts;
+    for my $f ("$ENV{HOME}/.ssh/config", "/etc/ssh/ssh_config") {
+        next unless defined $f && -r $f;
+        open my $fh, '<', $f or next;
+        while (my $line = <$fh>) {
+            $line =~ s/[\r\n]+\z//;
+            $line =~ s/^\s+//; $line =~ s/\s+$//;
+            $line =~ s/\s*#.*//;
+            next unless $line =~ /^Host\s+(.+)$/i;
+            for my $h (split /\s+/, $1) {
+                next if $h eq '' || $h =~ /[*?]/ || $h =~ /^!/;
+                $hosts{$h} = 1;
+            }
+        }
+        close $fh;
+    }
+    return %hosts;
 }
 
 # Bourne-shell single-quote a string. ssh forwards a single string

@@ -72,7 +72,14 @@ or whatever
 in the config file says.
 .TP
 \fB\-\-login\fR \fIuser@host\fR
-ssh login (also accepted as a positional argument).
+ssh login. Also accepted as a positional argument. Either
+.IR user@host ,
+or a bare
+.I Host
+alias from
+.B ~/.ssh/config
+(in which case ssh fills in User/Port/ProxyJump from its own config
+and the laptop side just uses the alias as the ControlPath key).
 .TP
 .BR \-P ", " \-\-port " " \fIPORT\fR
 ssh port.
@@ -233,6 +240,17 @@ List VNC sessions known to the daemon on
 .RS 4
 .nf
 .B net-connect wdkc@gateway.grfx.com
+.fi
+.RE
+.PP
+Same, using a
+.B Host
+alias from
+.B ~/.ssh/config
+(ssh handles user/port/jump):
+.RS 4
+.nf
+.B net-connect gateway
 .fi
 .RE
 .PP
