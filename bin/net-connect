@@ -3,152 +3,901 @@
 # Xpra, and named (IMAP/SMTP/...) sessions through a single ssh
 # tunnel.
 #
-# This commit ships the --list mode only — invoked over ssh on a
-# net-mgr-equipped host (the daemon host, which may or may not be
-# the same machine the laptop ssh's into; see PR description). It
-# snapshots the ports table and emits TSV rows, one per
-# (machine, ip, port):
+# This script wears two hats. Same binary, mode picked by --list:
 #
-#   PROTO  HOSTNAME       IP              PORT  SERVICE-LABEL  LAST-SEEN
+# REMOTE MODE:  net-connect --list [filter-regex] [--listen HOST[:PORT]] [--all]
+#   Run on a net-mgr-equipped host (typically the daemon host),
+#   usually invoked over ssh by the laptop side. Snapshots the
+#   ports table and emits TSV rows, one per (machine, ip, port):
+#       PROTO  HOSTNAME  IP  PORT  SERVICE-LABEL  LAST-SEEN
 #
-# PROTO is 'vnc' or 'xpra' (heuristically classified from service
-# name + port number). HOSTNAME is machines.primary_name.
-# SERVICE-LABEL is the raw 'service' string from the ports table
-# (or '-' if unknown). LAST-SEEN is the ports.last_seen timestamp.
+# LAPTOP MODE: net-connect [opts] [filter] [user@host]
+#   Opens (or reuses) one ssh ControlMaster connection to the login
+#   host, with a `-L` for the daemon port and one `-L` per slot in
+#   the pool. Talks to the net-mgr daemon over the tunnel.
 #
-# Usage:
-#   net-connect --list [filter-regex] [--listen HOST[:PORT]] [--all]
+#   - default: print the available targets (filter narrows by name)
+#   - --pick:  enter a persistent picker TUI; launching a session
+#              forks a viewer locally and asks the daemon to wire
+#              that slot to the chosen target with FORWARD. The TUI
+#              keeps running so multiple concurrent sessions are
+#              normal.
+#   - --yes:   if the filter narrows to exactly one match, auto-
+#              launch it and enter the TUI; otherwise just enter
+#              the TUI like --pick.
+#   - --forward NAME[,NAME...]: activate named forwards from
+#              [forward.NAME] config (e.g. 'imap', 'smtp') for the
+#              lifetime of the session. They live alongside picker
+#              slots in the same ssh tunnel.
 #
-# filter-regex matches against HOSTNAME (anchored as ^(?:...)$). With
-# no filter, every (vnc|xpra) entry is emitted. --all loosens the
-# port heuristics to include anything in the wider scan ranges even
-# without a recognised service name (useful for Xpra on non-default
-# ports).
+# Cleanup: on quit or signal, every active slot's FORWARD is dropped
+# (daemon also GCs them on disconnect as a safety net), every viewer
+# child gets SIGTERM, and the ssh control master is closed via
+# `ssh -O exit`.
 #
-# The laptop-side picker / TUI / viewer-launching modes land in a
-# follow-up commit; without --list the script currently just prints
-# usage.
+# CONFIG (~/.net-connect.conf):
+#   login        = wdkc@gateway.grfx.com    # default user@host
+#   port         = 80                       # default ssh port
+#   daemon       = nas3.grfx.com[:7531]     # daemon addr from
+#                                           #   login-host's POV
+#                                           #   (default: 127.0.0.1)
+#   proxy_jump   = wdkc@zmc1.grfx.com       # optional: ssh -J
+#   pool         = 5900-5909                # picker slot port range
+#   socket_dir   = /tmp                     # ControlPath dir
 #
-# Selection criteria (any of):
-#   - service LIKE '%vnc%' or in {rfb, x11vnc, vino}
-#   - service LIKE '%xpra%'
-#   - port in 5900-5999 (VNC display range)
-#   - port in 14500-15000 (typical Xpra range)
+#   [forward.imap]
+#   target = nas3:143                       # host:port (daemon POV)
+#   local  = 1143                           # laptop-side local port
 #
-# Exits 0 even if zero rows match — the picker treats empty output
-# as "no sessions". Non-zero exit is reserved for daemon-connect
-# failure.
+#   [viewer.vnc]
+#   cmd = cygstart -w "C:\Program Files\TigerVNC\vncviewer.exe" localhost::%PORT%
+#
+#   [viewer.xpra]
+#   cmd = xpra attach tcp://localhost:%PORT%/
+#
+# Exit codes:
+#   0 ok / clean exit
+#   1 no target matched (default mode with filter)
+#   2 bad args / config
+#   3 ssh control master failure
+#   4 daemon connection failure
 
 use strict;
 use warnings;
 use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
+use IO::Socket::INET;
+use POSIX qw(:sys_wait_h);
 
 use NetMgr::Client;
 
-my $listen;
+# ---- args -----------------------------------------------------------
+
+my ($list_mode, $pick_mode, $yes_mode, $help, $verbose, $dry_run);
+my ($daemon, $login, $ssh_port, $proxy_jump);
+my ($pool_spec, $socket_dir, $config_path);
+my $listen;       # --list only
 my $include_loose;
-my $list_mode;
-my $help;
+my @forward_names;
+
 GetOptions(
-    'list|l'   => \$list_mode,
-    'listen=s' => \$listen,
-    'all|a'    => \$include_loose,
-    'help|h'   => \$help,
+    'list|l'        => \$list_mode,
+    'pick|p'        => \$pick_mode,
+    'yes|y'         => \$yes_mode,
+    'forward=s'     => \@forward_names,
+    'daemon=s'      => \$daemon,
+    'login=s'       => \$login,
+    'port|P=i'      => \$ssh_port,
+    'jump|J=s'      => \$proxy_jump,
+    'pool=s'        => \$pool_spec,
+    'socket-dir=s'  => \$socket_dir,
+    'config=s'      => \$config_path,
+    'listen=s'      => \$listen,
+    'all|a'         => \$include_loose,
+    'verbose|v'     => \$verbose,
+    'dry-run|n'     => \$dry_run,
+    'help|h'        => \$help,
 ) or usage(2);
 usage(0) if $help;
-usage(0) unless $list_mode;       # other modes land in the follow-up
 
-my $filter_re;
-if (@ARGV) {
-    my $pat = shift @ARGV;
-    usage(2) if @ARGV;       # at most one filter
-    $filter_re = eval { qr/^(?:$pat)$/ };
-    die "bad filter regex '$pat': $@\n" if $@;
+@forward_names = split /,/, join(',', @forward_names);
+
+# Filter and (optionally) user@host are positional.
+my ($filter_arg, $cli_login);
+for my $arg (@ARGV) {
+    if ($arg =~ /\@/) { $cli_login = $arg }
+    else              { $filter_arg = $arg }
+}
+$login = $cli_login if defined $cli_login;
+
+# ---- dispatch -------------------------------------------------------
+
+if ($list_mode) {
+    do_list($filter_arg);
+    exit 0;
 }
 
-my %args;
-$args{listen} = $listen if defined $listen;
-my $cli = NetMgr::Client->new(%args, timeout => 5);
-$cli->hello(consumer => "net-connect-list.$$");
+# Laptop mode from here down.
+my $cfg = load_config($config_path);
+$login      //= $cfg->{login};
+$ssh_port   //= $cfg->{port};
+$daemon     //= $cfg->{daemon};
+$proxy_jump //= $cfg->{proxy_jump};
+$pool_spec  //= $cfg->{pool} // '5900-5909';
+$socket_dir //= $cfg->{socket_dir} // '/tmp';
 
-my $machines  = $cli->snapshot(1, 'machines');
-my $ifaces    = $cli->snapshot(2, 'interfaces');
-my $addresses = $cli->snapshot(3, 'addresses',
-                               where => "family = 'v4' AND last_observed IS NOT NULL");
-my $ports     = $cli->snapshot(4, 'ports', where => "proto = 'tcp'");
-$cli->bye;
+defined $login or die "net-connect: no login configured (pass user\@host or set 'login = ...' in ~/.net-connect.conf)\n";
 
-# Index by mac.
-my %name_by_mid = map { $_->{id} => $_->{primary_name} }
-                  grep { defined $_->{id} && defined $_->{primary_name} }
-                  @$machines;
-my %mid_by_mac;
-for my $i (@$ifaces) {
-    next unless defined $i->{mac} && defined $i->{machine_id}
-                                  && length $i->{machine_id};
-    $mid_by_mac{ lc $i->{mac} } = $i->{machine_id};
-}
-my %ips_by_mac;
-for my $a (@$addresses) {
-    next unless $a->{mac} && $a->{addr};
-    push @{ $ips_by_mac{ lc $a->{mac} } }, $a->{addr};
+my @pool_ports = parse_pool($pool_spec);
+@pool_ports or die "net-connect: empty pool '$pool_spec'\n";
+
+# Resolve daemon to a ($host, $port) pair from the login-host's POV.
+my ($daemon_host, $daemon_port);
+if (defined $daemon && length $daemon) {
+    if ($daemon =~ /^([^:]+)(?::(\d+))?$/) {
+        ($daemon_host, $daemon_port) = ($1, $2 // 7531);
+    } else {
+        die "net-connect: bad --daemon '$daemon'\n";
+    }
+} else {
+    ($daemon_host, $daemon_port) = ('127.0.0.1', 7531);
 }
 
-# Walk ports, classify, emit.
-for my $p (sort {
-    ($name_by_mid{ $mid_by_mac{ lc $a->{mac} } // 0 } // '') cmp
-    ($name_by_mid{ $mid_by_mac{ lc $b->{mac} } // 0 } // '')
-    || ($a->{port} // 0) <=> ($b->{port} // 0)
-} @$ports) {
-    my ($proto, $kind) = _classify($p);
-    next unless defined $proto;
+# Allocate a free local port for the daemon tunnel + verify the pool
+# ports are free on the laptop.
+my $daemon_local = pick_free_local_port();
+my @pool_busy = grep { !is_local_port_free($_) } @pool_ports;
+if (@pool_busy) {
+    die "net-connect: pool ports already in use locally: @pool_busy\n"
+      . " (free them or set a different 'pool = LO-HI' in ~/.net-connect.conf)\n";
+}
 
-    my $mid  = $mid_by_mac{ lc $p->{mac} } // next;
-    my $name = $name_by_mid{$mid} // next;
-    next if $filter_re && $name !~ $filter_re;
-    my $ips  = $ips_by_mac{ lc $p->{mac} } || [];
-    next unless @$ips;
+vlog("login=$login daemon=$daemon_host:$daemon_port (local $daemon_local)"
+   . " pool=" . join(',', @pool_ports)
+   . (@forward_names ? " forwards=" . join(',', @forward_names) : ''));
 
-    my $svc = (defined $p->{service} && length $p->{service})
-              ? $p->{service} : '-';
-    my $seen = $p->{last_seen} // '-';
-    for my $ip (@$ips) {
-        printf "%s\t%s\t%s\t%d\t%s\t%s\n",
-            $proto, $name, $ip, $p->{port}, $svc, $seen;
+# Build named-forward records up-front so we can include their -L
+# options in the ssh launch and FORWARD them after connect.
+my @named_fwds = build_named_forwards($cfg, \@forward_names);
+
+# ---- ssh ControlMaster ----------------------------------------------
+
+my $ssh_socket = ssh_socket_path($socket_dir, $login, $ssh_port);
+my @ssh_base = build_ssh_base($login, $ssh_port, $proxy_jump, $ssh_socket);
+
+unless (ssh_master_alive(\@ssh_base)) {
+    open_ssh_master(\@ssh_base, $daemon_host, $daemon_port,
+                    $daemon_local, \@pool_ports, \@named_fwds);
+}
+
+# Always tear the master down on exit so we don't leak it.
+our $cleanup_done;          # used in cleanup_and_exit + END below
+our $nm;                    # NetMgr::Client handle
+$SIG{INT} = $SIG{TERM} = $SIG{HUP} = sub { cleanup_and_exit(0) };
+END { cleanup_and_exit($?) if !$cleanup_done }
+
+# ---- daemon connection + named forwards -----------------------------
+
+$nm = eval { NetMgr::Client->new(listen => "127.0.0.1:$daemon_local",
+                                  timeout => 5) };
+if ($@ || !$nm) {
+    err("daemon not reachable through tunnel ($@)");
+    exit 4;
+}
+$nm->hello(consumer => "net-connect.$$");
+
+for my $f (@named_fwds) {
+    my $r = eval { $nm->forward(slot => $f->{local},
+                                 target => "$f->{target_host}:$f->{target_port}") };
+    if ($@) {
+        warn "warn: named forward '$f->{name}' failed: $@";
+        next;
+    }
+    vlog("named forward '$f->{name}' active: localhost:$f->{local} → "
+       . "$f->{target_host}:$f->{target_port} via $r->{method}");
+    $f->{installed} = 1;
+}
+
+# ---- fetch list ------------------------------------------------------
+
+my @targets = fetch_remote_list($nm, $filter_arg, $include_loose);
+
+# ---- mode-specific behaviour ----------------------------------------
+
+if ($pick_mode || $yes_mode) {
+    if ($yes_mode && @targets == 1) {
+        my $t = $targets[0];
+        my $slot = launch_session($nm, $t)
+            or warn "warn: failed to auto-launch $t->{name}\n";
+    }
+    run_tui($nm, \@targets);
+} else {
+    print_targets(\@targets);
+    if (@named_fwds) {
+        print STDERR "\nNamed forwards active (will close when you hit Ctrl-C):\n";
+        for my $f (@named_fwds) {
+            next unless $f->{installed};
+            printf STDERR "  %-10s  localhost:%-5d  →  %s:%d\n",
+                $f->{name}, $f->{local}, $f->{target_host}, $f->{target_port};
+        }
+        # Block until interrupted so the named forwards stay live.
+        print STDERR "\n(holding tunnel open; ^C to release)\n";
+        select(undef, undef, undef, 30) while 1;
+    }
+    exit(@targets ? 0 : 1);
+}
+
+cleanup_and_exit(0);
+
+# =====================================================================
+# Modes
+# =====================================================================
+
+# Remote --list: snapshots ports/addresses/machines from the local
+# net-mgr daemon, classifies ports, prints TSV.
+sub do_list {
+    my ($pattern) = @_;
+    my $rx;
+    if (defined $pattern) {
+        $rx = eval { qr/^(?:$pattern)$/ };
+        die "bad filter regex '$pattern': $@\n" if $@;
+    }
+
+    my %args;
+    $args{listen} = $listen if defined $listen;
+    my $cli = NetMgr::Client->new(%args, timeout => 5);
+    $cli->hello(consumer => "net-connect.list.$$");
+
+    my $machines  = $cli->snapshot(1, 'machines');
+    my $ifaces    = $cli->snapshot(2, 'interfaces');
+    my $addresses = $cli->snapshot(3, 'addresses',
+                                    where => "family = 'v4' AND last_observed IS NOT NULL");
+    my $ports     = $cli->snapshot(4, 'ports', where => "proto = 'tcp'");
+    $cli->bye;
+
+    my %name_by_mid = map { $_->{id} => $_->{primary_name} }
+                      grep { defined $_->{id} && defined $_->{primary_name} }
+                      @$machines;
+    my %mid_by_mac;
+    for my $i (@$ifaces) {
+        next unless defined $i->{mac} && defined $i->{machine_id}
+                                      && length $i->{machine_id};
+        $mid_by_mac{ lc $i->{mac} } = $i->{machine_id};
+    }
+    my %ips_by_mac;
+    for my $a (@$addresses) {
+        next unless $a->{mac} && $a->{addr};
+        push @{ $ips_by_mac{ lc $a->{mac} } }, $a->{addr};
+    }
+
+    for my $p (sort {
+        ($name_by_mid{ $mid_by_mac{ lc $a->{mac} } // 0 } // '') cmp
+        ($name_by_mid{ $mid_by_mac{ lc $b->{mac} } // 0 } // '')
+        || ($a->{port} // 0) <=> ($b->{port} // 0)
+    } @$ports) {
+        my ($proto) = classify_port($p, $include_loose);
+        next unless defined $proto;
+        my $mid  = $mid_by_mac{ lc $p->{mac} } // next;
+        my $name = $name_by_mid{$mid} // next;
+        next if $rx && $name !~ $rx;
+        my $ips = $ips_by_mac{ lc $p->{mac} } || [];
+        next unless @$ips;
+        my $svc = (defined $p->{service} && length $p->{service})
+                  ? $p->{service} : '-';
+        my $seen = $p->{last_seen} // '-';
+        for my $ip (@$ips) {
+            printf "%s\t%s\t%s\t%d\t%s\t%s\n",
+                $proto, $name, $ip, $p->{port}, $svc, $seen;
+        }
     }
 }
-exit 0;
 
-# Returns ($proto, $reason) or () to skip.
-sub _classify {
-    my ($p) = @_;
-    my $svc = lc($p->{service} // '');
+sub classify_port {
+    my ($p, $loose) = @_;
+    my $svc  = lc($p->{service} // '');
     my $port = $p->{port} // 0;
-    return ('vnc', "service=$svc")  if $svc =~ /vnc|^rfb$|x11vnc|vino/;
-    return ('xpra', "service=$svc") if $svc =~ /xpra/;
-    if ($include_loose || $svc eq '') {
-        return ('vnc',  "port=$port (5900-5999)") if $port >= 5900 && $port <= 5999;
-        return ('xpra', "port=$port (14500-15000)") if $port >= 14500 && $port <= 15000;
+    return ('vnc')  if $svc =~ /vnc|^rfb$|x11vnc|vino/;
+    return ('xpra') if $svc =~ /xpra/;
+    if ($loose || $svc eq '') {
+        return ('vnc')  if $port >= 5900 && $port <= 5999;
+        return ('xpra') if $port >= 14500 && $port <= 15000;
     }
     return ();
 }
 
+# Laptop side: ssh into the login host and run net-connect --list,
+# parse the TSV. Filter is passed through.
+sub fetch_remote_list {
+    my ($nm, $pattern, $loose) = @_;
+    # ssh joins post-login args with spaces and the remote shell
+    # parses them again — so anything we want to survive (regex
+    # metacharacters in the filter, --listen value with colons) must
+    # be shell-quoted on this side.
+    my @remote = ('/usr/local/bin/net-connect', '--list',
+                  '--listen', "$daemon_host:$daemon_port");
+    push @remote, '--all' if $loose;
+    push @remote, $pattern if defined $pattern;
+    my $remote_cmd = join ' ', map { sh_quote($_) } @remote;
+    my @cmd = (@ssh_base, '--', $remote_cmd);
+    vlog("fetch list: @cmd");
+    # Fork + redirect child STDIN — ssh otherwise reads from our
+    # STDIN to forward to the remote, eating any keystrokes the TUI
+    # was meant to receive.
+    my $pid = open my $fh, '-|';
+    defined $pid or die "fork: $!\n";
+    if ($pid == 0) {
+        open STDIN, '<', '/dev/null';
+        exec @cmd;
+        die "exec ssh: $!";
+    }
+    my @rows;
+    while (my $line = <$fh>) {
+        chomp $line;
+        my @f = split /\t/, $line;
+        next unless @f >= 6;
+        push @rows, {
+            proto => $f[0], name => $f[1], ip => $f[2],
+            port => $f[3] + 0, service => $f[4], last_seen => $f[5],
+        };
+    }
+    close $fh;
+    return @rows;
+}
+
+# =====================================================================
+# Display
+# =====================================================================
+
+sub print_targets {
+    my ($rows) = @_;
+    if (!@$rows) {
+        print STDERR "no matching targets\n";
+        return;
+    }
+    printf "%-5s  %-22s  %-15s  %-5s  %s\n",
+        "PROTO", "HOST", "IP", "PORT", "SERVICE";
+    for my $t (@$rows) {
+        printf "%-5s  %-22s  %-15s  %-5d  %s\n",
+            $t->{proto}, $t->{name}, $t->{ip}, $t->{port}, $t->{service};
+    }
+}
+
+# =====================================================================
+# Picker TUI
+# =====================================================================
+
+# Per-slot record: { slot, target=>{...}, pid, viewer_cmd, started }
+my %active;        # slot port → record
+my @free_slots;    # initialised in run_tui
+
+# SIGCHLD reaper: fires when a viewer exits. Reap, find the slot it
+# was in, send UNFORWARD, push the slot back to the free list. Don't
+# touch terminal state — the redraw on next prompt will reflect.
+my @reaped_pids;
+$SIG{CHLD} = sub {
+    while ((my $p = waitpid(-1, WNOHANG)) > 0) {
+        push @reaped_pids, $p;
+    }
+};
+
+sub run_tui {
+    my ($nm, $rows) = @_;
+    @free_slots = @pool_ports;
+    # Drop any slot already grabbed by a named forward (defensive —
+    # named forwards should use distinct local ports).
+    my %taken = map { $_->{local} => 1 } @named_fwds;
+    @free_slots = grep { !$taken{$_} } @free_slots;
+
+    my $filter_re;
+    while (1) {
+        # Process any reaped viewers.
+        if (@reaped_pids) {
+            for my $pid (@reaped_pids) {
+                for my $slot (keys %active) {
+                    my $a = $active{$slot};
+                    next unless $a->{pid} == $pid;
+                    eval { $nm->unforward(slot => $slot) };
+                    delete $active{$slot};
+                    push @free_slots, $slot;
+                    print STDERR "[slot $slot] viewer for $a->{target}{name} exited\n";
+                }
+            }
+            @reaped_pids = ();
+        }
+
+        my @display = $filter_re
+            ? grep { $_->{name} =~ $filter_re } @$rows
+            : @$rows;
+
+        printf "\n==[ net-connect → %s%s ]==\n",
+            $login, ($daemon ? " (daemon $daemon_host:$daemon_port)" : '');
+        if (%active) {
+            print "Active sessions:\n";
+            for my $slot (sort { $a <=> $b } keys %active) {
+                my $a = $active{$slot};
+                printf "  [%d] %s (%s:%d) — pid %d\n",
+                    $slot, $a->{target}{name}, $a->{target}{ip},
+                    $a->{target}{port}, $a->{pid};
+            }
+        }
+        printf "\nTargets%s (%d):\n",
+            ($filter_re ? " matching /$$filter_re/" : ''), scalar(@display);
+        if (!@display) {
+            print "  (no matches)\n";
+        } else {
+            for my $i (0 .. $#display) {
+                my $t = $display[$i];
+                my $active_note = '';
+                for my $slot (keys %active) {
+                    if ($active{$slot}{target}{name} eq $t->{name}
+                     && $active{$slot}{target}{port} == $t->{port}) {
+                        $active_note = " [active slot $slot]"; last;
+                    }
+                }
+                printf "  %2d. %-5s  %-22s  %-15s  %-5d  %s%s\n",
+                    $i+1, $t->{proto}, $t->{name}, $t->{ip},
+                    $t->{port}, $t->{service}, $active_note;
+            }
+        }
+        print "\n[number=launch] [k SLOT=close] [r=refresh] "
+            . "[f REGEX=filter] [F=clear filter] [q=quit]\n";
+        print "> ";
+        my $line = <STDIN>;
+        unless (defined $line) { print "\n"; last }   # ^D
+        chomp $line;
+        $line =~ s/^\s+//; $line =~ s/\s+$//;
+        next unless length $line;
+
+        if    ($line =~ /^q(uit)?$/i)   { last }
+        elsif ($line =~ /^F$/)          { $filter_re = undef }
+        elsif ($line =~ /^f\s+(.+)$/i)  {
+            my $p = $1;
+            $filter_re = eval { qr/$p/ };
+            warn "bad regex '$p': $@\n" if $@;
+        }
+        elsif ($line =~ /^r(efresh)?$/i) {
+            @$rows = fetch_remote_list($nm, $filter_arg, $include_loose);
+        }
+        elsif ($line =~ /^k\s+(\d+)$/i) {
+            my $slot = $1 + 0;
+            close_session($nm, $slot);
+        }
+        elsif ($line =~ /^(\d+)$/) {
+            my $idx = $1 - 1;
+            if ($idx < 0 || $idx >= @display) {
+                print STDERR "out of range\n";
+            } else {
+                launch_session($nm, $display[$idx]);
+            }
+        }
+        else {
+            print STDERR "unknown command: $line\n";
+        }
+    }
+}
+
+sub close_session {
+    my ($nm, $slot) = @_;
+    my $a = $active{$slot} or do {
+        print STDERR "no active session in slot $slot\n";
+        return;
+    };
+    kill 'TERM', $a->{pid};
+    # SIGCHLD reaper will pick it up and trigger UNFORWARD.
+}
+
+# =====================================================================
+# Slot allocation + viewer launch
+# =====================================================================
+
+sub launch_session {
+    my ($nm, $target) = @_;
+    my $slot = shift @free_slots;
+    unless (defined $slot) {
+        print STDERR "no free slots (pool exhausted)\n";
+        return undef;
+    }
+
+    my $r = eval { $nm->forward(slot => $slot,
+                                 target => "$target->{ip}:$target->{port}") };
+    if ($@) {
+        unshift @free_slots, $slot;
+        print STDERR "FORWARD failed: $@\n";
+        return undef;
+    }
+    vlog("forward installed: slot=$slot $target->{name} ($target->{ip}:$target->{port}) via $r->{method}");
+
+    my $cmd = viewer_command($target->{proto}, $slot);
+    unless ($cmd) {
+        print STDERR "no viewer for $target->{proto}; tunnel is open at "
+                   . "localhost:$slot\n";
+        $active{$slot} = {
+            slot => $slot, target => $target, pid => $$,  # placeholder
+            viewer_cmd => undef, started => time(),
+        };
+        return $slot;
+    }
+
+    my $pid = fork;
+    if (!defined $pid) {
+        eval { $nm->unforward(slot => $slot) };
+        unshift @free_slots, $slot;
+        print STDERR "fork failed: $!\n";
+        return undef;
+    }
+    if ($pid == 0) {
+        POSIX::setsid();
+        open STDIN,  '<', '/dev/null';
+        open STDOUT, '>>', '/dev/null';
+        open STDERR, '>>', '/dev/null';
+        exec @$cmd;
+        exit 127;
+    }
+    $active{$slot} = {
+        slot => $slot, target => $target, pid => $pid,
+        viewer_cmd => $cmd, started => time(),
+    };
+    print STDERR "launched [slot $slot] $target->{name}: @$cmd\n";
+    return $slot;
+}
+
+# =====================================================================
+# Viewer detection
+# =====================================================================
+
+sub viewer_command {
+    my ($proto, $local_port) = @_;
+
+    # Config override?
+    my $key = "viewer.$proto";
+    if (my $tmpl = $cfg->{$key}{cmd}) {
+        return [ split_cmd(subst_port($tmpl, $local_port)) ];
+    }
+
+    if    ($proto eq 'vnc')  { return find_vnc_viewer($local_port) }
+    elsif ($proto eq 'xpra') { return find_xpra_viewer($local_port) }
+    return undef;
+}
+
+sub subst_port {
+    my ($s, $port) = @_;
+    my $display = $port >= 5900 ? ($port - 5900) : $port;
+    $s =~ s/%PORT%/$port/g;
+    $s =~ s/%DISPLAY%/$display/g;
+    return $s;
+}
+
+# Cygwin install paths. A single match wins; user-overridable via
+# [viewer.vnc] cmd = ... in config.
+my @VNC_CANDIDATES = (
+    # On PATH (works on Linux too)
+    [ 'PATH', 'vncviewer',  '%PATH%', 'vncviewer localhost::%PORT%' ],
+    [ 'PATH', 'tvnviewer',  '%PATH%', 'tvnviewer localhost::%PORT%' ],
+    [ 'PATH', 'xtigervncviewer', '%PATH%', 'xtigervncviewer localhost::%PORT%' ],
+    # Cygwin / Windows installs
+    [ 'cygdrive', '/cygdrive/c/Program Files/TigerVNC/vncviewer.exe',
+      '%FOUND%', 'cygstart -w "%FOUND%" localhost::%PORT%' ],
+    [ 'cygdrive', '/cygdrive/c/Program Files/TightVNC/tvnviewer.exe',
+      '%FOUND%', 'cygstart -w "%FOUND%" localhost::%PORT%' ],
+    [ 'cygdrive', '/cygdrive/c/Program Files/RealVNC/VNC Viewer/vncviewer.exe',
+      '%FOUND%', 'cygstart -w "%FOUND%" localhost::%PORT%' ],
+    [ 'cygdrive', '/cygdrive/c/Program Files/uvnc bvba/UltraVNC/vncviewer.exe',
+      '%FOUND%', 'cygstart -w "%FOUND%" localhost::%PORT%' ],
+    [ 'cygdrive', '/cygdrive/c/Program Files (x86)/TigerVNC/vncviewer.exe',
+      '%FOUND%', 'cygstart -w "%FOUND%" localhost::%PORT%' ],
+);
+
+my @XPRA_CANDIDATES = (
+    [ 'PATH', 'xpra', '%PATH%', 'xpra attach tcp://localhost:%PORT%/' ],
+    [ 'cygdrive', '/cygdrive/c/Program Files/Xpra/xpra.exe',
+      '%FOUND%', 'cygstart -w "%FOUND%" attach tcp://localhost:%PORT%/' ],
+    [ 'cygdrive', '/cygdrive/c/Program Files (x86)/Xpra/xpra.exe',
+      '%FOUND%', 'cygstart -w "%FOUND%" attach tcp://localhost:%PORT%/' ],
+);
+
+sub find_vnc_viewer  { _find_viewer(\@VNC_CANDIDATES,  $_[0]) }
+sub find_xpra_viewer { _find_viewer(\@XPRA_CANDIDATES, $_[0]) }
+
+sub _find_viewer {
+    my ($cands, $local_port) = @_;
+    for my $c (@$cands) {
+        my ($kind, $key, undef, $template) = @$c;
+        my $found;
+        if    ($kind eq 'PATH')     { $found = which($key) }
+        elsif ($kind eq 'cygdrive') { $found = $key if -x $key }
+        next unless $found;
+        my $cmd = $template;
+        $cmd =~ s/%FOUND%/$found/g;
+        $cmd = subst_port($cmd, $local_port);
+        return [ split_cmd($cmd) ];
+    }
+    return undef;
+}
+
+sub which {
+    my ($cmd) = @_;
+    for my $d (split /:/, $ENV{PATH} // '/usr/bin:/bin') {
+        my $p = "$d/$cmd";
+        return $p if -x $p;
+    }
+    return undef;
+}
+
+# Bourne-shell single-quote a string. ssh forwards a single string
+# to the remote shell, so any caller-supplied value (filter regexes,
+# host:port forms with colons) needs this on the way out.
+sub sh_quote {
+    my ($s) = @_;
+    return "''" unless defined $s && length $s;
+    return $s   if $s =~ /^[A-Za-z0-9_.\/=:,@-]+$/;
+    (my $q = $s) =~ s/'/'\\''/g;
+    return "'$q'";
+}
+
+# Minimal command-line tokenizer that respects double quotes. Good
+# enough for our generated viewer commands.
+sub split_cmd {
+    my ($s) = @_;
+    my @out;
+    while ($s =~ /\G\s*(?:"([^"]*)"|(\S+))/gc) {
+        push @out, defined $1 ? $1 : $2;
+    }
+    return @out;
+}
+
+# =====================================================================
+# ssh ControlMaster
+# =====================================================================
+
+sub ssh_socket_path {
+    my ($dir, $login, $port) = @_;
+    (my $safe = "$login-" . ($port // 22)) =~ s/[^A-Za-z0-9._-]/_/g;
+    return "$dir/net-connect-$safe.sock";
+}
+
+sub build_ssh_base {
+    my ($login, $port, $jump, $sock) = @_;
+    my @cmd = ('ssh', '-S', $sock,
+               '-o', 'ControlMaster=auto',
+               '-o', "ControlPath=$sock",
+               '-o', 'ControlPersist=60');
+    push @cmd, '-p', $port if defined $port;
+    push @cmd, '-J', $jump if defined $jump && length $jump;
+    push @cmd, $login;
+    return @cmd;
+}
+
+sub ssh_master_alive {
+    my ($base) = @_;
+    my @check = (@$base, '-O', 'check');
+    my $rc = run_quiet(@check);
+    return $rc == 0;
+}
+
+# system() inherits the parent's STDIN; for any short-lived ssh
+# helper invocation that's a problem because ssh will read keystrokes
+# the TUI is waiting for. Redirect everything through /dev/null and
+# /dev/null. Returns the exit code (rc>>8).
+sub run_quiet {
+    my @cmd = @_;
+    my $pid = fork;
+    die "fork: $!" unless defined $pid;
+    if ($pid == 0) {
+        open STDIN,  '<', '/dev/null';
+        # keep STDOUT for whatever the caller wanted; STDERR carries
+        # 'Master running' / 'No such file' which we want to see.
+        exec @cmd;
+        exit 127;
+    }
+    waitpid $pid, 0;
+    return $? >> 8;
+}
+
+sub open_ssh_master {
+    my ($base, $dh, $dp, $dlocal, $pool, $named) = @_;
+    my @forwards;
+    push @forwards, '-L', "$dlocal:$dh:$dp";
+    for my $slot (@$pool) {
+        push @forwards, '-L', "$slot:$dh:$slot";
+    }
+    for my $f (@$named) {
+        push @forwards, '-L',
+            "$f->{local}:$f->{target_host}:$f->{target_port}";
+    }
+    my @launch;
+    # Slot in -fN flags between the ControlMaster opts (already in
+    # @$base before the login arg) and the login.
+    my $login_idx = $#$base;       # last element is the login
+    my @prefix = @$base[0 .. $login_idx - 1];
+    my $login  = $base->[$login_idx];
+    @launch = (@prefix, '-f', '-N', @forwards, $login);
+
+    vlog("opening ssh master: @launch");
+    if ($dry_run) {
+        print STDERR "(dry-run) would run: @launch\n";
+        exit 0;
+    }
+    my $rc = run_quiet(@launch);
+    if ($rc != 0) {
+        err("ssh master failed (rc=$rc)");
+        exit 3;
+    }
+    # Brief grace period for socket to be ready.
+    for (1..20) {
+        last if ssh_master_alive($base);
+        select(undef, undef, undef, 0.05);
+    }
+    ssh_master_alive($base) or do { err("ssh master never came up"); exit 3 };
+}
+
+# =====================================================================
+# Cleanup
+# =====================================================================
+
+sub cleanup_and_exit {
+    my ($rc) = @_;
+    return if $cleanup_done;
+    $cleanup_done = 1;
+    # Unforward everything we own (defensive — daemon will GC on
+    # disconnect anyway).
+    if ($nm) {
+        for my $slot (keys %active) {
+            eval { $nm->unforward(slot => $slot) };
+        }
+        for my $f (@named_fwds) {
+            next unless $f->{installed};
+            eval { $nm->unforward(slot => $f->{local}) };
+        }
+        eval { $nm->bye };
+    }
+    # Reap viewers that are still running.
+    for my $a (values %active) {
+        next unless $a->{pid} && $a->{pid} != $$;
+        kill 'TERM', $a->{pid};
+    }
+    # Close the ssh master.
+    if (defined $ssh_socket && -S $ssh_socket) {
+        run_quiet(@ssh_base, '-O', 'exit') if @ssh_base;
+    }
+    exit($rc // 0);
+}
+
+# =====================================================================
+# Config loader
+# =====================================================================
+
+sub load_config {
+    my ($path) = @_;
+    $path //= "$ENV{HOME}/.net-connect.conf";
+    my %cfg;
+    return \%cfg unless -r $path;
+    open my $fh, '<', $path or return \%cfg;
+    my $section = '_top';
+    while (my $line = <$fh>) {
+        $line =~ s/[\r\n]+\z//;
+        $line =~ s/\s*#.*//;
+        $line =~ s/^\s+//;
+        $line =~ s/\s+$//;
+        next unless length $line;
+        if ($line =~ /^\[([^\]]+)\]$/) { $section = $1; next }
+        if ($line =~ /^([\w.-]+)\s*=\s*(.*)$/) {
+            my ($k, $v) = ($1, $2);
+            if ($section eq '_top') { $cfg{$k} = $v }
+            else                    { $cfg{$section}{$k} = $v }
+        }
+    }
+    return \%cfg;
+}
+
+# =====================================================================
+# Named forwards
+# =====================================================================
+
+sub build_named_forwards {
+    my ($cfg, $names) = @_;
+    my @out;
+    for my $n (@$names) {
+        my $key = "forward.$n";
+        my $sect = $cfg->{$key};
+        unless ($sect) {
+            warn "no [forward.$n] section in config; skipping\n";
+            next;
+        }
+        my $tgt = $sect->{target};
+        my $loc = $sect->{local};
+        unless ($tgt && $loc && $loc =~ /^\d+$/) {
+            warn "[forward.$n] needs target=HOST:PORT and local=PORT; skipping\n";
+            next;
+        }
+        my ($th, $tp) = $tgt =~ /^([^:]+)(?::(\d+))?$/;
+        unless ($th && $tp) {
+            warn "[forward.$n] bad target='$tgt'; skipping\n";
+            next;
+        }
+        push @out, {
+            name => $n, local => $loc + 0,
+            target_host => $th, target_port => $tp + 0,
+        };
+    }
+    return @out;
+}
+
+# =====================================================================
+# Helpers
+# =====================================================================
+
+sub parse_pool {
+    my ($spec) = @_;
+    my @out;
+    for my $tok (split /[,\s]+/, $spec) {
+        if ($tok =~ /^(\d+)-(\d+)$/) {
+            my ($lo, $hi) = ($1+0, $2+0);
+            return () if $lo > $hi || $lo < 1 || $hi > 65535;
+            push @out, $lo .. $hi;
+        }
+        elsif ($tok =~ /^(\d+)$/) { push @out, $1+0 }
+        else                       { return () }
+    }
+    return @out;
+}
+
+sub pick_free_local_port {
+    my $s = IO::Socket::INET->new(LocalAddr => '127.0.0.1',
+                                   LocalPort => 0,
+                                   Proto     => 'tcp',
+                                   Listen    => 1)
+        or die "free-port bind: $!";
+    my $p = $s->sockport;
+    $s->close;
+    return $p;
+}
+
+sub is_local_port_free {
+    my ($p) = @_;
+    my $s = IO::Socket::INET->new(LocalAddr => '127.0.0.1',
+                                   LocalPort => $p,
+                                   Proto     => 'tcp',
+                                   Listen    => 1,
+                                   ReuseAddr => 1);
+    if ($s) { $s->close; return 1 }
+    return 0;
+}
+
+sub vlog { print STDERR "[v] $_[0]\n" if $verbose }
+sub err  { print STDERR "net-connect: $_[0]\n" }
+
 sub usage {
     my ($rc) = @_;
     print STDERR <<"EOF";
-Usage: net-connect --list [filter-regex] [--listen HOST[:PORT]] [--all]
+Usage:
+  net-connect [opts] [filter] [user\@host]      # list, --pick, or --yes
+  net-connect --list [filter] [--listen H:P]   # remote-side helper
 
-Emits TSV rows of VNC/Xpra endpoints known to net-mgr:
-  PROTO  HOSTNAME  IP  PORT  SERVICE-LABEL  LAST-SEEN
+Options (laptop mode):
+  --pick / -p          enter persistent picker TUI
+  --yes  / -y          auto-launch if filter matches exactly one;
+                       enter TUI either way
+  --forward N[,N...]   activate named forwards from [forward.N] config
+  --daemon HOST[:PORT] daemon address from the SSH-host's POV
+                       (default: 127.0.0.1:7531 or config)
+  --login user\@host    ssh login (also accepted as positional)
+  -P / --port PORT     ssh port
+  -J / --jump HOST     ssh ProxyJump
+  --pool LO-HI         picker slot port range (default 5900-5909)
+  --socket-dir DIR     ControlPath dir (default /tmp)
+  --config PATH        config file (default ~/.net-connect.conf)
+  -v / --verbose       trace ssh / FORWARD / launch decisions
+  -n / --dry-run       print ssh command without running
+  -h / --help
 
-filter-regex restricts by HOSTNAME (anchored). --all loosens port
-classification to include any 5900-5999 / 14500-15000 entry even
-without a recognised service name.
+Options (--list mode):
+  --listen HOST:PORT   net-mgr daemon to query (default 127.0.0.1:7531)
+  --all / -a           include 5900-5999 / 14500-15000 ports even
+                       when service is unknown
 
-(Other modes — picker TUI, viewer launch, named forwards — are
-landing in a follow-up commit.)
+Exit: 0 ok · 1 no match (default mode) · 2 args/config · 3 ssh ·
+      4 daemon connect.
 EOF
-    exit($rc // 2);
+    exit($rc // 0);
 }
