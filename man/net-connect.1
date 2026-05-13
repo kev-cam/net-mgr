@@ -1,0 +1,266 @@
+.TH NET-CONNECT 1 "2026-05-13" "net-mgr" "User Commands"
+.SH NAME
+net-connect \- pick + tunnel VNC, Xpra, and named services through a single ssh master
+.SH SYNOPSIS
+.B net-connect
+.RI [ filter ]
+.RI [ user@host ]
+.br
+.B net-connect
+.B \-\-pick
+.RI [ filter ]
+.RI [ user@host ]
+.br
+.B net-connect
+.B \-\-yes
+.RI [ filter ]
+.RI [ user@host ]
+.br
+.B net-connect
+.B \-\-list
+.RI [ filter ]
+.RB [ \-\-listen
+.IR HOST:PORT ]
+.SH DESCRIPTION
+.B net-connect
+opens (or reuses) a single ssh
+.B ControlMaster
+connection to a login host and uses the net-mgr daemon's FORWARD verb
+to wire local-loopback ports on the laptop to whichever LAN target the
+user picks. It wears two hats:
+.TP
+.B remote helper (\-\-list)
+Run on the daemon host (typically over ssh from the laptop side).
+Snapshots the
+.B ports
+table and emits TSV rows of every VNC/Xpra endpoint, one per
+(machine, ip, port).
+.TP
+.B laptop entry-point (everything else)
+Drives the ssh tunnel and the picker. Default mode prints the
+matching targets and exits.
+.B \-\-pick
+enters a persistent picker TUI;
+.B \-\-yes
+auto-launches the unique match (if any) and then enters the TUI.
+.PP
+The same binary serves both roles \(em the laptop side runs the remote
+helper over ssh to fetch the target list.
+.SH OPTIONS
+.SS "Laptop mode"
+.TP
+.BR \-p ", " \-\-pick
+Enter the persistent picker TUI. Multiple concurrent sessions are
+supported (one per pool slot).
+.TP
+.BR \-y ", " \-\-yes
+If the filter narrows to exactly one match, auto-launch it; either
+way enter the TUI.
+.TP
+\fB\-\-forward \fINAME\fR[,\fINAME\fR\.\.\.]
+Activate named forwards from the corresponding
+.BI [forward. NAME ]
+config sections (e.g.
+.IR imap ", " smtp )
+for the lifetime of the session.
+.TP
+\fB\-\-daemon \fIHOST\fR[\fI:PORT\fR]
+net-mgr daemon address from the SSH-host's perspective. Defaults to
+.B 127.0.0.1:7531
+or whatever
+.B daemon
+in the config file says.
+.TP
+\fB\-\-login\fR \fIuser@host\fR
+ssh login (also accepted as a positional argument).
+.TP
+.BR \-P ", " \-\-port " " \fIPORT\fR
+ssh port.
+.TP
+.BR \-J ", " \-\-jump " " \fIuser@host\fR
+ssh ProxyJump.
+.TP
+\fB\-\-pool \fILO-HI\fR
+Picker slot port range. Default
+.BR 5950-5959 .
+Each slot is a local-loopback port the laptop's ssh tunnel will
+forward; the daemon's FORWARD then DNATs it to the picked target.
+All listed ports must be free on the laptop at startup.
+.TP
+\fB\-\-socket-dir \fIDIR\fR
+ssh ControlPath dir (default
+.BR /tmp ).
+.TP
+\fB\-\-config \fIPATH\fR
+Config file (default
+.BR ~/.net-connect.conf ).
+.TP
+.BR \-v ", " \-\-verbose
+Trace ssh launch, FORWARD installs, viewer launches.
+.TP
+.BR \-n ", " \-\-dry-run
+Print the ssh master command and exit without running.
+.TP
+.BR \-h ", " \-\-help
+Show usage and exit.
+.SS "\-\-list mode"
+.TP
+\fB\-\-listen \fIHOST:PORT\fR
+net-mgr daemon to query. Default
+.BR 127.0.0.1:7531 .
+.TP
+.BR \-a ", " \-\-all
+Include 5900-5999 / 14500-15000 ports even when service is unknown
+(useful for Xpra on non-default ports).
+.SH "PICKER TUI"
+Per prompt, the menu accepts:
+.TP
+\fInumber\fR
+Launch session for that target. Allocates a free slot, asks the
+daemon to FORWARD it, forks a viewer (non-blocking; control returns
+immediately for the next pick).
+.TP
+\fBk \fISLOT\fR
+Close the named slot. Sends SIGTERM to the viewer (which the SIGCHLD
+reaper notices, UNFORWARDs the slot, and frees it). For no-viewer
+slots, UNFORWARDs directly.
+.TP
+.B r
+Refresh the target list from the daemon.
+.TP
+\fBf \fIREGEX\fR
+Apply a substring filter. Use
+.B F
+to clear it.
+.TP
+.B q
+Quit. Every active slot is UNFORWARDed, viewer children get
+SIGTERM, and the ssh master is closed via
+.BR "ssh -O exit" .
+The daemon's connection-bound GC is the safety net behind it all.
+.SH "CONFIG FILE"
+.B ~/.net-connect.conf
+is INI-style. Top-level keys plus
+.BI [ section ]
+groupings.
+.PP
+.RS 4
+.nf
+\fB# Login defaults\fR
+login        = wdkc@gateway.grfx.com
+port         = 80
+\fB# daemon\fR     = nas3.grfx.com         # only if ≠ login host
+\fB# proxy_jump\fR = wdkc@zmc1.grfx.com    # optional ssh \-J
+\fBpool\fR         = 5950-5959
+
+\fB# Named forwards (use with --forward NAME)\fR
+[forward.imap]
+target = nas3:143
+local  = 1143
+
+[forward.smtp]
+target = nas3:587
+local  = 1587
+
+\fB# Viewer overrides (defaults are autodetected)\fR
+[viewer.vnc]
+cmd = cygstart -w "C:\\Program Files\\TigerVNC\\vncviewer.exe" localhost::%PORT%
+
+[viewer.xpra]
+cmd = xpra attach tcp://localhost:%PORT%/
+.fi
+.RE
+.PP
+.B %PORT%
+in viewer commands is the local slot port.
+.B %DISPLAY%
+is
+.IR slot - 5900
+(the VNC display number) when applicable.
+.SH "OFF-HOST DAEMON"
+When the daemon lives on a different host than the ssh login (e.g.
+log into zmc1, daemon is on nas3), set
+.B daemon
+in the laptop config and add the entry-point's LAN to
+.B [forward] allow_peers
+in
+.B /etc/net-mgr/config
+on the daemon host \(em otherwise the daemon's loopback-only check
+rejects the FORWARD request.
+.SH "VIEWER DETECTION"
+.B net-connect
+searches PATH first
+.RB ( vncviewer ", " tvnviewer ", " xtigervncviewer ", " xpra ),
+then the standard Cygwin install paths under
+.BR "C:\\Program Files\\" :
+TigerVNC, TightVNC, RealVNC, UltraVNC, Xpra. The first hit wins. To
+override, set
+.BR "[viewer.PROTO] cmd = ..."
+in the config.
+.PP
+If no viewer is found, the slot is still installed and
+.B net-connect
+prints
+.BI "tunnel is open at localhost:" PORT
+\(em point any client at it manually.
+.SH EXIT STATUS
+.TP
+.B 0
+ok / clean exit.
+.TP
+.B 1
+no target matched (default mode with filter).
+.TP
+.B 2
+bad args / config.
+.TP
+.B 3
+ssh ControlMaster failure.
+.TP
+.B 4
+daemon connection failure.
+.SH FILES
+.TP
+.B ~/.net-connect.conf
+laptop-side config.
+.TP
+.B /tmp/net-connect-USER_HOST-PORT.sock
+ssh ControlPath socket. Reused on subsequent runs to the same login.
+.SH EXAMPLES
+.PP
+List VNC sessions known to the daemon on
+.IR gateway.grfx.com :
+.RS 4
+.nf
+.B net-connect wdkc@gateway.grfx.com
+.fi
+.RE
+.PP
+Pick interactively, restricted to
+.I nas3*
+hosts:
+.RS 4
+.nf
+.B net-connect --pick 'nas3.*' wdkc@gateway.grfx.com
+.fi
+.RE
+.PP
+Auto-launch the unique
+.I mediapc
+session, then enter the TUI for follow-on picks:
+.RS 4
+.nf
+.B net-connect --yes mediapc wdkc@gateway.grfx.com
+.fi
+.RE
+.PP
+Open IMAP and SMTP forwards (no picker, holds the tunnel until
+.BR ^C ):
+.RS 4
+.nf
+.B net-connect --forward imap,smtp
+.fi
+.RE
+.SH "SEE ALSO"
+.BR net-mgr (7),
+.BR ssh_config (5)

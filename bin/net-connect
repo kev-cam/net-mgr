@@ -124,7 +124,7 @@ $login      //= $cfg->{login};
 $ssh_port   //= $cfg->{port};
 $daemon     //= $cfg->{daemon};
 $proxy_jump //= $cfg->{proxy_jump};
-$pool_spec  //= $cfg->{pool} // '5900-5909';
+$pool_spec  //= $cfg->{pool} // '5950-5959';   # off the usual VNC range
 $socket_dir //= $cfg->{socket_dir} // '/tmp';
 
 defined $login or die "net-connect: no login configured (pass user\@host or set 'login = ...' in ~/.net-connect.conf)\n";
@@ -166,7 +166,12 @@ my @named_fwds = build_named_forwards($cfg, \@forward_names);
 my $ssh_socket = ssh_socket_path($socket_dir, $login, $ssh_port);
 my @ssh_base = build_ssh_base($login, $ssh_port, $proxy_jump, $ssh_socket);
 
-unless (ssh_master_alive(\@ssh_base)) {
+# First-run socket check: ssh -O check writes a "Control socket
+# connect(...): No such file or directory" to stderr if the socket
+# isn't there yet. Harmless but alarming-looking. Run the first
+# check quietly; if it fails we open the master and from then on
+# subsequent checks have a real socket to find.
+unless (ssh_master_alive(\@ssh_base, quiet => 1)) {
     open_ssh_master(\@ssh_base, $daemon_host, $daemon_port,
                     $daemon_local, \@pool_ports, \@named_fwds);
 }
@@ -682,25 +687,36 @@ sub build_ssh_base {
 }
 
 sub ssh_master_alive {
-    my ($base) = @_;
+    my ($base, %opt) = @_;
     my @check = (@$base, '-O', 'check');
-    my $rc = run_quiet(@check);
+    my $rc = run_quiet(@check, $opt{quiet} ? (_silence_stderr => 1) : ());
     return $rc == 0;
 }
 
 # system() inherits the parent's STDIN; for any short-lived ssh
 # helper invocation that's a problem because ssh will read keystrokes
-# the TUI is waiting for. Redirect everything through /dev/null and
-# /dev/null. Returns the exit code (rc>>8).
+# the TUI is waiting for. Redirect STDIN to /dev/null. Optionally
+# silence STDERR too (used for the first-run -O check, which would
+# otherwise complain about a missing socket file). Returns the exit
+# code (rc>>8). Filters out our pseudo-arg before exec.
 sub run_quiet {
     my @cmd = @_;
+    my $silence_stderr = 0;
+    my @real;
+    while (@cmd) {
+        my $a = shift @cmd;
+        if ($a eq '_silence_stderr') {
+            $silence_stderr = shift @cmd;
+        } else {
+            push @real, $a;
+        }
+    }
     my $pid = fork;
     die "fork: $!" unless defined $pid;
     if ($pid == 0) {
         open STDIN,  '<', '/dev/null';
-        # keep STDOUT for whatever the caller wanted; STDERR carries
-        # 'Master running' / 'No such file' which we want to see.
-        exec @cmd;
+        open STDERR, '>', '/dev/null' if $silence_stderr;
+        exec @real;
         exit 127;
     }
     waitpid $pid, 0;
@@ -907,7 +923,7 @@ Options (laptop mode):
   --login user\@host    ssh login (also accepted as positional)
   -P / --port PORT     ssh port
   -J / --jump HOST     ssh ProxyJump
-  --pool LO-HI         picker slot port range (default 5900-5909)
+  --pool LO-HI         picker slot port range (default 5950-5959)
   --socket-dir DIR     ControlPath dir (default /tmp)
   --config PATH        config file (default ~/.net-connect.conf)
   -v / --verbose       trace ssh / FORWARD / launch decisions

@@ -29,7 +29,7 @@ SBINS = net-mgr net-mgr-setup net-dns net-mgr-relay
 # without polluting BINDIR. Each script must support --describe.
 RECOVERYS = net-recover-tlsg2424
 UNITS = net-mgr.service net-dns.service net-mgr-relay.service
-MAN1S = net-alias.1 net-discover.1 net-fix.1 net-gen-dnsmasq.1 \
+MAN1S = net-alias.1 net-connect.1 net-discover.1 net-fix.1 net-gen-dnsmasq.1 \
         net-import-dhcp.1 net-name.1 net-ping.1 net-poll-ap.1 \
         net-report.1 net-roam.1 net-router.1 net-scan.1 net-show.1 \
         net-tp-scan.1 net-var.1 net-watch.1
