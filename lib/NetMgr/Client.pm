@@ -132,6 +132,36 @@ sub status {
     return $cmd->{kv} || {};
 }
 
+# FORWARD slot=N target=IP:PORT — ask the daemon to wire its
+# loopback:slot to IP:PORT for the lifetime of this connection.
+# Returns the OK kv hashref ({slot, method}) or croaks on ERR.
+sub forward {
+    my ($self, %args) = @_;
+    croak "forward needs slot=" unless defined $args{slot};
+    croak "forward needs target=" unless defined $args{target};
+    my $r = $self->send_recv(
+        "FORWARD " . format_kv(slot => $args{slot}, target => $args{target})
+    );
+    croak "forward: no reply from daemon" unless defined $r;
+    my $cmd = parse_line($r);
+    croak "forward: $cmd->{msg}" if $cmd->{verb} eq 'ERR';
+    croak "forward: unexpected reply '$r'" unless $cmd->{verb} eq 'OK';
+    return $cmd->{kv} || {};
+}
+
+# UNFORWARD slot=N — release a forward early; otherwise it's freed
+# automatically when the connection closes. Returns 1 on success,
+# croaks on ERR.
+sub unforward {
+    my ($self, %args) = @_;
+    croak "unforward needs slot=" unless defined $args{slot};
+    my $r = $self->send_recv("UNFORWARD " . format_kv(slot => $args{slot}));
+    croak "unforward: no reply from daemon" unless defined $r;
+    my $cmd = parse_line($r);
+    croak "unforward: $cmd->{msg}" if $cmd->{verb} eq 'ERR';
+    return 1;
+}
+
 sub bye {
     my ($self) = @_;
     $self->send_line("BYE");

@@ -203,12 +203,13 @@ sub _accept {
     my $peer = sprintf "%s:%d", $cli->peerhost // '?', $cli->peerport // 0;
     my $fd   = fileno($cli);
     $self->{clients}{$fd} = {
-        sock   => $cli,
-        peer   => $peer,
-        buffer => '',
-        kind   => undef,    # 'producer' | 'consumer'
-        ident  => undef,    # source=... or consumer=...
-        subs   => {},       # id → { table, mode, where_ast }
+        sock     => $cli,
+        peer     => $peer,
+        buffer   => '',
+        kind     => undef,    # 'producer' | 'consumer'
+        ident    => undef,    # source=... or consumer=...
+        subs     => {},       # id → { table, mode, where_ast }
+        forwards => {},       # slot port → { method, target, cookie|pid }
     };
     $self->{select}->add($cli);
     $self->_log("connect $peer fd=$fd");
@@ -244,6 +245,18 @@ sub _handle_readable {
 sub _drop_client {
     my ($self, $fd, $why) = @_;
     my $cli = delete $self->{clients}{$fd} or return;
+    # Tear down any port forwards this connection still owns. Same
+    # rationale as for subscriptions, but FORWARDs leave kernel side-
+    # effects (iptables rules, socat children) so we have to do it
+    # explicitly rather than relying on hash deletion.
+    if ($cli->{forwards} && %{ $cli->{forwards} }) {
+        for my $slot (keys %{ $cli->{forwards} }) {
+            my $f = $cli->{forwards}{$slot};
+            eval { $self->_remove_forward($f) };
+            $self->_log("warn: tearing down slot=$slot on disconnect failed: $@")
+                if $@;
+        }
+    }
     $self->{select}->remove($cli->{sock});
     eval { $cli->{sock}->close };
     $self->_log("disconnect $cli->{peer} fd=$fd ($why)");
@@ -286,6 +299,8 @@ sub _handle_line {
     elsif ($verb eq 'POLL')      { $self->_handle_poll($cli, $cmd) }
     elsif ($verb eq 'BYE')       { $self->_drop_client(fileno($cli->{sock}), 'bye') }
     elsif ($verb eq 'STATUS')    { $self->_handle_status($cli) }
+    elsif ($verb eq 'FORWARD')   { $self->_handle_forward($cli, $cmd) }
+    elsif ($verb eq 'UNFORWARD') { $self->_handle_unforward($cli, $cmd) }
     else {
         $self->_send($cli, format_err("verb $verb not handled"));
     }
@@ -388,6 +403,89 @@ sub _handle_unsub {
     } else {
         $self->_send($cli, format_err("no such subscription sub=$sub"));
     }
+}
+
+# ---- FORWARD / UNFORWARD --------------------------------------------
+#
+# Wires a local-loopback port (the laptop end of an ssh -L tunnel)
+# to a LAN target by installing an iptables OUTPUT-chain DNAT rule
+# (or a socat process if iptables is unavailable). Forwards live for
+# the duration of the connection that requested them; on disconnect,
+# every still-installed forward is torn down.
+#
+# Authorisation: only loopback peers (127.0.0.1) may FORWARD. The
+# laptop reaches the daemon by tunnelling an extra -L through ssh,
+# so its source from sshd's POV is 127.0.0.1; LAN peers are not
+# allowed to ask the daemon to install firewall rules on their
+# behalf.
+
+sub _handle_forward {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+
+    return $self->_send($cli, format_err("FORWARD requires HELLO first"))
+        unless defined $cli->{kind};
+    return $self->_send($cli,
+        format_err("FORWARD restricted to loopback peers (127.0.0.1)"))
+        unless _peer_is_loopback($cli);
+
+    my $slot = $kv->{slot};
+    my $tgt  = $kv->{target};
+    return $self->_send($cli, format_err("FORWARD requires slot=PORT"))
+        unless defined $slot && $slot =~ /^\d+$/ && $slot >= 1 && $slot <= 65535;
+    return $self->_send($cli, format_err("FORWARD requires target=IP:PORT"))
+        unless defined $tgt && $tgt =~ /^(\d+\.\d+\.\d+\.\d+):(\d+)$/;
+    my ($tip, $tport) = ($1, $2);
+    return $self->_send($cli, format_err("bad target port $tport"))
+        unless $tport >= 1 && $tport <= 65535;
+
+    # Replace any existing forward on the same slot for this connection.
+    if (my $old = delete $cli->{forwards}{$slot}) {
+        eval { $self->_remove_forward($old) };
+        $self->_log("warn: replacing slot=$slot remove-old failed: $@") if $@;
+    }
+
+    my $f = eval {
+        $self->_install_forward(
+            slot   => $slot + 0,
+            target => "$tip:$tport",
+            owner  => $cli->{ident} // 'anon',
+            fd     => fileno($cli->{sock}),
+        );
+    };
+    if ($@ || !$f) {
+        my $msg = $@ // 'install failed';
+        $msg =~ s/\s+at\s+\S+\s+line\s+\d+\.?$//;
+        return $self->_send($cli, format_err("FORWARD failed: $msg"));
+    }
+
+    $cli->{forwards}{$slot} = $f;
+    $self->_log("forward $cli->{ident} slot=$slot → $tip:$tport via $f->{method}");
+    $self->_send($cli, format_ok(slot => $slot, method => $f->{method}));
+}
+
+sub _handle_unforward {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my $slot = $kv->{slot};
+    return $self->_send($cli, format_err("UNFORWARD requires slot=PORT"))
+        unless defined $slot && $slot =~ /^\d+$/;
+    my $f = delete $cli->{forwards}{$slot}
+        or return $self->_send($cli, format_err("no such forward slot=$slot"));
+    eval { $self->_remove_forward($f) };
+    if ($@) {
+        my $msg = $@; $msg =~ s/\s+at\s+\S+\s+line\s+\d+\.?$//;
+        return $self->_send($cli, format_err("UNFORWARD: $msg"));
+    }
+    $self->_log("unforward $cli->{ident} slot=$slot");
+    $self->_send($cli, format_ok(slot => $slot));
+}
+
+sub _peer_is_loopback {
+    my ($cli) = @_;
+    my $sock = $cli->{sock} or return 0;
+    my $h = eval { $sock->peerhost } // '';
+    return $h eq '127.0.0.1' || $h eq '::1';
 }
 
 # Walks every consumer's subscriptions; for each that matches table+WHERE,
@@ -1367,6 +1465,174 @@ sub _process_dnsmasq_event {
         }
     }
     $self->_log_event(%$_) for @ev;
+}
+
+# ---- forward backend (iptables / socat) -----------------------------
+#
+# Two implementations behind one interface so the FORWARD verb doesn't
+# care which is in use. Iptables is preferred when available because
+# it's stateless from the daemon's POV (one rule, no child process to
+# supervise). Socat is the no-root fallback.
+#
+# Forward record shape:
+#   { method => 'iptables',
+#     slot   => 5901,
+#     target => '192.168.15.104:5900',
+#     cookie => 'net-mgr:fwd:42:5901',   # iptables comment marker
+#   }
+#   { method => 'socat',
+#     slot   => 5901,
+#     target => '192.168.15.104:5900',
+#     pid    => 12345,
+#   }
+
+sub _forward_method {
+    my ($self) = @_;
+    return $self->{_fwd_method_cache}
+        if exists $self->{_fwd_method_cache};
+
+    # Allow explicit pin via [forward] method = iptables|socat in the
+    # daemon config. Otherwise probe.
+    my $cfg_method = eval { $self->{cfg}{forward}{method} } // 'auto';
+    if ($cfg_method eq 'iptables' || $cfg_method eq 'socat') {
+        $self->_log("forward backend pinned to '$cfg_method' by config");
+        return $self->{_fwd_method_cache} = $cfg_method;
+    }
+
+    # Auto: prefer iptables if we can run it AND we're root.
+    if ($> == 0 && _have_cmd('iptables')) {
+        # Enable route_localnet on lo; harmless if already on. Required
+        # for OUTPUT-chain DNAT from 127.0.0.1/* to a non-loopback dest.
+        system('sysctl', '-q', '-w',
+               'net.ipv4.conf.lo.route_localnet=1') == 0
+            or $self->_log("warn: sysctl route_localnet=1 failed (rc=$?)");
+        $self->_log("forward backend = iptables (root + iptables found)");
+        return $self->{_fwd_method_cache} = 'iptables';
+    }
+    if (_have_cmd('socat')) {
+        $self->_log("forward backend = socat (no iptables / not root)");
+        return $self->{_fwd_method_cache} = 'socat';
+    }
+    $self->_log("warn: no forward backend available (need iptables+root or socat)");
+    return $self->{_fwd_method_cache} = '';
+}
+
+sub _have_cmd {
+    my ($cmd) = @_;
+    for my $d (split /:/, $ENV{PATH} // '/usr/sbin:/sbin:/usr/bin:/bin') {
+        return 1 if -x "$d/$cmd";
+    }
+    return 0;
+}
+
+sub _install_forward {
+    my ($self, %args) = @_;
+    my $slot   = $args{slot}   or croak "slot required";
+    my $target = $args{target} or croak "target required";
+    my $owner  = $args{owner}  // 'anon';
+    my $fd     = $args{fd}     // 0;
+
+    my $method = $self->_forward_method
+        or croak "no forward backend available";
+
+    if ($method eq 'iptables') {
+        return $self->_iptables_install($slot, $target, $fd);
+    } else {
+        return $self->_socat_install($slot, $target);
+    }
+}
+
+sub _remove_forward {
+    my ($self, $f) = @_;
+    return unless ref $f;
+    if ($f->{method} eq 'iptables') {
+        return $self->_iptables_remove($f);
+    } elsif ($f->{method} eq 'socat') {
+        return $self->_socat_remove($f);
+    }
+    croak "unknown forward method '$f->{method}'";
+}
+
+# OUTPUT-chain DNAT in the nat table. -d 127.0.0.1 matches the
+# loopback destination that ssh's local end of `ssh -L slot:127.0.0.1:slot`
+# will connect to. Comment marker carries fd so cleanup-on-disconnect
+# can identify our own rules even if state is lost mid-restart.
+sub _iptables_install {
+    my ($self, $slot, $target, $fd) = @_;
+    my ($ip, $port) = split /:/, $target, 2;
+    my $cookie = "net-mgr:fwd:$$:$fd:$slot";
+    my @cmd = ('iptables', '-t', 'nat', '-I', 'OUTPUT',
+               '-p', 'tcp', '-d', '127.0.0.1', '--dport', $slot,
+               '-m', 'comment', '--comment', $cookie,
+               '-j', 'DNAT', '--to-destination', "$ip:$port");
+    my $rc = system(@cmd);
+    if ($rc != 0) {
+        croak "iptables install rc=" . ($rc >> 8);
+    }
+    return {
+        method => 'iptables',
+        slot   => $slot,
+        target => $target,
+        cookie => $cookie,
+    };
+}
+
+sub _iptables_remove {
+    my ($self, $f) = @_;
+    my ($ip, $port) = split /:/, $f->{target}, 2;
+    my @cmd = ('iptables', '-t', 'nat', '-D', 'OUTPUT',
+               '-p', 'tcp', '-d', '127.0.0.1', '--dport', $f->{slot},
+               '-m', 'comment', '--comment', $f->{cookie},
+               '-j', 'DNAT', '--to-destination', "$ip:$port");
+    my $rc = system(@cmd);
+    croak "iptables remove rc=" . ($rc >> 8) if $rc != 0;
+    return 1;
+}
+
+# Socat fallback — listens on 127.0.0.1:slot, forks per connection,
+# proxies to the target. Detached so a daemon restart doesn't kill
+# them, but tracked by pid for explicit teardown.
+sub _socat_install {
+    my ($self, $slot, $target) = @_;
+    my ($ip, $port) = split /:/, $target, 2;
+    my $pid = fork;
+    croak "fork: $!" unless defined $pid;
+    if ($pid == 0) {
+        # child: run socat, replacing this process
+        POSIX::setsid();
+        open STDIN,  '<', '/dev/null';
+        open STDOUT, '>>', '/dev/null';
+        open STDERR, '>>', '/dev/null';
+        exec 'socat',
+            "TCP-LISTEN:$slot,bind=127.0.0.1,fork,reuseaddr",
+            "TCP:$ip:$port";
+        exit 127;
+    }
+    # parent: tiny grace period, then check it didn't exit immediately
+    select(undef, undef, undef, 0.1);
+    if (waitpid($pid, POSIX::WNOHANG()) == $pid) {
+        croak "socat exited immediately (rc=" . ($? >> 8) . ")";
+    }
+    return {
+        method => 'socat',
+        slot   => $slot,
+        target => $target,
+        pid    => $pid,
+    };
+}
+
+sub _socat_remove {
+    my ($self, $f) = @_;
+    my $pid = $f->{pid} or return 1;
+    kill 'TERM', $pid;
+    # Brief wait for it to die; SIGKILL if it doesn't.
+    for (1..10) {
+        return 1 if waitpid($pid, POSIX::WNOHANG()) == $pid;
+        select(undef, undef, undef, 0.05);
+    }
+    kill 'KILL', $pid;
+    waitpid($pid, 0);
+    return 1;
 }
 
 1;

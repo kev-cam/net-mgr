@@ -1,0 +1,139 @@
+#!/usr/bin/perl
+# net-connect-list — emit the list of remote-desktop endpoints
+# net-mgr knows about (VNC / Xpra), one per line. Run on a net-mgr-
+# equipped host (typically the gateway the laptop ssh's into).
+#
+# Output is TSV, one row per (machine_id, ip, port):
+#
+#   PROTO  HOSTNAME       IP              PORT  SERVICE-LABEL  LAST-SEEN
+#
+# PROTO is 'vnc' or 'xpra' (heuristically classified from service
+# name + port number). HOSTNAME is machines.primary_name. SERVICE-
+# LABEL is the raw 'service' string from the ports table (or '-' if
+# unknown). LAST-SEEN is the ports.last_seen timestamp, useful for
+# the picker to dim stale entries.
+#
+# Usage:
+#   net-connect-list [filter-regex] [--listen HOST[:PORT]] [--all]
+#
+# filter-regex matches against HOSTNAME (anchored as ^(?:...)$). With
+# no filter, every (vnc|xpra) entry is emitted. --all loosens the port
+# heuristics to include anything in the wider scan ranges even without
+# a recognised service name (useful for Xpra on non-default ports).
+#
+# Selection criteria (any of):
+#   - service LIKE '%vnc%' or in {rfb, x11vnc, vino}
+#   - service LIKE '%xpra%'
+#   - port in 5900-5999 (VNC display range)
+#   - port in 14500-15000 (typical Xpra range)
+#
+# Exits 0 even if zero rows match — the picker treats empty output as
+# "no sessions". Non-zero exit is reserved for daemon-connect failure.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+use NetMgr::Client;
+
+my $listen;
+my $include_loose;
+my $help;
+GetOptions(
+    'listen=s' => \$listen,
+    'all|a'    => \$include_loose,
+    'help|h'   => \$help,
+) or usage(2);
+usage(0) if $help;
+
+my $filter_re;
+if (@ARGV) {
+    my $pat = shift @ARGV;
+    usage(2) if @ARGV;       # at most one filter
+    $filter_re = eval { qr/^(?:$pat)$/ };
+    die "bad filter regex '$pat': $@\n" if $@;
+}
+
+my %args;
+$args{listen} = $listen if defined $listen;
+my $cli = NetMgr::Client->new(%args, timeout => 5);
+$cli->hello(consumer => "net-connect-list.$$");
+
+my $machines  = $cli->snapshot(1, 'machines');
+my $ifaces    = $cli->snapshot(2, 'interfaces');
+my $addresses = $cli->snapshot(3, 'addresses',
+                               where => "family = 'v4' AND last_observed IS NOT NULL");
+my $ports     = $cli->snapshot(4, 'ports', where => "proto = 'tcp'");
+$cli->bye;
+
+# Index by mac.
+my %name_by_mid = map { $_->{id} => $_->{primary_name} }
+                  grep { defined $_->{id} && defined $_->{primary_name} }
+                  @$machines;
+my %mid_by_mac;
+for my $i (@$ifaces) {
+    next unless defined $i->{mac} && defined $i->{machine_id}
+                                  && length $i->{machine_id};
+    $mid_by_mac{ lc $i->{mac} } = $i->{machine_id};
+}
+my %ips_by_mac;
+for my $a (@$addresses) {
+    next unless $a->{mac} && $a->{addr};
+    push @{ $ips_by_mac{ lc $a->{mac} } }, $a->{addr};
+}
+
+# Walk ports, classify, emit.
+for my $p (sort {
+    ($name_by_mid{ $mid_by_mac{ lc $a->{mac} } // 0 } // '') cmp
+    ($name_by_mid{ $mid_by_mac{ lc $b->{mac} } // 0 } // '')
+    || ($a->{port} // 0) <=> ($b->{port} // 0)
+} @$ports) {
+    my ($proto, $kind) = _classify($p);
+    next unless defined $proto;
+
+    my $mid  = $mid_by_mac{ lc $p->{mac} } // next;
+    my $name = $name_by_mid{$mid} // next;
+    next if $filter_re && $name !~ $filter_re;
+    my $ips  = $ips_by_mac{ lc $p->{mac} } || [];
+    next unless @$ips;
+
+    my $svc = (defined $p->{service} && length $p->{service})
+              ? $p->{service} : '-';
+    my $seen = $p->{last_seen} // '-';
+    for my $ip (@$ips) {
+        printf "%s\t%s\t%s\t%d\t%s\t%s\n",
+            $proto, $name, $ip, $p->{port}, $svc, $seen;
+    }
+}
+exit 0;
+
+# Returns ($proto, $reason) or () to skip.
+sub _classify {
+    my ($p) = @_;
+    my $svc = lc($p->{service} // '');
+    my $port = $p->{port} // 0;
+    return ('vnc', "service=$svc")  if $svc =~ /vnc|^rfb$|x11vnc|vino/;
+    return ('xpra', "service=$svc") if $svc =~ /xpra/;
+    if ($include_loose || $svc eq '') {
+        return ('vnc',  "port=$port (5900-5999)") if $port >= 5900 && $port <= 5999;
+        return ('xpra', "port=$port (14500-15000)") if $port >= 14500 && $port <= 15000;
+    }
+    return ();
+}
+
+sub usage {
+    my ($rc) = @_;
+    print STDERR <<"EOF";
+Usage: net-connect-list [filter-regex] [--listen HOST[:PORT]] [--all]
+
+Emits TSV rows of VNC/Xpra endpoints known to net-mgr:
+  PROTO  HOSTNAME  IP  PORT  SERVICE-LABEL  LAST-SEEN
+
+filter-regex restricts by HOSTNAME (anchored). --all loosens port
+classification to include any 5900-5999 / 14500-15000 entry even
+without a recognised service name.
+EOF
+    exit($rc // 2);
+}

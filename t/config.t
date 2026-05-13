@@ -10,7 +10,7 @@ use NetMgr::Config;
 # defaults when file is missing
 {
     my $cfg = NetMgr::Config->load('/no/such/path');
-    is($cfg->{manager}{listen}, '127.0.0.1:7531', 'default listen');
+    is($cfg->{manager}{listen}, 'auto',           'default listen = auto');
     is($cfg->{mysql}{db},       'netmgr',         'default db');
     is($cfg->{scanner}{presence_interval}, 90,    'default presence interval');
     is($cfg->{timeouts}{ap},    120,              'default AP timeout');

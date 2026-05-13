@@ -12,6 +12,12 @@ package NetMgr::Protocol;
 #                                              returns OK output=<b64>
 #   SUBSCRIBE sub=N mode=<m> FROM <table> [WHERE <expr>]
 #   UNSUB     sub=N
+#   FORWARD   slot=PORT target=IP:PORT       -- daemon installs an
+#                                              iptables/socat forward
+#                                              from loopback:PORT to the
+#                                              given LAN target. Lives
+#                                              for this connection.
+#   UNFORWARD slot=PORT                      -- remove a prior forward
 #   BYE
 #
 # Replies (server → client):
@@ -64,6 +70,8 @@ sub parse_line {
     if    ($verb eq 'HELLO')     { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'OBSERVE')   { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'GONE')      { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'FORWARD')   { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'UNFORWARD') { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'BYE')       { croak "BYE takes no args" if @toks }
     elsif ($verb eq 'STATUS')    { croak "STATUS takes no args" if @toks }
     elsif ($verb eq 'UNSUB') {
