@@ -1,25 +1,33 @@
 #!/usr/bin/perl
-# net-connect-list — emit the list of remote-desktop endpoints
-# net-mgr knows about (VNC / Xpra), one per line. Run on a net-mgr-
-# equipped host (typically the gateway the laptop ssh's into).
+# net-connect — laptop entry-point + remote helper for routing VNC,
+# Xpra, and named (IMAP/SMTP/...) sessions through a single ssh
+# tunnel.
 #
-# Output is TSV, one row per (machine_id, ip, port):
+# This commit ships the --list mode only — invoked over ssh on a
+# net-mgr-equipped host (the daemon host, which may or may not be
+# the same machine the laptop ssh's into; see PR description). It
+# snapshots the ports table and emits TSV rows, one per
+# (machine, ip, port):
 #
 #   PROTO  HOSTNAME       IP              PORT  SERVICE-LABEL  LAST-SEEN
 #
 # PROTO is 'vnc' or 'xpra' (heuristically classified from service
-# name + port number). HOSTNAME is machines.primary_name. SERVICE-
-# LABEL is the raw 'service' string from the ports table (or '-' if
-# unknown). LAST-SEEN is the ports.last_seen timestamp, useful for
-# the picker to dim stale entries.
+# name + port number). HOSTNAME is machines.primary_name.
+# SERVICE-LABEL is the raw 'service' string from the ports table
+# (or '-' if unknown). LAST-SEEN is the ports.last_seen timestamp.
 #
 # Usage:
-#   net-connect-list [filter-regex] [--listen HOST[:PORT]] [--all]
+#   net-connect --list [filter-regex] [--listen HOST[:PORT]] [--all]
 #
 # filter-regex matches against HOSTNAME (anchored as ^(?:...)$). With
-# no filter, every (vnc|xpra) entry is emitted. --all loosens the port
-# heuristics to include anything in the wider scan ranges even without
-# a recognised service name (useful for Xpra on non-default ports).
+# no filter, every (vnc|xpra) entry is emitted. --all loosens the
+# port heuristics to include anything in the wider scan ranges even
+# without a recognised service name (useful for Xpra on non-default
+# ports).
+#
+# The laptop-side picker / TUI / viewer-launching modes land in a
+# follow-up commit; without --list the script currently just prints
+# usage.
 #
 # Selection criteria (any of):
 #   - service LIKE '%vnc%' or in {rfb, x11vnc, vino}
@@ -27,8 +35,9 @@
 #   - port in 5900-5999 (VNC display range)
 #   - port in 14500-15000 (typical Xpra range)
 #
-# Exits 0 even if zero rows match — the picker treats empty output as
-# "no sessions". Non-zero exit is reserved for daemon-connect failure.
+# Exits 0 even if zero rows match — the picker treats empty output
+# as "no sessions". Non-zero exit is reserved for daemon-connect
+# failure.
 
 use strict;
 use warnings;
@@ -40,13 +49,16 @@ use NetMgr::Client;
 
 my $listen;
 my $include_loose;
+my $list_mode;
 my $help;
 GetOptions(
+    'list|l'   => \$list_mode,
     'listen=s' => \$listen,
     'all|a'    => \$include_loose,
     'help|h'   => \$help,
 ) or usage(2);
 usage(0) if $help;
+usage(0) unless $list_mode;       # other modes land in the follow-up
 
 my $filter_re;
 if (@ARGV) {
@@ -126,7 +138,7 @@ sub _classify {
 sub usage {
     my ($rc) = @_;
     print STDERR <<"EOF";
-Usage: net-connect-list [filter-regex] [--listen HOST[:PORT]] [--all]
+Usage: net-connect --list [filter-regex] [--listen HOST[:PORT]] [--all]
 
 Emits TSV rows of VNC/Xpra endpoints known to net-mgr:
   PROTO  HOSTNAME  IP  PORT  SERVICE-LABEL  LAST-SEEN
@@ -134,6 +146,9 @@ Emits TSV rows of VNC/Xpra endpoints known to net-mgr:
 filter-regex restricts by HOSTNAME (anchored). --all loosens port
 classification to include any 5900-5999 / 14500-15000 entry even
 without a recognised service name.
+
+(Other modes — picker TUI, viewer launch, named forwards — are
+landing in a follow-up commit.)
 EOF
     exit($rc // 2);
 }

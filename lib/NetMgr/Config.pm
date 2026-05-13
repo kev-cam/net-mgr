@@ -217,6 +217,7 @@ my %ACTIVE = (
     peers      => '*',                        # consumed by net-mgr-relay
     uplinks    => '*',                        # consumed by net-uplink-probe
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
+    forward    => [qw(method allow_peers)],   # net-connect FORWARD backend
 );
 
 # Returns a list of "[section] key" strings for entries in $path that

@@ -413,11 +413,19 @@ sub _handle_unsub {
 # the duration of the connection that requested them; on disconnect,
 # every still-installed forward is torn down.
 #
-# Authorisation: only loopback peers (127.0.0.1) may FORWARD. The
-# laptop reaches the daemon by tunnelling an extra -L through ssh,
-# so its source from sshd's POV is 127.0.0.1; LAN peers are not
-# allowed to ask the daemon to install firewall rules on their
-# behalf.
+# Authorisation: by default, only loopback peers (127.0.0.1) may
+# FORWARD. The laptop usually reaches the daemon by tunnelling an
+# extra -L through ssh terminating at the daemon host, so its source
+# from sshd's POV is 127.0.0.1.
+#
+# When the daemon host is NOT the ssh entry-point — e.g., the laptop
+# logs into zmc1 but the daemon is on nas3, with the laptop's tunnel
+# `-L 7531:nas3.grfx.com:7531` — connections from the daemon's POV
+# come from zmc1's LAN IP, not loopback. Set
+#   [forward]
+#   allow_peers = 192.168.15.0/24, 192.168.223.0/24
+# in the daemon config to permit those peers. Loopback is always
+# allowed regardless of config.
 
 sub _handle_forward {
     my ($self, $cli, $cmd) = @_;
@@ -426,8 +434,9 @@ sub _handle_forward {
     return $self->_send($cli, format_err("FORWARD requires HELLO first"))
         unless defined $cli->{kind};
     return $self->_send($cli,
-        format_err("FORWARD restricted to loopback peers (127.0.0.1)"))
-        unless _peer_is_loopback($cli);
+        format_err("FORWARD peer not permitted (loopback only by default; "
+                 . "see [forward] allow_peers)"))
+        unless $self->_peer_may_forward($cli);
 
     my $slot = $kv->{slot};
     my $tgt  = $kv->{target};
@@ -486,6 +495,42 @@ sub _peer_is_loopback {
     my $sock = $cli->{sock} or return 0;
     my $h = eval { $sock->peerhost } // '';
     return $h eq '127.0.0.1' || $h eq '::1';
+}
+
+# Loopback always allowed; otherwise the peer's IPv4 must fall in one
+# of the CIDRs listed in [forward] allow_peers (comma- or whitespace-
+# separated). Parsed once and cached.
+sub _peer_may_forward {
+    my ($self, $cli) = @_;
+    return 1 if _peer_is_loopback($cli);
+    my $sock = $cli->{sock} or return 0;
+    my $h = eval { $sock->peerhost } // '';
+    return 0 unless $h =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+    my $peer = ($1 << 24) | ($2 << 16) | ($3 << 8) | $4;
+    my $cidrs = $self->{_fwd_allow_cidrs} //= _parse_cidrs(
+        eval { $self->{cfg}{forward}{allow_peers} } // ''
+    );
+    for my $c (@$cidrs) {
+        return 1 if ($peer & $c->[1]) == $c->[0];
+    }
+    return 0;
+}
+
+sub _parse_cidrs {
+    my ($s) = @_;
+    my @out;
+    for my $tok (split /[\s,]+/, $s) {
+        next unless length $tok;
+        if ($tok =~ m{^(\d+)\.(\d+)\.(\d+)\.(\d+)(?:/(\d+))?$}) {
+            my ($a,$b,$c,$d,$pl) = ($1,$2,$3,$4,$5);
+            $pl //= 32;
+            next unless $pl >= 0 && $pl <= 32;
+            my $ipi  = ($a << 24) | ($b << 16) | ($c << 8) | $d;
+            my $mask = $pl == 0 ? 0 : ((0xffffffff << (32 - $pl)) & 0xffffffff);
+            push @out, [ $ipi & $mask, $mask ];
+        }
+    }
+    return \@out;
 }
 
 # Walks every consumer's subscriptions; for each that matches table+WHERE,
