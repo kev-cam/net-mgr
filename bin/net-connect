@@ -416,9 +416,12 @@ sub run_tui {
             print "Active sessions:\n";
             for my $slot (sort { $a <=> $b } keys %active) {
                 my $a = $active{$slot};
-                printf "  [%d] %s (%s:%d) — pid %d\n",
+                my $tag = defined $a->{pid}
+                          ? "pid $a->{pid}"
+                          : "no viewer (manual)";
+                printf "  [%d] %s (%s:%d) — %s\n",
                     $slot, $a->{target}{name}, $a->{target}{ip},
-                    $a->{target}{port}, $a->{pid};
+                    $a->{target}{port}, $tag;
             }
         }
         printf "\nTargets%s (%d):\n",
@@ -483,8 +486,18 @@ sub close_session {
         print STDERR "no active session in slot $slot\n";
         return;
     };
-    kill 'TERM', $a->{pid};
-    # SIGCHLD reaper will pick it up and trigger UNFORWARD.
+    if (defined $a->{pid}) {
+        # Real viewer child — TERM it; SIGCHLD reaper will then
+        # send UNFORWARD and free the slot.
+        kill 'TERM', $a->{pid};
+    } else {
+        # No-viewer slot — UNFORWARD ourselves. (Without this the
+        # slot would never be released because no SIGCHLD ever fires.)
+        eval { $nm->unforward(slot => $slot) };
+        delete $active{$slot};
+        push @free_slots, $slot;
+        print STDERR "[slot $slot] tunnel closed\n";
+    }
 }
 
 # =====================================================================
@@ -511,9 +524,9 @@ sub launch_session {
     my $cmd = viewer_command($target->{proto}, $slot);
     unless ($cmd) {
         print STDERR "no viewer for $target->{proto}; tunnel is open at "
-                   . "localhost:$slot\n";
+                   . "localhost:$slot (use 'k $slot' to release)\n";
         $active{$slot} = {
-            slot => $slot, target => $target, pid => $$,  # placeholder
+            slot => $slot, target => $target, pid => undef,
             viewer_cmd => undef, started => time(),
         };
         return $slot;
@@ -718,6 +731,14 @@ sub open_ssh_master {
         print STDERR "(dry-run) would run: @launch\n";
         exit 0;
     }
+    # If a stale socket file is sitting at our ControlPath (laptop
+    # crashed last time, ssh master died without unlinking, etc.),
+    # remove it before launching — otherwise the new master errors
+    # out with "ControlPath already exists".
+    if (defined $ssh_socket && -e $ssh_socket && !ssh_master_alive($base)) {
+        vlog("removing stale ssh socket $ssh_socket");
+        unlink $ssh_socket;
+    }
     my $rc = run_quiet(@launch);
     if ($rc != 0) {
         err("ssh master failed (rc=$rc)");
@@ -751,9 +772,11 @@ sub cleanup_and_exit {
         }
         eval { $nm->bye };
     }
-    # Reap viewers that are still running.
+    # TERM any viewer children we own. (Skip undef = no-viewer slots
+    # and skip $$ defensively in case a future code path stuffs our
+    # own pid in by mistake.)
     for my $a (values %active) {
-        next unless $a->{pid} && $a->{pid} != $$;
+        next unless defined $a->{pid} && $a->{pid} != $$;
         kill 'TERM', $a->{pid};
     }
     # Close the ssh master.
