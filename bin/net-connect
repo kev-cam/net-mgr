@@ -586,6 +586,7 @@ sub viewer_command {
     # Config override?
     my $key = "viewer.$proto";
     if (my $tmpl = $cfg->{$key}{cmd}) {
+        vlog("viewer [$key] override: $tmpl");
         return [ split_cmd(subst_port($tmpl, $local_port)) ];
     }
 
@@ -602,36 +603,47 @@ sub subst_port {
     return $s;
 }
 
-# Cygwin install paths. A single match wins; user-overridable via
-# [viewer.vnc] cmd = ... in config.
-my @VNC_CANDIDATES = (
-    # On PATH (works on Linux too)
-    [ 'PATH', 'vncviewer',  '%PATH%', 'vncviewer localhost::%PORT%' ],
-    [ 'PATH', 'tvnviewer',  '%PATH%', 'tvnviewer localhost::%PORT%' ],
-    [ 'PATH', 'xtigervncviewer', '%PATH%', 'xtigervncviewer localhost::%PORT%' ],
-    # Cygwin / Windows installs
-    [ 'cygdrive', '/cygdrive/c/Program Files/TigerVNC/vncviewer.exe',
-      '%FOUND%', 'cygstart -w "%FOUND%" localhost::%PORT%' ],
-    [ 'cygdrive', '/cygdrive/c/Program Files/TightVNC/tvnviewer.exe',
-      '%FOUND%', 'cygstart -w "%FOUND%" localhost::%PORT%' ],
-    [ 'cygdrive', '/cygdrive/c/Program Files/RealVNC/VNC Viewer/vncviewer.exe',
-      '%FOUND%', 'cygstart -w "%FOUND%" localhost::%PORT%' ],
-    [ 'cygdrive', '/cygdrive/c/Program Files/uvnc bvba/UltraVNC/vncviewer.exe',
-      '%FOUND%', 'cygstart -w "%FOUND%" localhost::%PORT%' ],
-    [ 'cygdrive', '/cygdrive/c/Program Files (x86)/TigerVNC/vncviewer.exe',
-      '%FOUND%', 'cygstart -w "%FOUND%" localhost::%PORT%' ],
-);
+sub find_vnc_viewer  { _find_viewer(_vnc_candidates(),  $_[0]) }
+sub find_xpra_viewer { _find_viewer(_xpra_candidates(), $_[0]) }
 
-my @XPRA_CANDIDATES = (
-    [ 'PATH', 'xpra', '%PATH%', 'xpra attach tcp://localhost:%PORT%/' ],
-    [ 'cygdrive', '/cygdrive/c/Program Files/Xpra/xpra.exe',
-      '%FOUND%', 'cygstart -w "%FOUND%" attach tcp://localhost:%PORT%/' ],
-    [ 'cygdrive', '/cygdrive/c/Program Files (x86)/Xpra/xpra.exe',
-      '%FOUND%', 'cygstart -w "%FOUND%" attach tcp://localhost:%PORT%/' ],
-);
+# Candidate lists are returned by these accessors so they exist
+# regardless of whether top-level `my @X = (...)` initialisers have
+# run yet. The earlier shape (top-level my-arrays after the main
+# dispatch block) bit us: the script's main flow exits before the
+# arrays' initialiser runs, so find_vnc_viewer would always see an
+# empty list and report "no viewer".
+sub _vnc_candidates {
+    return [
+        # On PATH (works on Linux too)
+        [ 'PATH', 'vncviewer',       '%PATH%', 'vncviewer localhost::%PORT%' ],
+        [ 'PATH', 'tvnviewer',       '%PATH%', 'tvnviewer localhost::%PORT%' ],
+        [ 'PATH', 'xtigervncviewer', '%PATH%', 'xtigervncviewer localhost::%PORT%' ],
+        [ 'PATH', 'xtightvncviewer', '%PATH%', 'xtightvncviewer localhost::%PORT%' ],
+        [ 'PATH', 'xvnc4viewer',     '%PATH%', 'xvnc4viewer localhost::%PORT%' ],
+        [ 'PATH', 'remmina',         '%PATH%', 'remmina -c "vnc://localhost:%PORT%"' ],
+        # Cygwin / Windows installs
+        [ 'cygdrive', '/cygdrive/c/Program Files/TigerVNC/vncviewer.exe',
+          '%FOUND%', 'cygstart -w "%FOUND%" localhost::%PORT%' ],
+        [ 'cygdrive', '/cygdrive/c/Program Files/TightVNC/tvnviewer.exe',
+          '%FOUND%', 'cygstart -w "%FOUND%" localhost::%PORT%' ],
+        [ 'cygdrive', '/cygdrive/c/Program Files/RealVNC/VNC Viewer/vncviewer.exe',
+          '%FOUND%', 'cygstart -w "%FOUND%" localhost::%PORT%' ],
+        [ 'cygdrive', '/cygdrive/c/Program Files/uvnc bvba/UltraVNC/vncviewer.exe',
+          '%FOUND%', 'cygstart -w "%FOUND%" localhost::%PORT%' ],
+        [ 'cygdrive', '/cygdrive/c/Program Files (x86)/TigerVNC/vncviewer.exe',
+          '%FOUND%', 'cygstart -w "%FOUND%" localhost::%PORT%' ],
+    ];
+}
 
-sub find_vnc_viewer  { _find_viewer(\@VNC_CANDIDATES,  $_[0]) }
-sub find_xpra_viewer { _find_viewer(\@XPRA_CANDIDATES, $_[0]) }
+sub _xpra_candidates {
+    return [
+        [ 'PATH', 'xpra', '%PATH%', 'xpra attach tcp://localhost:%PORT%/' ],
+        [ 'cygdrive', '/cygdrive/c/Program Files/Xpra/xpra.exe',
+          '%FOUND%', 'cygstart -w "%FOUND%" attach tcp://localhost:%PORT%/' ],
+        [ 'cygdrive', '/cygdrive/c/Program Files (x86)/Xpra/xpra.exe',
+          '%FOUND%', 'cygstart -w "%FOUND%" attach tcp://localhost:%PORT%/' ],
+    ];
+}
 
 sub _find_viewer {
     my ($cands, $local_port) = @_;
@@ -640,6 +652,7 @@ sub _find_viewer {
         my $found;
         if    ($kind eq 'PATH')     { $found = which($key) }
         elsif ($kind eq 'cygdrive') { $found = $key if -x $key }
+        vlog("viewer probe $kind:$key → " . ($found // 'miss'));
         next unless $found;
         my $cmd = $template;
         $cmd =~ s/%FOUND%/$found/g;
