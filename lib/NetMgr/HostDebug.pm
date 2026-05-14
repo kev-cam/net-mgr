@@ -82,7 +82,11 @@ sub format_report {
     }
     if ($r->{dns}{resolv_conf}) {
         push @out, "  --- /etc/resolv.conf ---";
-        push @out, _indent($r->{dns}{resolv_conf}, 4);
+        my $rc = $r->{dns}{resolv_conf};
+        # strip comment-only and blank lines — boilerplate from
+        # systemd-resolved's stub file is just noise here
+        $rc = join("\n", grep { /\S/ && !/^\s*#/ } split /\n/, $rc);
+        push @out, _indent($rc, 4);
     }
     if ($r->{dns}{resolvectl}) {
         push @out, "  --- resolvectl status ---";
