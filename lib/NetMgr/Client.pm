@@ -163,6 +163,27 @@ sub unforward {
     return 1;
 }
 
+# NAT_MASQUERADE iface=NAME state=on|off [boot=1] — toggle
+# MASQUERADE on POSTROUTING for an egress interface. Persistent
+# (rule survives this connection's disconnect); boot=1 writes
+# through to /etc/iptables (via netfilter-persistent if available).
+# Returns the OK kv hashref ({iface, state, boot?}) or croaks.
+sub nat_masquerade {
+    my ($self, %args) = @_;
+    croak "nat_masquerade needs iface=" unless defined $args{iface};
+    croak "nat_masquerade needs state="
+        unless defined $args{state} && $args{state} =~ /^(?:on|off)$/i;
+    my %kv = (iface => $args{iface}, state => lc $args{state});
+    $kv{boot} = 1 if $args{boot};
+    my $r = $self->send_recv("NAT_MASQUERADE " . format_kv(%kv));
+    croak "nat_masquerade: no reply from daemon" unless defined $r;
+    my $cmd = parse_line($r);
+    croak "nat_masquerade: $cmd->{msg}" if $cmd->{verb} eq 'ERR';
+    croak "nat_masquerade: unexpected reply '$r'"
+        unless $cmd->{verb} eq 'OK';
+    return $cmd->{kv} || {};
+}
+
 sub bye {
     my ($self) = @_;
     $self->send_line("BYE");

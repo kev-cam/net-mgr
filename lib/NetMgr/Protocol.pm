@@ -18,6 +18,14 @@ package NetMgr::Protocol;
 #                                              given LAN target. Lives
 #                                              for this connection.
 #   UNFORWARD slot=PORT                      -- remove a prior forward
+#   NAT_MASQUERADE iface=NAME state=on|off [boot=1]
+#                                            -- toggle MASQUERADE on
+#                                              POSTROUTING for an
+#                                              egress interface.
+#                                              Persistent (no per-conn
+#                                              cleanup); boot=1 also
+#                                              writes through to
+#                                              /etc/iptables.
 #   BYE
 #
 # Replies (server → client):
@@ -72,6 +80,7 @@ sub parse_line {
     elsif ($verb eq 'GONE')      { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'FORWARD')   { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'UNFORWARD') { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'NAT_MASQUERADE') { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'BYE')       { croak "BYE takes no args" if @toks }
     elsif ($verb eq 'STATUS')    { croak "STATUS takes no args" if @toks }
     elsif ($verb eq 'UNSUB') {

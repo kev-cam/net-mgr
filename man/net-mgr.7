@@ -162,6 +162,22 @@ Used by
 .B UNFORWARD slot=PORT
 Release a forward early.
 .TP
+.B NAT_MASQUERADE iface=NAME state=on|off [boot=1]
+Toggle MASQUERADE on the nat POSTROUTING chain for the named egress
+interface. Idempotent. Used to make a candidate gateway routing-
+ready before flipping clients onto it. Persistent (rule outlives
+this connection \(em MASQUERADE on an outbound iface doesn't expose
+anything inbound, so per-connection cleanup isn't needed).
+.B boot=1
+also writes through to
+.IR /etc/iptables/rules.v4
+(via
+.B netfilter-persistent
+when present), so the rule survives reboot. Authorisation is the
+same as for FORWARD: loopback always allowed; off-host peers gated
+by
+.BR "[forward] allow_peers" .
+.TP
 .B BYE
 Clean disconnect.
 .SH WEB UI

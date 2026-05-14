@@ -301,6 +301,7 @@ sub _handle_line {
     elsif ($verb eq 'STATUS')    { $self->_handle_status($cli) }
     elsif ($verb eq 'FORWARD')   { $self->_handle_forward($cli, $cmd) }
     elsif ($verb eq 'UNFORWARD') { $self->_handle_unforward($cli, $cmd) }
+    elsif ($verb eq 'NAT_MASQUERADE') { $self->_handle_nat_masquerade($cli, $cmd) }
     else {
         $self->_send($cli, format_err("verb $verb not handled"));
     }
@@ -488,6 +489,125 @@ sub _handle_unforward {
     }
     $self->_log("unforward $cli->{ident} slot=$slot");
     $self->_send($cli, format_ok(slot => $slot));
+}
+
+# ---- NAT_MASQUERADE -------------------------------------------------
+#
+# Install or remove an iptables MASQUERADE rule on the daemon host's
+# nat POSTROUTING chain, scoped to the named egress interface. Used
+# by net-set to make a candidate gateway routing-ready before we flip
+# clients onto it.
+#
+#   NAT_MASQUERADE iface=enp4s0 state=on  [boot=1]
+#   NAT_MASQUERADE iface=enp4s0 state=off
+#
+# Idempotent: state=on with the rule already present is a no-op
+# (returns OK). state=off with no marked rule for that iface is also
+# a no-op. boot=1 also writes through to /etc/iptables/rules.v4 (or
+# netfilter-persistent save) so the rule survives reboot; OK reply
+# notes which mechanism was used.
+#
+# Authorisation: same as FORWARD (loopback always allowed; off-host
+# peers gated by [forward] allow_peers). MASQUERADE on an outbound
+# interface doesn't expose anything inbound, so persistence is the
+# default (no per-connection cleanup).
+
+sub _handle_nat_masquerade {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+
+    return $self->_send($cli, format_err("NAT_MASQUERADE requires HELLO first"))
+        unless defined $cli->{kind};
+    return $self->_send($cli,
+        format_err("NAT_MASQUERADE peer not permitted (loopback only by default; "
+                 . "see [forward] allow_peers)"))
+        unless $self->_peer_may_forward($cli);
+
+    my $iface = $kv->{iface};
+    my $state = lc($kv->{state} // '');
+    my $boot  = $kv->{boot} ? 1 : 0;
+    return $self->_send($cli, format_err("NAT_MASQUERADE requires iface=NAME"))
+        unless defined $iface && $iface =~ /^[A-Za-z0-9._-]+$/;
+    return $self->_send($cli, format_err("NAT_MASQUERADE state must be 'on' or 'off'"))
+        unless $state eq 'on' || $state eq 'off';
+
+    return $self->_send($cli, format_err("iptables not available on this host"))
+        unless _have_cmd('iptables');
+
+    my $cookie = "net-mgr:masq:$iface";
+    my $present = _masq_rule_present($iface, $cookie);
+
+    my $boot_msg;
+    if ($state eq 'on') {
+        unless ($present) {
+            my @cmd = ('iptables', '-t', 'nat', '-A', 'POSTROUTING',
+                       '-o', $iface,
+                       '-m', 'comment', '--comment', $cookie,
+                       '-j', 'MASQUERADE');
+            my $rc = system(@cmd);
+            if ($rc != 0) {
+                return $self->_send($cli,
+                    format_err("iptables install rc=" . ($rc >> 8)));
+            }
+            $self->_log("nat_masquerade $cli->{ident} iface=$iface ON");
+        }
+        $boot_msg = $self->_persist_iptables if $boot;
+    } else {
+        # state=off — remove every rule with our marker for this iface.
+        my $removed = 0;
+        while (_masq_rule_present($iface, $cookie)) {
+            my @cmd = ('iptables', '-t', 'nat', '-D', 'POSTROUTING',
+                       '-o', $iface,
+                       '-m', 'comment', '--comment', $cookie,
+                       '-j', 'MASQUERADE');
+            my $rc = system(@cmd);
+            last if $rc != 0;
+            $removed++;
+        }
+        $self->_log("nat_masquerade $cli->{ident} iface=$iface OFF removed=$removed")
+            if $removed;
+        $boot_msg = $self->_persist_iptables if $boot;
+    }
+
+    my %ok = (iface => $iface, state => $state);
+    $ok{boot} = $boot_msg if defined $boot_msg;
+    $self->_send($cli, format_ok(%ok));
+}
+
+# Returns 1 if a POSTROUTING rule with our marker for $iface exists.
+sub _masq_rule_present {
+    my ($iface, $cookie) = @_;
+    open my $fh, '-|', 'iptables', '-t', 'nat', '-S', 'POSTROUTING'
+        or return 0;
+    my $hit = 0;
+    while (my $line = <$fh>) {
+        if ($line =~ /-o \Q$iface\E\b/
+         && $line =~ /\Q$cookie\E/
+         && $line =~ /-j MASQUERADE/) {
+            $hit = 1; last;
+        }
+    }
+    close $fh;
+    return $hit;
+}
+
+# Try the common Debian/Ubuntu persistence mechanisms in order.
+# Returns a short string describing what was used, suitable for the
+# OK reply's boot=... field.
+sub _persist_iptables {
+    my ($self) = @_;
+    if (_have_cmd('netfilter-persistent')) {
+        my $rc = system('netfilter-persistent', 'save');
+        return $rc == 0 ? 'netfilter-persistent'
+                        : 'netfilter-persistent-failed';
+    }
+    if (-d '/etc/iptables' && _have_cmd('iptables-save')) {
+        my $tmp = '/etc/iptables/rules.v4.tmp';
+        my $rc  = system("iptables-save > $tmp && mv $tmp /etc/iptables/rules.v4");
+        return $rc == 0 ? 'iptables-save->/etc/iptables/rules.v4'
+                        : 'iptables-save-failed';
+    }
+    return 'no-mechanism';
 }
 
 sub _peer_is_loopback {
