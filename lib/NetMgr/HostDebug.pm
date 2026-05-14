@@ -31,6 +31,7 @@ sub collect {
     $r{listeners}  = _listeners();
     $r{services}   = _services();
     $r{dhcp}       = _dhcp();
+    $r{router}     = _router();
     return \%r;
 }
 
@@ -117,6 +118,31 @@ sub format_report {
                 $L->{server} // '?',
                 $L->{remaining} // '?');
         }
+    }
+    push @out, '';
+
+    # Router-readiness
+    push @out, "==[ ROUTER ]==";
+    my $rt = $r->{router} || {};
+    push @out, "  ip_forward (v4):    " . ($rt->{ip_forward}    // '?');
+    push @out, "  ip_forward (v6):    " . ($rt->{ip_forward_v6} // '?');
+    if (@{ $rt->{defaults} || [] }) {
+        push @out, "  default routes:";
+        push @out, "    $_" for @{ $rt->{defaults} };
+    } else {
+        push @out, "  default routes:     (none)";
+    }
+    if ($rt->{nat_postrouting}) {
+        push @out, "  NAT POSTROUTING:    $rt->{nat_postrouting}";
+    }
+    if ($rt->{filter_forward}) {
+        push @out, "  FILTER FORWARD:     $rt->{filter_forward}";
+    }
+    if (@{ $rt->{ssh_tunnels} || [] }) {
+        push @out, "  ssh tunnels:";
+        push @out, "    $_" for @{ $rt->{ssh_tunnels} };
+    } else {
+        push @out, "  ssh tunnels:        (none)";
     }
     push @out, '';
 
@@ -453,6 +479,83 @@ sub _format_remaining {
 # -------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------
+
+sub _router {
+    my %r;
+    $r{ip_forward}    = _read_first('/proc/sys/net/ipv4/ip_forward');
+    $r{ip_forward_v6} = _read_first('/proc/sys/net/ipv6/conf/all/forwarding');
+
+    # Default routes summarised one per line (iface + via).
+    my @defaults;
+    for my $line (split /\n/, _capture('ip', '-4', 'route', 'show', 'default')) {
+        # default via 192.168.15.252 dev eth0 proto dhcp metric 20101
+        my ($via)  = $line =~ /\bvia\s+(\S+)/;
+        my ($dev)  = $line =~ /\bdev\s+(\S+)/;
+        my ($metric)=$line =~ /\bmetric\s+(\S+)/;
+        next unless $via && $dev;
+        my $s = "via $via dev $dev";
+        $s .= " metric $metric" if defined $metric;
+        push @defaults, $s;
+    }
+    $r{defaults} = \@defaults;
+
+    # NAT POSTROUTING summary (counts of MASQUERADE / SNAT rules and
+    # any non-default chain targets). iptables-save doesn't need root
+    # on most distros if we only want -L counters; we use -nvL on the
+    # nat table because it's the cleanest.
+    if (_have('iptables')) {
+        my $nat = _capture('iptables', '-t', 'nat', '-S', 'POSTROUTING');
+        my @lines = grep { /^-A/ } split /\n/, $nat;
+        my $masq  = grep { /-j MASQUERADE/ } @lines;
+        my $snat  = grep { /-j SNAT/ }       @lines;
+        my $other = scalar(@lines) - $masq - $snat;
+        $r{nat_postrouting} = sprintf "%d rules (MASQUERADE=%d SNAT=%d other=%d)",
+            scalar(@lines), $masq, $snat, $other;
+        # Also note the FORWARD policy + rule count — a router needs
+        # to be ACCEPTing or have explicit allow rules.
+        my $fwd = _capture('iptables', '-S', 'FORWARD');
+        my @fl  = split /\n/, $fwd;
+        my ($pol) = $fwd =~ /^-P FORWARD (\S+)/m;
+        my $fcount = grep { /^-A/ } @fl;
+        $r{filter_forward} = sprintf "policy=%s rules=%d",
+            ($pol // '?'), $fcount;
+    }
+
+    # SSH tunnel processes — heuristic: ssh client invocations with
+    # -N (no command) or -R/-L forwards. Tunnel-back-to-ISP processes
+    # are the canonical "is the cellular link alive" signal on
+    # one-way uplinks.
+    my @tun;
+    if (open my $fh, '-|', 'ps', '-eo', 'pid,etime,args') {
+        my $hdr = <$fh>;    # discard header
+        while (my $line = <$fh>) {
+            chomp $line;
+            # drop leading pid + etime, look at args
+            next unless $line =~ /^\s*\d+\s+\S+\s+(.*)$/;
+            my $args = $1;
+            # match ssh clients only (not sshd)
+            next unless $args =~ /^(?:\S*\/)?ssh(?:\s|$)/;
+            next unless $args =~ /\s-N\b/
+                     || $args =~ /\s-[RL]\s/
+                     || $args =~ /\sControlMaster=/i;
+            push @tun, $line;
+        }
+        close $fh;
+    }
+    $r{ssh_tunnels} = \@tun;
+
+    return \%r;
+}
+
+sub _read_first {
+    my ($path) = @_;
+    open my $fh, '<', $path or return undef;
+    my $line = <$fh>;
+    close $fh;
+    return undef unless defined $line;
+    chomp $line;
+    return $line;
+}
 
 sub _have {
     my ($cmd) = @_;
