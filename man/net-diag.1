@@ -1,0 +1,92 @@
+.TH NET-DIAG 1 "2026-05-13" "net-mgr" "User Commands"
+.SH NAME
+net-diag \- print everything net-mgr knows about a host
+.SH SYNOPSIS
+.B net-diag
+.RI [ options ]
+.IR name-regex | IP
+.SH DESCRIPTION
+.B net-diag
+is a one-stop diagnostic dump for a host: how it's connected (which
+interfaces, AP association, vendor/kind), where each address came
+from (the
+.B addresses.source
+field, e.g.
+.IR wndrhawk:DHCP ", " kc-qernel:dhcp.master ", " 192.168.15.231:arp ),
+DHCP lease records, the names net-mgr knows it by, the open-port
+inventory, and a fresh DNS view (forward + reverse) from the
+caller's resolver.
+.PP
+The argument is treated as an IP if it parses as v4 or v6, else as
+a Perl regex anchored to the full name and matched against
+.BR machines.primary_name ", " hostnames ", " aliases ", and "
+.BR friendly_names .
+Multiple matches are printed in turn, so
+.B 'nas3.*'
+prints
+.IR nas3-up ", " nas3-down ", " nas3-dwn2
+in one go.
+.SH OPTIONS
+.TP
+\fB\-\-listen \fIHOST:PORT\fR
+net-mgr daemon to query (default
+.BR 127.0.0.1:7531 ).
+.TP
+.B \-\-no\-dns
+Skip the local-resolver DNS lookups entirely.
+.TP
+.B \-\-no\-rdns
+Skip just reverse DNS; forward lookups still run.
+.TP
+.B \-\-raw
+Don't pretty-translate
+.IR <ip>:<method>
+source fields to
+.IR <hostname>:<method> .
+.TP
+.BR \-h ", " \-\-help
+Show usage.
+.SH EXIT STATUS
+.TP
+.B 0
+At least one machine matched.
+.TP
+.B 1
+No match.
+.TP
+.B 2
+Bad arguments.
+.SH EXAMPLES
+.PP
+Dump everything for nas3-up:
+.RS 4
+.nf
+.B net-diag nas3-up
+.fi
+.RE
+.PP
+Same, by IP:
+.RS 4
+.nf
+.B net-diag 192.168.15.104
+.fi
+.RE
+.PP
+Show every nas3 sibling at once:
+.RS 4
+.nf
+.B net-diag 'nas3.*'
+.fi
+.RE
+.PP
+Skip DNS lookups (faster, useful when off-network):
+.RS 4
+.nf
+.B net-diag --no-dns zmc1
+.fi
+.RE
+.SH "SEE ALSO"
+.BR net-lookup (1),
+.BR net-show (1),
+.BR net-find-rogue-dhcp (1),
+.BR net-mgr (7)

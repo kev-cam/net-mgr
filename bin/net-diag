@@ -1,0 +1,377 @@
+#!/usr/bin/perl
+# net-diag — print everything net-mgr knows about a host: how it's
+# connected (interfaces, AP association), where each address came
+# from (DHCP server / config import / arp / nmap), what names it
+# answers to, what ports are open, and a fresh DNS view from THIS
+# host's resolver.
+#
+# Usage:
+#   net-diag [opts] <name-regex|IP>
+#
+# Options:
+#   --listen HOST[:PORT]   net-mgr daemon (default 127.0.0.1:7531)
+#   --no-dns               skip the local-resolver DNS lookups
+#   --no-rdns              skip just reverse-DNS (forward still done)
+#   --raw                  don't translate '<ip>:<method>' source
+#                          fields to '<hostname>:<method>'
+#   -h / --help
+#
+# The argument is treated as an IP if it parses as one (v4 or v6),
+# otherwise as a Perl regex anchored to the full name and matched
+# against machines.primary_name, hostnames, aliases, and friendly_
+# names. Multiple machine matches are printed in turn.
+#
+# Exit: 0 on at least one match · 1 on no match · 2 on bad args.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use Socket qw(inet_pton inet_ntop AF_INET AF_INET6);
+
+use NetMgr::Client;
+
+my ($listen, $no_dns, $no_rdns, $raw, $help);
+GetOptions(
+    'listen=s'  => \$listen,
+    'no-dns'    => \$no_dns,
+    'no-rdns'   => \$no_rdns,
+    'raw'       => \$raw,
+    'help|h'    => \$help,
+) or usage(2);
+usage(0) if $help;
+usage(2) unless @ARGV == 1;
+
+my $arg = $ARGV[0];
+
+# ---- pull snapshots --------------------------------------------------
+
+my %args; $args{listen} = $listen if defined $listen;
+my $cli = NetMgr::Client->new(%args, timeout => 5);
+$cli->hello(consumer => "net-diag.$$");
+
+my $machines    = $cli->snapshot(1, 'machines');
+my $ifaces      = $cli->snapshot(2, 'interfaces');
+my $addresses   = $cli->snapshot(3, 'addresses');
+my $hostnames   = $cli->snapshot(4, 'hostnames');
+my $aliases     = $cli->snapshot(5, 'aliases');
+my $friendly    = $cli->snapshot(6, 'friendly_names');
+my $associations= $cli->snapshot(7, 'associations');
+my $dhcp_leases = $cli->snapshot(8, 'dhcp_leases');
+my $ports       = $cli->snapshot(9, 'ports');
+$cli->bye;
+
+# ---- indexes --------------------------------------------------------
+
+my %machine_by_id  = map { $_->{id} => $_ } @$machines;
+my %name_by_id     = map { $_->{id} => $_->{primary_name} }
+                     grep { defined $_->{primary_name} } @$machines;
+my %iface_by_mac;
+my %ifaces_by_mid;
+for my $i (@$ifaces) {
+    next unless $i->{mac};
+    $iface_by_mac{ lc $i->{mac} } = $i;
+    if (defined $i->{machine_id} && length $i->{machine_id}) {
+        push @{ $ifaces_by_mid{ $i->{machine_id} } }, $i;
+    }
+}
+my %addrs_by_mac;
+push @{ $addrs_by_mac{ lc $_->{mac} } }, $_ for grep { $_->{mac} } @$addresses;
+my %hostnames_by_mid;
+push @{ $hostnames_by_mid{ $_->{machine_id} } }, $_ for grep { defined $_->{machine_id} } @$hostnames;
+my %aliases_by_mid;
+push @{ $aliases_by_mid{ $_->{machine_id} } }, $_ for grep { defined $_->{machine_id} } @$aliases;
+my %friendly_by_mid;
+push @{ $friendly_by_mid{ $_->{machine_id} } }, $_ for grep { defined $_->{machine_id} } @$friendly;
+my %assoc_by_client;
+push @{ $assoc_by_client{ lc $_->{client_mac} } }, $_ for grep { $_->{client_mac} } @$associations;
+my %lease_by_mac;
+push @{ $lease_by_mac{ lc $_->{mac} } }, $_ for grep { $_->{mac} } @$dhcp_leases;
+my %ports_by_mac;
+push @{ $ports_by_mac{ lc $_->{mac} } }, $_ for grep { $_->{mac} } @$ports;
+
+# IP → hostname lookup table (for translating source field).
+my %name_for_ip;
+for my $a (@$addresses) {
+    next unless $a->{addr} && $a->{mac};
+    my $i = $iface_by_mac{ lc $a->{mac} } or next;
+    next unless defined $i->{machine_id};
+    my $n = $name_by_id{ $i->{machine_id} } or next;
+    $name_for_ip{ $a->{addr} } //= $n;
+}
+
+# ---- resolve $arg → list of machine_ids -----------------------------
+
+my @mids;
+if (my ($fam, $canon) = parse_ip($arg)) {
+    my $af = $fam eq 'v4' ? AF_INET : AF_INET6;
+    my %seen;
+    for my $a (@$addresses) {
+        next unless $a->{addr};
+        my $bin = inet_pton($af, $a->{addr}) or next;
+        next unless inet_ntop($af, $bin) eq $canon;
+        my $i = $iface_by_mac{ lc $a->{mac} } or next;
+        next unless defined $i->{machine_id};
+        push @mids, $i->{machine_id} unless $seen{ $i->{machine_id} }++;
+    }
+} else {
+    my $rx = eval { qr/^(?:$arg)$/ };
+    die "bad regex '$arg': $@\n" if $@;
+    my %seen;
+    for my $m (@$machines) {
+        next unless $m->{primary_name};
+        push @mids, $m->{id} if $m->{primary_name} =~ $rx && !$seen{ $m->{id} }++;
+    }
+    for my $row (@$hostnames, @$aliases, @$friendly) {
+        next unless $row->{name} && defined $row->{machine_id};
+        push @mids, $row->{machine_id}
+            if $row->{name} =~ $rx && !$seen{ $row->{machine_id} }++;
+    }
+}
+
+unless (@mids) {
+    print STDERR "net-diag: no machine matches '$arg'\n";
+    exit 1;
+}
+
+for my $mid (@mids) { print_machine($mid) }
+exit 0;
+
+# =====================================================================
+# Per-machine report
+# =====================================================================
+
+sub print_machine {
+    my ($mid) = @_;
+    my $m = $machine_by_id{$mid};
+    unless ($m) {
+        printf "==[ (machine_id=%d, no row) ]==\n", $mid;
+        return;
+    }
+
+    printf "\n==[ %s  (machine_id=%d) ]==\n",
+        $m->{primary_name} // '(no primary_name)', $mid;
+    printf "  online=%s  last_seen=%s%s\n",
+        ($m->{online} ? 'yes' : 'no'),
+        ($m->{last_seen} // '(never)'),
+        ($m->{notes} ? "  notes=\"$m->{notes}\"" : '');
+
+    # Interfaces + their addresses + AP association.
+    my @if = sort { ($a->{kind}//'') cmp ($b->{kind}//'')
+                 || ($a->{mac}//'') cmp ($b->{mac}//'') }
+             @{ $ifaces_by_mid{$mid} || [] };
+    if (!@if) {
+        print "  (no interfaces)\n";
+    } else {
+        printf "\nInterfaces (%d):\n", scalar @if;
+        for my $i (@if) {
+            print_iface($i);
+        }
+    }
+
+    print_names($mid, $m);
+    print_ports($mid, \@if);
+    print_dns($mid, $m, \@if) unless $no_dns;
+}
+
+sub print_iface {
+    my ($i) = @_;
+    printf "  %s  %-9s  %-20s  online=%-3s  last_observed=%s\n",
+        $i->{mac}, ($i->{kind} // '?'), trunc($i->{vendor} // '', 20),
+        ($i->{online} ? 'yes' : 'no'),
+        ($i->{last_observed} // '(never)');
+
+    my @a = sort { ($a->{family}//'') cmp ($b->{family}//'')
+                || ($a->{addr}//'') cmp ($b->{addr}//'') }
+            @{ $addrs_by_mac{ lc $i->{mac} } || [] };
+    for my $aa (@a) {
+        my $src = $aa->{source} // '(unknown)';
+        $src = pretty_source($src) unless $raw;
+        printf "    %-39s  source=%-32s  last_observed=%s",
+            $aa->{addr}, $src, ($aa->{last_observed} // '(never)');
+        if (defined $aa->{last_rtt_ms}) {
+            printf "  rtt=%.1fms", $aa->{last_rtt_ms};
+            printf "(min %.1f)", $aa->{min_rtt_ms} if defined $aa->{min_rtt_ms};
+        }
+        print "\n";
+    }
+
+    # WiFi association (this iface as the client side).
+    if (lc($i->{kind} // '') eq 'wifi') {
+        for my $as (@{ $assoc_by_client{ lc $i->{mac} } || [] }) {
+            my $ap_iface = $iface_by_mac{ lc $as->{ap_mac} };
+            my $ap_name  = $ap_iface && defined $ap_iface->{machine_id}
+                         ? ($name_by_id{ $ap_iface->{machine_id} } // '?')
+                         : '?';
+            printf "    associated → AP %s (%s)  signal=%-4s  ssid=%-16s  last_seen=%s\n",
+                $as->{ap_mac}, $ap_name,
+                (defined $as->{signal} ? "$as->{signal}dBm" : '?'),
+                ($as->{ssid} // '?'),
+                ($as->{last_seen} // '?');
+        }
+    }
+
+    # DHCP lease (live record from the lease table).
+    for my $L (@{ $lease_by_mac{ lc $i->{mac} } || [] }) {
+        my $via_ap = $L->{ap_mac} ? " via AP $L->{ap_mac}" : '';
+        printf "    DHCP lease %s%s%s  expires=%s  last_seen=%s\n",
+            ($L->{ip} // '?'),
+            ($L->{hostname} ? " (hostname=$L->{hostname})" : ''),
+            $via_ap,
+            ($L->{expires} // '?'),
+            ($L->{last_seen} // '?');
+    }
+}
+
+sub print_names {
+    my ($mid, $m) = @_;
+    my @h = map { "$_->{name} (src=$_->{source})" }
+            @{ $hostnames_by_mid{$mid} || [] };
+    my @a = map {
+        my $cidr = $_->{prefer_subnet_cidr};
+        $cidr ? "$_->{name} → $cidr" : $_->{name};
+    } @{ $aliases_by_mid{$mid} || [] };
+    my @f = map { $_->{name} } @{ $friendly_by_mid{$mid} || [] };
+
+    print "\nNames known to net-mgr:\n";
+    printf "  primary    %s\n", $m->{primary_name} // '(none)';
+    printf "  hostnames  %s\n", @h ? join(', ', @h) : '(none)';
+    printf "  aliases    %s\n", @a ? join(', ', @a) : '(none)';
+    printf "  friendly   %s\n", @f ? join(', ', @f) : '(none)';
+}
+
+sub print_ports {
+    my ($mid, $ifs) = @_;
+    my %p;
+    for my $i (@$ifs) {
+        for my $row (@{ $ports_by_mac{ lc $i->{mac} } || [] }) {
+            my $key = "$row->{port}/$row->{proto}";
+            $p{$key} //= {
+                port => $row->{port}, proto => $row->{proto},
+                service => $row->{service}, last_seen => $row->{last_seen},
+            };
+        }
+    }
+    return unless %p;
+    my @rows = sort {
+        $a->{port} <=> $b->{port} || $a->{proto} cmp $b->{proto}
+    } values %p;
+    printf "\nKnown open ports (%d):\n", scalar @rows;
+    for my $r (@rows) {
+        printf "  %5d/%-3s  %-16s  last_seen=%s\n",
+            $r->{port}, $r->{proto}, ($r->{service} // '-'),
+            ($r->{last_seen} // '?');
+    }
+}
+
+sub print_dns {
+    my ($mid, $m, $ifs) = @_;
+
+    # Names to resolve forward: primary + every hostname + every alias.
+    my @names;
+    push @names, $m->{primary_name} if $m->{primary_name};
+    push @names, $_->{name} for @{ $hostnames_by_mid{$mid} || [] };
+    push @names, $_->{name} for @{ $aliases_by_mid{$mid} || [] };
+    push @names, $_->{name} for @{ $friendly_by_mid{$mid} || [] };
+    my %seen;
+    @names = grep { !$seen{$_}++ } @names;
+
+    # IPs to resolve reverse: every address on every interface.
+    my @ips;
+    for my $i (@$ifs) {
+        for my $a (@{ $addrs_by_mac{ lc $i->{mac} } || [] }) {
+            push @ips, $a->{addr} if $a->{addr};
+        }
+    }
+    my %seen_i; @ips = grep { !$seen_i{$_}++ } @ips;
+
+    print "\nDNS view (this host's resolver):\n";
+    print "  forward:\n";
+    for my $n (@names) {
+        my @r = dns_forward($n);
+        printf "    %-30s → %s\n",
+            $n, @r ? join(', ', @r) : '(no record)';
+    }
+    unless ($no_rdns) {
+        print "  reverse:\n";
+        for my $ip (@ips) {
+            my $name = dns_reverse($ip);
+            printf "    %-39s → %s\n",
+                $ip, $name // '(no PTR)';
+        }
+    }
+}
+
+# =====================================================================
+# Helpers
+# =====================================================================
+
+sub pretty_source {
+    my ($s) = @_;
+    return $s unless $s =~ /^(\d+\.\d+\.\d+\.\d+):(.+)$/;
+    my ($ip, $tail) = ($1, $2);
+    my $name = $name_for_ip{$ip} // return $s;
+    return "$name:$tail";
+}
+
+sub parse_ip {
+    my ($s) = @_;
+    return unless defined $s && length $s;
+    if (my $b = inet_pton(AF_INET, $s))  { return ('v4', inet_ntop(AF_INET, $b)) }
+    if (my $b = inet_pton(AF_INET6, $s)) { return ('v6', inet_ntop(AF_INET6, $b)) }
+    return;
+}
+
+sub dns_forward {
+    my ($name) = @_;
+    return () unless defined $name && length $name;
+    my @r = gethostbyname($name);
+    return () unless @r >= 5;
+    my @addrs;
+    for my $a (@r[4..$#r]) {
+        next unless defined $a && length($a) == 4;
+        push @addrs, inet_ntop(AF_INET, $a);
+    }
+    return @addrs;
+}
+
+sub dns_reverse {
+    my ($ip) = @_;
+    my $bin = inet_pton(AF_INET, $ip) or return undef;
+    my $name = gethostbyaddr($bin, AF_INET);
+    return $name && length $name ? $name : undef;
+}
+
+sub trunc {
+    my ($s, $n) = @_;
+    return $s if length($s) <= $n;
+    return substr($s, 0, $n - 1) . '…';
+}
+
+sub usage {
+    my ($rc) = @_;
+    print STDERR <<"EOF";
+Usage: net-diag [opts] <name-regex|IP>
+
+Print everything net-mgr knows about a host:
+  - which interfaces (mac, kind, vendor, online state)
+  - which addresses each interface has, where each came from
+    (source field: '<source-host>:<method>')
+  - WiFi AP association (signal, ssid, last_seen)
+  - DHCP lease records (server, hostname offered, expiry)
+  - all names net-mgr knows for this machine
+  - any open ports
+  - a fresh DNS view (forward + reverse) from this host's resolver
+
+Options:
+  --listen HOST[:PORT]   net-mgr daemon (default 127.0.0.1:7531)
+  --no-dns               skip the local-resolver DNS lookups
+  --no-rdns              skip just reverse DNS
+  --raw                  don't pretty-translate IP-shaped source
+                         fields to hostnames
+
+Exit: 0 on at least one match · 1 on no match · 2 on bad args.
+EOF
+    exit($rc // 0);
+}
