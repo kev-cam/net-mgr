@@ -107,9 +107,15 @@ sub format_report {
         push @out, "    $_" for @{ $r->{dhcp}{servers} };
     }
     if (@{ $r->{dhcp}{leases} || [] }) {
-        push @out, "  lease files:";
+        push @out, "  leases:";
+        push @out, sprintf("    %-8s  %-15s  %-15s  %s",
+            "IFACE", "IP", "SERVER", "REMAINING");
         for my $L (@{ $r->{dhcp}{leases} }) {
-            push @out, "    $L->{path}: $L->{summary}";
+            push @out, sprintf("    %-8s  %-15s  %-15s  %s",
+                $L->{iface}  // '?',
+                $L->{ip}     // '?',
+                $L->{server} // '?',
+                $L->{remaining} // '?');
         }
     }
     push @out, '';
@@ -378,22 +384,70 @@ sub _dhcp {
     $r{clients} = \@cl;
     $r{servers} = \@sv;
 
-    # Lease files we know about.
-    my @leases;
+    # Parsed lease summaries — one row per interface, latest lease wins.
+    $r{leases} = _parse_leases();
+    return \%r;
+}
+
+# Returns an arrayref of { iface, ip, server, remaining } hashes
+# from any lease file we recognise. Currently handles ISC dhclient
+# format (the most common Linux). Files unread (perms) or unparseable
+# are skipped silently. If multiple lease blocks reference the same
+# interface, the last one wins (matches dhclient's own "latest" rule).
+sub _parse_leases {
+    my @rows;
+    my %by_iface;
     for my $glob ('/var/lib/dhcp/dhclient*.leases',
-                  '/var/lib/dhclient/dhclient*.lease*',
-                  '/var/lib/dhcpcd/*.lease*',
-                  '/run/systemd/netif/leases/*',
-                  '/var/lib/NetworkManager/*.lease*') {
-        for my $p (glob $glob) {
-            next unless -r $p;
-            my $sz = -s $p;
-            push @leases, { path => $p, summary => "size=${sz}b mtime="
-                . scalar(localtime((stat $p)[9])) };
+                  '/var/lib/dhclient/dhclient*.lease*') {
+        for my $path (glob $glob) {
+            next unless -r $path;
+            open my $fh, '<', $path or next;
+            my $lease; my @blocks;
+            while (my $line = <$fh>) {
+                $line =~ s/[\r\n]+\z//;
+                if ($line =~ /^\s*lease\s*\{/) { $lease = {} }
+                elsif ($line =~ /^\s*\}/)        { push @blocks, $lease if $lease; $lease = undef }
+                elsif ($lease) {
+                    if    ($line =~ /interface\s+"([^"]+)"/)               { $lease->{iface}  = $1 }
+                    elsif ($line =~ /fixed-address\s+(\S+?);/)              { $lease->{ip}     = $1 }
+                    elsif ($line =~ /dhcp-server-identifier\s+(\S+?);/)     { $lease->{server} = $1 }
+                    elsif ($line =~ /expire\s+\d+\s+(\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2})/) {
+                        $lease->{expire_str} = $1;
+                    }
+                }
+            }
+            close $fh;
+            for my $b (@blocks) {
+                next unless $b->{iface};
+                $by_iface{ $b->{iface} } = $b;   # last lease wins
+            }
         }
     }
-    $r{leases} = \@leases;
-    return \%r;
+    for my $iface (sort keys %by_iface) {
+        my $b = $by_iface{$iface};
+        push @rows, {
+            iface     => $iface,
+            ip        => $b->{ip},
+            server    => $b->{server},
+            remaining => _format_remaining($b->{expire_str}),
+        };
+    }
+    return \@rows;
+}
+
+# dhclient writes 'expire W YYYY/MM/DD HH:MM:SS' in UTC.
+sub _format_remaining {
+    my ($s) = @_;
+    return undef unless defined $s
+        && $s =~ m{^(\d{4})/(\d{2})/(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$};
+    require Time::Local;
+    my $expire = Time::Local::timegm($6,$5,$4,$3,$2-1,$1-1900);
+    my $secs = $expire - time();
+    return 'expired' if $secs <= 0;
+    if    ($secs < 60)        { return "${secs}s" }
+    elsif ($secs < 3600)      { return sprintf "%dm%02ds", $secs/60, $secs%60 }
+    elsif ($secs < 86400)     { return sprintf "%dh%02dm", $secs/3600, ($secs%3600)/60 }
+    else                       { return sprintf "%dd%02dh", $secs/86400, ($secs%86400)/3600 }
 }
 
 # -------------------------------------------------------------------
