@@ -134,7 +134,12 @@ Async kick of a named producer (e.g.
 .TP
 .B POLL \fIname\fR [\fIk=v ...\fR]
 Sync RPC: server runs a whitelisted local probe and returns its
-output base64-encoded.
+output base64-encoded. Names currently registered:
+.IR fw_state ", " ssh_forwards ", " host-debug
+(the last is the daemon-side equivalent of
+.BR net-diag (1)
+with no args, used by
+.BR "net-diag --remote" ).
 .TP
 .B STATUS
 Daemon state: started_at, listeners, client counts, schema version.

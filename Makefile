@@ -37,6 +37,7 @@ MAN7S = net-mgr.7
 LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \
         NetMgr/Manager.pm NetMgr/Client.pm NetMgr/Resolver.pm \
         NetMgr/Relay.pm NetMgr/Vendor.pm NetMgr/Subnets.pm \
+        NetMgr/HostDebug.pm \
         NetMgr/Producer/AP.pm NetMgr/Producer/Scan.pm \
         NetMgr/Producer/DhcpMaster.pm NetMgr/Producer/Fingerprint.pm
 

@@ -900,6 +900,9 @@ sub _reap_triggers {
 # can reach :7531 can already drive producers via TRIGGER, so POLL
 # isn't widening the attack surface — just exposing read-only probes
 # of host state that the daemon can already see.
+# Each value is either a shell-script string (run via /bin/sh -c) or
+# a code-ref that returns a string. The dispatcher in _handle_poll
+# picks the right path.
 my %POLL_SCRIPTS = (
     fw_state => <<'SH',
 echo ===KIND===
@@ -918,24 +921,32 @@ iptables-save -t filter 2>/dev/null
 echo ===END===
 SH
     ssh_forwards => 'pgrep -lfa ssh 2>/dev/null',
+    'host-debug' => sub {
+        require NetMgr::HostDebug;
+        return NetMgr::HostDebug::format_report();
+    },
 );
 
 sub _handle_poll {
     my ($self, $cli, $cmd) = @_;
     my $name = $cmd->{name} // '';
-    my $script = $POLL_SCRIPTS{$name};
-    if (!defined $script) {
+    my $handler = $POLL_SCRIPTS{$name};
+    if (!defined $handler) {
         my @ok = sort keys %POLL_SCRIPTS;
         return $self->_send($cli,
             format_err("unknown POLL '$name' (allowed: @ok)"));
     }
     my $output = '';
     eval {
-        open(my $fh, '-|', '/bin/sh', '-c', $script)
-            or die "fork /bin/sh: $!\n";
-        local $/;
-        $output = <$fh> // '';
-        close $fh;
+        if (ref($handler) eq 'CODE') {
+            $output = $handler->() // '';
+        } else {
+            open(my $fh, '-|', '/bin/sh', '-c', $handler)
+                or die "fork /bin/sh: $!\n";
+            local $/;
+            $output = <$fh> // '';
+            close $fh;
+        }
     };
     if ($@) {
         my $e = $@; chomp $e;

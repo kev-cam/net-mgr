@@ -111,9 +111,10 @@ sub poll {
     my $line = "POLL $name";
     $line .= " " . format_kv(%args) if %args;
     my $r = $self->send_recv($line);
-    return undef unless defined $r;
-    my $cmd = eval { parse_line($r) } or return undef;
-    return undef unless $cmd->{verb} eq 'OK';
+    croak "POLL $name: no reply from daemon" unless defined $r;
+    my $cmd = eval { parse_line($r) } or croak "POLL $name: bad reply '$r'";
+    croak "POLL $name: $cmd->{msg}" if $cmd->{verb} eq 'ERR';
+    croak "POLL $name: unexpected reply '$r'" unless $cmd->{verb} eq 'OK';
     my $b64 = ($cmd->{kv} || {})->{output};
     return '' unless defined $b64;
     require MIME::Base64;

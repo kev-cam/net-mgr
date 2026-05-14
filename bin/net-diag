@@ -1,27 +1,39 @@
 #!/usr/bin/perl
-# net-diag — print everything net-mgr knows about a host: how it's
-# connected (interfaces, AP association), where each address came
-# from (DHCP server / config import / arp / nmap), what names it
-# answers to, what ports are open, and a fresh DNS view from THIS
-# host's resolver.
+# net-diag — host-level network diagnostics. Three modes:
 #
-# Usage:
-#   net-diag [opts] <name-regex|IP>
+#   net-diag                       # local: introspect THIS host
+#                                  # (no daemon contact)
+#   net-diag --remote HOST[:PORT]  # remote: same introspection done
+#                                  # by the daemon there, via
+#                                  # POLL host-debug
+#   net-diag NAME-OR-IP            # DB lookup: dump everything the
+#                                  # local daemon knows about that
+#                                  # machine (snapshots its tables)
+#
+# The local + remote modes don't need any DB knowledge — they ask
+# the host (or its daemon) about its own interfaces, routes, DNS
+# resolver config, DHCP client/server state, and listeners on the
+# usual network ports. Useful when chasing rogue DHCP, DNS confusion,
+# missing default routes, etc.
+#
+# DB-lookup mode (the original net-diag) treats the argument as an
+# IP if it parses as one (v4 or v6), otherwise as a Perl regex
+# anchored to the full name and matched against machines.primary_name,
+# hostnames, aliases, and friendly_names. Multiple matches are
+# printed in turn.
 #
 # Options:
-#   --listen HOST[:PORT]   net-mgr daemon (default 127.0.0.1:7531)
-#   --no-dns               skip the local-resolver DNS lookups
-#   --no-rdns              skip just reverse-DNS (forward still done)
-#   --raw                  don't translate '<ip>:<method>' source
-#                          fields to '<hostname>:<method>'
+#   --remote HOST[:PORT]    run host-debug against a remote daemon
+#   --listen HOST[:PORT]    DB-lookup mode: which daemon to query
+#                           (default 127.0.0.1:7531)
+#   --no-dns                DB mode: skip local-resolver lookups
+#   --no-rdns               DB mode: skip reverse DNS only
+#   --raw                   DB mode: don't translate '<ip>:<method>'
+#                           source fields to '<hostname>:<method>'
 #   -h / --help
 #
-# The argument is treated as an IP if it parses as one (v4 or v6),
-# otherwise as a Perl regex anchored to the full name and matched
-# against machines.primary_name, hostnames, aliases, and friendly_
-# names. Multiple machine matches are printed in turn.
-#
-# Exit: 0 on at least one match · 1 on no match · 2 on bad args.
+# Exit: 0 on success · 1 on no match (DB mode) · 2 on bad args
+#       · 4 on daemon connection failure (--remote)
 
 use strict;
 use warnings;
@@ -32,16 +44,31 @@ use Socket qw(inet_pton inet_ntop AF_INET AF_INET6);
 
 use NetMgr::Client;
 
-my ($listen, $no_dns, $no_rdns, $raw, $help);
+my ($listen, $remote, $no_dns, $no_rdns, $raw, $help);
 GetOptions(
     'listen=s'  => \$listen,
+    'remote=s'  => \$remote,
     'no-dns'    => \$no_dns,
     'no-rdns'   => \$no_rdns,
     'raw'       => \$raw,
     'help|h'    => \$help,
 ) or usage(2);
 usage(0) if $help;
-usage(2) unless @ARGV == 1;
+usage(2) if @ARGV > 1;
+
+# Mode dispatch:
+#   no positional + no --remote → local host introspection
+#   no positional + --remote     → remote-via-daemon host introspection
+#   one positional               → DB lookup against local daemon
+#                                  (--remote ignored — they're orthogonal)
+if (!@ARGV) {
+    if (defined $remote) {
+        do_remote_host_debug($remote);
+    } else {
+        do_local_host_debug();
+    }
+    exit 0;
+}
 
 my $arg = $ARGV[0];
 
@@ -349,29 +376,61 @@ sub trunc {
     return substr($s, 0, $n - 1) . '…';
 }
 
+sub do_local_host_debug {
+    require NetMgr::HostDebug;
+    print NetMgr::HostDebug::format_report();
+}
+
+sub do_remote_host_debug {
+    my ($spec) = @_;
+    my %a;
+    $a{listen} = $spec if defined $spec && length $spec;
+    my $cli = eval { NetMgr::Client->new(%a, timeout => 8) };
+    if ($@ || !$cli) {
+        my $msg = $@ // 'connect failed';
+        $msg =~ s/\s+at\s+\S+\s+line\s+\d+\.?$//;
+        print STDERR "net-diag: cannot reach daemon at $spec: $msg\n";
+        exit 4;
+    }
+    $cli->hello(consumer => "net-diag.$$");
+    my $out = eval { $cli->poll('host-debug') };
+    if ($@ || !defined $out) {
+        my $msg = $@ // 'no output';
+        $msg =~ s/\s+at\s+\S+\s+line\s+\d+\.?$//;
+        print STDERR "net-diag: POLL host-debug failed: $msg\n";
+        exit 4;
+    }
+    eval { $cli->bye };
+    print $out;
+}
+
 sub usage {
     my ($rc) = @_;
     print STDERR <<"EOF";
-Usage: net-diag [opts] <name-regex|IP>
+Usage:
+  net-diag                       # introspect THIS host (no daemon)
+  net-diag --remote HOST[:PORT]  # introspect a remote host via its
+                                 # net-mgr daemon (POLL host-debug)
+  net-diag [opts] <name|IP>      # DB lookup against the local daemon
 
-Print everything net-mgr knows about a host:
-  - which interfaces (mac, kind, vendor, online state)
-  - which addresses each interface has, where each came from
-    (source field: '<source-host>:<method>')
-  - WiFi AP association (signal, ssid, last_seen)
-  - DHCP lease records (server, hostname offered, expiry)
-  - all names net-mgr knows for this machine
-  - any open ports
-  - a fresh DNS view (forward + reverse) from this host's resolver
+Local + remote modes report: interfaces (mac/kind/addrs/flags),
+routes (v4 + v6), DNS resolver config (resolv.conf + resolvectl),
+DHCP client/server processes + lease files, listeners on usual
+ports, and active/enabled state of the common DHCP/DNS units.
 
-Options:
-  --listen HOST[:PORT]   net-mgr daemon (default 127.0.0.1:7531)
-  --no-dns               skip the local-resolver DNS lookups
-  --no-rdns              skip just reverse DNS
-  --raw                  don't pretty-translate IP-shaped source
-                         fields to hostnames
+DB-lookup mode (positional NAME or IP) reports what the daemon's
+DB knows: interfaces, addresses with their source fields, WiFi AP
+association, DHCP lease records, all known names, open ports, and
+a fresh local-resolver DNS view.
 
-Exit: 0 on at least one match · 1 on no match · 2 on bad args.
+Options (DB-lookup mode only):
+  --listen HOST[:PORT]   daemon to query (default 127.0.0.1:7531)
+  --no-dns               skip local-resolver DNS lookups
+  --no-rdns              skip reverse DNS only
+  --raw                  don't translate IP-shaped source prefixes
+                         to hostnames
+
+Exit: 0 ok · 1 DB no-match · 2 bad args · 4 daemon connect.
 EOF
     exit($rc // 0);
 }

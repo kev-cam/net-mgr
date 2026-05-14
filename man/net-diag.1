@@ -1,24 +1,50 @@
-.TH NET-DIAG 1 "2026-05-13" "net-mgr" "User Commands"
+.TH NET-DIAG 1 "2026-05-14" "net-mgr" "User Commands"
 .SH NAME
-net-diag \- print everything net-mgr knows about a host
+net-diag \- host-level network diagnostics + net-mgr DB lookup
 .SH SYNOPSIS
+.B net-diag
+.br
+.B net-diag
+\fB\-\-remote\fR \fIHOST\fR[\fI:PORT\fR]
+.br
 .B net-diag
 .RI [ options ]
 .IR name-regex | IP
 .SH DESCRIPTION
 .B net-diag
-is a one-stop diagnostic dump for a host: how it's connected (which
-interfaces, AP association, vendor/kind), where each address came
-from (the
+has three modes, picked by the arguments:
+.TP
+.B Local host introspection (no args)
+Reports on the host running the command, without contacting any
+daemon. Useful for "why is DHCP/DNS doing the wrong thing on this
+box". Sections include interfaces (mac, kind, addrs, flags), v4/v6
+routes, DNS resolver config (resolv.conf + resolvectl when
+present), DHCP client/server processes + lease files, listeners on
+the usual network ports (53, 67/68, 5353, ...), and
+active/enabled state of the common DHCP/DNS systemd units.
+.TP
+.B Remote host introspection (\-\-remote HOST)
+Connects to the net-mgr daemon at
+.I HOST
+(default port 7531) and runs the same host-level introspection
+there via the
+.B POLL host-debug
+verb. The daemon returns a formatted report; this end just prints
+it. Requires net-mgr to be running on the target.
+.TP
+.B DB lookup (positional NAME or IP)
+Asks the local net-mgr daemon for everything its DB knows about
+the matching machine: interfaces, addresses (with the
 .B addresses.source
-field, e.g.
+field showing where each lease/observation came from \(em e.g.
 .IR wndrhawk:DHCP ", " kc-qernel:dhcp.master ", " 192.168.15.231:arp ),
-DHCP lease records, the names net-mgr knows it by, the open-port
-inventory, and a fresh DNS view (forward + reverse) from the
-caller's resolver.
+WiFi AP association, DHCP lease records, all known names, and
+open ports. Also prints a fresh local-resolver DNS view (forward
++ reverse).
 .PP
-The argument is treated as an IP if it parses as v4 or v6, else as
-a Perl regex anchored to the full name and matched against
+In DB-lookup mode the argument is treated as an IP if it parses as
+v4 or v6, else as a Perl regex anchored to the full name and
+matched against
 .BR machines.primary_name ", " hostnames ", " aliases ", and "
 .BR friendly_names .
 Multiple matches are printed in turn, so
@@ -28,18 +54,22 @@ prints
 in one go.
 .SH OPTIONS
 .TP
+\fB\-\-remote\fR \fIHOST\fR[\fI:PORT\fR]
+Run host-debug against a remote daemon. Mutually exclusive with the
+DB-lookup positional.
+.TP
 \fB\-\-listen \fIHOST:PORT\fR
-net-mgr daemon to query (default
+DB-lookup mode: which daemon to query (default
 .BR 127.0.0.1:7531 ).
 .TP
 .B \-\-no\-dns
-Skip the local-resolver DNS lookups entirely.
+DB mode: skip the local-resolver DNS lookups entirely.
 .TP
 .B \-\-no\-rdns
-Skip just reverse DNS; forward lookups still run.
+DB mode: skip just reverse DNS; forward lookups still run.
 .TP
 .B \-\-raw
-Don't pretty-translate
+DB mode: don't pretty-translate
 .IR <ip>:<method>
 source fields to
 .IR <hostname>:<method> .
@@ -49,23 +79,40 @@ Show usage.
 .SH EXIT STATUS
 .TP
 .B 0
-At least one machine matched.
+Success.
 .TP
 .B 1
-No match.
+DB-lookup mode: no machine matched.
 .TP
 .B 2
 Bad arguments.
+.TP
+.B 4
+Remote mode: cannot reach the daemon, or POLL failed.
 .SH EXAMPLES
 .PP
-Dump everything for nas3-up:
+Introspect this host (DHCP setup, DNS, listeners, etc.):
+.RS 4
+.nf
+.B net-diag
+.fi
+.RE
+.PP
+Same, but on a remote net-mgr-equipped host:
+.RS 4
+.nf
+.B net-diag --remote nas3.grfx.com
+.fi
+.RE
+.PP
+DB lookup by name:
 .RS 4
 .nf
 .B net-diag nas3-up
 .fi
 .RE
 .PP
-Same, by IP:
+DB lookup by IP:
 .RS 4
 .nf
 .B net-diag 192.168.15.104
@@ -76,13 +123,6 @@ Show every nas3 sibling at once:
 .RS 4
 .nf
 .B net-diag 'nas3.*'
-.fi
-.RE
-.PP
-Skip DNS lookups (faster, useful when off-network):
-.RS 4
-.nf
-.B net-diag --no-dns zmc1
 .fi
 .RE
 .SH "SEE ALSO"
