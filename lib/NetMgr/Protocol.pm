@@ -26,6 +26,14 @@ package NetMgr::Protocol;
 #                                              cleanup); boot=1 also
 #                                              writes through to
 #                                              /etc/iptables.
+#   SET_GATEWAY action=set via=IP [dev=NAME] [metric=N]
+#   SET_GATEWAY action=clear           [metric=N]
+#                                            -- install (or remove)
+#                                              a low-metric default
+#                                              route. Default
+#                                              metric=1 wins over
+#                                              DHCP defaults; clear
+#                                              reverts cleanly.
 #   BYE
 #
 # Replies (server → client):
@@ -81,6 +89,7 @@ sub parse_line {
     elsif ($verb eq 'FORWARD')   { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'UNFORWARD') { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'NAT_MASQUERADE') { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'SET_GATEWAY')    { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'BYE')       { croak "BYE takes no args" if @toks }
     elsif ($verb eq 'STATUS')    { croak "STATUS takes no args" if @toks }
     elsif ($verb eq 'UNSUB') {

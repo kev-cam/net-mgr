@@ -302,6 +302,7 @@ sub _handle_line {
     elsif ($verb eq 'FORWARD')   { $self->_handle_forward($cli, $cmd) }
     elsif ($verb eq 'UNFORWARD') { $self->_handle_unforward($cli, $cmd) }
     elsif ($verb eq 'NAT_MASQUERADE') { $self->_handle_nat_masquerade($cli, $cmd) }
+    elsif ($verb eq 'SET_GATEWAY')    { $self->_handle_set_gateway($cli, $cmd) }
     else {
         $self->_send($cli, format_err("verb $verb not handled"));
     }
@@ -608,6 +609,90 @@ sub _persist_iptables {
                         : 'iptables-save-failed';
     }
     return 'no-mechanism';
+}
+
+# ---- SET_GATEWAY ----------------------------------------------------
+#
+# Install (or remove) a low-metric default route on the daemon host.
+# The strategy is to leave whatever default route DHCP gave us in
+# place and add a competing one at metric=1; the kernel always picks
+# the lowest-metric default, so traffic switches to ours immediately.
+# To revert, remove the metric=1 entry — DHCP's default takes back
+# over with no need to touch dhclient/networkd state.
+#
+#   SET_GATEWAY action=set via=IP [dev=NAME] [metric=1]
+#   SET_GATEWAY action=clear         [metric=1]
+#
+# Idempotent. action=set replaces any prior route at the same metric
+# (we own that metric for this purpose). Authorisation is the same
+# as FORWARD: loopback always allowed; off-host gated by
+# [forward] allow_peers.
+
+sub _handle_set_gateway {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+
+    return $self->_send($cli, format_err("SET_GATEWAY requires HELLO first"))
+        unless defined $cli->{kind};
+    return $self->_send($cli,
+        format_err("SET_GATEWAY peer not permitted (loopback only by default; "
+                 . "see [forward] allow_peers)"))
+        unless $self->_peer_may_forward($cli);
+
+    return $self->_send($cli, format_err("ip(8) not available on this host"))
+        unless _have_cmd('ip');
+
+    my $action = lc($kv->{action} // 'set');
+    my $metric = $kv->{metric} // 1;
+    return $self->_send($cli, format_err("metric must be 0..4294967295"))
+        unless $metric =~ /^\d+$/ && $metric <= 4294967295;
+
+    if ($action eq 'clear') {
+        # Remove every default route at this metric (typically just one).
+        # Loop because successive `ip route del` may match siblings.
+        my $removed = 0;
+        for (1..8) {
+            my $rc = system('ip', 'route', 'del', 'default',
+                            'metric', $metric);
+            last if $rc != 0;       # nothing left to delete
+            $removed++;
+        }
+        $self->_log("set_gateway $cli->{ident} CLEAR metric=$metric removed=$removed");
+        return $self->_send($cli, format_ok(action => 'clear',
+                                            metric => $metric,
+                                            removed => $removed));
+    }
+
+    if ($action ne 'set') {
+        return $self->_send($cli,
+            format_err("SET_GATEWAY action must be 'set' or 'clear'"));
+    }
+
+    my $via = $kv->{via};
+    return $self->_send($cli, format_err("SET_GATEWAY action=set requires via=IP"))
+        unless defined $via && $via =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+    my $dev = $kv->{dev};
+    return $self->_send($cli, format_err("dev must be A-Za-z0-9._-"))
+        if defined $dev && $dev !~ /^[A-Za-z0-9._-]+$/;
+
+    # Replace any existing route we own at this metric (idempotent).
+    system('ip', 'route', 'del', 'default', 'metric', $metric);   # may fail; OK
+
+    my @cmd = ('ip', 'route', 'add', 'default', 'via', $via,
+               'metric', $metric);
+    push @cmd, 'dev', $dev if defined $dev;
+    my $rc = system(@cmd);
+    if ($rc != 0) {
+        return $self->_send($cli,
+            format_err("ip route add rc=" . ($rc >> 8)));
+    }
+    $self->_log("set_gateway $cli->{ident} SET via=$via dev="
+              . ($dev // 'auto') . " metric=$metric");
+    $self->_send($cli, format_ok(
+        action => 'set', via => $via,
+        dev    => ($dev // 'auto'),
+        metric => $metric,
+    ));
 }
 
 sub _peer_is_loopback {

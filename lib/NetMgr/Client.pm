@@ -184,6 +184,29 @@ sub nat_masquerade {
     return $cmd->{kv} || {};
 }
 
+# SET_GATEWAY action=set via=IP [dev=NAME] [metric=N]
+# SET_GATEWAY action=clear        [metric=N]
+# Returns the OK kv hashref or croaks on ERR.
+sub set_gateway {
+    my ($self, %args) = @_;
+    my $action = lc($args{action} // (defined $args{via} ? 'set' : 'clear'));
+    croak "set_gateway action must be 'set' or 'clear'"
+        unless $action eq 'set' || $action eq 'clear';
+    my %kv = (action => $action);
+    if ($action eq 'set') {
+        croak "set_gateway action=set requires via=IP" unless defined $args{via};
+        $kv{via}    = $args{via};
+        $kv{dev}    = $args{dev}    if defined $args{dev};
+    }
+    $kv{metric} = $args{metric} if defined $args{metric};
+    my $r = $self->send_recv("SET_GATEWAY " . format_kv(%kv));
+    croak "set_gateway: no reply from daemon" unless defined $r;
+    my $cmd = parse_line($r);
+    croak "set_gateway: $cmd->{msg}" if $cmd->{verb} eq 'ERR';
+    croak "set_gateway: unexpected reply '$r'" unless $cmd->{verb} eq 'OK';
+    return $cmd->{kv} || {};
+}
+
 sub bye {
     my ($self) = @_;
     $self->send_line("BYE");

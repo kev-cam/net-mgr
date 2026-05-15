@@ -1,0 +1,179 @@
+#!/usr/bin/perl
+# net-set — push routing/forwarding decisions to net-mgr-equipped
+# hosts via the daemon protocol. Today this is just gateway selection;
+# room for related operations (forwards, NAT toggles, …) as the need
+# arises.
+#
+# Usage:
+#   net-set --gateway HOST  TARGET [TARGET ...]
+#   net-set --clear         TARGET [TARGET ...]
+#   net-set --gateway HOST --all
+#   net-set --gateway HOST --status            # query, no change
+#
+# HOST = name or IP of the gateway to install. net-set resolves it
+#        via net-lookup if it's not already an IP. Picked from the
+#        target's /24 when net-lookup --all returns multiple options.
+#
+# TARGET = name or IP of a host running net-mgr. The default daemon
+#        port is 7531; override with HOST:PORT.
+#
+# --metric N      override the route metric (default 1, beats DHCP).
+# --dev IFACE     pin egress interface (default: kernel decides).
+# --boot          ask the daemon to also persist (NAT_MASQUERADE
+#                 path; SET_GATEWAY is runtime-only and reverts on
+#                 the next dhclient renew/reboot).
+# --dry-run       show what would be sent, don't send.
+# --quiet         only show changes; silent on success.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+use NetMgr::Client;
+
+my ($gateway, $clear, $all, $status, $metric, $dev, $dry, $quiet, $help);
+GetOptions(
+    'gateway=s'  => \$gateway,
+    'clear'      => \$clear,
+    'all'        => \$all,
+    'status'     => \$status,
+    'metric=i'   => \$metric,
+    'dev=s'      => \$dev,
+    'dry-run|n'  => \$dry,
+    'quiet|q'    => \$quiet,
+    'help|h'     => \$help,
+) or usage(2);
+usage(0) if $help;
+
+usage(2) unless $gateway || $clear || $status;
+usage(2) if $clear && $gateway;
+usage(2) if !$status && !@ARGV && !$all;
+
+# --all expansion is intentionally a TODO: we'd need to enumerate
+# net-mgr peers from the local DB. For now you list targets by hand.
+if ($all) {
+    die "net-set: --all not implemented yet (list targets explicitly)\n";
+}
+
+my @targets = @ARGV;
+die "net-set: no targets\n" unless @targets;
+
+# Resolve $gateway → IP once, per target's /24 (deferred per-target).
+my $rc = 0;
+for my $t (@targets) {
+    my ($host, $port) = split /:/, $t, 2;
+    $port //= 7531;
+    my $cli = eval { NetMgr::Client->new(listen => "$host:$port", timeout => 5) };
+    if ($@ || !$cli) {
+        my $msg = $@ // 'connect failed';
+        $msg =~ s/\s+at\s+\S+\s+line\s+\d+\.?$//;
+        warn "$t: $msg\n";
+        $rc = 1; next;
+    }
+    $cli->hello(consumer => "net-set.$$");
+
+    if ($status) {
+        # Print the target's current default routes via host-debug;
+        # cheap diagnostic, no change.
+        my $out = eval { $cli->poll('host-debug') };
+        if ($@) { warn "$t: $@\n"; $rc = 1; eval { $cli->bye }; next }
+        # Pull just the ROUTER section out.
+        my $section = '';
+        my $in;
+        for my $line (split /\n/, $out) {
+            if ($line =~ /^==\[ ROUTER /)    { $in = 1; $section .= "$line\n"; next }
+            if ($line =~ /^==\[/ && $in)     { $in = 0; last }
+            $section .= "$line\n" if $in;
+        }
+        print "=== $t ===\n", $section, "\n";
+        eval { $cli->bye };
+        next;
+    }
+
+    if ($clear) {
+        my %k = ();
+        $k{metric} = $metric if defined $metric;
+        if ($dry) {
+            print STDERR "$t: would SET_GATEWAY action=clear"
+                       . (defined $metric ? " metric=$metric" : '') . "\n";
+            eval { $cli->bye }; next;
+        }
+        my $r = eval { $cli->set_gateway(action => 'clear', %k) };
+        if ($@) { warn "$t: $@"; $rc = 1; eval { $cli->bye }; next }
+        print "$t: cleared (metric=$r->{metric}, removed=$r->{removed})\n"
+            unless $quiet && ($r->{removed} // 0) == 0;
+        eval { $cli->bye };
+        next;
+    }
+
+    # Else: --gateway HOST (set)
+    my $via = resolve_gateway($gateway, $host);
+    unless ($via) {
+        warn "$t: cannot resolve gateway '$gateway'\n";
+        $rc = 1; eval { $cli->bye }; next;
+    }
+    my %k = (action => 'set', via => $via);
+    $k{dev}    = $dev    if defined $dev;
+    $k{metric} = $metric if defined $metric;
+    if ($dry) {
+        print STDERR "$t: would SET_GATEWAY via=$via"
+                   . (defined $dev ? " dev=$dev" : '')
+                   . (defined $metric ? " metric=$metric" : '') . "\n";
+        eval { $cli->bye }; next;
+    }
+    my $r = eval { $cli->set_gateway(%k) };
+    if ($@) { warn "$t: $@"; $rc = 1; eval { $cli->bye }; next }
+    printf "%s: gateway → %s (dev=%s metric=%s)\n",
+        $t, $r->{via}, ($r->{dev} // '?'), ($r->{metric} // '?')
+        unless $quiet;
+    eval { $cli->bye };
+}
+
+exit $rc;
+
+# Resolve a gateway name to an IP. If $name is already a v4 dotted-
+# quad, pass through. Otherwise shell out to net-lookup (which
+# already knows about prefer_subnet_cidr aliases). Pass --include-stale
+# so static-only entries (gateway1, gateway2 that may not have been
+# pinged recently) still resolve.
+sub resolve_gateway {
+    my ($name, $target_host) = @_;
+    return $name if $name =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+    my $cmd = "net-lookup --include-stale " . shell_quote($name) . " 2>/dev/null";
+    chomp(my $ip = `$cmd`);
+    return $ip if $ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+    return undef;
+}
+
+sub shell_quote {
+    my ($s) = @_;
+    return "''" unless defined $s && length $s;
+    return $s   if $s =~ /^[A-Za-z0-9_.\/=:,@-]+$/;
+    (my $q = $s) =~ s/'/'\\''/g;
+    return "'$q'";
+}
+
+sub usage {
+    my ($rc) = @_;
+    print STDERR <<"EOF";
+Usage:
+  net-set --gateway HOST  TARGET [TARGET ...]
+  net-set --clear         TARGET [TARGET ...]
+  net-set --status        TARGET [TARGET ...]
+
+  HOST   = name or IP of the gateway to install (resolved via
+           net-lookup if not already an IP)
+  TARGET = name or IP of a host running net-mgr (HOST:PORT to
+           override default daemon port 7531)
+
+Options:
+  --metric N      route metric for our entry (default 1)
+  --dev IFACE     pin egress interface
+  --dry-run / -n  show what would be sent, don't send
+  --quiet  / -q   only print changes
+  --help   / -h
+EOF
+    exit($rc // 0);
+}
