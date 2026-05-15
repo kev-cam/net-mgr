@@ -1327,6 +1327,7 @@ sub _handle_observe {
         elsif ($kind eq 'host')        { @events = $self->_obs_host($cli, $kv) }
         elsif ($kind eq 'port')        { @events = $self->_obs_port($cli, $kv) }
         elsif ($kind eq 'ping')        { @events = $self->_obs_ping($cli, $kv) }
+        elsif ($kind eq 'link')        { @events = $self->_obs_link($cli, $kv) }
         elsif ($kind eq 'event')       { @events = $self->_obs_event($cli, $kv) }
         elsif ($kind eq 'forward')     { @events = $self->_obs_forward($cli, $kv) }
         else {
@@ -1635,10 +1636,14 @@ sub _obs_ping {
     my $rtt    = $kv->{rtt_ms};
     die "ping: rtt_ms required\n" unless defined $rtt;
     die "ping: rtt_ms not numeric\n" unless $rtt =~ /^\d+(?:\.\d+)?$/;
+    my $loss = $kv->{loss_pct};
+    if (defined $loss) {
+        die "ping: loss_pct not numeric\n" unless $loss =~ /^\d+(?:\.\d+)?$/;
+    }
 
-    my $r = $self->{db}->update_rtt(
-        mac => $mac, addr => $addr, family => 'v4', rtt_ms => $rtt
-    );
+    my %args = (mac => $mac, addr => $addr, family => 'v4', rtt_ms => $rtt);
+    $args{loss_pct} = $loss if defined $loss;
+    my $r = $self->{db}->update_rtt(%args);
     return unless $r->{found};   # row missing — silent no-op (producer bug)
 
     # update_rtt writes directly (not via _upsert) so it doesn't auto-
@@ -1684,6 +1689,30 @@ sub _obs_ping {
     }
 
     return @ev;
+}
+
+# kind=link mac=NAME link_speed_mbps=N — push interface link rate.
+# Source is sysfs (/sys/class/net/$IF/speed) for wired, iw for wifi;
+# producer is bin/net-link-stats. Silent no-op if the interface row
+# doesn't exist yet (the producer should know its own MACs).
+sub _obs_link {
+    my ($self, $cli, $kv) = @_;
+    my $mac = $kv->{mac} or die "link: mac required\n";
+    my $sp  = $kv->{link_speed_mbps};
+    die "link: link_speed_mbps required\n" unless defined $sp;
+    die "link: link_speed_mbps not an integer\n" unless $sp =~ /^-?\d+$/;
+    my $rows = $self->{db}->update_link_speed(
+        mac => $mac, link_speed_mbps => $sp + 0
+    );
+    if ($rows) {
+        # Re-fetch + emit so streaming consumers see the new value.
+        my $row = $self->{db}->dbh->selectrow_hashref(
+            "SELECT * FROM interfaces WHERE mac = ?", undef, lc $mac
+        );
+        $self->_emit_change(table => 'interfaces', op => 'update', row => $row)
+            if $row;
+    }
+    return ();
 }
 
 # Lets clients persist arbitrary events without DB credentials. Used by

@@ -1,0 +1,158 @@
+#!/usr/bin/perl
+# net-link-stats — push per-interface link rate to net-mgr.
+#
+# Usage:
+#   net-link-stats [--listen HOST[:PORT]] [--quiet] [--dry-run]
+#
+# For every UP non-loopback interface on this host, look up:
+#   - MAC from /sys/class/net/$IF/address
+#   - link speed in Mbps:
+#       wired  → /sys/class/net/$IF/speed
+#       wifi   → `iw dev $IF link` "tx bitrate" line (Mbit/s)
+#   - kind   from /sys/class/net/$IF/wireless presence (wifi vs eth)
+#
+# Push as `OBSERVE kind=link mac=$MAC link_speed_mbps=$N`. The
+# daemon updates interfaces.link_speed_mbps; net-lookup uses it
+# for tie-breaking (faster link wins among otherwise equal scores).
+#
+# Designed to be run periodically (cron / systemd timer) on every
+# host whose interfaces matter — typically the gateways and any
+# server we ssh into. Hosts whose link rate is constant don't need
+# repeat runs; the producer is idempotent.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+use NetMgr::Client;
+
+my ($listen, $quiet, $dry, $help);
+GetOptions(
+    'listen=s'  => \$listen,
+    'quiet|q'   => \$quiet,
+    'dry-run|n' => \$dry,
+    'help|h'    => \$help,
+) or usage(2);
+usage(0) if $help;
+
+my @ifs = list_ifaces();
+unless (@ifs) {
+    print STDERR "net-link-stats: no UP interfaces with a MAC address\n"
+        unless $quiet;
+    exit 0;
+}
+
+my $cli;
+unless ($dry) {
+    my %args; $args{listen} = $listen if defined $listen;
+    $cli = NetMgr::Client->new(%args, timeout => 5);
+    $cli->hello(consumer => "net-link-stats.$$");
+}
+
+for my $i (@ifs) {
+    my $name = $i->{name};
+    my $mac  = $i->{mac};
+    my $sp   = read_speed($name, $i->{kind});
+    if (!defined $sp) {
+        printf STDERR "  %-12s %s  (link speed unknown)\n", $name, $mac
+            unless $quiet;
+        next;
+    }
+    if ($dry) {
+        printf "  %-12s %s  speed=%dMbps  (dry-run)\n", $name, $mac, $sp;
+        next;
+    }
+    my $reply = $cli->observe(
+        kind => 'link', mac => $mac, link_speed_mbps => $sp
+    );
+    if ($reply && $reply =~ /^ERR/) {
+        warn "  $name ($mac): $reply\n";
+        next;
+    }
+    printf "  %-12s %s  speed=%dMbps\n", $name, $mac, $sp unless $quiet;
+}
+
+$cli->bye if $cli;
+exit 0;
+
+# ---- iface enumeration ---------------------------------------------
+
+sub list_ifaces {
+    my @out;
+    open my $fh, '-|', 'ip', '-br', 'link', 'show'
+        or die "ip link: $!\n";
+    while (my $line = <$fh>) {
+        chomp $line;
+        my @f = split ' ', $line;
+        next unless @f >= 3;
+        my ($name, $state, $mac) = @f[0,1,2];
+        next if $name eq 'lo';
+        next unless $state eq 'UP' || $state eq 'UNKNOWN';
+        next unless $mac =~ /^[0-9a-f:]{17}$/i;
+        push @out, {
+            name => $name,
+            mac  => lc $mac,
+            kind => -d "/sys/class/net/$name/wireless"
+                 || -e "/sys/class/net/$name/phy80211" ? 'wifi'
+                 : -d "/sys/class/net/$name/bridge"    ? 'bridge'
+                 : 'ethernet',
+        };
+    }
+    close $fh;
+    return @out;
+}
+
+# ---- per-iface link speed -----------------------------------------
+
+sub read_speed {
+    my ($name, $kind) = @_;
+    if ($kind eq 'wifi') {
+        return read_wifi_bitrate($name);
+    }
+    if ($kind eq 'bridge') {
+        # Bridges don't have a link rate; reflect the slowest of their
+        # member ports, OR just skip — for now, skip.
+        return undef;
+    }
+    # Wired (or anything else with a sysfs speed file).
+    open my $fh, '<', "/sys/class/net/$name/speed" or return undef;
+    chomp(my $sp = <$fh> // '');
+    close $fh;
+    return undef unless $sp =~ /^-?\d+$/;
+    return undef if $sp < 0;        # -1 = link down or unknown
+    return $sp + 0;
+}
+
+sub read_wifi_bitrate {
+    my ($name) = @_;
+    open my $fh, '-|', 'iw', 'dev', $name, 'link' or return undef;
+    my $rate;
+    while (my $line = <$fh>) {
+        if ($line =~ /tx bitrate:\s*([\d.]+)\s*MBit\/s/i) {
+            $rate = $1;
+            last;
+        }
+    }
+    close $fh;
+    return undef unless defined $rate;
+    return int($rate + 0.5);
+}
+
+sub usage {
+    my ($rc) = @_;
+    print STDERR <<"EOF";
+Usage: net-link-stats [--listen HOST[:PORT]] [--quiet] [--dry-run]
+
+Reads link speed for every UP iface on this host (sysfs for wired,
+iw for wifi) and pushes 'kind=link' OBSERVEs to the local net-mgr
+daemon. Wired uses /sys/class/net/IF/speed; wifi parses
+'iw dev IF link' for the tx bitrate. Bridges are skipped.
+
+  --listen HOST[:PORT]   daemon address (default 127.0.0.1:7531)
+  --quiet                only print failures
+  --dry-run              print what would be sent, don't send
+EOF
+    exit($rc // 0);
+}

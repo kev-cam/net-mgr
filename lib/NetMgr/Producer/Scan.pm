@@ -165,4 +165,42 @@ sub fping_rtt {
     return { alive => \%alive, dead => \@dead };
 }
 
+# Multi-sample variant. Same as fping_rtt but runs N pings per host
+# (`fping -C N`) and returns both min RTT and packet-loss percentage:
+#   { alive => { ip => { min_rtt_ms => $m, loss_pct => $p } }, dead => [...] }
+# fping summary line for -C N is:
+#   192.168.15.31 : 0.34 0.31 - 0.29 -        (N entries; '-' = lost)
+sub fping_rtt_loss {
+    my ($n, @ips) = @_;
+    return { alive => {}, dead => [] } unless @ips;
+    return fping_rtt(@ips) if !$n || $n < 1;
+    my $cmd = "fping -C $n -q "
+            . join(' ', map { quotemeta } @ips)
+            . ' 2>&1';
+    open my $fh, '-|', $cmd
+        or return { alive => {}, dead => [], error => "fping: $!" };
+    my %alive;
+    while (my $line = <$fh>) {
+        chomp $line;
+        if ($line =~ /^(\S+)\s*:\s*(.*)$/) {
+            my ($ip, $rest) = ($1, $2);
+            my @samples = split /\s+/, $rest;
+            next unless @samples;
+            my @rtts = grep { /^[\d.]+$/ } @samples;
+            next unless @rtts;
+            my $min  = $rtts[0];
+            $min = $_ < $min ? $_ : $min for @rtts;
+            my $loss = 100 * (scalar(@samples) - scalar(@rtts))
+                           / scalar(@samples);
+            $alive{$ip} = {
+                min_rtt_ms => $min + 0,
+                loss_pct   => $loss + 0,
+            };
+        }
+    }
+    close $fh;
+    my @dead = grep { !exists $alive{$_} } @ips;
+    return { alive => \%alive, dead => \@dead };
+}
+
 1;

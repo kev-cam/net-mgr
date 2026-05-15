@@ -24,11 +24,13 @@ my $listen;
 my $auto;
 my $reset;
 my $all;
+my $samples;
 GetOptions(
-    'listen=s' => \$listen,
-    'auto'     => \$auto,
-    'reset'    => \$reset,
-    'all'      => \$all,
+    'listen=s'  => \$listen,
+    'auto'      => \$auto,
+    'reset'     => \$reset,
+    'all'       => \$all,
+    'samples=i' => \$samples,
 ) or die "bad options\n";
 
 my $cli = NetMgr::Client->new(listen => $listen);
@@ -68,15 +70,28 @@ for my $r (@$rows) {
     push @{ $macs_by_ip{ $r->{addr} } }, $r->{mac};
 }
 
-my $res = NetMgr::Producer::Scan::fping_rtt(@ips);
-warn sprintf("alive=%d dead=%d\n",
-             scalar(keys %{ $res->{alive} }), scalar(@{ $res->{dead} }));
+my $res;
+if ($samples && $samples > 1) {
+    # Multi-sample run: collect both min RTT and packet-loss %.
+    $res = NetMgr::Producer::Scan::fping_rtt_loss($samples, @ips);
+} else {
+    # Single-shot. Wrap in same structure as the multi-sample form
+    # so the loop below can stay one shape.
+    my $r = NetMgr::Producer::Scan::fping_rtt(@ips);
+    my %alive = map { $_ => { min_rtt_ms => $r->{alive}{$_} } } keys %{ $r->{alive} };
+    $res = { alive => \%alive, dead => $r->{dead} };
+}
+warn sprintf("alive=%d dead=%d%s\n",
+             scalar(keys %{ $res->{alive} }), scalar(@{ $res->{dead} }),
+             ($samples && $samples > 1 ? " (samples=$samples)" : ''));
 for my $ip (sort keys %{ $res->{alive} }) {
-    my $rtt  = $res->{alive}{$ip};
+    my $info = $res->{alive}{$ip};
     my $macs = $macs_by_ip{$ip} or next;
     for my $mac (@$macs) {
-        my $reply = $cli->observe(kind => 'ping', mac => $mac, addr => $ip,
-                                  rtt_ms => $rtt);
+        my %obs = (kind => 'ping', mac => $mac, addr => $ip,
+                   rtt_ms => $info->{min_rtt_ms});
+        $obs{loss_pct} = $info->{loss_pct} if defined $info->{loss_pct};
+        my $reply = $cli->observe(%obs);
         warn "$ip ($mac): $reply\n" if $reply && $reply =~ /^ERR/;
     }
 }

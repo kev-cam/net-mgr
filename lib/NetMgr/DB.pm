@@ -711,15 +711,31 @@ sub update_rtt {
     );
     return { found => 0 } unless $was;
 
-    $self->{dbh}->do(
-        "UPDATE addresses
-            SET last_rtt_ms   = ?,
-                min_rtt_ms    = LEAST(IFNULL(min_rtt_ms, ?), ?),
-                last_observed = CURRENT_TIMESTAMP,
-                last_seen     = CURRENT_TIMESTAMP
-          WHERE mac = ? AND family = ? AND addr = ?",
-        undef, $rtt, $rtt, $rtt, $mac, $family, $addr
-    );
+    # Optional loss_pct (multi-sample fping; 0..100 float). Pass undef
+    # to leave the existing value alone.
+    my $loss = $f{loss_pct};
+    if (defined $loss) {
+        $self->{dbh}->do(
+            "UPDATE addresses
+                SET last_rtt_ms   = ?,
+                    min_rtt_ms    = LEAST(IFNULL(min_rtt_ms, ?), ?),
+                    loss_pct      = ?,
+                    last_observed = CURRENT_TIMESTAMP,
+                    last_seen     = CURRENT_TIMESTAMP
+              WHERE mac = ? AND family = ? AND addr = ?",
+            undef, $rtt, $rtt, $rtt, $loss + 0, $mac, $family, $addr
+        );
+    } else {
+        $self->{dbh}->do(
+            "UPDATE addresses
+                SET last_rtt_ms   = ?,
+                    min_rtt_ms    = LEAST(IFNULL(min_rtt_ms, ?), ?),
+                    last_observed = CURRENT_TIMESTAMP,
+                    last_seen     = CURRENT_TIMESTAMP
+              WHERE mac = ? AND family = ? AND addr = ?",
+            undef, $rtt, $rtt, $rtt, $mac, $family, $addr
+        );
+    }
     my ($new_min) = $self->{dbh}->selectrow_array(
         "SELECT min_rtt_ms FROM addresses
           WHERE mac = ? AND family = ? AND addr = ?",
@@ -732,6 +748,24 @@ sub update_rtt {
         prev_last   => $was->{last_rtt_ms},
         last_rtt_ms => $rtt,
     };
+}
+
+# Update interfaces.link_speed_mbps for a given mac. Returns 1 if a
+# row was updated, 0 if there's no such interface yet.
+sub update_link_speed {
+    my ($self, %f) = @_;
+    croak "mac required" unless $f{mac};
+    croak "link_speed_mbps required" unless defined $f{link_speed_mbps};
+    my $mac = lc $f{mac};
+    my $sp  = $f{link_speed_mbps};
+    return 0 unless $sp =~ /^-?\d+$/;
+    my $rows = $self->{dbh}->do(
+        "UPDATE interfaces
+            SET link_speed_mbps = ?, last_seen = CURRENT_TIMESTAMP
+          WHERE mac = ?",
+        undef, $sp + 0, $mac
+    );
+    return $rows ? 1 : 0;
 }
 
 # Manual reset of min_rtt_ms (and last_rtt_ms) so a known-bad
