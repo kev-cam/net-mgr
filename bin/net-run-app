@@ -1,0 +1,207 @@
+#!/usr/bin/perl
+# net-run-app — generic wrapper that resolves a host alias to its
+# best current IP via net-lookup, then exec's an underlying app
+# (ssh/sftp/scp/rsync/mosh/vncviewer/...) with the destination
+# rewritten in place.
+#
+# Dispatch is by basename($0). The expected install layout is one
+# real script + symlinks per app:
+#
+#   /usr/local/bin/net-run-app   (this script)
+#   /usr/local/bin/net-ssh   ─→  net-run-app
+#   /usr/local/bin/net-sftp  ─→  net-run-app
+#   /usr/local/bin/net-scp   ─→  net-run-app
+#   /usr/local/bin/net-rsync ─→  net-run-app
+#   /usr/local/bin/net-mosh  ─→  net-run-app
+#   /usr/local/bin/net-vnc   ─→  net-run-app
+#
+# Each link has its own argv-parsing rules ("layout") because the
+# underlying app's positional grammar differs:
+#
+#   ssh-style    — first non-option token is [user@]host. Used for
+#                  ssh and mosh.
+#   sftp-style   — same as ssh, but the host token may have a
+#                  trailing :path.
+#   rsync-style  — every positional token matching [user@]host:path
+#                  is a candidate (could be both src and dst). Used
+#                  for rsync and scp.
+#   vnc-style    — host[:display|::port].
+#
+# The host alias is resolved with `net-lookup --verify $host.*` so a
+# dead candidate IP doesn't get handed to the app. If the original
+# token had no user@ prefix and the corresponding ssh_config(5) entry
+# has a User= directive, we look it up via `ssh -G` and put it back
+# (otherwise `ssh some-alias` and `ssh some-alias-IP` would behave
+# differently w.r.t. the user).
+#
+# Pass-through: numeric-IP destinations, no destination at all
+# (`ssh --version`), or apps not in our table all fall through with
+# argv unchanged.
+
+use strict;
+use warnings;
+use File::Basename qw(basename);
+
+# ---- per-link layout table -----------------------------------------
+
+# Single-letter ssh flags whose following token is an argument.
+my %SSH_ARG_FLAGS = map { ('-' . $_) => 1 }
+    qw(B b c D E e F I i J L l m O o p Q R S W w);
+
+# Most rsync flags don't take a separate-token arg (they're either
+# bool short flags like -avP or long --opt=val). A few do.
+my %RSYNC_ARG_FLAGS = map { ('-' . $_) => 1 }
+    qw(e T B);   # -e remote-shell, -T temp-dir, -B block-size
+
+my %SPEC = (
+    'net-ssh'   => { cmd => 'ssh',       layout => 'ssh',
+                     arg_flags => \%SSH_ARG_FLAGS },
+    'net-mosh'  => { cmd => 'mosh',      layout => 'ssh',
+                     arg_flags => \%SSH_ARG_FLAGS },
+    'net-sftp'  => { cmd => 'sftp',      layout => 'sftp',
+                     arg_flags => \%SSH_ARG_FLAGS },
+    'net-scp'   => { cmd => 'scp',       layout => 'rsync',
+                     arg_flags => \%SSH_ARG_FLAGS },
+    'net-rsync' => { cmd => 'rsync',     layout => 'rsync',
+                     arg_flags => \%RSYNC_ARG_FLAGS },
+    'net-vnc'   => { cmd => 'vncviewer', layout => 'vnc',
+                     arg_flags => {} },
+);
+
+# ---- main dispatch -------------------------------------------------
+
+my $self = basename($0);
+my $spec = $SPEC{$self};
+unless ($spec) {
+    die "$self: unknown link name (expected one of: "
+      . join(', ', sort keys %SPEC) . ")\n";
+}
+
+my @new_argv = @ARGV;       # mutated in place by the rewriters
+if    ($spec->{layout} eq 'ssh')   { rewrite_ssh_like(\@new_argv, $spec, 0) }
+elsif ($spec->{layout} eq 'sftp')  { rewrite_ssh_like(\@new_argv, $spec, 1) }
+elsif ($spec->{layout} eq 'rsync') { rewrite_rsync_like(\@new_argv, $spec) }
+elsif ($spec->{layout} eq 'vnc')   { rewrite_vnc(\@new_argv, $spec) }
+
+exec $spec->{cmd}, @new_argv;
+die "exec $spec->{cmd}: $!\n";
+
+# ---- ssh-style rewriter ---------------------------------------------
+#
+# Walk argv. The first token that isn't a flag (or a flag's argument)
+# is the destination — rewrite it. $allow_path lets the host token
+# carry a trailing :path (sftp form).
+
+sub rewrite_ssh_like {
+    my ($argv, $spec, $allow_path) = @_;
+    my $arg_flags = $spec->{arg_flags};
+    my $i = 0;
+    while ($i < @$argv) {
+        my $a = $argv->[$i];
+        # Attached arg form: -iFILE, -pPORT.
+        if ($a =~ /^-[A-Za-z].+$/) { $i++; next }
+        # Detached arg form: -i FILE.
+        if ($arg_flags->{$a}) { $i += 2; next }
+        # Standalone flag.
+        if ($a =~ /^-/) { $i++; next }
+        # First positional — the destination. Rewrite and stop.
+        $argv->[$i] = rewrite_host_token($a, $allow_path);
+        return;
+    }
+}
+
+# ---- rsync-style rewriter -------------------------------------------
+#
+# Walk argv. Every positional that looks like [user@]host:path gets
+# its host part rewritten. Multiple are possible (src + dst).
+
+sub rewrite_rsync_like {
+    my ($argv, $spec) = @_;
+    my $arg_flags = $spec->{arg_flags};
+    my $i = 0;
+    while ($i < @$argv) {
+        my $a = $argv->[$i];
+        if ($a eq '--')            { $i++; last }       # end-of-flags marker
+        if ($a =~ /^-[A-Za-z].+$/) { $i++; next }       # -avP / --info=...
+        if ($arg_flags->{$a})      { $i += 2; next }
+        if ($a =~ /^-/)            { $i++; next }
+        # Positional. Rewrite if it's host:path form (skip plain
+        # local paths like "/tmp/foo" or "./bar").
+        if ($a =~ /:/ && $a !~ m{^/} && $a !~ m{^\./} && $a !~ m{^\.\./}) {
+            $argv->[$i] = rewrite_host_token($a, 1);
+        }
+        $i++;
+    }
+}
+
+# ---- vnc-style rewriter ---------------------------------------------
+#
+# vncviewer takes [options] HOST[:DISPLAY|::PORT]. Find the first
+# positional and rewrite its host part.
+
+sub rewrite_vnc {
+    my ($argv, $spec) = @_;
+    my $i = 0;
+    while ($i < @$argv) {
+        my $a = $argv->[$i];
+        if ($a =~ /^-/) { $i++; next }
+        if ($a =~ /^([^:\s]+)(::?\d+)?$/) {
+            my ($h, $tail) = ($1, $2 // '');
+            return if $h =~ /^\d+\.\d+\.\d+\.\d+\z/;
+            my $ip = lookup_host($h);
+            $argv->[$i] = defined $ip ? "$ip$tail" : $a;
+            return;
+        }
+        $i++;
+    }
+}
+
+# ---- shared host-token machinery -----------------------------------
+
+sub rewrite_host_token {
+    my ($token, $allow_path) = @_;
+    my ($user, $host, $path) = ('', '', '');
+    if ($allow_path) {
+        if ($token =~ /^(?:([^@]+)\@)?([^:@\s]+)(:.*)?$/) {
+            ($user, $host, $path) = ($1 // '', $2, $3 // '');
+        } else {
+            return $token;
+        }
+    } else {
+        if ($token =~ /^(?:([^@]+)\@)?([^:@\s]+)$/) {
+            ($user, $host) = ($1 // '', $2);
+        } else {
+            return $token;
+        }
+    }
+    return $token if $host =~ /^\d+\.\d+\.\d+\.\d+\z/;
+    my $ip = lookup_host($host);
+    return $token unless defined $ip;
+    if (!length $user) {
+        # No user@ supplied. Take one from ssh_config so an alias's
+        # User= directive still wins after we rewrite the host to a
+        # numeric IP.
+        if (open my $fh, '-|', 'ssh', '-G', $host) {
+            while (my $line = <$fh>) {
+                chomp $line;
+                if ($line =~ /^user\s+(\S+)$/) { $user = "$1\@"; last }
+            }
+            close $fh;
+        }
+    } else {
+        $user .= '@';
+    }
+    return "$user$ip$path";
+}
+
+sub lookup_host {
+    my ($host) = @_;
+    open my $fh, '-|', 'net-lookup', '--verify', "$host.*" or return undef;
+    my $ip;
+    while (my $line = <$fh>) {
+        chomp $line;
+        if ($line =~ /^(\d+\.\d+\.\d+\.\d+)\z/) { $ip = $1; last }
+    }
+    close $fh;
+    return $ip;
+}

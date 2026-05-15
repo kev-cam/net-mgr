@@ -23,7 +23,12 @@ CGIDIR     ?= /usr/lib/cgi-bin
 APACHE_CONF_DIR ?= $(SYSCONFDIR)/apache2/conf-available
 DESTDIR    ?=
 
-BINS  = net-alias net-poll-ap net-audit net-connect net-diag net-discover net-find-lost net-find-peers net-find-rogue-dhcp net-fw net-gen-apache-conf net-gen-dnsmasq net-import-dhcp net-import-ssh-forwards net-fix net-lookup net-name net-ping net-kill-rogue-dhcp net-roam net-router net-scan net-report net-set net-show net-ssh net-tp-scan net-uplink-probe net-var net-watch net-wifi-survey net-zones
+BINS  = net-alias net-poll-ap net-audit net-connect net-diag net-discover net-find-lost net-find-peers net-find-rogue-dhcp net-fw net-gen-apache-conf net-gen-dnsmasq net-import-dhcp net-import-ssh-forwards net-fix net-lookup net-name net-ping net-kill-rogue-dhcp net-roam net-router net-run-app net-scan net-report net-set net-show net-tp-scan net-uplink-probe net-var net-watch net-wifi-survey net-zones
+
+# Symlinks installed pointing at net-run-app — each link picks its
+# behavior from basename($0) so adding a new wrapper is a one-line
+# entry in net-run-app's %SPEC + a name here.
+RUN_APP_LINKS = net-ssh net-mosh net-sftp net-scp net-rsync net-vnc
 SBINS = net-mgr net-mgr-setup net-dns net-mgr-relay
 # Recovery scripts live off PATH so net-find-lost can enumerate them
 # without polluting BINDIR. Each script must support --describe.
@@ -216,6 +221,10 @@ install: .version
 	      bin/$$f > $(DESTDIR)$(BINDIR)/$$f.tmp && \
 	  mv $(DESTDIR)$(BINDIR)/$$f.tmp $(DESTDIR)$(BINDIR)/$$f && \
 	  chmod 755 $(DESTDIR)$(BINDIR)/$$f; \
+	done
+	@for l in $(RUN_APP_LINKS); do \
+	  echo "  symlink $(DESTDIR)$(BINDIR)/$$l → net-run-app"; \
+	  ln -sf net-run-app $(DESTDIR)$(BINDIR)/$$l; \
 	done
 	@for f in $(RECOVERYS); do \
 	  echo "  recovery/$$f → $(DESTDIR)$(RECOVERYDIR)/$$f"; \
