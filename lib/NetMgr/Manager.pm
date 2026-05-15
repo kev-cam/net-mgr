@@ -21,6 +21,7 @@ use FindBin ();
 use POSIX ();
 use NetMgr::Protocol qw(parse_line format_ok format_err format_row format_eos format_ready);
 use NetMgr::Where    qw(parse eval_ast);
+use NetMgr::Auth     ();
 
 # Logical tables a SUBSCRIBE may target.
 my %SUBSCRIBABLE = map { $_ => 1 } qw(
@@ -49,6 +50,11 @@ sub new {
         dnsmasq_listeners => {}, # "host:port" → { sock, host, port, buffer }
         started_at => time(),    # for STATUS uptime reporting
         stop      => 0,
+        auth_state => NetMgr::Auth::new_state(
+            signers_path    => '/etc/net-mgr/allowed_signers',
+            authorized_keys => $> == 0 ? '/root/.ssh/authorized_keys'
+                                       : ((getpwuid($>))[7] // '') . '/.ssh/authorized_keys',
+        ),
     }, $class;
     return $self;
 }
@@ -210,6 +216,8 @@ sub _accept {
         ident    => undef,    # source=... or consumer=...
         subs     => {},       # id → { table, mode, where_ast }
         forwards => {},       # slot port → { method, target, cookie|pid }
+        auth     => undef,    # { key_id, nonce_b64 } once AUTH starts;
+                              # { key_id, verified=>1 } once verified
     };
     $self->{select}->add($cli);
     $self->_log("connect $peer fd=$fd");
@@ -303,6 +311,8 @@ sub _handle_line {
     elsif ($verb eq 'UNFORWARD') { $self->_handle_unforward($cli, $cmd) }
     elsif ($verb eq 'NAT_MASQUERADE') { $self->_handle_nat_masquerade($cli, $cmd) }
     elsif ($verb eq 'SET_GATEWAY')    { $self->_handle_set_gateway($cli, $cmd) }
+    elsif ($verb eq 'AUTH')           { $self->_handle_auth($cli, $cmd) }
+    elsif ($verb eq 'AUTH_RESPONSE')  { $self->_handle_auth_response($cli, $cmd) }
     else {
         $self->_send($cli, format_err("verb $verb not handled"));
     }
@@ -436,9 +446,9 @@ sub _handle_forward {
     return $self->_send($cli, format_err("FORWARD requires HELLO first"))
         unless defined $cli->{kind};
     return $self->_send($cli,
-        format_err("FORWARD peer not permitted (loopback only by default; "
-                 . "see [forward] allow_peers)"))
-        unless $self->_peer_may_forward($cli);
+        format_err("FORWARD peer not permitted (need AUTH or loopback; "
+                 . "see [forward] allow_peers for IP-based legacy access)"))
+        unless $self->_peer_may_mutate($cli);
 
     my $slot = $kv->{slot};
     my $tgt  = $kv->{target};
@@ -520,9 +530,9 @@ sub _handle_nat_masquerade {
     return $self->_send($cli, format_err("NAT_MASQUERADE requires HELLO first"))
         unless defined $cli->{kind};
     return $self->_send($cli,
-        format_err("NAT_MASQUERADE peer not permitted (loopback only by default; "
-                 . "see [forward] allow_peers)"))
-        unless $self->_peer_may_forward($cli);
+        format_err("NAT_MASQUERADE peer not permitted (need AUTH or loopback; "
+                 . "see [forward] allow_peers for IP-based legacy access)"))
+        unless $self->_peer_may_mutate($cli);
 
     my $iface = $kv->{iface};
     my $state = lc($kv->{state} // '');
@@ -635,9 +645,9 @@ sub _handle_set_gateway {
     return $self->_send($cli, format_err("SET_GATEWAY requires HELLO first"))
         unless defined $cli->{kind};
     return $self->_send($cli,
-        format_err("SET_GATEWAY peer not permitted (loopback only by default; "
-                 . "see [forward] allow_peers)"))
-        unless $self->_peer_may_forward($cli);
+        format_err("SET_GATEWAY peer not permitted (need AUTH or loopback; "
+                 . "see [forward] allow_peers for IP-based legacy access)"))
+        unless $self->_peer_may_mutate($cli);
 
     return $self->_send($cli, format_err("ip(8) not available on this host"))
         unless _have_cmd('ip');
@@ -693,6 +703,75 @@ sub _handle_set_gateway {
         dev    => ($dev // 'auto'),
         metric => $metric,
     ));
+}
+
+# ---- AUTH / AUTH_RESPONSE -------------------------------------------
+#
+# SSH-key client authentication via OpenSSH's SSHSIG scheme. See
+# NetMgr::Auth for the verification mechanics. Workflow:
+#
+#   client → AUTH key-id=ID
+#   server → READY nonce=base64
+#   client → AUTH_RESPONSE sig=base64(armored sshsig)
+#   server → OK key-id=ID  (or ERR ...)
+#
+# After OK, $cli->{auth} = { key_id => ID, verified => 1 } and
+# privileged verbs (FORWARD, NAT_MASQUERADE, SET_GATEWAY) accept the
+# connection regardless of source IP. Without auth, the legacy
+# loopback-or-allow_peers IP check still applies.
+#
+# The nonce is per-connection and one-shot — once consumed by an
+# AUTH_RESPONSE (success or failure), it's cleared. The client must
+# AUTH again to retry.
+
+sub _handle_auth {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my $key_id = $kv->{key_id};
+    return $self->_send($cli, format_err("AUTH requires key_id="))
+        unless defined $key_id && length $key_id;
+    return $self->_send($cli, format_err("AUTH requires HELLO first"))
+        unless defined $cli->{kind};
+    my $nonce = NetMgr::Auth::fresh_nonce();
+    $cli->{auth} = { key_id => $key_id, nonce => $nonce, verified => 0 };
+    $self->_send($cli, format_ready(nonce => $nonce, key_id => $key_id));
+}
+
+sub _handle_auth_response {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my $sig = $kv->{sig};
+    my $auth = $cli->{auth};
+    unless (defined $auth && defined $auth->{nonce} && !$auth->{verified}) {
+        return $self->_send($cli,
+            format_err("AUTH_RESPONSE without prior AUTH"));
+    }
+    return $self->_send($cli, format_err("AUTH_RESPONSE requires sig="))
+        unless defined $sig && length $sig;
+
+    my ($ok, $err) = NetMgr::Auth::verify(
+        $self->{auth_state}, $auth->{key_id}, $auth->{nonce}, $sig);
+    # Always invalidate the nonce — one-shot regardless of outcome.
+    delete $auth->{nonce};
+    if (!$ok) {
+        $cli->{auth} = undef;
+        $self->_log("auth FAIL $cli->{peer} key-id=$auth->{key_id}: $err");
+        return $self->_send($cli, format_err("AUTH failed: $err"));
+    }
+    $cli->{auth} = { key_id => $auth->{key_id}, verified => 1 };
+    $self->_log("auth OK $cli->{peer} key_id=$auth->{key_id}");
+    $self->_send($cli, format_ok(key_id => $auth->{key_id}));
+}
+
+# True if this connection is allowed to mutate (FORWARD,
+# NAT_MASQUERADE, SET_GATEWAY). Loopback peers always allowed;
+# verified-auth connections always allowed regardless of source IP;
+# otherwise fall through to the legacy allow_peers IP check.
+sub _peer_may_mutate {
+    my ($self, $cli) = @_;
+    return 1 if _peer_is_loopback($cli);
+    return 1 if $cli->{auth} && $cli->{auth}{verified};
+    return $self->_peer_may_forward($cli);
 }
 
 sub _peer_is_loopback {

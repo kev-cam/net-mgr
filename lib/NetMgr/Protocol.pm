@@ -34,6 +34,16 @@ package NetMgr::Protocol;
 #                                              metric=1 wins over
 #                                              DHCP defaults; clear
 #                                              reverts cleanly.
+#   AUTH key-id=ID                          -- begin SSH-key auth.
+#                                              Server replies READY
+#                                              with a one-shot nonce.
+#   AUTH_RESPONSE sig=base64(sshsig)        -- complete auth. Server
+#                                              verifies via
+#                                              ssh-keygen -Y verify;
+#                                              on OK the connection
+#                                              is privileged for
+#                                              FORWARD / NAT_MASQUERADE
+#                                              / SET_GATEWAY.
 #   BYE
 #
 # Replies (server → client):
@@ -90,6 +100,8 @@ sub parse_line {
     elsif ($verb eq 'UNFORWARD') { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'NAT_MASQUERADE') { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'SET_GATEWAY')    { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'AUTH')           { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'AUTH_RESPONSE')  { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'BYE')       { croak "BYE takes no args" if @toks }
     elsif ($verb eq 'STATUS')    { croak "STATUS takes no args" if @toks }
     elsif ($verb eq 'UNSUB') {

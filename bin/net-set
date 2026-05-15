@@ -137,6 +137,18 @@ sub try_netmgr {
     eval { $cli->hello(consumer => "net-set.$$") };
     return (0, "$t: hello failed ($@)") if $@;
 
+    # Best-effort SSH-key auth. Fall back silently to the legacy
+    # IP-based gate (loopback / [forward] allow_peers) if the local
+    # SSH key isn't trusted by the remote daemon — the verb itself
+    # will then fail with a clearer "peer not permitted" message.
+    eval { $cli->auth };
+    if ($@ && $@ !~ /AUTH failed/) {
+        # Anything other than a clean AUTH-rejection is worth showing
+        # (missing ssh-keygen, missing key file, etc.).
+        my $m = $@; chomp $m;
+        warn "$t: auth: $m\n";
+    }
+
     my $rc = 0; my $msg;
     if ($args->{action} eq 'clear') {
         my %k; $k{metric} = $args->{metric} if defined $args->{metric};

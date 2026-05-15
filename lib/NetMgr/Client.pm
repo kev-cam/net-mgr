@@ -207,6 +207,80 @@ sub set_gateway {
     return $cmd->{kv} || {};
 }
 
+# auth(key_id => 'me@host', key_file => '~/.ssh/id_rsa') — drive the
+# AUTH / AUTH_RESPONSE handshake. Returns 1 on success or croaks
+# with the daemon's error message. After success the connection is
+# privileged for FORWARD/NAT_MASQUERADE/SET_GATEWAY regardless of
+# source IP.
+#
+# key_id defaults to "$USER\@$hostname" (matching the comment ssh
+# typically embeds in id_*.pub). key_file defaults to the first of
+# ~/.ssh/id_ed25519, ~/.ssh/id_rsa that exists. Override either.
+sub auth {
+    my ($self, %args) = @_;
+    my $key_id = $args{key_id} // _default_key_id();
+    my $key_file = $args{key_file} // _default_key_file();
+    croak "auth: no key_id"   unless defined $key_id   && length $key_id;
+    croak "auth: no key_file" unless defined $key_file && -r $key_file;
+
+    # Step 1: AUTH key_id=ID  →  READY nonce=...
+    $self->send_line("AUTH " . format_kv(key_id => $key_id));
+    my $reply = $self->recv_line;
+    croak "auth: no reply to AUTH" unless defined $reply;
+    my $cmd = parse_line($reply);
+    croak "auth: $cmd->{msg}" if $cmd->{verb} eq 'ERR';
+    croak "auth: unexpected reply '$reply'" unless $cmd->{verb} eq 'READY';
+    my $nonce = ($cmd->{kv} || {})->{nonce};
+    croak "auth: READY missing nonce" unless defined $nonce && length $nonce;
+
+    # Step 2: ssh-keygen -Y sign the nonce, send AUTH_RESPONSE.
+    require File::Temp;
+    require MIME::Base64;
+    my $tn = File::Temp->new;
+    binmode $tn; print $tn $nonce; $tn->flush;
+    my $ts = File::Temp->new(SUFFIX => '.sig');
+    binmode $ts;
+    my $rc = system("ssh-keygen -q -Y sign -n net-mgr -f " . _shq($key_file)
+                  . " < " . _shq($tn->filename)
+                  . " > " . _shq($ts->filename) . " 2>/dev/null");
+    croak "auth: ssh-keygen sign rc=" . ($rc >> 8) if $rc != 0;
+    open my $sf, '<', $ts->filename or croak "auth: open sig: $!";
+    my $sig;
+    { local $/; $sig = <$sf>; }
+    close $sf;
+    my $sig_b64 = MIME::Base64::encode_base64($sig, '');
+
+    $self->send_line("AUTH_RESPONSE " . format_kv(sig => $sig_b64));
+    my $r2 = $self->recv_line;
+    croak "auth: no reply to AUTH_RESPONSE" unless defined $r2;
+    my $c2 = parse_line($r2);
+    croak "auth: $c2->{msg}" if $c2->{verb} eq 'ERR';
+    croak "auth: unexpected reply '$r2'" unless $c2->{verb} eq 'OK';
+    return 1;
+}
+
+sub _default_key_id {
+    my $user = $ENV{USER} // (getpwuid($<))[0] // 'unknown';
+    chomp(my $host = `hostname`);
+    return "$user\@$host";
+}
+
+sub _default_key_file {
+    for my $f ("ssh/id_ed25519", "ssh/id_rsa", "ssh/id_ecdsa") {
+        my $p = "$ENV{HOME}/.$f";
+        return $p if -r $p;
+    }
+    return undef;
+}
+
+sub _shq {
+    my ($s) = @_;
+    return "''" unless defined $s && length $s;
+    return $s if $s =~ m{^[A-Za-z0-9_./=,\@:-]+$};
+    (my $q = $s) =~ s/'/'\\''/g;
+    return "'$q'";
+}
+
 sub bye {
     my ($self) = @_;
     $self->send_line("BYE");

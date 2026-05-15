@@ -178,6 +178,28 @@ same as for FORWARD: loopback always allowed; off-host peers gated
 by
 .BR "[forward] allow_peers" .
 .TP
+.B AUTH key_id=ID
+Begin SSH-key authentication. Server replies READY with a one-shot
+nonce.
+.TP
+.B AUTH_RESPONSE sig=base64(sshsig)
+Complete authentication. Client signs the nonce with its private
+key (namespace=net-mgr) using
+.BR ssh-keygen (1)
+.B -Y sign
+and base64-encodes the armored signature. Server verifies via
+.B ssh-keygen -Y verify
+against
+.IR /etc/net-mgr/allowed_signers
+augmented with each line of
+.IR /root/.ssh/authorized_keys
+(converted to allowed_signers format on the fly using the comment
+as the principal). On OK the connection is privileged for FORWARD,
+NAT_MASQUERADE, and SET_GATEWAY regardless of source IP — superseding
+the IP-based
+.B [forward] allow_peers
+check, which remains a fallback for unauthenticated peers.
+.TP
 .B BYE
 Clean disconnect.
 .SH WEB UI
