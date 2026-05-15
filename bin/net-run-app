@@ -37,10 +37,21 @@
 # Pass-through: numeric-IP destinations, no destination at all
 # (`ssh --version`), or apps not in our table all fall through with
 # argv unchanged.
+#
+# Cygwin: each link can advertise a list of well-known Windows
+# install paths in $SPEC{$link}{cygwin_candidates}. On first use
+# under Cygwin, net-run-app probes them; if exactly one is found
+# it's saved automatically, if multiple are found the user picks
+# one. The choice persists in ~/.net-run-app.conf as a per-link
+# `cmd =` template (e.g. `cygstart -w "C:\..." %HOST%`). %HOST%
+# expands to the resolved destination (with display/port suffix
+# preserved). Re-prompt with `net-run-app --rescan` (drops the
+# saved entry for this link, then runs).
 
 use strict;
 use warnings;
 use File::Basename qw(basename);
+use File::Path     qw(make_path);
 
 # ---- per-link layout table -----------------------------------------
 
@@ -52,6 +63,28 @@ my %SSH_ARG_FLAGS = map { ('-' . $_) => 1 }
 # bool short flags like -avP or long --opt=val). A few do.
 my %RSYNC_ARG_FLAGS = map { ('-' . $_) => 1 }
     qw(e T B);   # -e remote-shell, -T temp-dir, -B block-size
+
+# Well-known Windows install paths to probe under Cygwin. First match
+# wins per (display label) entry — but we keep all matches in the
+# offer so the user can pick. Strings use %FOUND% for the resolved
+# .exe path and %HOST% for the destination token (post-IP-resolve).
+my @CYGWIN_VNC_CANDIDATES = (
+    [ 'TigerVNC',
+      '/cygdrive/c/Program Files/TigerVNC/vncviewer.exe',
+      'cygstart -w "%FOUND%" %HOST%' ],
+    [ 'TigerVNC (32-bit)',
+      '/cygdrive/c/Program Files (x86)/TigerVNC/vncviewer.exe',
+      'cygstart -w "%FOUND%" %HOST%' ],
+    [ 'TightVNC',
+      '/cygdrive/c/Program Files/TightVNC/tvnviewer.exe',
+      'cygstart -w "%FOUND%" -host=%HOST%' ],
+    [ 'RealVNC',
+      '/cygdrive/c/Program Files/RealVNC/VNC Viewer/vncviewer.exe',
+      'cygstart -w "%FOUND%" %HOST%' ],
+    [ 'UltraVNC',
+      '/cygdrive/c/Program Files/uvnc bvba/UltraVNC/vncviewer.exe',
+      'cygstart -w "%FOUND%" %HOST%' ],
+);
 
 my %SPEC = (
     'net-ssh'   => { cmd => 'ssh',       layout => 'ssh',
@@ -65,7 +98,8 @@ my %SPEC = (
     'net-rsync' => { cmd => 'rsync',     layout => 'rsync',
                      arg_flags => \%RSYNC_ARG_FLAGS },
     'net-vnc'   => { cmd => 'vncviewer', layout => 'vnc',
-                     arg_flags => {} },
+                     arg_flags => {},
+                     cygwin_candidates => \@CYGWIN_VNC_CANDIDATES },
 );
 
 # ---- main dispatch -------------------------------------------------
@@ -77,11 +111,38 @@ unless ($spec) {
       . join(', ', sort keys %SPEC) . ")\n";
 }
 
+# --rescan (must come first in argv) drops any saved Cygwin-launcher
+# entry for this link before we proceed, so the next pass re-probes.
+if (@ARGV && $ARGV[0] eq '--rescan') {
+    shift @ARGV;
+    config_clear_link($self);
+    print STDERR "$self: cleared saved launcher (will re-probe)\n";
+}
+
 my @new_argv = @ARGV;       # mutated in place by the rewriters
+my $resolved_host;          # set by vnc rewriter for cygwin override
 if    ($spec->{layout} eq 'ssh')   { rewrite_ssh_like(\@new_argv, $spec, 0) }
 elsif ($spec->{layout} eq 'sftp')  { rewrite_ssh_like(\@new_argv, $spec, 1) }
 elsif ($spec->{layout} eq 'rsync') { rewrite_rsync_like(\@new_argv, $spec) }
-elsif ($spec->{layout} eq 'vnc')   { rewrite_vnc(\@new_argv, $spec) }
+elsif ($spec->{layout} eq 'vnc')   { $resolved_host = rewrite_vnc(\@new_argv, $spec) }
+
+# Cygwin override: if the link has cygwin_candidates and we're on
+# Cygwin, swap the exec target for whatever's saved (or freshly
+# probed) in ~/.net-run-app.conf. The saved cmd template is
+# tokenised here; %HOST% expands to the rewritten destination
+# (already-resolved IP + any :display/::port tail).
+if (is_cygwin() && $spec->{cygwin_candidates} && defined $resolved_host) {
+    my $tmpl = config_get_cmd($self)
+            // probe_and_save_cygwin($self, $spec->{cygwin_candidates});
+    if (defined $tmpl) {
+        (my $expanded = $tmpl) =~ s/\Q%HOST%\E/$resolved_host/g;
+        my @cmd = split_cmd($expanded);
+        if (@cmd) {
+            exec { $cmd[0] } @cmd;
+            die "exec $cmd[0]: $!\n";
+        }
+    }
+}
 
 exec $spec->{cmd}, @new_argv;
 die "exec $spec->{cmd}: $!\n";
@@ -147,13 +208,15 @@ sub rewrite_vnc {
         if ($a =~ /^-/) { $i++; next }
         if ($a =~ /^([^:\s]+)(::?\d+)?$/) {
             my ($h, $tail) = ($1, $2 // '');
-            return if $h =~ /^\d+\.\d+\.\d+\.\d+\z/;
+            return "$h$tail" if $h =~ /^\d+\.\d+\.\d+\.\d+\z/;
             my $ip = lookup_host($h);
-            $argv->[$i] = defined $ip ? "$ip$tail" : $a;
-            return;
+            my $rewritten = defined $ip ? "$ip$tail" : $a;
+            $argv->[$i] = $rewritten;
+            return $rewritten;
         }
         $i++;
     }
+    return undef;
 }
 
 # ---- shared host-token machinery -----------------------------------
@@ -193,6 +256,189 @@ sub rewrite_host_token {
     }
     return "$user$ip$path";
 }
+
+# ---- Cygwin helpers + saved-config layout ---------------------------
+#
+# Config file (~/.net-run-app.conf) is INI-style:
+#
+#   [net-vnc]
+#   cmd = cygstart -w "/cygdrive/c/Program Files/TigerVNC/vncviewer.exe" %HOST%
+#
+# One section per link. The `cmd` value is the literal exec template;
+# %HOST% is substituted with the resolved destination at run time.
+
+sub is_cygwin {
+    return $^O =~ /^cygwin/i || -d '/cygdrive/c';
+}
+
+sub config_path {
+    return ($ENV{HOME} // '/tmp') . '/.net-run-app.conf';
+}
+
+# Returns the saved cmd template for $link, or undef.
+sub config_get_cmd {
+    my ($link) = @_;
+    my $path = config_path();
+    return undef unless -r $path;
+    open my $fh, '<', $path or return undef;
+    my $section = '_top';
+    my $cmd;
+    while (my $line = <$fh>) {
+        $line =~ s/[\r\n]+\z//;
+        $line =~ s/\s*#.*//;
+        $line =~ s/^\s+//; $line =~ s/\s+$//;
+        next unless length $line;
+        if ($line =~ /^\[([^\]]+)\]$/) { $section = $1; next }
+        next unless $section eq $link;
+        if ($line =~ /^cmd\s*=\s*(.*)$/) { $cmd = $1; last }
+    }
+    close $fh;
+    return $cmd;
+}
+
+# Append (or replace) a `cmd` for $link in the config file.
+sub config_set_cmd {
+    my ($link, $cmd) = @_;
+    my $path = config_path();
+    my @lines;
+    if (-r $path) {
+        open my $fh, '<', $path;
+        @lines = <$fh>;
+        close $fh;
+        chomp @lines;
+    }
+    my @out;
+    my $section = '_top';
+    my $in_link = 0;
+    my $written = 0;
+    for my $line (@lines) {
+        if ($line =~ /^\s*\[([^\]]+)\]\s*$/) {
+            # Closing the link section: write our cmd if not yet written.
+            if ($in_link && !$written) {
+                push @out, "cmd = $cmd";
+                $written = 1;
+            }
+            $section = $1;
+            $in_link = ($section eq $link);
+            push @out, $line;
+            next;
+        }
+        if ($in_link && $line =~ /^\s*cmd\s*=/) {
+            push @out, "cmd = $cmd" unless $written;
+            $written = 1;
+            next;     # drop old cmd line
+        }
+        push @out, $line;
+    }
+    if ($in_link && !$written) {
+        push @out, "cmd = $cmd";
+        $written = 1;
+    }
+    if (!$written) {
+        push @out, '' if @out && length $out[-1];
+        push @out, "[$link]", "cmd = $cmd";
+    }
+    open my $wfh, '>', $path or die "write $path: $!\n";
+    print $wfh join("\n", @out), "\n";
+    close $wfh;
+    chmod 0600, $path;       # may contain hostnames / paths
+}
+
+# Drop the [link] section's cmd entirely (called by --rescan).
+sub config_clear_link {
+    my ($link) = @_;
+    my $path = config_path();
+    return unless -r $path;
+    open my $fh, '<', $path or return;
+    my @lines = <$fh>;
+    close $fh;
+    chomp @lines;
+    my $section = '_top';
+    my @out;
+    for my $line (@lines) {
+        if ($line =~ /^\s*\[([^\]]+)\]\s*$/) {
+            $section = $1;
+            push @out, $line;
+            next;
+        }
+        next if $section eq $link && $line =~ /^\s*cmd\s*=/;
+        push @out, $line;
+    }
+    open my $wfh, '>', $path or return;
+    print $wfh join("\n", @out), "\n";
+    close $wfh;
+}
+
+# Probe the candidate list; if exactly one is found, save it
+# automatically. If multiple, prompt. If none, return undef so the
+# caller falls through to the default cmd. Honours $ENV{NET_RUN_APP_VIEWER}
+# as an explicit override (matching the candidate's display label).
+sub probe_and_save_cygwin {
+    my ($link, $candidates) = @_;
+    my @found;
+    for my $c (@$candidates) {
+        my ($label, $path, $template) = @$c;
+        push @found, { label => $label, path => $path, template => $template }
+            if -x $path || -e $path;     # cygwin .exe may not be -x
+    }
+    if (!@found) {
+        print STDERR "$link: no Windows viewers found in standard "
+                   . "install paths; falling through to default '$SPEC{$link}{cmd}'\n";
+        return undef;
+    }
+
+    my $pick;
+    if (@found == 1) {
+        $pick = $found[0];
+        print STDERR "$link: found $pick->{label}; saving to "
+                   . config_path() . "\n";
+    } elsif (defined $ENV{NET_RUN_APP_VIEWER}) {
+        for my $f (@found) {
+            $pick = $f if $f->{label} eq $ENV{NET_RUN_APP_VIEWER};
+        }
+        unless ($pick) {
+            print STDERR "$link: NET_RUN_APP_VIEWER='$ENV{NET_RUN_APP_VIEWER}'"
+                       . " didn't match any of: " . join(', ',
+                            map { $_->{label} } @found) . "\n";
+            return undef;
+        }
+    } else {
+        print STDERR "$link: multiple Windows viewers found, pick one:\n";
+        for my $i (0 .. $#found) {
+            printf STDERR "  %d. %-25s %s\n",
+                $i+1, $found[$i]{label}, $found[$i]{path};
+        }
+        print STDERR "  > ";
+        my $line = <STDIN>;
+        defined $line or return undef;
+        chomp $line; $line =~ s/^\s+|\s+$//g;
+        return undef unless $line =~ /^(\d+)$/;
+        my $idx = $1 - 1;
+        return undef if $idx < 0 || $idx > $#found;
+        $pick = $found[$idx];
+    }
+
+    # Materialise the template now (substitute %FOUND%); %HOST% stays
+    # for run-time expansion.
+    my $cmd = $pick->{template};
+    $cmd =~ s/\Q%FOUND%\E/$pick->{path}/g;
+    config_set_cmd($link, $cmd);
+    return $cmd;
+}
+
+# Tiny shell-ish tokeniser. Respects "quoted strings" so paths with
+# spaces (every Windows install path) survive unmangled. No shell
+# substitution, no globs.
+sub split_cmd {
+    my ($s) = @_;
+    my @out;
+    while ($s =~ /\G\s*(?:"([^"]*)"|(\S+))/gc) {
+        push @out, defined $1 ? $1 : $2;
+    }
+    return @out;
+}
+
+# ---- net-lookup wrapper --------------------------------------------
 
 sub lookup_host {
     my ($host) = @_;
