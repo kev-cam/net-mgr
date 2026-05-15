@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 19;
+our $SCHEMA_VERSION = 20;
 
 sub new {
     my ($class, %args) = @_;
@@ -492,6 +492,24 @@ CREATE TABLE IF NOT EXISTS isp_secrets (
             ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
+        return;
+    }
+    if ($v == 20) {
+        # Link-speed + per-destination packet-loss columns. Used by
+        # net-lookup's scoring (wired-over-wifi tiebreak via
+        # interfaces.kind, RTT/loss for fine-grained ranking).
+        # Producers (ethtool, fping, iw) populate them; columns
+        # default NULL until that lands. Skipped if a column already
+        # exists (re-run safety on hand-migrated DBs).
+        for my $alter (
+            "ALTER TABLE interfaces ADD COLUMN link_speed_mbps INT NULL",
+            "ALTER TABLE addresses  ADD COLUMN loss_pct        FLOAT NULL",
+        ) {
+            eval { $self->{dbh}->do($alter) };
+            if ($@ && $@ !~ /duplicate column|Duplicate column/i) {
+                die $@;
+            }
+        }
         return;
     }
     croak "no migration for schema v$v";

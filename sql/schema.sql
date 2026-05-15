@@ -462,3 +462,12 @@ CREATE TABLE IF NOT EXISTS isp_secrets (
             ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 INSERT IGNORE INTO schema_version (version) VALUES (19);
+
+-- Link-speed + per-destination packet-loss tracking (schema 20).
+-- Populated by producers (ethtool/iw for link_speed_mbps,
+-- fping for loss_pct); used by net-lookup for wired/wifi
+-- preference and quality-aware scoring. Both NULL until
+-- producers populate.
+ALTER TABLE interfaces ADD COLUMN link_speed_mbps INT NULL;
+ALTER TABLE addresses  ADD COLUMN loss_pct        FLOAT NULL;
+INSERT IGNORE INTO schema_version (version) VALUES (20);

@@ -18,12 +18,15 @@
 # inferred from the input. Paper-only addresses are honored on
 # reverse — the user typed the IP explicitly.
 #
-# Each candidate IP is scored by routing closeness to this host:
-#   2  = same /24 as one of our interface addresses (direct L2)
-#   1  = otherwise reachable (the kernel returns a route to it)
-#   0  = no route — last resort
-# Aliases.prefer_subnet_cidr nudges score by +1 when the alias's name
-# matched and the IP is in that CIDR (the user's explicit hint).
+# Each candidate IP is scored on path quality from this host:
+#   +4  same /24 as one of our interface addresses (direct L2)
+#   +2  the address is on a wired (ethernet) interface
+#   +1  kernel-reachable (a route exists, even if via default)
+#   +1  IP falls inside an alias's prefer_subnet_cidr (the user's
+#       explicit hint)
+# Ties are broken by min observed RTT (lower wins) then dotted quad.
+# So the typical "wired same-/24" address at 7 beats a wifi same-/24
+# address at 5; both beat a far-side wired at 3.
 #
 # Default output is the single best IP. --all prints every matching
 # IP, highest-scored first, deduplicated.
@@ -138,16 +141,34 @@ if (!%matched_mids) {
 my %macs_by_mid;
 push @{ $macs_by_mid{ $_->{machine_id} } }, $_->{mac}
     for grep { defined $_->{machine_id} && $_->{machine_id} } @$ifaces;
+# kind per mac (ethernet / wifi / virtual / unknown). Used in scoring
+# to prefer wired interfaces over wireless.
+my %kind_by_mac = map { lc $_->{mac} => ($_->{kind} // 'unknown') }
+                  grep { $_->{mac} } @$ifaces;
+# Per-address metadata so scoring can consult RTT / loss without
+# refetching. Keyed by the address string.
+my %meta_by_addr;
 my %addrs_by_mac;
-push @{ $addrs_by_mac{ $_->{mac} } }, $_->{addr} for @$addresses;
+for my $a (@$addresses) {
+    next unless defined $a->{addr} && defined $a->{mac};
+    push @{ $addrs_by_mac{ $a->{mac} } }, $a->{addr};
+    $meta_by_addr{ $a->{addr} } = {
+        mac          => lc $a->{mac},
+        min_rtt_ms   => $a->{min_rtt_ms},
+        last_rtt_ms  => $a->{last_rtt_ms},
+        loss_pct     => $a->{loss_pct},
+    };
+}
 
 my %seen;
-my @candidates;       # list of [score, ip]
+my @candidates;       # list of [score, rtt_for_tiebreak, ip]
 for my $mid (keys %matched_mids) {
     for my $mac (@{ $macs_by_mid{$mid} || [] }) {
         for my $ip (@{ $addrs_by_mac{$mac} || [] }) {
             next if $seen{$ip}++;
-            push @candidates, [ _score($ip, \@prefer_cidrs), $ip ];
+            my $score = _score($ip, \@prefer_cidrs, \%kind_by_mac, \%meta_by_addr);
+            my $rtt = ($meta_by_addr{$ip} || {})->{min_rtt_ms} // 9999;
+            push @candidates, [ $score, $rtt, $ip ];
         }
     }
 }
@@ -156,8 +177,13 @@ if (!@candidates) {
     exit 1;
 }
 
-@candidates = sort { $b->[0] <=> $a->[0] || _ipkey($a->[1]) cmp _ipkey($b->[1]) }
-              @candidates;
+# Sort: score desc, RTT asc (lower is better — fastest path wins ties),
+# then IP asc as final deterministic tiebreak.
+@candidates = sort {
+       $b->[0] <=> $a->[0]
+    || $a->[1] <=> $b->[1]
+    || _ipkey($a->[2]) cmp _ipkey($b->[2])
+} @candidates;
 
 # --verify: keep only IPs that respond to a 1s ping. Stops at the
 # first responder when --all isn't set, so the common case is one
@@ -165,7 +191,7 @@ if (!@candidates) {
 if ($verify) {
     my @alive;
     for my $c (@candidates) {
-        next unless _ping_ok($c->[1]);
+        next unless _ping_ok($c->[2]);
         push @alive, $c;
         last unless $all;
     }
@@ -174,9 +200,9 @@ if ($verify) {
 }
 
 if ($all) {
-    print "$_->[1]\n" for @candidates;
+    print "$_->[2]\n" for @candidates;
 } else {
-    print "$candidates[0][1]\n";
+    print "$candidates[0][2]\n";
 }
 exit 0;
 
@@ -290,25 +316,41 @@ sub _ipkey {
 }
 
 sub _score {
-    my ($ip, $prefer) = @_;
+    my ($ip, $prefer, $kind_by_mac, $meta_by_addr) = @_;
     my $ipi = _ip2int($ip);
     return 0 unless defined $ipi;
 
     my $score = 0;
-    # Same /24 as one of our local addresses → direct L2.
+
+    # +4: same /24 as one of our local addresses → direct L2 access.
+    # Strongest signal — same broadcast domain, no router hop.
     for my $n (@local_nets) {
-        if (($ipi & $n->[1]) == $n->[0]) { $score = 2; last }
+        if (($ipi & $n->[1]) == $n->[0]) { $score += 4; last }
     }
-    # Otherwise, kernel-reachable (default route handles it) → 1.
-    if ($score == 0 && _has_route($ip)) {
-        $score = 1;
+
+    # +2: address is on a wired (ethernet) interface. Wired beats
+    # WiFi for both throughput and reliability; this preference
+    # matters when a host has both (e.g. nas3-up wired vs nas3-air
+    # wifi, both on the same /24).
+    my $meta = $meta_by_addr->{$ip};
+    if ($meta && $kind_by_mac->{ $meta->{mac} } &&
+        lc($kind_by_mac->{ $meta->{mac} }) eq 'ethernet') {
+        $score += 2;
     }
-    # Bump if an alias on the matched name pinned a preferred subnet.
+
+    # +1: kernel knows how to route to it (even if not on our /24).
+    # Trumps unreachable but loses to direct.
+    if (_has_route($ip)) {
+        $score += 1;
+    }
+
+    # +1: alias matched and pinned a preferred subnet that contains
+    # this address. Lets `prefer_subnet_cidr` win when explicit.
     for my $cidr (@$prefer) {
         next unless $cidr =~ m{^(\d+\.\d+\.\d+\.\d+)/(\d+)$};
         my $ni = _ip2int($1) // next;
         my $m  = $2 == 0 ? 0 : ((0xffffffff << (32 - $2)) & 0xffffffff);
-        if (($ipi & $m) == ($ni & $m)) { $score++; last }
+        if (($ipi & $m) == ($ni & $m)) { $score += 1; last }
     }
     return $score;
 }
@@ -345,9 +387,10 @@ The pattern is a Perl regex; net-lookup wraps it as ^(?:...)\$ before
 matching against machines.primary_name, friendly_names, hostnames,
 and aliases.
 
-Scoring (highest wins):
-  +2  same /24 as one of this host's interfaces (direct L2)
-  +1  otherwise kernel-reachable
+Scoring (highest wins; ties broken by min RTT, then dotted quad):
+  +4  same /24 as one of this host's interfaces (direct L2)
+  +2  the address is on a wired (ethernet) interface
+  +1  kernel-reachable (route exists)
   +1  IP is inside an alias's prefer_subnet_cidr (when the alias matched)
 
 By default, paper-only addresses (last_observed IS NULL — known from
