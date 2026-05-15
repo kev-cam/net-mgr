@@ -46,7 +46,7 @@ use Getopt::Long qw(:config no_ignore_case bundling);
 use NetMgr::Client;
 
 my ($gateway, $clear, $status, $metric, $dev,
-    $listen, $ssh_user, $dry, $quiet, $help);
+    $listen, $ssh_user, $dry, $quiet, $help, $all, $kind_filter);
 GetOptions(
     'gateway=s'  => \$gateway,
     'clear'      => \$clear,
@@ -55,6 +55,8 @@ GetOptions(
     'dev=s'      => \$dev,
     'listen=s'   => \$listen,
     'ssh-user=s' => \$ssh_user,
+    'all'        => \$all,
+    'kind=s'     => \$kind_filter,
     'dry-run|n'  => \$dry,
     'quiet|q'    => \$quiet,
     'help|h'     => \$help,
@@ -62,7 +64,8 @@ GetOptions(
 usage(0) if $help;
 usage(2) unless $gateway || $clear || $status;
 usage(2) if $clear && $gateway;
-usage(2) unless @ARGV;
+usage(2) if $kind_filter && $kind_filter !~ /^(ap|netmgr)$/;
+usage(2) unless @ARGV || $all;
 
 $listen   //= '127.0.0.1:7531';
 $ssh_user //= 'root';
@@ -73,7 +76,33 @@ $ssh_user //= 'root';
 my $cls = load_classifier($listen);
 
 my $rc = 0;
-for my $t (@ARGV) {
+my @targets = @ARGV;
+if ($all) {
+    push @targets, expand_all($cls, $kind_filter);
+
+    # Don't tell the destination gateway to use itself. Match by mac
+    # so we skip every IP belonging to the same machine — e.g. if
+    # gateway2-down resolves to .15.251 we'll also skip the .15.175
+    # wifi address belonging to gateway2.
+    if ($gateway && (my $gw_ip = resolve_gw($gateway))) {
+        my $gw_mac = $cls->{ip_to_mac}{$gw_ip};
+        @targets = grep {
+            my $ip  = is_ipv4($_) ? $_ : net_lookup($_);
+            my $mac = defined $ip ? $cls->{ip_to_mac}{$ip} : undef;
+            !($ip && $ip eq $gw_ip)
+              && !($mac && $gw_mac && $mac eq $gw_mac);
+        } @targets;
+    }
+
+    unless (@targets) {
+        die "net-set: --all matched nothing (local daemon down? "
+          . "no aps + no peers known?)\n";
+    }
+    print STDERR "net-set --all: " . scalar(@targets) . " target(s): "
+               . join(', ', @targets) . "\n" unless $quiet;
+}
+
+for my $t (@targets) {
     my ($ok, $msg) = handle_target($t, {
         action  => $clear ? 'clear' : ($status ? 'status' : 'set'),
         gateway => $gateway,
@@ -297,10 +326,46 @@ sub status_target {
 # Classification — query local daemon for aps/interfaces/addresses
 # =====================================================================
 
+# Returns a list of target IPs covering the LAN: every AP from the
+# `aps` table, plus every reachable net-mgr peer from `peers`. With
+# $kind, restrict to one kind.
+sub expand_all {
+    my ($cls, $kind) = @_;
+    my @out;
+    my %seen;
+    if (!$kind || $kind eq 'ap') {
+        # APs — pick the first IP we know for each AP MAC.
+        for my $mac (sort keys %{ $cls->{ap_mac} }) {
+            my $ip = _ip_for_mac($cls, $mac);
+            next unless defined $ip && !$seen{$ip}++;
+            push @out, $ip;
+        }
+    }
+    if (!$kind || $kind eq 'netmgr') {
+        # net-mgr peers.
+        my $peers = $cls->{peers} || [];
+        for my $p (@$peers) {
+            my $h = $p->{host} or next;
+            next if $seen{$h}++;
+            push @out, $h;
+        }
+    }
+    return @out;
+}
+
+sub _ip_for_mac {
+    my ($cls, $mac) = @_;
+    # Reverse the ip_to_mac map to find the first IP for $mac.
+    while (my ($ip, $m) = each %{ $cls->{ip_to_mac} }) {
+        return $ip if $m eq $mac;
+    }
+    return undef;
+}
+
 sub load_classifier {
     my ($listen) = @_;
     my %c = (ip_to_mac => {}, ap_mac => {}, kind_by_mac => {},
-             name_to_ips => {}, available => 0);
+             name_to_ips => {}, peers => [], available => 0);
     my $cli = eval { NetMgr::Client->new(listen => $listen, timeout => 5) };
     return \%c unless $cli;
     eval {
@@ -310,7 +375,9 @@ sub load_classifier {
         my $addrs = $cli->snapshot(3, 'addresses',
                                     where => "family = 'v4'");
         my $machs = $cli->snapshot(4, 'machines');
+        my $peers = eval { $cli->snapshot(5, 'peers') } || [];
         $cli->bye;
+        $c{peers} = [ grep { $_->{host} } @$peers ];
 
         $c{ap_mac}{ lc $_->{mac} } = 1 for grep { $_->{mac} } @$aps;
         my %name_by_mid = map { $_->{id} => $_->{primary_name} }
@@ -419,11 +486,16 @@ sub usage {
     print STDERR <<"EOF";
 Usage:
   net-set --gateway HOST  TARGET [TARGET ...]
-  net-set --clear         TARGET [TARGET ...]
-  net-set --status        TARGET [TARGET ...]
+  net-set --gateway HOST  --all [--kind ap|netmgr]
+  net-set --clear         TARGET [TARGET ...] | --all
+  net-set --status        TARGET [TARGET ...] | --all
 
   HOST    = gateway to install (resolved via net-lookup if not an IP)
   TARGET  = host whose gateway to switch (name or IP)
+  --all   = enumerate from the local daemon's snapshots: every AP in
+            'aps' (DD-WRT path) plus every reachable peer in 'peers'
+            (net-mgr path). The destination gateway and any other
+            interface on the same machine are auto-skipped.
 
 Per target, net-set picks the right mechanism by querying the local
 net-mgr's classification:
@@ -435,6 +507,7 @@ net-mgr's classification:
 Options:
   --metric N         route metric (Linux paths; default 1)
   --dev IFACE        pin egress interface
+  --kind ap|netmgr   restrict --all to one kind
   --listen H[:P]     local daemon for classification (default 127.0.0.1:7531)
   --ssh-user USER    ssh user for AP/Linux paths (default root)
   --dry-run / -n     don't apply

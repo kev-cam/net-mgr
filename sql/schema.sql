@@ -425,3 +425,40 @@ CREATE TABLE IF NOT EXISTS wifi_radio_state (
 
 INSERT IGNORE INTO schema_version (version) VALUES (17);
 INSERT IGNORE INTO schema_version (version) VALUES (18);
+
+-- ISP-link bookkeeping. Failover decisions need to know which gateway
+-- machine can reach which ISP, with what credentials. isp_links is
+-- public-readable; the actual secret material lives in isp_secrets,
+-- which the daemon gates to AUTH'd peers only.
+CREATE TABLE IF NOT EXISTS isp_links (
+    gateway_machine_id INT          NOT NULL,
+    isp_name           VARCHAR(64)  NOT NULL,    -- 'comcast', 'tmobile', ...
+    iface              VARCHAR(32),               -- WAN iface on the gateway
+    mac                CHAR(17),                  -- MAC used (cloned for Comcast)
+    auth_type          VARCHAR(32),               -- 'mac', 'pppoe', 'dhcp', 'wpa2'
+    auth_user          VARCHAR(255),
+    status             VARCHAR(32) NOT NULL DEFAULT 'active',
+                                                  -- active | standby | broken | unknown
+    notes              TEXT,
+    last_seen          DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                   ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (gateway_machine_id, isp_name),
+    KEY idx_isp        (isp_name),
+    KEY idx_status     (status),
+    CONSTRAINT fk_isp_links_machine
+        FOREIGN KEY (gateway_machine_id) REFERENCES machines(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS isp_secrets (
+    gateway_machine_id INT          NOT NULL,
+    isp_name           VARCHAR(64)  NOT NULL,
+    auth_secret        VARCHAR(255),
+    last_changed       DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                   ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (gateway_machine_id, isp_name),
+    CONSTRAINT fk_isp_secrets_link
+        FOREIGN KEY (gateway_machine_id, isp_name)
+            REFERENCES isp_links(gateway_machine_id, isp_name)
+            ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+INSERT IGNORE INTO schema_version (version) VALUES (19);

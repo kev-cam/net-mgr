@@ -28,9 +28,15 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
     machines hostnames interfaces addresses ports aps
     associations dhcp_leases events aliases dhcp_vars
     subnet_routers friendly_names wifi_sockets lost_devices
-    peers uplinks
+    peers uplinks isp_links
     forwarding_rules zone_classes interface_zones wifi_zones
     audit_annotations wifi_scan_results wifi_radio_state
+);
+
+# Tables whose contents are sensitive (credentials etc.); SUBSCRIBE
+# is allowed only when the calling connection has completed AUTH.
+my %SUBSCRIBABLE_AUTH = map { $_ => 1 } qw(
+    isp_secrets
 );
 
 sub new {
@@ -365,7 +371,13 @@ sub _handle_subscribe {
     my $table = $cmd->{table};
     my $where = $cmd->{where};
     return $self->_send($cli, format_err("unknown table '$table'"))
-        unless $SUBSCRIBABLE{$table};
+        unless $SUBSCRIBABLE{$table} || $SUBSCRIBABLE_AUTH{$table};
+    if ($SUBSCRIBABLE_AUTH{$table}
+     && !( ($cli->{auth} && $cli->{auth}{verified})
+        || _peer_is_loopback($cli) )) {
+        return $self->_send($cli,
+            format_err("table '$table' requires AUTH (or loopback peer)"));
+    }
 
     my $where_ast = eval { NetMgr::Where::parse($where) };
     if ($@) {

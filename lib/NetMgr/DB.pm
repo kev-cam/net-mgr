@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 18;
+our $SCHEMA_VERSION = 19;
 
 sub new {
     my ($class, %args) = @_;
@@ -448,6 +448,48 @@ CREATE TABLE IF NOT EXISTS wifi_radio_state (
     updated_at      DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
                                 ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (scanner_mac, scanner_iface)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
+    if ($v == 19) {
+        # ISP-link bookkeeping. Failover decisions need to know which
+        # gateway machine can reach which ISP, with what credentials.
+        # Public-readable in isp_links; the secret column lives in a
+        # separate isp_secrets table that's gated to AUTH'd peers only
+        # (see %SUBSCRIBABLE_AUTH in Manager.pm).
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS isp_links (
+    gateway_machine_id INT          NOT NULL,
+    isp_name           VARCHAR(64)  NOT NULL,    -- 'comcast', 'tmobile', ...
+    iface              VARCHAR(32),               -- WAN iface on the gateway
+    mac                CHAR(17),                  -- MAC used (cloned for Comcast)
+    auth_type          VARCHAR(32),               -- 'mac', 'pppoe', 'dhcp', 'wpa2'
+    auth_user          VARCHAR(255),
+    status             VARCHAR(32) NOT NULL DEFAULT 'active',
+                                                  -- active | standby | broken | unknown
+    notes              TEXT,
+    last_seen          DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                   ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (gateway_machine_id, isp_name),
+    KEY idx_isp        (isp_name),
+    KEY idx_status     (status),
+    CONSTRAINT fk_isp_links_machine
+        FOREIGN KEY (gateway_machine_id) REFERENCES machines(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS isp_secrets (
+    gateway_machine_id INT          NOT NULL,
+    isp_name           VARCHAR(64)  NOT NULL,
+    auth_secret        VARCHAR(255),              -- PPPoE password / WPA passphrase
+    last_changed       DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                   ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (gateway_machine_id, isp_name),
+    CONSTRAINT fk_isp_secrets_link
+        FOREIGN KEY (gateway_machine_id, isp_name)
+            REFERENCES isp_links(gateway_machine_id, isp_name)
+            ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
         return;
