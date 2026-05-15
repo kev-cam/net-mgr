@@ -1,29 +1,41 @@
 #!/usr/bin/perl
-# net-set — push routing/forwarding decisions to net-mgr-equipped
-# hosts via the daemon protocol. Today this is just gateway selection;
-# room for related operations (forwards, NAT toggles, …) as the need
-# arises.
+# net-set — push routing decisions to network hosts. The mechanism
+# depends on what the target is, classified by querying the local
+# net-mgr daemon's aps/interfaces/addresses snapshots:
+#
+#   - DD-WRT AP (target's MAC is in `aps`)
+#       ssh in. `ip route replace default via $IP dev br0` for the
+#       AP's own egress. Then nvram set lan_gateway/wan_gateway,
+#       nvram commit, restart dnsmasq — so the option=3 advertised
+#       to DHCP clients changes too. Clients pick it up at lease
+#       renewal.
+#
+#   - net-mgr peer (target reachable on TCP/7531)
+#       SET_GATEWAY action=set via=$IP. Daemon installs a metric=1
+#       default route that beats DHCP's. Clean revert via --clear.
+#
+#   - Plain Linux without net-mgr
+#       ssh in. `ip route replace default via $IP metric 1`. Same
+#       semantics as the daemon path. No persistence — reverts on
+#       next dhclient renew or reboot.
 #
 # Usage:
 #   net-set --gateway HOST  TARGET [TARGET ...]
 #   net-set --clear         TARGET [TARGET ...]
-#   net-set --gateway HOST --all
-#   net-set --gateway HOST --status            # query, no change
+#   net-set --status        TARGET [TARGET ...]
 #
-# HOST = name or IP of the gateway to install. net-set resolves it
-#        via net-lookup if it's not already an IP. Picked from the
-#        target's /24 when net-lookup --all returns multiple options.
+# HOST    = gateway to install. Resolved via net-lookup if not an IP.
+# TARGET  = name or IP of the host whose gateway to switch.
 #
-# TARGET = name or IP of a host running net-mgr. The default daemon
-#        port is 7531; override with HOST:PORT.
+# --metric N         route metric for our entry (default 1)
+# --dev IFACE        pin egress interface (Linux paths only)
+# --listen H[:P]     where to query the local daemon for classification
+#                    (default 127.0.0.1:7531)
+# --ssh-user USER    ssh user for AP/Linux fallback (default root)
+# --dry-run / -n     show what would happen, do nothing
+# --quiet   / -q     only print changes
 #
-# --metric N      override the route metric (default 1, beats DHCP).
-# --dev IFACE     pin egress interface (default: kernel decides).
-# --boot          ask the daemon to also persist (NAT_MASQUERADE
-#                 path; SET_GATEWAY is runtime-only and reverts on
-#                 the next dhclient renew/reboot).
-# --dry-run       show what would be sent, don't send.
-# --quiet         only show changes; silent on success.
+# Exit: 0 ok · non-0 if any target failed.
 
 use strict;
 use warnings;
@@ -33,119 +45,334 @@ use Getopt::Long qw(:config no_ignore_case bundling);
 
 use NetMgr::Client;
 
-my ($gateway, $clear, $all, $status, $metric, $dev, $dry, $quiet, $help);
+my ($gateway, $clear, $status, $metric, $dev,
+    $listen, $ssh_user, $dry, $quiet, $help);
 GetOptions(
     'gateway=s'  => \$gateway,
     'clear'      => \$clear,
-    'all'        => \$all,
     'status'     => \$status,
     'metric=i'   => \$metric,
     'dev=s'      => \$dev,
+    'listen=s'   => \$listen,
+    'ssh-user=s' => \$ssh_user,
     'dry-run|n'  => \$dry,
     'quiet|q'    => \$quiet,
     'help|h'     => \$help,
 ) or usage(2);
 usage(0) if $help;
-
 usage(2) unless $gateway || $clear || $status;
 usage(2) if $clear && $gateway;
-usage(2) if !$status && !@ARGV && !$all;
+usage(2) unless @ARGV;
 
-# --all expansion is intentionally a TODO: we'd need to enumerate
-# net-mgr peers from the local DB. For now you list targets by hand.
-if ($all) {
-    die "net-set: --all not implemented yet (list targets explicitly)\n";
-}
+$listen   //= '127.0.0.1:7531';
+$ssh_user //= 'root';
 
-my @targets = @ARGV;
-die "net-set: no targets\n" unless @targets;
+# Pull classification info from the local daemon up-front. If it
+# isn't reachable we can still operate, just without the AP/MAC
+# correlation — every target falls back to net-mgr-or-ssh detection.
+my $cls = load_classifier($listen);
 
-# Resolve $gateway → IP once, per target's /24 (deferred per-target).
 my $rc = 0;
-for my $t (@targets) {
-    my ($host, $port) = split /:/, $t, 2;
-    $port //= 7531;
-    my $cli = eval { NetMgr::Client->new(listen => "$host:$port", timeout => 5) };
-    if ($@ || !$cli) {
-        my $msg = $@ // 'connect failed';
-        $msg =~ s/\s+at\s+\S+\s+line\s+\d+\.?$//;
-        warn "$t: $msg\n";
-        $rc = 1; next;
-    }
-    $cli->hello(consumer => "net-set.$$");
-
-    if ($status) {
-        # Print the target's current default routes via host-debug;
-        # cheap diagnostic, no change.
-        my $out = eval { $cli->poll('host-debug') };
-        if ($@) { warn "$t: $@\n"; $rc = 1; eval { $cli->bye }; next }
-        # Pull just the ROUTER section out.
-        my $section = '';
-        my $in;
-        for my $line (split /\n/, $out) {
-            if ($line =~ /^==\[ ROUTER /)    { $in = 1; $section .= "$line\n"; next }
-            if ($line =~ /^==\[/ && $in)     { $in = 0; last }
-            $section .= "$line\n" if $in;
-        }
-        print "=== $t ===\n", $section, "\n";
-        eval { $cli->bye };
-        next;
-    }
-
-    if ($clear) {
-        my %k = ();
-        $k{metric} = $metric if defined $metric;
-        if ($dry) {
-            print STDERR "$t: would SET_GATEWAY action=clear"
-                       . (defined $metric ? " metric=$metric" : '') . "\n";
-            eval { $cli->bye }; next;
-        }
-        my $r = eval { $cli->set_gateway(action => 'clear', %k) };
-        if ($@) { warn "$t: $@"; $rc = 1; eval { $cli->bye }; next }
-        print "$t: cleared (metric=$r->{metric}, removed=$r->{removed})\n"
-            unless $quiet && ($r->{removed} // 0) == 0;
-        eval { $cli->bye };
-        next;
-    }
-
-    # Else: --gateway HOST (set)
-    my $via = resolve_gateway($gateway, $host);
-    unless ($via) {
-        warn "$t: cannot resolve gateway '$gateway'\n";
-        $rc = 1; eval { $cli->bye }; next;
-    }
-    my %k = (action => 'set', via => $via);
-    $k{dev}    = $dev    if defined $dev;
-    $k{metric} = $metric if defined $metric;
-    if ($dry) {
-        print STDERR "$t: would SET_GATEWAY via=$via"
-                   . (defined $dev ? " dev=$dev" : '')
-                   . (defined $metric ? " metric=$metric" : '') . "\n";
-        eval { $cli->bye }; next;
-    }
-    my $r = eval { $cli->set_gateway(%k) };
-    if ($@) { warn "$t: $@"; $rc = 1; eval { $cli->bye }; next }
-    printf "%s: gateway → %s (dev=%s metric=%s)\n",
-        $t, $r->{via}, ($r->{dev} // '?'), ($r->{metric} // '?')
-        unless $quiet;
-    eval { $cli->bye };
+for my $t (@ARGV) {
+    my ($ok, $msg) = handle_target($t, {
+        action  => $clear ? 'clear' : ($status ? 'status' : 'set'),
+        gateway => $gateway,
+        metric  => $metric,
+        dev     => $dev,
+    });
+    $rc = 1 unless $ok;
+    print "$msg\n" if $msg && (!$quiet || !$ok);
 }
-
 exit $rc;
 
-# Resolve a gateway name to an IP. If $name is already a v4 dotted-
-# quad, pass through. Otherwise shell out to net-lookup (which
-# already knows about prefer_subnet_cidr aliases). Pass --include-stale
-# so static-only entries (gateway1, gateway2 that may not have been
-# pinged recently) still resolve.
-sub resolve_gateway {
-    my ($name, $target_host) = @_;
-    return $name if $name =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
-    my $cmd = "net-lookup --include-stale " . shell_quote($name) . " 2>/dev/null";
-    chomp(my $ip = `$cmd`);
-    return $ip if $ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+# =====================================================================
+# Per-target dispatcher
+# =====================================================================
+
+sub handle_target {
+    my ($t, $args) = @_;
+    my ($host, $port) = split /:/, $t, 2;
+    $port //= 7531;
+
+    # Resolve the target host to an IP for classification + ssh.
+    my $ip = is_ipv4($host) ? $host : net_lookup($host);
+    return (0, "$t: cannot resolve '$host'") unless defined $ip;
+
+    my $kind = classify_target($cls, $ip, $host);
+    # status doesn't change anything; report classification + routes.
+    if ($args->{action} eq 'status') {
+        return status_target($t, $host, $port, $ip, $kind);
+    }
+
+    if ($kind eq 'ap') {
+        return ($args->{action} eq 'set'
+                ? ap_set($t, $ip, resolve_gw($args->{gateway}))
+                : ap_clear($t, $ip));
+    }
+
+    # Try net-mgr first (unless we already know it's not an option).
+    if ($kind ne 'plain') {
+        my ($ok, $msg) = try_netmgr($t, $host, $port, $args);
+        return ($ok, $msg) if $ok || $msg !~ /connect|connection refused|no route/i;
+    }
+
+    # ssh fallback (plain Linux semantics)
+    return ($args->{action} eq 'set'
+            ? linux_set($t, $ip, resolve_gw($args->{gateway}), $args->{metric}, $args->{dev})
+            : linux_clear($t, $ip, $args->{metric}));
+}
+
+# =====================================================================
+# net-mgr peer path
+# =====================================================================
+
+sub try_netmgr {
+    my ($t, $host, $port, $args) = @_;
+    my $cli = eval { NetMgr::Client->new(listen => "$host:$port", timeout => 4) };
+    if ($@ || !$cli) {
+        my $m = $@ // 'connect failed';
+        $m =~ s/\s+at\s+\S+\s+line\s+\d+\.?$//;
+        return (0, "$t: net-mgr unreachable ($m)");
+    }
+    eval { $cli->hello(consumer => "net-set.$$") };
+    return (0, "$t: hello failed ($@)") if $@;
+
+    my $rc = 0; my $msg;
+    if ($args->{action} eq 'clear') {
+        my %k; $k{metric} = $args->{metric} if defined $args->{metric};
+        if ($dry) {
+            $msg = "$t [netmgr]: would SET_GATEWAY action=clear"
+                 . (defined $args->{metric} ? " metric=$args->{metric}" : '');
+            $rc = 1;
+        } else {
+            my $r = eval { $cli->set_gateway(action => 'clear', %k) };
+            if ($@) { $msg = "$t [netmgr]: $@"; chomp $msg }
+            else {
+                $msg = "$t [netmgr]: cleared (metric=$r->{metric}, removed=$r->{removed})";
+                $rc = 1;
+            }
+        }
+    } else {
+        my $via = resolve_gw($args->{gateway})
+            or return (0, "$t: cannot resolve gateway '$args->{gateway}'");
+        my %k = (action => 'set', via => $via);
+        $k{dev}    = $args->{dev}    if defined $args->{dev};
+        $k{metric} = $args->{metric} if defined $args->{metric};
+        if ($dry) {
+            $msg = "$t [netmgr]: would SET_GATEWAY via=$via"
+                 . (defined $args->{dev} ? " dev=$args->{dev}" : '')
+                 . (defined $args->{metric} ? " metric=$args->{metric}" : '');
+            $rc = 1;
+        } else {
+            my $r = eval { $cli->set_gateway(%k) };
+            if ($@) { $msg = "$t [netmgr]: $@"; chomp $msg }
+            else {
+                $msg = sprintf "%s [netmgr]: gateway → %s (dev=%s metric=%s)",
+                    $t, $r->{via}, ($r->{dev} // '?'), ($r->{metric} // '?');
+                $rc = 1;
+            }
+        }
+    }
+    eval { $cli->bye };
+    return ($rc, $msg);
+}
+
+# =====================================================================
+# DD-WRT AP path (ssh)
+# =====================================================================
+
+sub ap_set {
+    my ($t, $ip, $via) = @_;
+    return (0, "$t: cannot resolve gateway") unless defined $via;
+    # Two effects:
+    #   1. ip route replace default via $via dev br0   — AP's own egress
+    #   2. nvram lan_gateway / wan_gateway + dnsmasq restart
+    #      so option=3 advertised to DHCP clients also flips.
+    # br0 is the canonical bridge name on every DD-WRT AP — eth +
+    # vlan + radios are all enslaved to it.
+    my $script = <<"SH";
+set -e
+ip route replace default via $via dev br0
+nvram set lan_gateway=$via
+nvram set wan_gateway=$via
+nvram commit
+# restart dnsmasq so the new option=3 reaches clients on renewal
+stopservice dnsmasq 2>/dev/null
+startservice dnsmasq 2>/dev/null
+echo OK iface=br0 via=$via
+SH
+    if ($dry) {
+        return (1, "$t [ap]: would ssh $ssh_user\@$ip + ip route replace default via $via dev br0; nvram + dnsmasq restart");
+    }
+    my ($ok, $out) = ssh_run($ip, $script);
+    return $ok
+        ? (1, "$t [ap]: gateway → $via (br0 + nvram + dnsmasq)")
+        : (0, "$t [ap]: ssh failed: $out");
+}
+
+sub ap_clear {
+    my ($t, $ip) = @_;
+    # AP --clear is intentionally not supported: we don't track a
+    # 'previous' nvram value and runtime metric=1 doesn't help on
+    # DD-WRT (default route is at metric=0). User should switch
+    # explicitly with --gateway gateway3 instead.
+    return (0, "$t [ap]: --clear not supported for APs; use "
+              . "--gateway gateway3 (or whichever) to switch back");
+}
+
+# =====================================================================
+# Plain Linux path (ssh fallback when net-mgr is missing)
+# =====================================================================
+
+sub linux_set {
+    my ($t, $ip, $via, $metric, $dev) = @_;
+    return (0, "$t: cannot resolve gateway") unless defined $via;
+    $metric //= 1;
+    my $devarg = defined $dev ? "dev $dev " : '';
+    my $script = "ip route replace default via $via ${devarg}metric $metric && echo OK";
+    if ($dry) {
+        return (1, "$t [linux]: would ssh $ssh_user\@$ip + $script");
+    }
+    my ($ok, $out) = ssh_run($ip, $script);
+    return $ok
+        ? (1, "$t [linux]: gateway → $via (metric=$metric, runtime only)")
+        : (0, "$t [linux]: ssh failed: $out");
+}
+
+sub linux_clear {
+    my ($t, $ip, $metric) = @_;
+    $metric //= 1;
+    my $script = "ip route del default metric $metric 2>/dev/null; echo OK";
+    if ($dry) {
+        return (1, "$t [linux]: would ssh $ssh_user\@$ip + $script");
+    }
+    my ($ok, $out) = ssh_run($ip, $script);
+    return $ok
+        ? (1, "$t [linux]: cleared metric=$metric override")
+        : (0, "$t [linux]: ssh failed: $out");
+}
+
+# =====================================================================
+# Status (read-only)
+# =====================================================================
+
+sub status_target {
+    my ($t, $host, $port, $ip, $kind) = @_;
+    # Try net-mgr's host-debug first (unless it's an AP — APs don't
+    # run net-mgr). Fall back to a tiny ssh probe.
+    if ($kind ne 'ap') {
+        my $cli = eval { NetMgr::Client->new(listen => "$host:$port", timeout => 4) };
+        if ($cli) {
+            $cli->hello(consumer => "net-set.$$");
+            my $out = eval { $cli->poll('host-debug') };
+            if (!$@ && defined $out) {
+                my ($section) = $out =~ /(==\[ ROUTER \]==.*?)(?:\n==\[|\z)/s;
+                eval { $cli->bye };
+                return (1, "=== $t [$kind] ===\n" . ($section // '(no ROUTER section)'));
+            }
+            eval { $cli->bye };
+        }
+    }
+    # ssh probe for AP / no-net-mgr
+    my ($ok, $out) = ssh_run($ip, 'ip route show default 2>/dev/null || route -n 2>/dev/null | grep ^0');
+    return $ok
+        ? (1, "=== $t [$kind] ===\n  default routes:\n    "
+              . join("\n    ", split /\n/, $out))
+        : (0, "$t: cannot probe ($out)");
+}
+
+# =====================================================================
+# Classification — query local daemon for aps/interfaces/addresses
+# =====================================================================
+
+sub load_classifier {
+    my ($listen) = @_;
+    my %c = (ip_to_mac => {}, ap_mac => {}, kind_by_mac => {},
+             name_to_ips => {}, available => 0);
+    my $cli = eval { NetMgr::Client->new(listen => $listen, timeout => 5) };
+    return \%c unless $cli;
+    eval {
+        $cli->hello(consumer => "net-set-cls.$$");
+        my $aps   = $cli->snapshot(1, 'aps');
+        my $ifs   = $cli->snapshot(2, 'interfaces');
+        my $addrs = $cli->snapshot(3, 'addresses',
+                                    where => "family = 'v4'");
+        my $machs = $cli->snapshot(4, 'machines');
+        $cli->bye;
+
+        $c{ap_mac}{ lc $_->{mac} } = 1 for grep { $_->{mac} } @$aps;
+        my %name_by_mid = map { $_->{id} => $_->{primary_name} }
+                          grep { defined $_->{primary_name} } @$machs;
+        my %mid_by_mac;
+        for my $i (@$ifs) {
+            next unless $i->{mac};
+            $c{kind_by_mac}{ lc $i->{mac} } = $i->{kind} // 'unknown';
+            $mid_by_mac{ lc $i->{mac} } = $i->{machine_id}
+                if defined $i->{machine_id};
+        }
+        for my $a (@$addrs) {
+            next unless $a->{mac} && $a->{addr};
+            $c{ip_to_mac}{ $a->{addr} } = lc $a->{mac};
+            my $name = $name_by_mid{ $mid_by_mac{ lc $a->{mac} } // 0 };
+            push @{ $c{name_to_ips}{$name} }, $a->{addr} if $name;
+        }
+        $c{available} = 1;
+    };
+    return \%c;
+}
+
+sub classify_target {
+    my ($cls, $ip, $name) = @_;
+    return 'unknown' unless $cls->{available};
+    my $mac = $cls->{ip_to_mac}{$ip};
+    return 'ap' if defined $mac && $cls->{ap_mac}{$mac};
+    return 'unknown';   # could be netmgr or plain — caller probes
+}
+
+# =====================================================================
+# Helpers
+# =====================================================================
+
+sub net_lookup {
+    my ($name) = @_;
+    chomp(my $ip = `net-lookup --include-stale @{[ shell_quote($name) ]} 2>/dev/null`);
+    return $ip if is_ipv4($ip);
+    # net-lookup matches against the daemon's known names. FQDNs that
+    # include dots usually aren't in primary_name as-is, so fall back
+    # to system DNS.
+    if ($name =~ /\./) {
+        require Socket;
+        my @r = gethostbyname($name);
+        if (@r >= 5 && defined $r[4]) {
+            my $packed = $r[4];
+            return Socket::inet_ntoa($packed) if length($packed) == 4;
+        }
+    }
     return undef;
 }
+
+sub resolve_gw {
+    my ($name) = @_;
+    return undef unless defined $name;
+    return $name if is_ipv4($name);
+
+    # If the local classifier has multiple IPs for this name, prefer
+    # an ethernet-kind interface — wifi gateways are nearly always
+    # the wrong thing for routing (they may not be wired into the
+    # LAN backbone, may rate-limit, etc.). Fall through to net-lookup
+    # if the classifier doesn't know.
+    if (my $ips = $cls->{name_to_ips}{$name}) {
+        my @eth = grep {
+            my $mac = $cls->{ip_to_mac}{$_};
+            $mac && ($cls->{kind_by_mac}{$mac} // '') eq 'ethernet';
+        } @$ips;
+        return $eth[0] if @eth;
+        return $ips->[0] if @$ips;
+    }
+    return net_lookup($name);
+}
+
+sub is_ipv4 { defined $_[0] && $_[0] =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/ }
 
 sub shell_quote {
     my ($s) = @_;
@@ -153,6 +380,26 @@ sub shell_quote {
     return $s   if $s =~ /^[A-Za-z0-9_.\/=:,@-]+$/;
     (my $q = $s) =~ s/'/'\\''/g;
     return "'$q'";
+}
+
+# Run a shell snippet on a remote host. Returns (rc-bool, captured-output).
+sub ssh_run {
+    my ($host, $script) = @_;
+    my @cmd = ('ssh', '-o', 'BatchMode=yes',
+                       '-o', 'ConnectTimeout=5',
+                       '-o', 'StrictHostKeyChecking=accept-new',
+                       '-T', '-q', "$ssh_user\@$host", 'sh');
+    my $pid = open my $fh, '|-';
+    return (0, "fork: $!") unless defined $pid;
+    if ($pid == 0) {
+        # child writes to ssh's stdin
+        exec { $cmd[0] } @cmd;
+        die "exec: $!";
+    }
+    print $fh $script;
+    close $fh;
+    my $rc = $?;
+    return ($rc == 0, $rc ? "ssh rc=" . ($rc >> 8) : 'ok');
 }
 
 sub usage {
@@ -163,17 +410,24 @@ Usage:
   net-set --clear         TARGET [TARGET ...]
   net-set --status        TARGET [TARGET ...]
 
-  HOST   = name or IP of the gateway to install (resolved via
-           net-lookup if not already an IP)
-  TARGET = name or IP of a host running net-mgr (HOST:PORT to
-           override default daemon port 7531)
+  HOST    = gateway to install (resolved via net-lookup if not an IP)
+  TARGET  = host whose gateway to switch (name or IP)
+
+Per target, net-set picks the right mechanism by querying the local
+net-mgr's classification:
+  - DD-WRT AP   → ssh + ip route replace + nvram lan_gateway +
+                  dnsmasq reload (also flips advertised option=3)
+  - net-mgr     → SET_GATEWAY verb (metric-1 override; --clear reverts)
+  - plain Linux → ssh + ip route replace default ... metric 1
 
 Options:
-  --metric N      route metric for our entry (default 1)
-  --dev IFACE     pin egress interface
-  --dry-run / -n  show what would be sent, don't send
-  --quiet  / -q   only print changes
-  --help   / -h
+  --metric N         route metric (Linux paths; default 1)
+  --dev IFACE        pin egress interface
+  --listen H[:P]     local daemon for classification (default 127.0.0.1:7531)
+  --ssh-user USER    ssh user for AP/Linux paths (default root)
+  --dry-run / -n     don't apply
+  --quiet   / -q     only print changes
+  --help    / -h
 EOF
     exit($rc // 0);
 }
