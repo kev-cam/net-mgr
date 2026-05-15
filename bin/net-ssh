@@ -70,10 +70,14 @@ sub resolve_dest {
     return $d if $host =~ /^\d+\.\d+\.\d+\.\d+\z/;
 
     # net-lookup takes a regex; 'HOST.*' covers the bare name and any
-    # FQDN form that starts with it.  First IPv4 in the reply wins;
-    # net-lookup already filters to live hosts by default.
+    # FQDN form that starts with it. --verify pings each candidate
+    # before returning — without it net-lookup trusts `ip route get`
+    # for reachability, which says "reachable" for any host whose
+    # subnet is in our routing table even when the host itself is
+    # actually down. Handing a dead IP to ssh just produces "No route
+    # to host" or a 30s timeout, so verify is worth its one-ping cost.
     my $ip;
-    if (open my $fh, '-|', 'net-lookup', "$host.*") {
+    if (open my $fh, '-|', 'net-lookup', '--verify', "$host.*") {
         while (my $line = <$fh>) {
             chomp $line;
             next unless $line =~ /^(\d+\.\d+\.\d+\.\d+)\z/;
