@@ -280,10 +280,16 @@ sub auto_push {
             return 0;
         }
     }
+    # Try ~/.netrc first; fall back to factory admin/admin if absent
+    # (a factory-reset switch by definition accepts those). Override
+    # via NET_RECOVER_USER / NET_RECOVER_PASS env if neither suits.
     my %creds = read_netrc($host);
-    unless ($creds{login} && defined $creds{password}) {
-        warn "auto-push: no netrc credentials for '$host'\n";
-        return 0;
+    if (!($creds{login} && defined $creds{password})) {
+        $creds{login}    = $ENV{NET_RECOVER_USER} // 'admin';
+        $creds{password} = $ENV{NET_RECOVER_PASS} // 'admin';
+        warn "auto-push: no netrc credentials for '$host'; "
+           . "using factory '$creds{login}/$creds{password}' "
+           . "(override via NET_RECOVER_USER / NET_RECOVER_PASS)\n";
     }
     my $cfg = read_switch_conf($host);
     my %ep = (
