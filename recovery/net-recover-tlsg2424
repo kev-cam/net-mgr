@@ -9,9 +9,10 @@
 # onto its new address.
 #
 # Usage:
-#   net-recover-tlsg2424 --iface eth0                    # manual web UI
-#   net-recover-tlsg2424 --iface eth0 --auto             # auto-push IP
-#   net-recover-tlsg2424 --iface eth0 --cleanup
+#   net-recover-tlsg2424 --iface eth0                    # print steps
+#   net-recover-tlsg2424 --iface eth0 --manual           # + browser + wait + cleanup
+#   net-recover-tlsg2424 --iface eth0 --auto             # HTTP push (experimental)
+#   net-recover-tlsg2424 --iface eth0 --cleanup          # remove alias
 #
 # Defaults are tuned for the TL-SG2424 (factory IP 192.168.0.1, web UI
 # on http://, login admin/admin or whatever's in ~/.netrc).
@@ -34,6 +35,7 @@ my $cleanup;
 my $no_browser;
 my $describe;
 my $auto;
+my $manual;
 my $verbose;
 my $help;
 
@@ -45,6 +47,7 @@ GetOptions(
     'cleanup'      => \$cleanup,
     'no-browser'   => \$no_browser,
     'auto'         => \$auto,
+    'manual'       => \$manual,
     'verbose|v'    => \$verbose,
     'describe'     => \$describe,
     'help|h'       => \$help,
@@ -138,8 +141,43 @@ printf "  IP Address:           %s\n", $target{ip}      // '(your mgmt IP)';
 printf "  Subnet Mask:          %s\n", $target{netmask} // '255.255.255.0';
 printf "  Default Gateway:      %s\n", $target{gateway} // '(your gateway)';
 print "Apply, then click       'Save Config' (top of UI), then 'Reboot'.\n";
+
+if ($manual) {
+    # Interactive helper: launch the browser, wait for the operator
+    # to do the dance, then run the cleanup automatically. Saves
+    # them remembering the cleanup invocation.
+    unless ($no_browser) {
+        my $opened = 0;
+        for my $b (qw(xdg-open sensible-browser firefox chromium)) {
+            my $path = "/usr/bin/$b";
+            next unless -x $path;
+            system { $path } $b, "http://$factory_ip/";
+            $opened = 1;
+            last;
+        }
+        if (!$opened) {
+            print "\n(no browser found in PATH — open the URL above manually)\n";
+        }
+    }
+    print "\nWhen the switch finishes rebooting and is reachable at "
+        . ($target{ip} // 'its new IP') . ", press <enter> to clean up.\n";
+    print "Or ^C to leave the alias in place.\n> ";
+    my $line = <STDIN>;   # block until enter / ^D / ^C
+    print "\n";
+    print "cleaning up ...\n";
+    my $rc = system('ip', 'addr', 'del', $alias_cidr, 'dev', $iface);
+    if ($rc == 0) { print "removed $alias_cidr from $iface\n" }
+    else          { warn  "alias del returned $rc (already gone?)\n" }
+    clear_lost_device($netrc_host, $factory_ip);
+    exit 0;
+}
+
+# Non-manual, non-auto: print where the operator needs to go and exit.
+# This is the legacy / cron-friendly path (net-find-lost uses it when
+# kicking the recovery automatically).
 print "\nWhen the switch is back at " . ($target{ip} // 'its new IP') . ":\n";
 print "  net-recover-tlsg2424 --iface $iface --cleanup\n";
+print "\nOr re-run with --manual to be walked through interactively.\n";
 
 if (!$no_browser && !$ENV{NET_MGR_AUTOMATED}) {
     for my $b (qw(xdg-open sensible-browser firefox chromium)) {
@@ -228,8 +266,9 @@ net-recover-tlsg2424 — bring a factory-reset TL-SG2424 back online.
 
 Usage:
   net-recover-tlsg2424 --iface NAME [--alias IP] [--factory IP] [--host NAME]
-  net-recover-tlsg2424 --iface NAME --auto
-  net-recover-tlsg2424 --iface NAME --cleanup
+  net-recover-tlsg2424 --iface NAME --manual    # interactive helper
+  net-recover-tlsg2424 --iface NAME --auto      # HTTP push (experimental)
+  net-recover-tlsg2424 --iface NAME --cleanup   # remove alias only
 
 Options:
   --iface, -i NAME   Interface the switch is reachable through (required).
@@ -240,12 +279,21 @@ Options:
                      swtch15). Also keys the netrc credential lookup
                      and the per-model overrides in
                      /etc/net-mgr/switches/<NAME>.conf.
+  --manual           Interactive helper: set up the alias, launch the
+                     browser at the factory IP, wait for the operator
+                     to walk through the web-UI steps, then run the
+                     cleanup automatically on <enter>. ^C to leave
+                     the alias in place.
   --auto             Push the target IP via the switch's web UI
                      instead of printing manual instructions. Reads
-                     login creds from ~/.netrc. Falls back to manual
-                     mode if the HTTP push fails.
+                     login creds from ~/.netrc (falls back to factory
+                     admin/admin if no entry). Endpoint URLs default
+                     to T1500G/T1600G-era firmware; override per
+                     model in /etc/net-mgr/switches/<NAME>.conf.
+                     Falls back to printing manual instructions if
+                     the HTTP push fails.
   --verbose, -v      Print HTTP request/response details under --auto.
-  --cleanup          Remove the alias and exit.
+  --cleanup          Remove the alias + clear lost_devices row, then exit.
   --no-browser       Don't try to launch a browser at the factory IP.
   --help, -h         Print this help.
 USAGE
