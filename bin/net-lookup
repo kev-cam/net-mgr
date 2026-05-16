@@ -47,6 +47,7 @@ my $all;
 my $family = 'v4';
 my $verify;
 my $include_stale;
+my $verbose;
 my $help;
 GetOptions(
     'listen=s'      => \$listen,
@@ -54,6 +55,7 @@ GetOptions(
     'family=s'      => \$family,
     'verify|v'      => \$verify,
     'include-stale' => \$include_stale,
+    'verbose'       => \$verbose,
     'help|h'        => \$help,
 ) or usage(2);
 usage(0) if $help;
@@ -125,12 +127,17 @@ for my $a (@$aliases) {
 }
 
 # Find machines whose name matches the regex, plus the prefer_subnet_cidr
-# hint when it came in via an alias row.
+# hint when it came in via an alias row. Keep the matched-name list
+# per mid too — --verbose uses it to print "IP\tname1,name2,…".
 my %matched_mids;             # mid => 1
+my %matched_names_by_mid;     # mid => [names]
 my @prefer_cidrs;             # explicit hints from matched aliases
-for my $name (keys %name2mids) {
+for my $name (sort keys %name2mids) {
     next unless $name =~ $rx;
-    $matched_mids{$_} = 1 for @{ $name2mids{$name} };
+    for my $mid (@{ $name2mids{$name} }) {
+        $matched_mids{$mid} = 1;
+        push @{ $matched_names_by_mid{$mid} }, $name;
+    }
     push @prefer_cidrs, $alias_pref{$name} if $alias_pref{$name};
 }
 
@@ -161,14 +168,14 @@ for my $a (@$addresses) {
 }
 
 my %seen;
-my @candidates;       # list of [score, rtt_for_tiebreak, ip]
+my @candidates;       # list of [score, rtt_for_tiebreak, ip, mid]
 for my $mid (keys %matched_mids) {
     for my $mac (@{ $macs_by_mid{$mid} || [] }) {
         for my $ip (@{ $addrs_by_mac{$mac} || [] }) {
             next if $seen{$ip}++;
             my $score = _score($ip, \@prefer_cidrs, \%kind_by_mac, \%meta_by_addr);
             my $rtt = ($meta_by_addr{$ip} || {})->{min_rtt_ms} // 9999;
-            push @candidates, [ $score, $rtt, $ip ];
+            push @candidates, [ $score, $rtt, $ip, $mid ];
         }
     }
 }
@@ -199,10 +206,16 @@ if ($verify) {
     exit 1 unless @candidates;
 }
 
-if ($all) {
-    print "$_->[2]\n" for @candidates;
-} else {
-    print "$candidates[0][2]\n";
+my @to_print = $all ? @candidates : ($candidates[0]);
+for my $c (@to_print) {
+    if ($verbose) {
+        my %seen_name;
+        my @names = grep { !$seen_name{$_}++ }
+                    @{ $matched_names_by_mid{ $c->[3] } || [] };
+        printf "%s\t%s\n", $c->[2], join(',', @names);
+    } else {
+        print "$c->[2]\n";
+    }
 }
 exit 0;
 
@@ -374,7 +387,7 @@ net-lookup — resolve a regex name to the best IP for this caller, or
             an IP to its host name.
 
 Usage:
-  net-lookup [--all] [--verify] [--include-stale]
+  net-lookup [--all] [--verify] [--include-stale] [--verbose]
              [--family v4|v6] [--listen HOST:PORT] <name-regex|IP>
 
 Forward (name → IP):
@@ -382,6 +395,7 @@ Forward (name → IP):
   net-lookup 'nas3(|-.*)'              # nas3, nas3-up, nas3-down, nas3-dwn2
   net-lookup --all 'wndr.*'            # every IP for every wndr-* host
   net-lookup --verify 'gateway3.*'     # ping each candidate before picking
+  net-lookup --verbose 'nas3.*'        # IP<TAB>matched-name(s), one per line
 
 The pattern is a Perl regex; net-lookup wraps it as ^(?:...)\$ before
 matching against machines.primary_name, friendly_names, hostnames,
@@ -401,6 +415,8 @@ dhcp.master config but never actually seen on the wire) are excluded.
 those that respond. Without --all, it stops at the first responder.
 
 Default prints one IP. --all prints every match, best-scored first.
+--verbose appends a TAB and the matching name(s) (comma-separated
+when one IP matched via several names like primary_name + alias).
 
 Reverse (IP → name):
   net-lookup 192.168.15.104            # primary_name for that machine
