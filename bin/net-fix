@@ -5,12 +5,17 @@
 # Usage:
 #   net-fix --mac MAC --name NAME [--subnet 192.168.223.0/24] [--ip IP]
 #           [--file /etc/net-mgr/dhcp.extra] [--dry-run] [--listen H:P]
+#   net-fix --subnet 192.168.223.0/24 --free        # list unused IPs
 #
 # Without --ip the picker lists free IP ranges in the subnet (skipping
 # dhcpd's dynamic range), shows the immediate neighbours (so you can
 # group cameras / power plugs / etc. near their kin), and prompts for a
 # selection. Default = first IP of the first listed range; you can also
 # type a specific IP.
+#
+# --free is a quiet, scriptable mode: prints one unused IPv4 address
+# per line (skipping anything in the dhcp dynamic range or already
+# allocated). Doesn't need --mac or --name; doesn't write anything.
 #
 # After picking, the tool appends:
 #   host <NAME> { hardware ethernet <MAC>; fixed-address <IP>; }
@@ -30,7 +35,7 @@ use NetMgr::Client;
 my $MASTER = '/etc/net-mgr/dhcp.master';
 my $EXTRA  = '/etc/net-mgr/dhcp.extra';
 
-my ($mac, $name, $subnet, $ip);
+my ($mac, $name, $subnet, $ip, $free_only);
 my $file    = $EXTRA;
 my $dry_run = 0;
 my $listen;
@@ -45,15 +50,23 @@ GetOptions(
     'dry-run|n' => \$dry_run,
     'yes|y'    => \$assume_yes,
     'listen=s' => \$listen,
+    'free'     => \$free_only,
 ) or die "bad options\n";
 
-$mac && $name or die <<'EOF';
+if ($free_only) {
+    $subnet or die "--free needs --subnet CIDR\n";
+} else {
+    $mac && $name or die <<'EOF';
 usage: net-fix --mac MAC --name NAME [--subnet CIDR] [--ip IP]
                [--file /etc/net-mgr/dhcp.extra] [--dry-run]
+       net-fix --subnet CIDR --free
 EOF
+}
 
-$mac =~ /^[0-9a-fA-F:]{17}$/ or die "bad MAC '$mac'\n";
-$mac = lc $mac;
+if (!$free_only) {
+    $mac =~ /^[0-9a-fA-F:]{17}$/ or die "bad MAC '$mac'\n";
+    $mac = lc $mac;
+}
 
 my $my_host = (split /\./, hostname())[0];
 
@@ -85,10 +98,12 @@ for my $h (@master_hosts) {
     $used{ $h->{ip} } //= $h->{name};
 }
 
-# Reject if MAC already has an entry in dhcp.master
-for my $h (@master_hosts) {
-    if ($h->{mac} eq $mac) {
-        die "MAC $mac already reserved as '$h->{name}' at $h->{ip} in $MASTER\n";
+# Reject if MAC already has an entry in dhcp.master (skip under --free).
+unless ($free_only) {
+    for my $h (@master_hosts) {
+        if ($h->{mac} eq $mac) {
+            die "MAC $mac already reserved as '$h->{name}' at $h->{ip} in $MASTER\n";
+        }
     }
 }
 
@@ -138,6 +153,17 @@ if ($sub_rec) {
             $dyn{"$net_base.$oct"} = 1;
         }
     }
+}
+
+# ---- --free: just print unused IPs and exit --------------------------
+if ($free_only) {
+    for my $oct (1..254) {
+        my $a = "$net_base.$oct";
+        next if $dyn{$a} || $used{$a};
+        print "$a\n";
+    }
+    $cli->bye;
+    exit 0;
 }
 
 # ---- explicit --ip path ----------------------------------------------
