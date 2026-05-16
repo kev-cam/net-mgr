@@ -2,13 +2,24 @@
 # net-audit-aps — check that every AP's DHCP server is advertising
 # the right default-gateway, and fix the drifted ones with --fix.
 #
-# The recurring problem: DD-WRT APs run their own dnsmasq for the
-# clients on their L2 segment. The advertised default-gateway
-# (DHCP option 3) comes from nvram lan_gateway / wan_gateway. If
-# those drift (operator changes via net-set, AP firmware reset,
-# rogue manual config) the clients on that AP route through the
-# wrong place until their lease renews and they pick up the right
-# option=3 on the next DHCPACK.
+# Two passes:
+#
+# 1. Default-gateway check.  DD-WRT APs run their own dnsmasq for the
+#    clients on their L2 segment. The advertised default-gateway
+#    (DHCP option 3) comes from nvram lan_gateway. If it drifts
+#    (operator changes via net-set, AP firmware reset, rogue manual
+#    config) the clients on that AP route through the wrong place
+#    until their lease renews and they pick up the right option=3.
+#
+# 2. Per-MAC static-lease check.  DD-WRT also keeps a
+#    nvram static_leases list mapping MAC → IP for DHCP reservations
+#    (Services > DHCP > Static Leases in the web UI). When an
+#    operator edits one on the AP without updating
+#    /etc/net-mgr/dhcp.master (the source of truth) the AP and
+#    dhcp.master disagree about which IP that device should get.
+#    For any MAC present in both, the IPs are compared; mismatch
+#    is flagged as DRIFT. Missing-on-AP / extra-on-AP are not
+#    flagged (not every AP serves every host's segment).
 #
 # Usage:
 #   net-audit-aps                          compare against the active gateway
@@ -36,6 +47,7 @@ use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
 
 use NetMgr::Client;
+use NetMgr::Producer::DhcpMaster;
 
 my ($gateway, $via_isp, $fix, $listen, $ssh_user, $quiet, $help);
 GetOptions(
@@ -164,7 +176,130 @@ if ($fix && @drifted) {
     }
 }
 
-if (@drifted) { exit($fix ? 0 : 1) }
+# ---- static-lease audit --------------------------------------------
+#
+# DD-WRT stores per-MAC DHCP reservations in nvram static_leases as
+#   mac=name=ip=lease_minutes  (space-separated entries).
+# Compare each AP's reservations against /etc/net-mgr/dhcp.master:
+# for any MAC present in both, the IP must match. Missing-on-AP /
+# extra-on-AP are common (each AP serves a different segment) and
+# would be noise, so we don't flag those by default.
+my $master = '/etc/net-mgr/dhcp.master';
+my @lease_drift;
+my @lease_fix_fail;
+if (-r $master) {
+    my @records = NetMgr::Producer::DhcpMaster::parse_file($master);
+    my @hosts   = NetMgr::Producer::DhcpMaster::hosts_only(@records);
+    my %master_ip = map { lc($_->{mac}) => { ip => $_->{ip}, name => $_->{name} } }
+                    grep { $_->{mac} && $_->{ip} } @hosts;
+
+    print "\n--- static-lease audit (vs $master) ---\n" unless $quiet;
+    my %seen_propagation;     # mac:ip → 1, dedupe across APs
+    my @new_macs;             # entries to propagate
+    my %ap_leases_by_mac;     # mac → AP-side name (for propagation)
+    for my $a (sort { $a->{name} cmp $b->{name} } @ap_list) {
+        next unless $a->{ip} ne '?';
+        my $leases = probe_ap_leases($a->{ip});
+        if (!defined $leases) {
+            next if $quiet;
+            printf "  %-22s %-15s  (leases probe failed)\n", $a->{name}, $a->{ip};
+            next;
+        }
+        for my $mac (sort keys %$leases) {
+            my $ap_ip   = $leases->{$mac}{ip};
+            my $ap_name = $leases->{$mac}{name};
+            if (my $m = $master_ip{$mac}) {
+                next if $m->{ip} eq $ap_ip;        # agree → OK
+                push @lease_drift, {
+                    ap_name   => $a->{name},
+                    ap_ip     => $a->{ip},
+                    mac       => $mac,
+                    ap_lease  => $ap_ip,
+                    master_ip => $m->{ip},
+                    name      => $m->{name},
+                };
+            } else {
+                # MAC not in dhcp.master. Maybe already in the DB
+                # (addresses) at this IP — if so it's noise, skip.
+                # Otherwise propagate.
+                my $key = "$mac:$ap_ip";
+                next if $seen_propagation{$key}++;
+                my @known = @{ $ip_by_mac{$mac} || [] };
+                next if grep { $_ eq $ap_ip } @known;
+                push @new_macs, {
+                    ap_name => $a->{name},
+                    mac     => $mac,
+                    ip      => $ap_ip,
+                    name    => $ap_name,
+                };
+            }
+        }
+    }
+    if (@lease_drift) {
+        printf "\n%-22s %-17s  %-12s  %-15s  %-15s\n",
+            "AP", "MAC", "HOST", "AP says", "master says"
+            unless $quiet;
+        for my $d (@lease_drift) {
+            printf "%-22s %-17s  %-12s  %-15s  %-15s  DRIFT\n",
+                $d->{ap_name}, $d->{mac}, $d->{name},
+                $d->{ap_lease}, $d->{master_ip};
+        }
+    } elsif (!$quiet) {
+        print "  all per-MAC reservations agree with $master\n";
+    }
+
+    if ($fix && @lease_drift) {
+        print "\n--- fixing static-lease drift (pushing dhcp.master to APs) ---\n";
+        my %by_ap;
+        push @{ $by_ap{ $_->{ap_ip} } }, $_ for @lease_drift;
+        my %name_for;
+        $name_for{ $_->{ap_ip} } //= $_->{ap_name} for @lease_drift;
+        for my $ap_ip (sort keys %by_ap) {
+            my $ok = push_lease_fix($ap_ip, $by_ap{$ap_ip});
+            printf "  %-22s %-15s  %s\n",
+                $name_for{$ap_ip}, $ap_ip, $ok ? "OK" : "FAILED";
+            push @lease_fix_fail, $ap_ip unless $ok;
+        }
+    }
+
+    # Propagate AP-only MACs (not in dhcp.master, not in DB at that
+    # IP) so net-mgr picks them up. OBSERVE kind=host is idempotent,
+    # so repeated runs cost nothing. Tagged source so it's clear
+    # where the entry came from when looking at the addresses table.
+    if (@new_macs) {
+        print "\n--- new MACs propagated to net-mgr ---\n" unless $quiet;
+        my $cli2 = NetMgr::Client->new(listen => $listen, timeout => 5);
+        $cli2->hello(consumer => "net-audit-aps.propagate.$$");
+        for my $n (@new_macs) {
+            my $reply = $cli2->observe(
+                kind        => 'host',
+                mac         => $n->{mac},
+                ip          => $n->{ip},
+                family      => 'v4',
+                name        => $n->{name} // '',
+                name_source => 'ap-static-leases',
+                source      => "audit:ap-static-leases:$n->{ap_name}",
+            );
+            if ($reply && $reply =~ /^ERR/) {
+                warn "  $n->{mac} -> $n->{ip} ($n->{name}): $reply\n";
+            } elsif (!$quiet) {
+                printf "  %-17s  %-15s  %-12s  from $n->{ap_name}\n",
+                    $n->{mac}, $n->{ip}, $n->{name} // '';
+            }
+        }
+        $cli2->bye;
+    }
+}
+
+# Exit code semantics:
+#   any drift (gateway or lease) → 1 unless --fix
+#   --fix but any push failed     → 1
+#   probe failures (no audit run) → 1
+#   else                          → 0
+my $drift_left = @drifted || @lease_drift;
+my $fix_bad    = @lease_fix_fail;
+if ($drift_left && !$fix)  { exit 1 }
+if ($fix && $fix_bad)      { exit 1 }
 exit($failed[0] ? 1 : 0);
 
 # =====================================================================
@@ -194,6 +329,85 @@ sub probe_ap_gateway {
     return undef if $? != 0;
     return undef unless $val =~ /^\d+\.\d+\.\d+\.\d+$/;
     return $val;
+}
+
+# Pull `nvram get static_leases` from an AP and parse into
+# { mac (lc) => { ip => ..., name => ... } }. DD-WRT's format is
+# space-separated entries, each "mac=name=ip=lease_minutes".
+# Returns undef on probe failure, empty hashref if the AP has no
+# static leases configured.
+sub probe_ap_leases {
+    my ($ip) = @_;
+    my @cmd = ('ssh', '-o', 'BatchMode=yes',
+                       '-o', 'ConnectTimeout=5',
+                       '-o', 'StrictHostKeyChecking=accept-new',
+                       '-T', '-q', "$ssh_user\@$ip",
+                       'nvram get static_leases');
+    my $pid = open my $fh, '-|';
+    return undef unless defined $pid;
+    if ($pid == 0) {
+        open STDIN, '<', '/dev/null';
+        exec @cmd; exit 127;
+    }
+    chomp(my $val = <$fh> // '');
+    close $fh;
+    return undef if $? != 0;
+    my %out;
+    for my $entry (split /\s+/, $val) {
+        my @f = split /=/, $entry;
+        next unless @f >= 3;
+        my ($mac, $name, $lease_ip) = ($f[0], $f[1], $f[2]);
+        next unless $mac =~ /^[0-9a-fA-F:]{17}$/
+                 && $lease_ip =~ /^\d+\.\d+\.\d+\.\d+$/;
+        $out{ lc $mac } = { ip => $lease_ip, name => $name };
+    }
+    return \%out;
+}
+
+# Push corrected static_leases back to an AP. $fixes is an arrayref
+# of {mac, master_ip, ...}. Reads current nvram static_leases,
+# replaces the IP field on matching MAC entries (leaves non-drifted
+# entries untouched), pushes back, commits, and HUPs dnsmasq so the
+# change takes effect immediately. Returns 1 on success, 0 on any
+# step failing.
+sub push_lease_fix {
+    my ($ap_ip, $fixes) = @_;
+    my $raw = _ssh_capture($ap_ip, 'nvram get static_leases');
+    return 0 unless defined $raw;
+    my %wanted = map { lc($_->{mac}) => $_->{master_ip} } @$fixes;
+    my @new;
+    for my $entry (split /\s+/, $raw) {
+        my @f = split /=/, $entry;
+        if (@f >= 3 && exists $wanted{ lc $f[0] }) {
+            $f[2] = $wanted{ lc $f[0] };
+        }
+        push @new, join('=', @f);
+    }
+    my $new_val = join(' ', @new);
+    # Single-quote the value because it contains spaces; the value
+    # itself never contains single quotes (MAC=NAME=IP=NUM tokens).
+    my $cmd = "nvram set static_leases='$new_val' && nvram commit "
+            . "&& killall -HUP dnsmasq";
+    return _ssh_run($ap_ip, $cmd);
+}
+
+sub _ssh_capture {
+    my ($ip, $cmd) = @_;
+    my @c = ('ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
+             '-T', '-q', "$ssh_user\@$ip", $cmd);
+    my $pid = open my $fh, '-|';
+    return undef unless defined $pid;
+    if ($pid == 0) { open STDIN, '<', '/dev/null'; exec @c; exit 127 }
+    chomp(my $val = <$fh> // '');
+    close $fh;
+    return $? == 0 ? $val : undef;
+}
+
+sub _ssh_run {
+    my ($ip, $cmd) = @_;
+    my @c = ('ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
+             '-T', '-q', "$ssh_user\@$ip", $cmd);
+    return system(@c) == 0;
 }
 
 # Resolve a machine name to an IP, preferring ethernet over wifi
