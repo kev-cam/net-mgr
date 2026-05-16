@@ -215,6 +215,8 @@ my %ACTIVE = (
     dns        => '*',
     bindings   => '*',                        # parsed for future use
     peers      => '*',                        # consumed by net-mgr-relay
+    cluster    => [qw(members role priority prefer_lan internet_facing
+                       election_interval)],   # cluster role / election
     uplinks    => '*',                        # consumed by net-uplink-probe
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
     forward    => [qw(method allow_peers)],   # net-connect FORWARD backend

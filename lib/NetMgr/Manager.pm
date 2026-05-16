@@ -61,8 +61,45 @@ sub new {
             authorized_keys => $> == 0 ? '/root/.ssh/authorized_keys'
                                        : ((getpwuid($>))[7] // '') . '/.ssh/authorized_keys',
         ),
+        cluster => _load_cluster_state($args{config}),
     }, $class;
     return $self;
+}
+
+# Parse [cluster] config into a normalised state hash. Returns a
+# hashref with defaults filled in even when [cluster] is absent —
+# absent config means a single-node "cluster" (this host alone),
+# which always has quorum and is its own master.
+sub _load_cluster_state {
+    my ($cfg) = @_;
+    my $c = $cfg->{cluster} // {};
+    my @members;
+    if (defined $c->{members}) {
+        @members = grep { length } map { s/^\s+|\s+$//gr } split /,/, $c->{members};
+    }
+    my $self_name = _local_member_name();
+    my %state = (
+        members          => \@members,
+        role             => $c->{role}        // 'auto',  # auto|master|follower|excluded
+        priority         => $c->{priority}    // 100,
+        prefer_lan       => exists $c->{prefer_lan} ? ($c->{prefer_lan} ? 1 : 0) : 1,
+        internet_facing  => $c->{internet_facing},        # 0|1|undef (=auto)
+        election_interval=> $c->{election_interval} // 60,
+        self_name        => $self_name,
+        is_member        => (!@members || grep { $_ eq $self_name } @members) ? 1 : 0,
+    );
+    return \%state;
+}
+
+# Identity used in cluster rosters. Hostname's first label (so the
+# config can reasonably use bare names like 'kc-qernel' rather than
+# fully-qualified). Override via env for testing.
+sub _local_member_name {
+    return $ENV{NET_MGR_CLUSTER_NAME} if defined $ENV{NET_MGR_CLUSTER_NAME};
+    require Sys::Hostname;
+    my $h = Sys::Hostname::hostname();
+    $h =~ s/\..*//;
+    return $h;
 }
 
 # ---- logging ----------------------------------------------------------
@@ -335,17 +372,61 @@ sub _handle_status {
         else                     { $unknown++ }
     }
     my $schema_v = eval { $self->{db}->current_schema_version } // 0;
+    my $cs = $self->{cluster} // {};
+    my $internet_facing = defined $cs->{internet_facing}
+                        ? ($cs->{internet_facing} ? 1 : 0)
+                        : _detect_internet_facing();
+    # Quorum is computed from roster size; if no roster the cluster
+    # is implicitly size 1 (this host alone) and always has quorum.
+    # Reachable-count tracking lands in commit 2 (election logic);
+    # for now expose the static lower bound: self is always reachable
+    # to itself.
+    my $roster_n = scalar @{ $cs->{members} // [] };
+    my $reachable = $roster_n ? 1 : 1;
+    my $quorum_ok = ($roster_n <= 1) ? 1
+                                     : ($reachable >= int($roster_n / 2) + 1);
     $self->_send($cli, format_ok(
-        started_at       => $self->{started_at},
-        now              => time(),
-        listeners        => join(',', sort @listeners),
-        clients          => scalar(keys %{ $self->{clients} }),
-        producers        => $producers,
-        consumers        => $consumers,
-        unknown          => $unknown,
-        triggers_pending => scalar(keys %{ $self->{triggers} }),
-        schema_version   => $schema_v,
+        started_at         => $self->{started_at},
+        now                => time(),
+        listeners          => join(',', sort @listeners),
+        clients            => scalar(keys %{ $self->{clients} }),
+        producers          => $producers,
+        consumers          => $consumers,
+        unknown            => $unknown,
+        triggers_pending   => scalar(keys %{ $self->{triggers} }),
+        schema_version     => $schema_v,
+        cluster_member     => $cs->{self_name},
+        cluster_role       => $cs->{role},
+        cluster_priority   => $cs->{priority},
+        cluster_prefer_lan => $cs->{prefer_lan},
+        cluster_internet_facing => $internet_facing,
+        cluster_members    => join(',', @{ $cs->{members} // [] }),
+        cluster_is_member  => $cs->{is_member},
+        reachable_members  => $reachable,
+        quorum_ok          => $quorum_ok,
     ));
+}
+
+# Heuristic: this host has an "internet-facing" default route if any
+# default route's egress iface name looks like a USB/PCIe NIC the
+# operator typically wires to a modem (enxXXXX, enpXsY, eth-USB-ish).
+# Returns 1 if internet-facing detected, 0 if not. Operator can
+# override via [cluster] internet_facing = 0|1.
+sub _detect_internet_facing {
+    open my $fh, '-|', 'ip', '-o', '-4', 'route', 'show', 'default'
+        or return 0;
+    my $internet = 0;
+    while (my $line = <$fh>) {
+        # default via X.X.X.X dev IFACE ...
+        if ($line =~ /\bdev\s+(\S+)/) {
+            my $iface = $1;
+            # Common patterns for USB-ethernet / NIC-on-PCIe / generic
+            # ethernet that operators use to connect to a modem.
+            $internet = 1 if $iface =~ /^(enx|enp\d+s|eth\d|wlp)/;
+        }
+    }
+    close $fh;
+    return $internet;
 }
 
 sub _handle_hello {
