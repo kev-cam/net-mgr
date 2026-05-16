@@ -25,9 +25,9 @@
 #   net-audit-aps                          read-only audit (exit 1 if drift)
 #   net-audit-aps --gateway gateway3-down  compare against a specific gateway
 #   net-audit-aps --via-isp comcast        compare against the ISP-serving gw
-#   net-audit-aps --fix                    interactive: prompt before each
-#                                          push (gateway flip / lease rewrite)
-#   net-audit-aps --auto                   non-interactive: push everything
+#   net-audit-aps --fix                    interactive: per drift, choose
+#                                          [a]p / [m]aster / [s]kip
+#   net-audit-aps --auto                   non-interactive: master wins for all
 #
 # Other options:
 #   --listen H[:P]    daemon for snapshot reads (default 127.0.0.1:7531)
@@ -168,14 +168,32 @@ unless ($quiet) {
 }
 
 if ($fix && @drifted) {
-    print "\n--- fixing drifted APs ---\n";
+    print "\n--- fixing gateway drift ---\n";
     for my $a (@drifted) {
-        my $prompt = sprintf "%-22s %-15s  set lan_gateway → %s ?",
-            $a->{name}, $a->{ip}, $expected_ip;
-        next unless $auto || ask_yn($prompt, 'y');
+        # The gateway audit has only one "right answer" (the expected
+        # gateway), so there's no AP-vs-master choice — just confirm
+        # the push. Y/N pattern reused via ask_a_m's [M] default
+        # (master-wins = "push the expected value").
+        my $do_push;
+        if ($auto) {
+            $do_push = 1;
+        } else {
+            my $prompt = sprintf "  %-22s %-15s  set lan_gateway → %s ?",
+                $a->{name}, $a->{ip}, $expected_ip;
+            my $c = ask_a_m($prompt);   # 'm' default → push
+            $do_push = ($c eq 'm');
+            # 'a' (take AP) for gateway doesn't make sense — there's
+            # no master-file equivalent. Treat as skip with a note.
+            if ($c eq 'a') {
+                print "    (AP gateway is operator-controlled; "
+                    . "use 'm' to push or 's' to skip)\n";
+                next;
+            }
+        }
+        next unless $do_push;
         my @cmd = ('net-set', '--gateway', $expected_name, $a->{ip});
         my $rc = system(@cmd);
-        print($rc == 0 ? "  OK\n" : "  FAILED (rc=" . ($rc>>8) . ")\n");
+        print($rc == 0 ? "    OK\n" : "    FAILED (rc=" . ($rc>>8) . ")\n");
     }
 }
 
@@ -312,27 +330,55 @@ if (-r $master) {
     }
 
     if ($fix && @lease_drift) {
-        print "\n--- fixing static-lease drift (pushing dhcp.master to APs) ---\n";
-        my %by_ap;
-        push @{ $by_ap{ $_->{ap_ip} } }, $_ for @lease_drift;
-        my %name_for;
-        $name_for{ $_->{ap_ip} } //= $_->{ap_name} for @lease_drift;
-        for my $ap_ip (sort keys %by_ap) {
-            my $items = $by_ap{$ap_ip};
-            my $summary = sprintf "%s (%s): rewrite %d static_lease entr%s",
-                $name_for{$ap_ip}, $ap_ip,
-                scalar(@$items), (@$items == 1 ? 'y' : 'ies');
-            if (!$auto) {
-                print "\n  $summary:\n";
-                for my $d (@$items) {
-                    printf "    %s  %s → %s\n",
-                        $d->{mac}, $d->{ap_lease}, $d->{master_ip};
+        print "\n--- resolving static-lease drift ---\n";
+        # Per-item user choice — but the actual nvram push is batched
+        # per-AP because each push is a single nvram set + commit +
+        # dnsmasq HUP. Accumulate per-AP fix lists keyed by the
+        # operator's choice.
+        my %ap_fix_master_wins;    # ap_ip → arrayref of drift entries
+        my %ap_name_for;
+        for my $d (sort {
+                $a->{ap_name} cmp $b->{ap_name} || $a->{mac} cmp $b->{mac}
+            } @lease_drift) {
+            my $choice;
+            if ($auto) {
+                $choice = 'm';
+            } else {
+                my $prompt = sprintf "  %-22s %-17s  %-12s  AP=%s  master=%s ?",
+                    $d->{ap_name}, $d->{mac}, $d->{name},
+                    $d->{ap_lease}, $d->{master_ip};
+                $choice = ask_a_m($prompt);
+            }
+            if ($choice eq 'm') {
+                push @{ $ap_fix_master_wins{ $d->{ap_ip} } }, $d;
+                $ap_name_for{ $d->{ap_ip} } //= $d->{ap_name};
+            } elsif ($choice eq 'a') {
+                # Take AP value: update dhcp.master + propagate to DB.
+                my $n = update_master_ip($master, $d->{mac}, $d->{ap_lease});
+                if ($n > 0) {
+                    print "    dhcp.master: $d->{name} ($d->{mac}) "
+                        . "→ $d->{ap_lease}\n";
+                    push @new_macs, {
+                        ap_name => $d->{ap_name},
+                        mac     => $d->{mac},
+                        ip      => $d->{ap_lease},
+                        name    => $d->{name},
+                    };
+                } else {
+                    warn "    dhcp.master: couldn't find $d->{mac} to update\n";
+                    push @lease_fix_fail, $d->{ap_ip};
                 }
             }
-            next unless $auto || ask_yn("  push these now?", 'y');
+            # 's' / skip → no-op
+        }
+
+        # Now push master-wins corrections, one batch per AP.
+        for my $ap_ip (sort keys %ap_fix_master_wins) {
+            my $items = $ap_fix_master_wins{$ap_ip};
+            print "  $ap_name_for{$ap_ip} ($ap_ip): pushing "
+                . scalar(@$items) . " correction(s) to AP\n";
             my $ok = push_lease_fix($ap_ip, $items);
-            printf "  %-22s %-15s  %s\n",
-                $name_for{$ap_ip}, $ap_ip, $ok ? "OK" : "FAILED";
+            printf "    %s\n", $ok ? "OK" : "FAILED";
             push @lease_fix_fail, $ap_ip unless $ok;
         }
     }
@@ -469,19 +515,55 @@ sub push_lease_fix {
     return _ssh_run($ap_ip, $cmd);
 }
 
-# Interactive y/N prompt with a default. Returns 1/0. EOF on stdin
-# (e.g. user piping commands in a script) returns the default — so
-# yes-default prompts in a script don't accidentally apply changes.
-sub ask_yn {
-    my ($prompt, $default) = @_;
-    $default //= 'n';
-    my $hint = $default eq 'y' ? 'Y/n' : 'y/N';
-    print "$prompt [$hint] ";
+# Per-drift choice: which side wins?
+#   a = take AP value      (update dhcp.master + propagate to DB)
+#   m = take master value  (push master to AP, current --fix path)
+#   s = skip               (leave drift in place)
+# Default is master-wins, matching the historical --fix behaviour.
+# EOF returns default so a piped run doesn't accidentally edit
+# dhcp.master.
+sub ask_a_m {
+    my ($prompt) = @_;
+    print "$prompt [A]P / [M]aster / [S]kip [M] ";
     my $line = <STDIN>;
-    return $default eq 'y' unless defined $line;     # EOF
+    return 'm' unless defined $line;
     $line =~ s/^\s+|\s+$//g;
-    return $default eq 'y' if $line eq '';
-    return $line =~ /^y/i ? 1 : 0;
+    return 'm' if $line eq '' || $line =~ /^m/i;
+    return 'a' if $line =~ /^a/i;
+    return 's' if $line =~ /^s/i;
+    return 'm';   # unrecognised → safe default
+}
+
+# In-place update of dhcp.master: find the host{} block containing
+# the given MAC and rewrite its fixed-address to $new_ip. Backup
+# copy goes to "$path.bak" before write. Returns the number of
+# host blocks matched (0 = not found, 1 = normal, >1 = duplicate
+# MAC entries which we'd all rewrite — flag suggests dhcp.master
+# itself needs cleanup).
+sub update_master_ip {
+    my ($path, $mac, $new_ip) = @_;
+    open my $rfh, '<', $path or return 0;
+    local $/;
+    my $content = <$rfh>;
+    close $rfh;
+    my $mac_re = quotemeta $mac;
+    my $count = ($content =~ s{
+        ( host \s+ \S+ \s* \{ [^{}]*
+          hardware \s+ ethernet \s+ $mac_re [^{}]*
+          fixed-address \s+ )
+        \d+\.\d+\.\d+\.\d+
+        ( [^{}]* \} )
+    }{$1$new_ip$2}gxsi);
+    return 0 if $count == 0;
+    # Backup, then atomic-ish write.
+    rename $path, "$path.bak" or warn "  backup: $!\n";
+    open my $wfh, '>', $path or do {
+        rename "$path.bak", $path;
+        die "write $path: $!\n";
+    };
+    print $wfh $content;
+    close $wfh;
+    return $count;
 }
 
 # /24-classful subnet string for an IPv4 address. NULL on bad input.
@@ -547,8 +629,8 @@ Usage:
   net-audit-aps                              audit against active isp_links
   net-audit-aps --gateway gateway3-down      audit against specific gateway
   net-audit-aps --via-isp comcast            audit against ISP-resolved gateway
-  net-audit-aps --fix                        prompt before each push (y/N)
-  net-audit-aps --auto                       push without prompting
+  net-audit-aps --fix                        per drift: [A]P / [M]aster / [S]kip
+  net-audit-aps --auto                       master wins everywhere, no prompts
 
 For each AP in the `aps` table, ssh in and read nvram lan_gateway
 and nvram static_leases. Compare against the expected gateway IP
@@ -558,9 +640,12 @@ a single /24 is reported; cross-subnet roaming reservations
 flagged. New MACs on an AP that aren't yet in net-mgr's DB get
 propagated automatically via OBSERVE kind=host.
 
-With --fix, each push is preceded by a y/N prompt. With --auto,
-prompts are skipped (use in cron or to apply a clean diff after
-review).
+With --fix, each drift is presented with a per-item choice:
+  A — take the AP's value (rewrite dhcp.master + propagate to DB)
+  M — take master's value (push to the AP, default)
+  S — skip (leave drift in place)
+With --auto, every drift is resolved master-wins without prompting.
+dhcp.master gets a .bak copy on the first write.
 EOF
     exit($rc // 0);
 }
