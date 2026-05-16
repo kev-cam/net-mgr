@@ -22,13 +22,12 @@
 #    flagged (not every AP serves every host's segment).
 #
 # Usage:
-#   net-audit-aps                          compare against the active gateway
-#                                          per isp_links (status='active')
+#   net-audit-aps                          read-only audit (exit 1 if drift)
 #   net-audit-aps --gateway gateway3-down  compare against a specific gateway
-#   net-audit-aps --via-isp comcast        compare against the gateway serving
-#                                          the named ISP
-#   net-audit-aps --fix                    push the corrected lan_gateway to
-#                                          drifted APs (via net-set)
+#   net-audit-aps --via-isp comcast        compare against the ISP-serving gw
+#   net-audit-aps --fix                    interactive: prompt before each
+#                                          push (gateway flip / lease rewrite)
+#   net-audit-aps --auto                   non-interactive: push everything
 #
 # Other options:
 #   --listen H[:P]    daemon for snapshot reads (default 127.0.0.1:7531)
@@ -49,11 +48,12 @@ use Getopt::Long qw(:config no_ignore_case bundling);
 use NetMgr::Client;
 use NetMgr::Producer::DhcpMaster;
 
-my ($gateway, $via_isp, $fix, $listen, $ssh_user, $quiet, $help);
+my ($gateway, $via_isp, $fix, $auto, $listen, $ssh_user, $quiet, $help);
 GetOptions(
     'gateway=s'  => \$gateway,
     'via-isp=s'  => \$via_isp,
     'fix'        => \$fix,
+    'auto'       => \$auto,
     'listen=s'   => \$listen,
     'ssh-user=s' => \$ssh_user,
     'quiet|q'    => \$quiet,
@@ -61,6 +61,7 @@ GetOptions(
 ) or usage(2);
 usage(0) if $help;
 usage(2) if $gateway && $via_isp;
+$fix = 1 if $auto;     # --auto implies --fix (just without the prompts)
 $ssh_user //= 'root';
 $listen   //= '127.0.0.1:7531';
 
@@ -169,10 +170,12 @@ unless ($quiet) {
 if ($fix && @drifted) {
     print "\n--- fixing drifted APs ---\n";
     for my $a (@drifted) {
-        printf "%-22s %s ", $a->{name}, $a->{ip};
+        my $prompt = sprintf "%-22s %-15s  set lan_gateway → %s ?",
+            $a->{name}, $a->{ip}, $expected_ip;
+        next unless $auto || ask_yn($prompt, 'y');
         my @cmd = ('net-set', '--gateway', $expected_name, $a->{ip});
         my $rc = system(@cmd);
-        print($rc == 0 ? "OK\n" : "FAILED (rc=" . ($rc>>8) . ")\n");
+        print($rc == 0 ? "  OK\n" : "  FAILED (rc=" . ($rc>>8) . ")\n");
     }
 }
 
@@ -180,23 +183,41 @@ if ($fix && @drifted) {
 #
 # DD-WRT stores per-MAC DHCP reservations in nvram static_leases as
 #   mac=name=ip=lease_minutes  (space-separated entries).
-# Compare each AP's reservations against /etc/net-mgr/dhcp.master:
-# for any MAC present in both, the IP must match. Missing-on-AP /
-# extra-on-AP are common (each AP serves a different segment) and
-# would be noise, so we don't flag those by default.
+#
+# Tablets and phones roam: the SAME MAC may legitimately have
+# different IPs on different /24 subnets (a per-subnet reservation
+# for whichever AP it's currently associated to). dhcp.master often
+# only has one entry per MAC (whichever subnet was first set up).
+# So the audit is subnet-scoped:
+#
+#   - Index dhcp.master by (mac, /24-of-fixed-address).
+#   - For each AP's lease, compute the /24 of the leased IP and
+#     compare only against dhcp.master's entry for that (mac,/24)
+#     pair. No entry in master for that subnet = not master's
+#     opinion, skip (just check propagation).
+#   - Cross-AP within the same /24 must agree: if two APs serving
+#     192.168.15.0/24 disagree on a MAC's IP, that's a real bug
+#     (clients get different IPs depending on which AP they DHCP
+#     from) and is flagged independently.
 my $master = '/etc/net-mgr/dhcp.master';
-my @lease_drift;
+my @lease_drift;          # AP disagrees with master, same subnet
+my @intra_subnet_drift;   # APs disagree with each other in same /24
 my @lease_fix_fail;
 if (-r $master) {
     my @records = NetMgr::Producer::DhcpMaster::parse_file($master);
     my @hosts   = NetMgr::Producer::DhcpMaster::hosts_only(@records);
-    my %master_ip = map { lc($_->{mac}) => { ip => $_->{ip}, name => $_->{name} } }
-                    grep { $_->{mac} && $_->{ip} } @hosts;
+    # %master_ip{ mac }{ subnet/24 } = { ip, name }
+    my %master_ip;
+    for my $h (grep { $_->{mac} && $_->{ip} } @hosts) {
+        my $sn = _subnet_of($h->{ip}) or next;
+        $master_ip{ lc $h->{mac} }{$sn} = { ip => $h->{ip}, name => $h->{name} };
+    }
 
     print "\n--- static-lease audit (vs $master) ---\n" unless $quiet;
     my %seen_propagation;     # mac:ip → 1, dedupe across APs
     my @new_macs;             # entries to propagate
-    my %ap_leases_by_mac;     # mac → AP-side name (for propagation)
+    # ip_by_mac_sn{mac}{subnet} = { ap_name => ip } for intra-subnet check.
+    my %ip_by_mac_sn;
     for my $a (sort { $a->{name} cmp $b->{name} } @ap_list) {
         next unless $a->{ip} ne '?';
         my $leases = probe_ap_leases($a->{ip});
@@ -208,7 +229,10 @@ if (-r $master) {
         for my $mac (sort keys %$leases) {
             my $ap_ip   = $leases->{$mac}{ip};
             my $ap_name = $leases->{$mac}{name};
-            if (my $m = $master_ip{$mac}) {
+            my $sn      = _subnet_of($ap_ip);
+            $ip_by_mac_sn{$mac}{$sn}{ $a->{name} } = $ap_ip if $sn;
+
+            if (my $m = $sn ? $master_ip{$mac}{$sn} : undef) {
                 next if $m->{ip} eq $ap_ip;        # agree → OK
                 push @lease_drift, {
                     ap_name   => $a->{name},
@@ -219,9 +243,11 @@ if (-r $master) {
                     name      => $m->{name},
                 };
             } else {
-                # MAC not in dhcp.master. Maybe already in the DB
-                # (addresses) at this IP — if so it's noise, skip.
-                # Otherwise propagate.
+                # No master entry for this (mac, subnet) pair. Either:
+                # a) MAC unknown to master entirely → propagate as new
+                # b) MAC known to master in a DIFFERENT subnet → this is
+                #    a roaming-device per-subnet assignment; treat as
+                #    propagation if not in DB yet.
                 my $key = "$mac:$ap_ip";
                 next if $seen_propagation{$key}++;
                 my @known = @{ $ip_by_mac{$mac} || [] };
@@ -235,6 +261,26 @@ if (-r $master) {
             }
         }
     }
+
+    # Intra-subnet consistency: any (mac, subnet) where two APs
+    # disagree on the IP is logged independently of the master.
+    for my $mac (sort keys %ip_by_mac_sn) {
+        for my $sn (sort keys %{ $ip_by_mac_sn{$mac} }) {
+            my %ips;
+            push @{ $ips{ $ip_by_mac_sn{$mac}{$sn}{$_} } }, $_
+                for sort keys %{ $ip_by_mac_sn{$mac}{$sn} };
+            next if keys(%ips) == 1;     # all APs in this /24 agree
+            for my $ip (sort keys %ips) {
+                push @intra_subnet_drift, {
+                    mac    => $mac,
+                    subnet => $sn,
+                    ip     => $ip,
+                    aps    => $ips{$ip},
+                };
+            }
+        }
+    }
+
     if (@lease_drift) {
         printf "\n%-22s %-17s  %-12s  %-15s  %-15s\n",
             "AP", "MAC", "HOST", "AP says", "master says"
@@ -248,6 +294,23 @@ if (-r $master) {
         print "  all per-MAC reservations agree with $master\n";
     }
 
+    if (@intra_subnet_drift) {
+        # Group by (mac, subnet) for a more readable display.
+        my %by_key;
+        for my $i (@intra_subnet_drift) {
+            push @{ $by_key{"$i->{mac}|$i->{subnet}"} }, $i;
+        }
+        print "\n--- intra-subnet disagreement (APs in same /24 differ) ---\n";
+        for my $k (sort keys %by_key) {
+            my @rows = @{ $by_key{$k} };
+            my ($mac, $sn) = split /\|/, $k;
+            print "  $mac in $sn:\n";
+            for my $r (@rows) {
+                printf "    %-15s  via %s\n", $r->{ip}, join(',', @{ $r->{aps} });
+            }
+        }
+    }
+
     if ($fix && @lease_drift) {
         print "\n--- fixing static-lease drift (pushing dhcp.master to APs) ---\n";
         my %by_ap;
@@ -255,7 +318,19 @@ if (-r $master) {
         my %name_for;
         $name_for{ $_->{ap_ip} } //= $_->{ap_name} for @lease_drift;
         for my $ap_ip (sort keys %by_ap) {
-            my $ok = push_lease_fix($ap_ip, $by_ap{$ap_ip});
+            my $items = $by_ap{$ap_ip};
+            my $summary = sprintf "%s (%s): rewrite %d static_lease entr%s",
+                $name_for{$ap_ip}, $ap_ip,
+                scalar(@$items), (@$items == 1 ? 'y' : 'ies');
+            if (!$auto) {
+                print "\n  $summary:\n";
+                for my $d (@$items) {
+                    printf "    %s  %s → %s\n",
+                        $d->{mac}, $d->{ap_lease}, $d->{master_ip};
+                }
+            }
+            next unless $auto || ask_yn("  push these now?", 'y');
+            my $ok = push_lease_fix($ap_ip, $items);
             printf "  %-22s %-15s  %s\n",
                 $name_for{$ap_ip}, $ap_ip, $ok ? "OK" : "FAILED";
             push @lease_fix_fail, $ap_ip unless $ok;
@@ -296,10 +371,13 @@ if (-r $master) {
 #   --fix but any push failed     → 1
 #   probe failures (no audit run) → 1
 #   else                          → 0
-my $drift_left = @drifted || @lease_drift;
+my $drift_left = @drifted || @lease_drift || @intra_subnet_drift;
 my $fix_bad    = @lease_fix_fail;
+# Intra-subnet drift isn't auto-fixable (which AP is right?), so it
+# always demands operator attention — non-zero even under --fix.
 if ($drift_left && !$fix)  { exit 1 }
 if ($fix && $fix_bad)      { exit 1 }
+if ($fix && @intra_subnet_drift) { exit 1 }
 exit($failed[0] ? 1 : 0);
 
 # =====================================================================
@@ -391,6 +469,28 @@ sub push_lease_fix {
     return _ssh_run($ap_ip, $cmd);
 }
 
+# Interactive y/N prompt with a default. Returns 1/0. EOF on stdin
+# (e.g. user piping commands in a script) returns the default — so
+# yes-default prompts in a script don't accidentally apply changes.
+sub ask_yn {
+    my ($prompt, $default) = @_;
+    $default //= 'n';
+    my $hint = $default eq 'y' ? 'Y/n' : 'y/N';
+    print "$prompt [$hint] ";
+    my $line = <STDIN>;
+    return $default eq 'y' unless defined $line;     # EOF
+    $line =~ s/^\s+|\s+$//g;
+    return $default eq 'y' if $line eq '';
+    return $line =~ /^y/i ? 1 : 0;
+}
+
+# /24-classful subnet string for an IPv4 address. NULL on bad input.
+sub _subnet_of {
+    my ($ip) = @_;
+    return undef unless defined $ip && $ip =~ /^(\d+\.\d+\.\d+)\.\d+$/;
+    return "$1.0/24";
+}
+
 sub _ssh_capture {
     my ($ip, $cmd) = @_;
     my @c = ('ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
@@ -447,11 +547,20 @@ Usage:
   net-audit-aps                              audit against active isp_links
   net-audit-aps --gateway gateway3-down      audit against specific gateway
   net-audit-aps --via-isp comcast            audit against ISP-resolved gateway
-  net-audit-aps --fix                        also push fix to drifted APs
+  net-audit-aps --fix                        prompt before each push (y/N)
+  net-audit-aps --auto                       push without prompting
 
-For each AP in the `aps` table, ssh in and read nvram lan_gateway.
-Compare against the expected gateway IP; print OK / DRIFT / unreachable.
-With --fix, call 'net-set --gateway HOST IP' for each drifted AP.
+For each AP in the `aps` table, ssh in and read nvram lan_gateway
+and nvram static_leases. Compare against the expected gateway IP
+and /etc/net-mgr/dhcp.master per (mac, /24). Per-MAC drift inside
+a single /24 is reported; cross-subnet roaming reservations
+(same MAC, different IP on different /24) are intentionally NOT
+flagged. New MACs on an AP that aren't yet in net-mgr's DB get
+propagated automatically via OBSERVE kind=host.
+
+With --fix, each push is preceded by a y/N prompt. With --auto,
+prompts are skipped (use in cron or to apply a clean diff after
+review).
 EOF
     exit($rc // 0);
 }
