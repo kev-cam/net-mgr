@@ -71,6 +71,11 @@ if ($cleanup) {
     my $rc = system('ip', 'addr', 'del', $alias_cidr, 'dev', $iface);
     if ($rc == 0) { print "removed $alias_cidr from $iface\n" }
     else          { warn  "alias del returned $rc (already gone?)\n" }
+    # The recovered switch isn't a wandering device any more — clear
+    # its row from net-mgr's lost_devices table so the Web UI / DB
+    # stop showing it. Best-effort: keep going if the daemon is
+    # unreachable or the entry was never there.
+    clear_lost_device($netrc_host, $factory_ip);
     exit($rc == 0 ? 0 : 1);
 }
 
@@ -398,6 +403,61 @@ sub read_netrc {
     }
     close $fh;
     return %r;
+}
+
+# Tell the local net-mgr daemon to drop the lost_devices row for
+# this switch's factory IP. Looks up the switch's MAC by primary_name
+# from net-mgr's interfaces table (the same name used as --host),
+# computes the /24 the factory IP lives in, then OBSERVE
+# kind=lost_device_delete. Best-effort: failure is logged but
+# doesn't fail the cleanup as a whole.
+sub clear_lost_device {
+    my ($host, $factory) = @_;
+    # /24 the factory IP belongs to (e.g. 192.168.0.1 → 192.168.0.0/24).
+    my ($base) = $factory =~ /^(\d+\.\d+\.\d+)\.\d+$/
+        or return;
+    my $subnet = "$base.0/24";
+
+    # Need a Perl client. Sub-shelling avoids hard-failing if the
+    # net-mgr libs aren't loadable from this script's context.
+    eval {
+        local @INC = (@INC, '/usr/local/share/perl5');
+        require NetMgr::Client;
+        my $cli = NetMgr::Client->new(timeout => 4);
+        $cli->hello(consumer => "recover-tlsg.$$");
+        # Find MAC by primary_name.
+        my $ifs   = $cli->snapshot(1, 'interfaces');
+        my $machs = $cli->snapshot(2, 'machines');
+        my %name_by_mid = map { $_->{id} => ($_->{primary_name}//'') } @$machs;
+        my $mac;
+        for my $i (@$ifs) {
+            next unless $i->{mac} && defined $i->{machine_id};
+            if (($name_by_mid{$i->{machine_id}}//'') eq $host) {
+                $mac = lc $i->{mac};
+                last;
+            }
+        }
+        unless ($mac) {
+            warn "  clear_lost: no MAC for primary_name=$host in DB\n";
+            $cli->bye;
+            return;
+        }
+        my $reply = $cli->observe(
+            kind   => 'lost_device_delete',
+            subnet => $subnet,
+            mac    => $mac,
+        );
+        if ($reply && $reply =~ /^ERR\s+(.*)/) {
+            warn "  clear_lost: $1\n";
+        } else {
+            print "  cleared lost_devices row ($subnet, $mac)\n";
+        }
+        $cli->bye;
+    };
+    if ($@) {
+        my $e = $@; $e =~ s/\s+at\s+\S+\s+line\s+\d+\.?$//;
+        warn "  clear_lost: best-effort failed ($e)\n";
+    }
 }
 
 # Tiny INI reader for /etc/net-mgr/switches/$HOST.conf.

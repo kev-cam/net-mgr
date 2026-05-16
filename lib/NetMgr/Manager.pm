@@ -1342,6 +1342,8 @@ sub _handle_observe {
         elsif ($kind eq 'isp_secret')  { @events = $self->_obs_isp_secret($cli, $kv) }
         elsif ($kind eq 'isp_link_delete')
                                        { @events = $self->_obs_isp_link_delete($cli, $kv) }
+        elsif ($kind eq 'lost_device_delete')
+                                       { @events = $self->_obs_lost_device_delete($cli, $kv) }
         elsif ($kind eq 'event')       { @events = $self->_obs_event($cli, $kv) }
         elsif ($kind eq 'forward')     { @events = $self->_obs_forward($cli, $kv) }
         else {
@@ -1802,6 +1804,26 @@ sub _obs_isp_secret {
         isp_name           => $isp,
         auth_secret        => $secret,
     );
+    return ();
+}
+
+# kind=lost_device_delete subnet=CIDR mac=MAC — clears the
+# lost_devices row that net-find-lost created. Used by the recovery
+# scripts after they've put a wandering device back at its proper
+# IP, so the device doesn't keep showing on the "Lost devices"
+# page.
+sub _obs_lost_device_delete {
+    my ($self, $cli, $kv) = @_;
+    my $subnet = $kv->{subnet} or die "lost_device_delete: subnet required\n";
+    my $mac    = $kv->{mac}    or die "lost_device_delete: mac required\n";
+    # Snapshot the row first so we can broadcast a delete event.
+    my $row = $self->{db}->dbh->selectrow_hashref(
+        "SELECT * FROM lost_devices WHERE subnet = ? AND mac = ?",
+        undef, $subnet, lc $mac
+    );
+    $self->{db}->delete_lost_device(subnet => $subnet, mac => $mac);
+    $self->_emit_change(table => 'lost_devices', op => 'delete', row => $row)
+        if $row;
     return ();
 }
 
