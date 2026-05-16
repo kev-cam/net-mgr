@@ -140,7 +140,13 @@ print "  IP Address Mode:      Static\n";
 printf "  IP Address:           %s\n", $target{ip}      // '(your mgmt IP)';
 printf "  Subnet Mask:          %s\n", $target{netmask} // '255.255.255.0';
 printf "  Default Gateway:      %s\n", $target{gateway} // '(your gateway)';
-print "Apply, then click       'Save Config' (top of UI), then 'Reboot'.\n";
+print "Apply.\n";
+print "\n";
+print "*** IMPORTANT: click 'Save Config' (top of UI) BEFORE rebooting. ***\n";
+print "*** Apply alone only changes the running config — without Save  ***\n";
+print "*** the switch reverts to factory on the next power cycle.      ***\n";
+print "\n";
+print "Then click 'Reboot'.\n";
 
 if ($manual) {
     # Interactive helper: launch the browser, wait for the operator
