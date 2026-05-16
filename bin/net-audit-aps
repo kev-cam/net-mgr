@@ -1,0 +1,243 @@
+#!/usr/bin/perl
+# net-audit-aps — check that every AP's DHCP server is advertising
+# the right default-gateway, and fix the drifted ones with --fix.
+#
+# The recurring problem: DD-WRT APs run their own dnsmasq for the
+# clients on their L2 segment. The advertised default-gateway
+# (DHCP option 3) comes from nvram lan_gateway / wan_gateway. If
+# those drift (operator changes via net-set, AP firmware reset,
+# rogue manual config) the clients on that AP route through the
+# wrong place until their lease renews and they pick up the right
+# option=3 on the next DHCPACK.
+#
+# Usage:
+#   net-audit-aps                          compare against the active gateway
+#                                          per isp_links (status='active')
+#   net-audit-aps --gateway gateway3-down  compare against a specific gateway
+#   net-audit-aps --via-isp comcast        compare against the gateway serving
+#                                          the named ISP
+#   net-audit-aps --fix                    push the corrected lan_gateway to
+#                                          drifted APs (via net-set)
+#
+# Other options:
+#   --listen H[:P]    daemon for snapshot reads (default 127.0.0.1:7531)
+#   --ssh-user USER   ssh user for AP probes (default root)
+#   --quiet / -q      only print drift
+#   --help / -h
+#
+# Exits 0 if every AP is correct (or --fix succeeded for all);
+# 1 if at least one AP is drifted (without --fix) or fix failed;
+# 2 on bad args / can't determine expected gateway.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+use NetMgr::Client;
+
+my ($gateway, $via_isp, $fix, $listen, $ssh_user, $quiet, $help);
+GetOptions(
+    'gateway=s'  => \$gateway,
+    'via-isp=s'  => \$via_isp,
+    'fix'        => \$fix,
+    'listen=s'   => \$listen,
+    'ssh-user=s' => \$ssh_user,
+    'quiet|q'    => \$quiet,
+    'help|h'     => \$help,
+) or usage(2);
+usage(0) if $help;
+usage(2) if $gateway && $via_isp;
+$ssh_user //= 'root';
+$listen   //= '127.0.0.1:7531';
+
+# ---- snapshot the daemon's view -------------------------------------
+
+my $cli = NetMgr::Client->new(listen => $listen, timeout => 5);
+$cli->hello(consumer => "net-audit-aps.$$");
+my $aps   = $cli->snapshot(1, 'aps');
+my $ifs   = $cli->snapshot(2, 'interfaces');
+my $addrs = $cli->snapshot(3, 'addresses', where => "family = 'v4'");
+my $machs = $cli->snapshot(4, 'machines');
+my $links = eval { $cli->snapshot(5, 'isp_links') } || [];
+$cli->bye;
+
+my %name_by_mid = map { $_->{id} => $_->{primary_name} }
+                  grep { defined $_->{primary_name} } @$machs;
+my %mid_by_mac;
+for my $i (@$ifs) {
+    next unless $i->{mac} && defined $i->{machine_id};
+    $mid_by_mac{ lc $i->{mac} } = $i->{machine_id};
+}
+my %ip_by_mac;
+for my $a (@$addrs) {
+    next unless $a->{mac} && $a->{addr};
+    push @{ $ip_by_mac{ lc $a->{mac} } }, $a->{addr};
+}
+
+# ---- resolve the expected gateway IP --------------------------------
+
+my $expected_name = $gateway;
+if ($via_isp && !$expected_name) {
+    my @act = grep { ($_->{status}//'') eq 'active'
+                  && ($_->{isp_name}//'') eq $via_isp } @$links;
+    @act = grep { ($_->{isp_name}//'') eq $via_isp } @$links unless @act;
+    if (@act) {
+        $expected_name = $name_by_mid{ $act[0]{gateway_machine_id} };
+    }
+    die "net-audit-aps: no isp_links row for ISP '$via_isp'\n"
+        unless $expected_name;
+}
+if (!$expected_name) {
+    # Default: pick whichever isp_links row is currently active. If
+    # multiple, prefer one whose name contains 'down' (LAN-side).
+    my @act = grep { ($_->{status}//'') eq 'active' } @$links;
+    die "net-audit-aps: no active isp_links rows; pass --gateway HOST\n"
+        unless @act;
+    my @names = map  { $name_by_mid{ $_->{gateway_machine_id} } } @act;
+    @names = grep { defined } @names;
+    @names = sort { ($b =~ /-down$/) <=> ($a =~ /-down$/) || $a cmp $b } @names;
+    $expected_name = $names[0];
+    die "net-audit-aps: couldn't pick a default gateway from isp_links\n"
+        unless $expected_name;
+}
+# Resolve name → IP, preferring ethernet
+my $expected_ip = resolve_gw($expected_name);
+die "net-audit-aps: can't resolve '$expected_name' to an IP\n"
+    unless $expected_ip;
+
+print "expected gateway: $expected_name = $expected_ip\n" unless $quiet;
+
+# ---- iterate APs ----------------------------------------------------
+
+my @ap_list;
+for my $a (@$aps) {
+    my $mac = lc $a->{mac};
+    my $mid = $mid_by_mac{$mac};
+    my $name = defined $mid ? $name_by_mid{$mid} : undef;
+    my $ips = $ip_by_mac{$mac} || [];
+    my ($ip) = grep { defined } @$ips;
+    push @ap_list, { mac => $mac, name => $name // '(unknown)',
+                     ip  => $ip // '?' };
+}
+
+my @drifted;
+my @failed;
+my @ok;
+
+printf "%-22s %-15s  %-15s  %s\n",
+    "AP", "IP", "lan_gateway", "status" unless $quiet;
+for my $a (sort { $a->{name} cmp $b->{name} } @ap_list) {
+    next unless $a->{ip} ne '?';
+    my $cur = probe_ap_gateway($a->{ip});
+    if (!defined $cur) {
+        push @failed, $a;
+        next if $quiet;
+        printf "%-22s %-15s  %-15s  %s\n",
+            $a->{name}, $a->{ip}, '?', 'probe FAILED';
+        next;
+    }
+    if ($cur eq $expected_ip) {
+        push @ok, $a;
+        next if $quiet;
+        printf "%-22s %-15s  %-15s  OK\n", $a->{name}, $a->{ip}, $cur;
+    } else {
+        push @drifted, { %$a, cur => $cur };
+        printf "%-22s %-15s  %-15s  DRIFT (should be $expected_ip)\n",
+            $a->{name}, $a->{ip}, $cur;
+    }
+}
+
+unless ($quiet) {
+    printf "\n%d ok / %d drift / %d unreachable (of %d)\n",
+        scalar(@ok), scalar(@drifted), scalar(@failed), scalar(@ap_list);
+}
+
+if ($fix && @drifted) {
+    print "\n--- fixing drifted APs ---\n";
+    for my $a (@drifted) {
+        printf "%-22s %s ", $a->{name}, $a->{ip};
+        my @cmd = ('net-set', '--gateway', $expected_name, $a->{ip});
+        my $rc = system(@cmd);
+        print($rc == 0 ? "OK\n" : "FAILED (rc=" . ($rc>>8) . ")\n");
+    }
+}
+
+if (@drifted) { exit($fix ? 0 : 1) }
+exit($failed[0] ? 1 : 0);
+
+# =====================================================================
+# Helpers
+# =====================================================================
+
+# Pull the lan_gateway value from an AP's nvram via ssh. Returns the
+# IP string or undef on any probe failure. DD-WRT keeps both
+# lan_gateway and wan_gateway nvram values; lan_gateway is what
+# dnsmasq's option=3 uses on a bridge-mode AP. We read both for
+# diagnostic completeness but only return lan_gateway for the audit.
+sub probe_ap_gateway {
+    my ($ip) = @_;
+    my @cmd = ('ssh', '-o', 'BatchMode=yes',
+                       '-o', 'ConnectTimeout=5',
+                       '-o', 'StrictHostKeyChecking=accept-new',
+                       '-T', '-q', "$ssh_user\@$ip",
+                       'nvram get lan_gateway');
+    my $pid = open my $fh, '-|';
+    return undef unless defined $pid;
+    if ($pid == 0) {
+        open STDIN, '<', '/dev/null';
+        exec @cmd; exit 127;
+    }
+    chomp(my $val = <$fh> // '');
+    close $fh;
+    return undef if $? != 0;
+    return undef unless $val =~ /^\d+\.\d+\.\d+\.\d+$/;
+    return $val;
+}
+
+# Resolve a machine name to an IP, preferring ethernet over wifi
+# (matching net-set's resolve_gw behaviour).
+sub resolve_gw {
+    my ($name) = @_;
+    return $name if $name =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+    # Same per-name lookup logic as net-set: pick ethernet first.
+    my %kind_by_mac;
+    for my $i (@$ifs) {
+        next unless $i->{mac};
+        $kind_by_mac{ lc $i->{mac} } = lc($i->{kind} // 'unknown');
+    }
+    my %ip_to_mac;
+    for my $a (@$addrs) {
+        next unless $a->{mac} && $a->{addr};
+        $ip_to_mac{ $a->{addr} } = lc $a->{mac};
+    }
+    my @ips_for;
+    for my $a (@$addrs) {
+        next unless $a->{mac} && $a->{addr};
+        my $mac = lc $a->{mac};
+        my $mid = $mid_by_mac{$mac};
+        next unless defined $mid;
+        push @ips_for, $a->{addr} if ($name_by_mid{$mid}//'') eq $name;
+    }
+    return undef unless @ips_for;
+    my @eth = grep { ($kind_by_mac{ $ip_to_mac{$_} // '' } // '')
+                     eq 'ethernet' } @ips_for;
+    return $eth[0] || $ips_for[0];
+}
+
+sub usage {
+    my ($rc) = @_;
+    print STDERR <<"EOF";
+Usage:
+  net-audit-aps                              audit against active isp_links
+  net-audit-aps --gateway gateway3-down      audit against specific gateway
+  net-audit-aps --via-isp comcast            audit against ISP-resolved gateway
+  net-audit-aps --fix                        also push fix to drifted APs
+
+For each AP in the `aps` table, ssh in and read nvram lan_gateway.
+Compare against the expected gateway IP; print OK / DRIFT / unreachable.
+With --fix, call 'net-set --gateway HOST IP' for each drifted AP.
+EOF
+    exit($rc // 0);
+}
