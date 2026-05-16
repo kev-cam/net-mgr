@@ -402,7 +402,17 @@ sub _handle_subscribe {
         if (my $bound = _extract_ts_lower_bound($where_ast)) {
             $qopts{since_epoch} = $bound;
         }
-        my $rows = $self->{db}->query_table($table, %qopts);
+        # Guard the DB call so a bug in query_table (missed allowlist
+        # entry, etc.) doesn't unwind out of the main loop and kill
+        # the daemon. Report as an ERR and drop the subscription;
+        # next connection isn't affected.
+        my $rows = eval { $self->{db}->query_table($table, %qopts) };
+        if ($@) {
+            my $e = $@; chomp $e;
+            $self->_log("err snapshot $table from $cli->{ident}: $e");
+            delete $cli->{subs}{$sub};
+            return $self->_send($cli, format_err("snapshot $table: $e"));
+        }
         for my $row (@$rows) {
             next if $where_ast && !eval_ast($where_ast, _row_for_match($row));
             $self->_send($cli, format_row($sub, $table, 'snapshot', %$row));
@@ -1328,6 +1338,10 @@ sub _handle_observe {
         elsif ($kind eq 'port')        { @events = $self->_obs_port($cli, $kv) }
         elsif ($kind eq 'ping')        { @events = $self->_obs_ping($cli, $kv) }
         elsif ($kind eq 'link')        { @events = $self->_obs_link($cli, $kv) }
+        elsif ($kind eq 'isp_link')    { @events = $self->_obs_isp_link($cli, $kv) }
+        elsif ($kind eq 'isp_secret')  { @events = $self->_obs_isp_secret($cli, $kv) }
+        elsif ($kind eq 'isp_link_delete')
+                                       { @events = $self->_obs_isp_link_delete($cli, $kv) }
         elsif ($kind eq 'event')       { @events = $self->_obs_event($cli, $kv) }
         elsif ($kind eq 'forward')     { @events = $self->_obs_forward($cli, $kv) }
         else {
@@ -1713,6 +1727,91 @@ sub _obs_link {
             if $row;
     }
     return ();
+}
+
+# kind=isp_link gateway=NAME isp=NAME [iface=...] [mac=...] [auth_type=...]
+#   [auth_user=...] [status=active|standby|broken|unknown] [notes=...]
+# Records that a gateway machine connects (or could connect) to a
+# given ISP via the named iface, with the listed credentials. Public-
+# readable. Resolves the gateway name → machine_id by primary_name.
+sub _obs_isp_link {
+    my ($self, $cli, $kv) = @_;
+    my $gw  = $kv->{gateway} or die "isp_link: gateway required\n";
+    my $isp = $kv->{isp}     or die "isp_link: isp required\n";
+    my $mid = $self->_machine_id_by_name($gw)
+        or die "isp_link: no machine named '$gw'\n";
+    my $r = $self->_upsert('isp_links', 'upsert_isp_link',
+        gateway_machine_id => $mid,
+        isp_name           => $isp,
+        iface              => $kv->{iface},
+        mac                => $kv->{mac},
+        auth_type          => $kv->{auth_type},
+        auth_user          => $kv->{auth_user},
+        status             => $kv->{status},
+        notes              => $kv->{notes},
+    );
+    return ();
+}
+
+# kind=isp_link_delete gateway=NAME isp=NAME — removes the link
+# (and via FK CASCADE, any matching secret).
+sub _obs_isp_link_delete {
+    my ($self, $cli, $kv) = @_;
+    my $gw  = $kv->{gateway} or die "isp_link_delete: gateway required\n";
+    my $isp = $kv->{isp}     or die "isp_link_delete: isp required\n";
+    my $mid = $self->_machine_id_by_name($gw)
+        or die "isp_link_delete: no machine named '$gw'\n";
+    # Snapshot the row first so we can emit a delete event.
+    my $row = $self->{db}->dbh->selectrow_hashref(
+        "SELECT * FROM isp_links
+          WHERE gateway_machine_id = ? AND isp_name = ?",
+        undef, $mid, $isp
+    );
+    $self->{db}->delete_isp_link(gateway_machine_id => $mid, isp_name => $isp);
+    $self->_emit_change(table => 'isp_links', op => 'delete', row => $row)
+        if $row;
+    return ();
+}
+
+# kind=isp_secret gateway=NAME isp=NAME secret=PASS — stores or
+# updates the credential. Restricted: requires either a loopback
+# peer or an authenticated connection (matching the SUBSCRIBE gate
+# on isp_secrets).
+sub _obs_isp_secret {
+    my ($self, $cli, $kv) = @_;
+    unless (_peer_is_loopback($cli)
+         || ($cli->{auth} && $cli->{auth}{verified})) {
+        die "isp_secret: requires AUTH (or loopback peer)\n";
+    }
+    my $gw     = $kv->{gateway} or die "isp_secret: gateway required\n";
+    my $isp    = $kv->{isp}     or die "isp_secret: isp required\n";
+    my $secret = $kv->{secret};
+    die "isp_secret: secret required\n" unless defined $secret;
+    my $mid = $self->_machine_id_by_name($gw)
+        or die "isp_secret: no machine named '$gw'\n";
+    # The corresponding isp_links row must exist (FK).
+    my ($exists) = $self->{db}->dbh->selectrow_array(
+        "SELECT 1 FROM isp_links
+          WHERE gateway_machine_id = ? AND isp_name = ?",
+        undef, $mid, $isp
+    );
+    die "isp_secret: no isp_link for $gw/$isp (create with isp_link first)\n"
+        unless $exists;
+    $self->{db}->upsert_isp_secret(
+        gateway_machine_id => $mid,
+        isp_name           => $isp,
+        auth_secret        => $secret,
+    );
+    return ();
+}
+
+sub _machine_id_by_name {
+    my ($self, $name) = @_;
+    my ($id) = $self->{db}->dbh->selectrow_array(
+        "SELECT id FROM machines WHERE primary_name = ? LIMIT 1",
+        undef, $name
+    );
+    return $id;
 }
 
 # Lets clients persist arbitrary events without DB credentials. Used by

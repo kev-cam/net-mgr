@@ -1,0 +1,231 @@
+#!/usr/bin/perl
+# net-isp — populate, list, and inspect the isp_links / isp_secrets
+# tables in net-mgr. Each row is a (gateway machine, ISP name) pair
+# describing how that gateway connects to that ISP: iface, MAC used
+# (Comcast cares), auth type and user, status, and optional notes.
+# Secrets (PPPoE password, WPA passphrase, …) live in a separate
+# auth-gated table.
+#
+# Usage:
+#   net-isp list                                    show all links
+#   net-isp show GATEWAY                            show links + secrets for one
+#   net-isp set GATEWAY ISP [opts]                  upsert
+#   net-isp clear GATEWAY ISP                       remove the link
+#
+# GATEWAY is a machines.primary_name (e.g. gateway2-down, gateway3-down).
+#
+# set options:
+#   --iface NAME       WAN interface on the gateway (e.g. enp4s0)
+#   --mac MAC          MAC used to authenticate (Comcast MAC-clone)
+#   --auth TYPE        mac | pppoe | dhcp | wpa2 (free-form really)
+#   --user USER        username (PPPoE etc.)
+#   --status S         active | standby | broken | unknown (default active)
+#   --notes "..."      free-form annotation
+#   --secret PASS      password / passphrase (stored in isp_secrets;
+#                      requires AUTH or loopback)
+#
+# Reads of isp_secrets require AUTH too — net-isp does the auth dance
+# automatically before any operation that needs it.
+#
+# Exit: 0 ok · 1 not found / no rows · 2 bad args.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+use NetMgr::Client;
+
+my ($listen, $iface, $mac, $auth_type, $auth_user, $status, $notes,
+    $secret, $no_auth, $help);
+GetOptions(
+    'listen=s'  => \$listen,
+    'iface=s'   => \$iface,
+    'mac=s'     => \$mac,
+    'auth=s'    => \$auth_type,
+    'user=s'    => \$auth_user,
+    'status=s'  => \$status,
+    'notes=s'   => \$notes,
+    'secret=s'  => \$secret,
+    'no-auth'   => \$no_auth,
+    'help|h'    => \$help,
+) or usage(2);
+usage(0) if $help;
+
+my $verb = shift @ARGV;
+usage(2) unless defined $verb;
+
+my %args; $args{listen} = $listen if defined $listen;
+my $cli = NetMgr::Client->new(%args, timeout => 5);
+$cli->hello(consumer => "net-isp.$$");
+
+# Auth up-front so we can read isp_secrets (and write them later if
+# the user passed --secret). Falls back to loopback-trusted if local.
+unless ($no_auth) {
+    my $ok = eval { $cli->auth; 1 };
+    if (!$ok && $verb !~ /^(list|show)$/) {
+        my $e = $@; chomp $e; $e =~ s/ at .*//;
+        warn "warn: auth failed ($e) — secret operations will be denied\n";
+    }
+}
+
+my $rc = 0;
+if    ($verb eq 'list')  { $rc = cmd_list($cli) }
+elsif ($verb eq 'show')  { $rc = cmd_show($cli, @ARGV) }
+elsif ($verb eq 'set')   { $rc = cmd_set($cli, @ARGV) }
+elsif ($verb eq 'clear') { $rc = cmd_clear($cli, @ARGV) }
+else                     { usage(2) }
+$cli->bye;
+exit $rc;
+
+# ---- list -----------------------------------------------------------
+
+sub cmd_list {
+    my ($cli) = @_;
+    my $links = $cli->snapshot(1, 'isp_links');
+    my $machs = $cli->snapshot(2, 'machines');
+    my %name = map { $_->{id} => $_->{primary_name} }
+               grep { defined $_->{primary_name} } @$machs;
+    unless (@$links) {
+        print STDERR "no isp_links\n";
+        return 1;
+    }
+    printf "%-20s  %-12s  %-12s  %-10s  %-8s  %-12s  %s\n",
+        "GATEWAY", "ISP", "IFACE", "MAC", "AUTH", "STATUS", "NOTES";
+    for my $r (sort {
+            ($name{$a->{gateway_machine_id}} // '') cmp
+                ($name{$b->{gateway_machine_id}} // '')
+         || $a->{isp_name} cmp $b->{isp_name}
+        } @$links) {
+        printf "%-20s  %-12s  %-12s  %-12s  %-8s  %-12s  %s\n",
+            $name{ $r->{gateway_machine_id} } // "(mid=$r->{gateway_machine_id})",
+            $r->{isp_name}, $r->{iface}     // '-',
+            $r->{mac}      // '-', $r->{auth_type} // '-',
+            $r->{status}   // '-', $r->{notes}     // '';
+    }
+    return 0;
+}
+
+# ---- show GATEWAY ---------------------------------------------------
+
+sub cmd_show {
+    my ($cli, $gw) = @_;
+    usage(2) unless defined $gw;
+    my $links = $cli->snapshot(1, 'isp_links');
+    my $machs = $cli->snapshot(2, 'machines');
+    my %name = map { $_->{id} => $_->{primary_name} }
+               grep { defined $_->{primary_name} } @$machs;
+    my %id_of = map { ($_->{primary_name} // '') => $_->{id} } @$machs;
+    my $mid = $id_of{$gw};
+    return (warn "no machine named '$gw'\n"), 1 unless defined $mid;
+    my @rows = grep { $_->{gateway_machine_id} == $mid } @$links;
+    unless (@rows) {
+        print STDERR "no isp_links for $gw\n";
+        return 1;
+    }
+    my $secrets = eval { $cli->snapshot(3, 'isp_secrets',
+                                where => "gateway_machine_id = $mid") };
+    my %secret_by_isp;
+    if (ref $secrets eq 'ARRAY') {
+        $secret_by_isp{ $_->{isp_name} } = $_->{auth_secret} for @$secrets;
+    }
+    for my $r (sort { $a->{isp_name} cmp $b->{isp_name} } @rows) {
+        print "$gw / $r->{isp_name}\n";
+        printf "  iface:     %s\n", $r->{iface}      // '-';
+        printf "  mac:       %s\n", $r->{mac}        // '-';
+        printf "  auth_type: %s\n", $r->{auth_type}  // '-';
+        printf "  auth_user: %s\n", $r->{auth_user}  // '-';
+        printf "  status:    %s\n", $r->{status}     // '-';
+        printf "  notes:     %s\n", $r->{notes}      // '';
+        printf "  last_seen: %s\n", $r->{last_seen}  // '-';
+        if (exists $secret_by_isp{ $r->{isp_name} }) {
+            printf "  secret:    %s\n", $secret_by_isp{ $r->{isp_name} };
+        } elsif (!defined $secrets) {
+            printf "  secret:    (auth required to view)\n";
+        } else {
+            printf "  secret:    (none stored)\n";
+        }
+        print "\n";
+    }
+    return 0;
+}
+
+# ---- set GATEWAY ISP [opts] -----------------------------------------
+
+sub cmd_set {
+    my ($cli, $gw, $isp) = @_;
+    usage(2) unless defined $gw && defined $isp;
+    my %kv = (kind => 'isp_link', gateway => $gw, isp => $isp);
+    $kv{iface}     = $iface     if defined $iface;
+    $kv{mac}       = $mac       if defined $mac;
+    $kv{auth_type} = $auth_type if defined $auth_type;
+    $kv{auth_user} = $auth_user if defined $auth_user;
+    $kv{status}    = $status    if defined $status;
+    $kv{notes}     = $notes     if defined $notes;
+    my $reply = $cli->observe(%kv);
+    if ($reply && $reply =~ /^ERR\s+(.*)/) {
+        warn "$gw/$isp: $1\n";
+        return 1;
+    }
+    print "$gw/$isp: set\n";
+
+    if (defined $secret) {
+        my $r2 = $cli->observe(
+            kind    => 'isp_secret',
+            gateway => $gw, isp => $isp, secret => $secret,
+        );
+        if ($r2 && $r2 =~ /^ERR\s+(.*)/) {
+            warn "$gw/$isp: secret: $1\n";
+            return 1;
+        }
+        print "$gw/$isp: secret stored\n";
+    }
+    return 0;
+}
+
+# ---- clear GATEWAY ISP ----------------------------------------------
+
+sub cmd_clear {
+    my ($cli, $gw, $isp) = @_;
+    usage(2) unless defined $gw && defined $isp;
+    my $reply = $cli->observe(
+        kind => 'isp_link_delete', gateway => $gw, isp => $isp,
+    );
+    if ($reply && $reply =~ /^ERR\s+(.*)/) {
+        warn "$gw/$isp: $1\n";
+        return 1;
+    }
+    print "$gw/$isp: cleared\n";
+    return 0;
+}
+
+# ---- usage ----------------------------------------------------------
+
+sub usage {
+    my ($rc) = @_;
+    print STDERR <<"EOF";
+Usage:
+  net-isp list
+  net-isp show   GATEWAY
+  net-isp set    GATEWAY ISP [opts]
+  net-isp clear  GATEWAY ISP
+
+GATEWAY is a machines.primary_name (e.g. gateway2-down).
+ISP is a free-form name (e.g. 'comcast', 'tmobile', 'wifi-fallback').
+
+Set options:
+  --iface NAME       WAN interface on the gateway
+  --mac MAC          MAC used to authenticate (Comcast MAC-clone)
+  --auth TYPE        mac | pppoe | dhcp | wpa2
+  --user USER        login user
+  --status STATUS    active | standby | broken | unknown
+  --notes "..."      free-form annotation
+  --secret PASS      password / passphrase (auth-gated)
+
+Other:
+  --listen H[:P]     net-mgr daemon (default 127.0.0.1:7531)
+  --no-auth          don't attempt SSH-key auth (forfeit secret access)
+EOF
+    exit($rc // 0);
+}

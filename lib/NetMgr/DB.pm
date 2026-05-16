@@ -1155,6 +1155,73 @@ sub delete_dhcp_var {
     return $self->{dbh}->do("DELETE FROM dhcp_vars WHERE name = ?", undef, $name);
 }
 
+# isp_links — public-readable. (machine_id, isp_name) is the PK.
+# Empty-string fields normalise to NULL so producers can leave keys
+# out without overwriting.
+sub upsert_isp_link {
+    my ($self, %f) = @_;
+    croak "gateway_machine_id required" unless defined $f{gateway_machine_id};
+    croak "isp_name required"           unless defined $f{isp_name};
+    for my $k (qw(iface mac auth_type auth_user notes)) {
+        $f{$k} = undef if defined $f{$k} && $f{$k} eq '';
+    }
+    $f{status} //= 'active';
+    $self->{dbh}->do(<<'SQL', undef,
+        INSERT INTO isp_links
+            (gateway_machine_id, isp_name, iface, mac,
+             auth_type, auth_user, status, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+            iface     = VALUES(iface),
+            mac       = VALUES(mac),
+            auth_type = VALUES(auth_type),
+            auth_user = VALUES(auth_user),
+            status    = VALUES(status),
+            notes     = VALUES(notes)
+SQL
+        $f{gateway_machine_id}, $f{isp_name}, $f{iface}, $f{mac},
+        $f{auth_type}, $f{auth_user}, $f{status}, $f{notes}
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM isp_links
+          WHERE gateway_machine_id = ? AND isp_name = ?",
+        undef, $f{gateway_machine_id}, $f{isp_name}
+    );
+}
+
+sub delete_isp_link {
+    my ($self, %f) = @_;
+    croak "gateway_machine_id required" unless defined $f{gateway_machine_id};
+    croak "isp_name required"           unless defined $f{isp_name};
+    return $self->{dbh}->do(
+        "DELETE FROM isp_links
+          WHERE gateway_machine_id = ? AND isp_name = ?",
+        undef, $f{gateway_machine_id}, $f{isp_name}
+    );
+}
+
+# isp_secrets — restricted. The matching isp_links row must exist
+# (FK cascades on delete). Caller is responsible for the auth check
+# at the protocol layer; this helper just writes.
+sub upsert_isp_secret {
+    my ($self, %f) = @_;
+    croak "gateway_machine_id required" unless defined $f{gateway_machine_id};
+    croak "isp_name required"           unless defined $f{isp_name};
+    croak "auth_secret required"        unless defined $f{auth_secret};
+    $self->{dbh}->do(<<'SQL', undef,
+        INSERT INTO isp_secrets (gateway_machine_id, isp_name, auth_secret)
+        VALUES (?, ?, ?)
+        ON DUPLICATE KEY UPDATE auth_secret = VALUES(auth_secret)
+SQL
+        $f{gateway_machine_id}, $f{isp_name}, $f{auth_secret}
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM isp_secrets
+          WHERE gateway_machine_id = ? AND isp_name = ?",
+        undef, $f{gateway_machine_id}, $f{isp_name}
+    );
+}
+
 sub upsert_wifi_socket {
     my ($self, %f) = @_;
     croak "machine_id and outlet required"
@@ -1567,7 +1634,7 @@ sub query_table {
         machines hostnames interfaces addresses ports aps
         associations dhcp_leases events aliases dhcp_vars
         subnet_routers friendly_names wifi_sockets lost_devices
-        peers uplinks forwarding_rules
+        peers uplinks isp_links isp_secrets forwarding_rules
         zone_classes interface_zones wifi_zones
         audit_annotations wifi_scan_results wifi_radio_state
     );
