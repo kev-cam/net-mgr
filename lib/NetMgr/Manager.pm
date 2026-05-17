@@ -1367,18 +1367,37 @@ SH
     },
 );
 
+# Coderef POLLs that need access to the daemon object (for in-memory
+# state, e.g. the cluster's peer_caps table). Keyed identically to
+# %POLL_SCRIPTS; checked first.
+my %POLL_METHODS = (
+    'peer-caps' => sub {
+        my ($self) = @_;
+        my $caps = $self->{cluster}{peer_caps} || {};
+        my @lines;
+        for my $name (sort keys %$caps) {
+            my $list = join(',', @{ $caps->{$name} || [] });
+            push @lines, "$name\t$list";
+        }
+        return join("\n", @lines) . "\n";
+    },
+);
+
 sub _handle_poll {
     my ($self, $cli, $cmd) = @_;
     my $name = $cmd->{name} // '';
+    my $method = $POLL_METHODS{$name};
     my $handler = $POLL_SCRIPTS{$name};
-    if (!defined $handler) {
-        my @ok = sort keys %POLL_SCRIPTS;
+    if (!defined $method && !defined $handler) {
+        my @ok = sort(keys %POLL_SCRIPTS, keys %POLL_METHODS);
         return $self->_send($cli,
             format_err("unknown POLL '$name' (allowed: @ok)"));
     }
     my $output = '';
     eval {
-        if (ref($handler) eq 'CODE') {
+        if ($method) {
+            $output = $method->($self) // '';
+        } elsif (ref($handler) eq 'CODE') {
             $output = $handler->() // '';
         } else {
             open(my $fh, '-|', '/bin/sh', '-c', $handler)

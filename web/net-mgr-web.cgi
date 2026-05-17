@@ -746,7 +746,7 @@ sub render_peers {
         $body .= '<h2>configured</h2>';
         $body .= '<table class=peers>';
         $body .= '<tr><th>peer</th><th>machine</th><th>address</th>'
-               . '<th>status</th><th>connect (ms)</th>'
+               . '<th>status</th><th>cluster</th><th>connect (ms)</th>'
                . '<th>uplinks</th><th>note</th></tr>';
         for my $p (@configured) {
             my $r       = $probe->($p);
@@ -760,13 +760,14 @@ sub render_peers {
             $body .= sprintf
                 '<tr class="%s"><td class=name>%s</td><td>%s</td>'
               . '<td><code>%s</code></td>'
-              . '<td class=status>%s</td><td class=meta>%s</td>'
+              . '<td class=status>%s</td><td>%s</td><td class=meta>%s</td>'
               . '<td>%s</td><td class=meta>%s</td></tr>',
                 join(' ', @cls),
                 escapeHTML($p->{label}),
                 escapeHTML($machine),
                 escapeHTML($p->{addr}),
                 ($r->{ok} ? 'reachable' : 'unreachable'),
+                _render_cluster_inline($r->{cluster}),
                 (defined $r->{rtt_ms} ? sprintf('%.1f', $r->{rtt_ms}) : '—'),
                 _render_uplinks_inline($r->{uplinks}),
                 escapeHTML($r->{note} // '');
@@ -779,7 +780,8 @@ sub render_peers {
         $body .= '<h2>discovered</h2>';
         $body .= '<table class=peers>';
         $body .= '<tr><th>host</th><th>machine</th><th>port</th>'
-               . '<th>last status</th><th>uplinks</th>'
+               . '<th>last status</th><th>cluster</th>'
+               . '<th>uplinks</th>'
                . '<th>schema</th><th>last RTT (ms)</th>'
                . '<th>peer uptime since</th><th>last seen</th></tr>';
         # Sort: same family stem clusters together; within a stem, by IP.
@@ -803,7 +805,7 @@ sub render_peers {
             $body .= sprintf
                 '<tr class="%s"><td class=name><code>%s</code>%s</td>'
               . '<td>%s</td><td>%s</td><td class=status>%s</td>'
-              . '<td>%s</td>'
+              . '<td>%s</td><td>%s</td>'
               . '<td>%s</td><td class=meta>%s</td>'
               . '<td class=meta>%s</td><td class=meta>%s</td></tr>',
                 join(' ', @cls),
@@ -811,6 +813,7 @@ sub render_peers {
                 escapeHTML($machine),
                 escapeHTML($p->{port} // ''),
                 escapeHTML($p->{last_status} // ''),
+                _render_cluster_inline($r->{cluster}),
                 _render_uplinks_inline($r->{uplinks}),
                 escapeHTML($p->{schema_version} // '?'),
                 (defined $p->{rtt_ms} ? sprintf('%.1f', $p->{rtt_ms}) : '—'),
@@ -894,18 +897,57 @@ sub probe_peer {
     my $rows  = eval { $client->snapshot(1, 'machines') };
     my $count = ($rows && ref $rows eq 'ARRAY') ? scalar @$rows : undef;
     my $upl   = eval { $client->snapshot(2, 'uplinks') };
+    # Cluster STATUS — fields are only populated on schema-20+ daemons.
+    # Older peers just return an empty hash for the cluster_ keys.
+    my $st    = eval { $client->status };
     eval { $client->bye };
     return {
         ok       => 1,
         rtt_ms   => $rtt,
         machines => $count,
         uplinks  => (ref $upl eq 'ARRAY' ? $upl : []),
+        cluster  => $st || {},
         note     => $@ ? "snapshot failed: $@" : '',
     };
 }
 
 # Render a peer's uplinks list as a small inline summary, e.g.
 #   comcast: ok 12.3ms · wifi: fail (5×)
+# Compact inline rendering of a peer's STATUS cluster_* fields:
+#   role · priority · quorum/Reachable · capabilities
+# Returns "—" if the peer didn't report any cluster fields (older
+# build, or it doesn't run with a [cluster] section). Master role
+# is highlighted; missing quorum gets a warning class.
+sub _render_cluster_inline {
+    my ($cs) = @_;
+    return '<span class=note>—</span>'
+        unless $cs && ref $cs eq 'HASH' && defined $cs->{cluster_member};
+    my $role = $cs->{cluster_role} // 'auto';
+    my $pri  = $cs->{cluster_priority} // '?';
+    my $caps = $cs->{cluster_capabilities} // '';
+    my $qok  = $cs->{quorum_ok};
+    my $rch  = $cs->{reachable_members} // '?';
+
+    my @parts;
+    my $role_cls = $role eq 'master'    ? 'cluster-master'
+                 : $role eq 'excluded'  ? 'cluster-excluded'
+                 : $role eq 'follower'  ? 'cluster-follower'
+                 :                         'cluster-auto';
+    push @parts, sprintf('<span class="%s">%s</span>',
+                         $role_cls, escapeHTML($role));
+    push @parts, sprintf('<span class=meta>pri=%s</span>', escapeHTML($pri));
+    if (defined $qok) {
+        my $qcls = $qok ? 'cluster-quorum-ok' : 'cluster-quorum-bad';
+        my $qtxt = $qok ? "quorum ($rch)" : "no quorum ($rch)";
+        push @parts, sprintf('<span class="%s">%s</span>',
+                             $qcls, escapeHTML($qtxt));
+    }
+    if (length $caps) {
+        push @parts, sprintf('<span class=meta>%s</span>', escapeHTML($caps));
+    }
+    return join(' · ', @parts);
+}
+
 sub _render_uplinks_inline {
     my ($uplinks) = @_;
     return '<span class=note>—</span>' unless $uplinks && @$uplinks;
@@ -1784,6 +1826,19 @@ table.peers tr.wan-router td.name { box-shadow: inset 4px 0 0 #f44; padding-left
 .up.up-ok      { background: rgba(60, 200, 100, 0.18); color: #cfc; }
 .up.up-fail    { background: rgba(220, 60, 60, 0.22);  color: #fcc; }
 .up.up-unknown { background: rgba(150,150,150,0.18);   color: #ccc; }
+/* Cluster role/quorum badges (peers page). Inline pill style. */
+.cluster-master       { background: rgba(80, 160, 240, 0.30); color: #cdf;
+                        padding: 0 6px; border-radius: 3px; font-weight: bold; }
+.cluster-auto         { background: rgba(150,150,150, 0.18);  color: #ddd;
+                        padding: 0 6px; border-radius: 3px; }
+.cluster-follower     { background: rgba(150,150,150, 0.18);  color: #ddd;
+                        padding: 0 6px; border-radius: 3px; }
+.cluster-excluded     { background: rgba(220, 60, 60, 0.22);  color: #fcc;
+                        padding: 0 6px; border-radius: 3px; }
+.cluster-quorum-ok    { background: rgba(60, 200, 100, 0.18); color: #cfc;
+                        padding: 0 6px; border-radius: 3px; }
+.cluster-quorum-bad   { background: rgba(220, 60, 60, 0.22);  color: #fcc;
+                        padding: 0 6px; border-radius: 3px; }
 table.wifi-busy { max-width: 720px; font-size: 0.9em; }
 table.wifi-busy td.bar { position: relative; min-width: 220px;
                          background: #181818; padding: 0; }

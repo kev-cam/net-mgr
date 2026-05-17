@@ -1,0 +1,256 @@
+#!/usr/bin/perl
+# net-peer — manage this daemon's local peer authority table
+# (/etc/net-mgr/peers) and inspect the cluster's election state.
+#
+# Each net-mgr daemon keeps its own opinion of what every other
+# peer is allowed to do. This tool is the CLI for reading and
+# (auth-gated) writing that opinion.
+#
+# Usage:
+#   net-peer list                       show local peer auth table
+#   net-peer show NAME                  show one peer's grants
+#   net-peer grant NAME cap1[,cap2…]    grant capabilities
+#   net-peer revoke NAME [cap1…]        remove caps (or whole peer)
+#   net-peer status                     STATUS from every roster member
+#                                       (who's master, quorum, etc.)
+#
+# Common options:
+#   --listen H[:P]   daemon address (default 127.0.0.1:7531)
+#   --no-auth        skip the SSH-key AUTH dance (writes will fail
+#                    unless the client is on loopback)
+#
+# 'grant' replaces the peer's full cap list with what you give —
+# it's not additive. To add to an existing list, fetch with
+# 'show' first.
+#
+# Exit: 0 ok · 1 not found / write failed · 2 bad args.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use MIME::Base64 qw(decode_base64);
+
+use NetMgr::Client;
+
+my ($listen, $no_auth, $help);
+GetOptions(
+    'listen=s'  => \$listen,
+    'no-auth'   => \$no_auth,
+    'help|h'    => \$help,
+) or usage(2);
+usage(0) if $help;
+
+my $verb = shift @ARGV;
+usage(2) unless defined $verb;
+
+my %args; $args{listen} = $listen if defined $listen;
+my $cli = NetMgr::Client->new(%args, timeout => 5);
+$cli->hello(consumer => "net-peer.$$");
+
+# Best-effort AUTH up-front so writes work even from off-host calls.
+unless ($no_auth) {
+    my $ok = eval { $cli->auth; 1 };
+    if (!$ok && $verb =~ /^(grant|revoke)$/) {
+        my $e = $@; chomp $e; $e =~ s/ at .*//;
+        warn "warn: auth failed ($e) — writes will be denied unless on loopback\n";
+    }
+}
+
+my $rc = 0;
+if    ($verb eq 'list')   { $rc = cmd_list($cli) }
+elsif ($verb eq 'show')   { $rc = cmd_show($cli, @ARGV) }
+elsif ($verb eq 'grant')  { $rc = cmd_grant($cli, @ARGV) }
+elsif ($verb eq 'revoke') { $rc = cmd_revoke($cli, @ARGV) }
+elsif ($verb eq 'status') { $rc = cmd_status($cli) }
+else                      { usage(2) }
+$cli->bye;
+exit $rc;
+
+# ---- list -----------------------------------------------------------
+
+sub cmd_list {
+    my ($cli) = @_;
+    my $caps = fetch_local_caps($cli);
+    unless (defined $caps && keys %$caps) {
+        print STDERR "no entries in local peer auth table\n"
+                   . "(grant some with: net-peer grant NAME cap1,cap2)\n";
+        return 1;
+    }
+    printf "%-22s  %s\n", "PEER", "CAPABILITIES";
+    for my $name (sort keys %$caps) {
+        printf "%-22s  %s\n",
+            $name, (join(', ', @{ $caps->{$name} }) || '(none)');
+    }
+    return 0;
+}
+
+# ---- show NAME ------------------------------------------------------
+
+sub cmd_show {
+    my ($cli, $name) = @_;
+    usage(2) unless defined $name;
+    my $caps = fetch_local_caps($cli) || {};
+    unless (exists $caps->{$name}) {
+        print STDERR "no entry for '$name' in local peer auth table\n";
+        return 1;
+    }
+    my @c = @{ $caps->{$name} };
+    if (@c) { print "$name: " . join(', ', @c) . "\n" }
+    else    { print "$name: (no capabilities granted; explicitly recognised)\n" }
+    return 0;
+}
+
+# ---- grant NAME caps -----------------------------------------------
+
+sub cmd_grant {
+    my ($cli, $name, $caps_arg) = @_;
+    usage(2) unless defined $name && defined $caps_arg;
+    my $reply = $cli->observe(
+        kind => 'peer_cap_set',
+        peer => $name,
+        caps => $caps_arg,
+    );
+    if ($reply && $reply =~ /^ERR\s+(.*)/) {
+        warn "$name: $1\n";
+        return 1;
+    }
+    print "$name: granted $caps_arg\n";
+    return 0;
+}
+
+# ---- revoke NAME [caps] --------------------------------------------
+#
+# Without caps, removes the peer entirely. With caps, fetches current
+# list, removes the named caps, and grants the remainder. (Net-mgr's
+# OBSERVE doesn't have a "remove a subset" verb — only set / clear.)
+
+sub cmd_revoke {
+    my ($cli, $name, $caps_arg) = @_;
+    usage(2) unless defined $name;
+    if (!defined $caps_arg) {
+        my $reply = $cli->observe(kind => 'peer_cap_clear', peer => $name);
+        if ($reply && $reply =~ /^ERR\s+(.*)/) {
+            warn "$name: $1\n";
+            return 1;
+        }
+        print "$name: cleared\n";
+        return 0;
+    }
+    my $caps = fetch_local_caps($cli) || {};
+    my %drop = map { $_ => 1 }
+               grep { length }
+               map  { s/^\s+|\s+$//gr }
+               split /,/, $caps_arg;
+    my @kept = grep { !$drop{$_} } @{ $caps->{$name} || [] };
+    my $reply = $cli->observe(
+        kind => 'peer_cap_set',
+        peer => $name,
+        caps => join(',', @kept),
+    );
+    if ($reply && $reply =~ /^ERR\s+(.*)/) {
+        warn "$name: $1\n";
+        return 1;
+    }
+    print "$name: now " . (join(', ', @kept) || '(none)') . "\n";
+    return 0;
+}
+
+# ---- status (cluster-wide) -----------------------------------------
+
+sub cmd_status {
+    my ($cli) = @_;
+    my $st = $cli->status;
+    return (warn "STATUS failed\n"), 1 unless $st;
+    print "=== local cluster view ===\n";
+    for my $k (qw(cluster_member cluster_role cluster_priority
+                  cluster_prefer_lan cluster_internet_facing
+                  cluster_capabilities cluster_members
+                  cluster_is_member cluster_peer_auth_count
+                  reachable_members quorum_ok)) {
+        printf "  %-26s %s\n", $k, ($st->{$k} // '');
+    }
+    my @members = grep { length } split /,/, ($st->{cluster_members} // '');
+    return 0 unless @members;
+
+    print "\n=== per-member STATUS ===\n";
+    printf "%-15s  %-8s  %-4s  %-8s  %s\n",
+        "MEMBER", "ROLE", "PRI", "QUORUM", "REACHABLE/CAPS";
+    for my $m (sort @members) {
+        my $ip = resolve_member($m);
+        if (!$ip) {
+            printf "%-15s  unresolved\n", $m;
+            next;
+        }
+        my %a; $a{listen} = "$ip:7531";
+        my $c2 = eval { NetMgr::Client->new(%a, timeout => 3) };
+        if (!$c2) {
+            printf "%-15s  unreachable\n", $m;
+            next;
+        }
+        eval { $c2->hello(consumer => "net-peer-status.$$") };
+        my $rs = eval { $c2->status };
+        eval { $c2->bye };
+        unless ($rs) {
+            printf "%-15s  STATUS-fail\n", $m;
+            next;
+        }
+        printf "%-15s  %-8s  %-4s  %-8s  %s\n",
+            $rs->{cluster_member}      // $m,
+            $rs->{cluster_role}        // '?',
+            $rs->{cluster_priority}    // '?',
+            ($rs->{quorum_ok} ? 'yes' : 'no'),
+            ($rs->{cluster_capabilities} // '');
+    }
+    return 0;
+}
+
+# ---- helpers --------------------------------------------------------
+
+# POLL peer-caps on the local daemon; returns hashref { name => [caps] }
+# or undef on failure.
+sub fetch_local_caps {
+    my ($cli) = @_;
+    my $b64 = eval { $cli->poll('peer-caps') };
+    return undef unless defined $b64;
+    my %out;
+    for my $line (split /\n/, $b64) {
+        next unless length $line;
+        my ($name, $list) = split /\t/, $line, 2;
+        $out{$name} = [ grep { length } split /,/, ($list // '') ];
+    }
+    return \%out;
+}
+
+sub resolve_member {
+    my ($name) = @_;
+    open my $fh, '-|', 'net-lookup', '--verify', $name or return undef;
+    my $ip;
+    while (my $line = <$fh>) {
+        chomp $line;
+        if ($line =~ /^(\d+\.\d+\.\d+\.\d+)$/) { $ip = $1; last }
+    }
+    close $fh;
+    return $ip;
+}
+
+sub usage {
+    my ($rc) = @_;
+    print STDERR <<"EOF";
+Usage:
+  net-peer list
+  net-peer show   NAME
+  net-peer grant  NAME cap1[,cap2…]
+  net-peer revoke NAME [cap1…]
+  net-peer status
+
+Reads and edits THIS daemon's /etc/net-mgr/peers — the local
+opinion of what other cluster members are allowed to do.
+
+'grant' SETS the full cap list (not additive). 'revoke' without
+caps removes the peer entirely; with caps removes just those
+tags from the existing list.
+EOF
+    exit($rc // 0);
+}
