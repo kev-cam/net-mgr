@@ -93,6 +93,40 @@ if ($db) {
     }
 }
 
+# Local cluster roster — peers discovered with a cluster_member
+# that ISN'T in this list get logged as 'unconfigured peer found'
+# events so an operator can decide whether to add them.
+my %roster_member;
+if (my $cm = NetMgr::Config->load(
+        $ENV{NET_MGR_CONF} // '/etc/net-mgr/config')->{cluster}{members}) {
+    for my $m (split /[,\s]+/, $cm) {
+        next unless length $m;
+        $roster_member{$m} = 1;
+    }
+}
+
+# Emit-event helper. Opens a fresh control connection (this script
+# already used $cli; reusing it for OBSERVE post-bye would need a
+# reconnect anyway). Best-effort: if the local daemon's down, skip.
+my $event_cli;
+sub _emit_unconfigured_peer {
+    my ($ip, $member) = @_;
+    unless ($event_cli) {
+        $event_cli = eval {
+            NetMgr::Client->new(listen => $listen, timeout => 3);
+        } or return;
+        eval { $event_cli->hello(consumer => "find-peers-event.$$") };
+    }
+    eval {
+        $event_cli->observe(
+            kind    => 'event',
+            type    => 'unconfigured_peer_found',
+            addr    => $ip,
+            details => qq({"member":"$member"}),
+        );
+    };
+}
+
 my $found = 0;
 my $new   = 0;
 for my $ip (@ips) {
@@ -134,7 +168,21 @@ for my $ip (@ips) {
         started_at     => $started_iso,
         rtt_ms         => $rtt,
     );
+
+    # If the peer reports a cluster_member name that isn't in our
+    # roster, surface it once per discovery. We only emit when the
+    # peer is new in the peers table (so the operator isn't spammed
+    # every find-peers tick).
+    if ($is_new && $st->{cluster_member}
+        && %roster_member
+        && !$roster_member{ $st->{cluster_member} }) {
+        _emit_unconfigured_peer($ip, $st->{cluster_member});
+        warn "  unconfigured peer: $st->{cluster_member} at $ip "
+           . "(not in [cluster] members)\n" unless $quiet;
+    }
 }
+
+eval { $event_cli->bye } if $event_cli;
 
 warn "found $found peer(s); $new new\n" if !$quiet || $new;
 exit 0;

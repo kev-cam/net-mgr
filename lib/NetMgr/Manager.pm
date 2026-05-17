@@ -1258,7 +1258,7 @@ sub _check_periodic_triggers {
     my $now   = time();
     $self->{periodic_last} //= {};
 
-    for my $name (qw(scan-ap presence discover)) {
+    for my $name (qw(scan-ap presence discover find-peers)) {
         my $interval = $sched->{$name} // 0;
         next unless $interval && $interval > 0;
         my $last = $self->{periodic_last}{$name} // 0;
@@ -1287,6 +1287,15 @@ sub _fire_periodic {
     } elsif ($name eq 'discover') {
         $bin  = $self->_producer_path('net-discover');
         @args = ('--discover');
+    } elsif ($name eq 'find-peers') {
+        # Auto-discover other net-mgr daemons on the LAN. The tool
+        # writes its findings to the local `peers` table; the new
+        # 'unconfigured peer found' event-emit path lives in
+        # net-find-peers itself (sees a peer whose primary_name
+        # isn't in [cluster] members, emits an event). Keeping the
+        # logic there avoids duplicating it in this dispatcher.
+        $bin  = $self->_producer_path('net-find-peers');
+        @args = ('--quiet');
     } else {
         return;
     }
