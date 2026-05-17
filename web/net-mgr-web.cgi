@@ -397,6 +397,10 @@ sub render_machine_detail {
 
     my $info = '';
     $info .= "<dt>id</dt><dd>$mid</dd>";
+    if ($m && $m->{replicated_from}) {
+        $info .= '<dt>provenance</dt><dd>'
+               . _provenance_badge($m) . '</dd>';
+    }
     $info .= '<dt>names</dt><dd>'
            . join(', ', map { escapeHTML($_) } @hns)
            . '</dd>' if @hns;
@@ -466,11 +470,13 @@ sub render_iface_block {
         $vendor = "$oui (OUI)" if defined $oui;
     }
     my $online = $iface->{online} ? 'online' : 'offline';
+    my $prov = _provenance_badge($iface);
 
     my $addr_html = @addrs
         ? join '', map {
             my $src = $_->{source} ? " <span class=src>($_->{source})</span>" : '';
-            '<li><code>' . escapeHTML($_->{addr}) . '</code>' . $src . '</li>';
+            my $ap  = _provenance_badge($_);
+            '<li><code>' . escapeHTML($_->{addr}) . '</code>' . $src . $ap . '</li>';
         } @addrs
         : '<li class=note>none on file</li>';
 
@@ -522,7 +528,7 @@ sub render_iface_block {
 
     return <<HTML;
 <section class="iface $online">
-<h3>$mac <span class=meta>$kind · $vendor · $online</span></h3>
+<h3>$mac <span class=meta>$kind · $vendor · $online</span>$prov</h3>
 <dl class=info>
   <dt>addresses</dt><dd><ul class=addrlist>$addr_html</ul></dd>
   $events_html
@@ -530,6 +536,18 @@ sub render_iface_block {
 $port_html
 </section>
 HTML
+}
+
+# replicated_from provenance badge. Returns a small inline HTML
+# fragment when the row was replicated from another cluster master,
+# empty string for local rows. Same style used across machine,
+# interface, and address renderers.
+sub _provenance_badge {
+    my ($row) = @_;
+    my $from = $row && $row->{replicated_from};
+    return '' unless defined $from && length $from;
+    return ' <span class=provenance title="replicated from cluster master">'
+         . '↩ ' . escapeHTML($from) . '</span>';
 }
 
 # OUI vendor lookup from the IEEE registry CSV. Returns the
@@ -1839,6 +1857,9 @@ table.peers tr.wan-router td.name { box-shadow: inset 4px 0 0 #f44; padding-left
                         padding: 0 6px; border-radius: 3px; }
 .cluster-quorum-bad   { background: rgba(220, 60, 60, 0.22);  color: #fcc;
                         padding: 0 6px; border-radius: 3px; }
+/* Provenance badge: a row whose authority is a cluster master. */
+.provenance { color: #99c; font-size: 0.85em; margin-left: 6px;
+              font-style: italic; }
 table.wifi-busy { max-width: 720px; font-size: 0.9em; }
 table.wifi-busy td.bar { position: relative; min-width: 220px;
                          background: #181818; padding: 0; }
