@@ -471,3 +471,28 @@ INSERT IGNORE INTO schema_version (version) VALUES (19);
 ALTER TABLE interfaces ADD COLUMN link_speed_mbps INT NULL;
 ALTER TABLE addresses  ADD COLUMN loss_pct        FLOAT NULL;
 INSERT IGNORE INTO schema_version (version) VALUES (20);
+
+-- replicated_from: which cluster master a row came from, NULL = local.
+-- Stamped on every row written by net-mgr-relay; left alone by local
+-- OBSERVE writes. Master's periodic replication keeps overwriting,
+-- so "master's info takes precedence" is enforced by the cycle
+-- rather than runtime errors. Audit / debug column too.
+ALTER TABLE machines     ADD COLUMN replicated_from VARCHAR(64) NULL;
+ALTER TABLE machines     ADD KEY idx_replicated_from (replicated_from);
+ALTER TABLE hostnames    ADD COLUMN replicated_from VARCHAR(64) NULL;
+ALTER TABLE hostnames    ADD KEY idx_replicated_from (replicated_from);
+ALTER TABLE interfaces   ADD COLUMN replicated_from VARCHAR(64) NULL;
+ALTER TABLE interfaces   ADD KEY idx_replicated_from (replicated_from);
+ALTER TABLE addresses    ADD COLUMN replicated_from VARCHAR(64) NULL;
+ALTER TABLE addresses    ADD KEY idx_replicated_from (replicated_from);
+ALTER TABLE ports        ADD COLUMN replicated_from VARCHAR(64) NULL;
+ALTER TABLE ports        ADD KEY idx_replicated_from (replicated_from);
+ALTER TABLE aps          ADD COLUMN replicated_from VARCHAR(64) NULL;
+ALTER TABLE aps          ADD KEY idx_replicated_from (replicated_from);
+ALTER TABLE associations ADD COLUMN replicated_from VARCHAR(64) NULL;
+ALTER TABLE associations ADD KEY idx_replicated_from (replicated_from);
+ALTER TABLE dhcp_leases  ADD COLUMN replicated_from VARCHAR(64) NULL;
+ALTER TABLE dhcp_leases  ADD KEY idx_replicated_from (replicated_from);
+ALTER TABLE aliases      ADD COLUMN replicated_from VARCHAR(64) NULL;
+ALTER TABLE aliases      ADD KEY idx_replicated_from (replicated_from);
+INSERT IGNORE INTO schema_version (version) VALUES (21);

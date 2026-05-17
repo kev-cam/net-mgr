@@ -35,6 +35,12 @@ sub run {
     my $db   = $args{db}   or croak "db required";
     my $log  = $args{log_fh} // \*STDERR;
     my $backoff = $args{backoff} // 5;
+    # The cluster_member name to stamp on every replicated row's
+    # replicated_from column. The script (net-mgr-relay) passes
+    # this in from its election result. Without it, rows still
+    # replicate but aren't tagged — useful for --peer debug runs
+    # where we don't want to claim a particular master identity.
+    my $repl_from = $args{replicated_from};
 
     while (1) {
         my $err;
@@ -42,7 +48,13 @@ sub run {
             _log($log, "[relay] connecting to $peer");
             my $cli = NetMgr::Client->new(listen => $peer, timeout => 5);
             $cli->hello(consumer => "net-mgr-relay.$$");
-            _run_session($cli, $db, $log);
+            # If no master_name was passed in, derive it from the
+            # peer's own STATUS — saves the caller from doing it.
+            $repl_from //= do {
+                my $st = eval { $cli->status };
+                $st && $st->{cluster_member};
+            };
+            _run_session($cli, $db, $log, $repl_from);
             $cli->bye;
         };
         $err = $@;
@@ -53,7 +65,7 @@ sub run {
 }
 
 sub _run_session {
-    my ($cli, $db, $log) = @_;
+    my ($cli, $db, $log, $repl_from) = @_;
     my %idmap;     # peer_machine_id → local_machine_id
 
     my $sub = 0;
@@ -71,7 +83,7 @@ sub _run_session {
             my $kv     = $cmd->{kv};
             my $table  = $kv->{table};
             my $apply  = __PACKAGE__->can("_apply_$table") or next;
-            eval { $apply->($db, $kv, \%idmap) };
+            eval { $apply->($db, $kv, \%idmap, $repl_from) };
             _log($log, "[relay] apply $table: $@") if $@;
         } elsif ($cmd->{verb} eq 'ERR') {
             _log($log, "[relay] peer ERR: $cmd->{msg}");
@@ -88,9 +100,29 @@ sub _log {
 }
 
 # ---- per-table apply functions --------------------------------------
+#
+# Each _apply_$table($db, $row, $idmap, $repl_from):
+#   1. UPSERT the row using the existing DB method.
+#   2. If $repl_from is set, stamp replicated_from on the row by
+#      its natural key. This is a single UPDATE; cheap and lets
+#      the upsert methods stay untouched. On the next replication
+#      tick the master's value is re-stamped, so local divergence
+#      between ticks gets overwritten.
+#
+# _stamp($db, $table, $repl_from, WHERE_clause, @binds) does the
+# stamp uniformly so each apply function stays short.
+
+sub _stamp {
+    my ($db, $table, $repl_from, $where, @binds) = @_;
+    return unless defined $repl_from && length $repl_from;
+    $db->dbh->do(
+        "UPDATE $table SET replicated_from = ? WHERE $where",
+        undef, $repl_from, @binds
+    );
+}
 
 sub _apply_machines {
-    my ($db, $row, $idmap) = @_;
+    my ($db, $row, $idmap, $repl_from) = @_;
     my $name = $row->{primary_name};
     return unless defined $name && length $name;
     my ($lid) = $db->dbh->selectrow_array(
@@ -108,10 +140,11 @@ sub _apply_machines {
         $lid = $r->{now}{id};
     }
     $idmap->{ $row->{id} } = $lid if $row->{id};
+    _stamp($db, 'machines', $repl_from, 'id = ?', $lid);
 }
 
 sub _apply_hostnames {
-    my ($db, $row, $idmap) = @_;
+    my ($db, $row, $idmap, $repl_from) = @_;
     my $mid = $idmap->{ $row->{machine_id} // '' };
     return unless $mid && $row->{name} && $row->{source};
     $db->upsert_hostname(
@@ -119,10 +152,13 @@ sub _apply_hostnames {
         name       => $row->{name},
         source     => $row->{source},
     );
+    _stamp($db, 'hostnames', $repl_from,
+           'machine_id = ? AND name = ? AND source = ?',
+           $mid, $row->{name}, $row->{source});
 }
 
 sub _apply_interfaces {
-    my ($db, $row, $idmap) = @_;
+    my ($db, $row, $idmap, $repl_from) = @_;
     return unless $row->{mac};
     my %args = ( mac => $row->{mac} );
     $args{kind}    = $row->{kind}    if defined $row->{kind};
@@ -136,10 +172,11 @@ sub _apply_interfaces {
         $args{machine_id} = $lmid if $lmid;
     }
     $db->upsert_interface(%args);
+    _stamp($db, 'interfaces', $repl_from, 'mac = ?', lc $row->{mac});
 }
 
 sub _apply_addresses {
-    my ($db, $row, $idmap) = @_;
+    my ($db, $row, $idmap, $repl_from) = @_;
     return unless $row->{mac} && $row->{addr} && $row->{family};
     $db->upsert_address(
         mac    => $row->{mac},
@@ -149,10 +186,13 @@ sub _apply_addresses {
         (defined $row->{last_observed} && length $row->{last_observed}
             ? (last_observed => $row->{last_observed}) : ()),
     );
+    _stamp($db, 'addresses', $repl_from,
+           'mac = ? AND family = ? AND addr = ?',
+           lc $row->{mac}, $row->{family}, $row->{addr});
 }
 
 sub _apply_ports {
-    my ($db, $row, $idmap) = @_;
+    my ($db, $row, $idmap, $repl_from) = @_;
     return unless $row->{mac} && defined $row->{port};
     $db->upsert_port(
         mac     => $row->{mac},
@@ -160,10 +200,13 @@ sub _apply_ports {
         proto   => $row->{proto} // 'tcp',
         service => $row->{service},
     );
+    _stamp($db, 'ports', $repl_from,
+           'mac = ? AND port = ? AND proto = ?',
+           lc $row->{mac}, $row->{port}, $row->{proto} // 'tcp');
 }
 
 sub _apply_aps {
-    my ($db, $row, $idmap) = @_;
+    my ($db, $row, $idmap, $repl_from) = @_;
     return unless $row->{mac};
     $db->upsert_ap(
         mac   => $row->{mac},
@@ -171,10 +214,11 @@ sub _apply_aps {
         model => $row->{model},
         board => $row->{board},
     );
+    _stamp($db, 'aps', $repl_from, 'mac = ?', lc $row->{mac});
 }
 
 sub _apply_associations {
-    my ($db, $row, $idmap) = @_;
+    my ($db, $row, $idmap, $repl_from) = @_;
     return unless $row->{ap_mac} && $row->{client_mac};
     $db->upsert_association(
         ap_mac     => $row->{ap_mac},
@@ -182,10 +226,13 @@ sub _apply_associations {
         iface      => $row->{iface},
         signal     => $row->{signal},
     );
+    _stamp($db, 'associations', $repl_from,
+           'ap_mac = ? AND client_mac = ?',
+           lc $row->{ap_mac}, lc $row->{client_mac});
 }
 
 sub _apply_dhcp_leases {
-    my ($db, $row, $idmap) = @_;
+    my ($db, $row, $idmap, $repl_from) = @_;
     return unless $row->{mac} && $row->{ip};
     $db->upsert_lease(
         mac      => $row->{mac},
@@ -194,10 +241,12 @@ sub _apply_dhcp_leases {
         expires  => $row->{expires},
         ap_mac   => $row->{ap_mac},
     );
+    _stamp($db, 'dhcp_leases', $repl_from,
+           'mac = ? AND ip = ?', lc $row->{mac}, $row->{ip});
 }
 
 sub _apply_aliases {
-    my ($db, $row, $idmap) = @_;
+    my ($db, $row, $idmap, $repl_from) = @_;
     return unless $row->{name};
     my $mid = $idmap->{ $row->{machine_id} // '' };
     return unless $mid;
@@ -208,6 +257,7 @@ sub _apply_aliases {
         source             => $row->{source},
         notes              => $row->{notes},
     );
+    _stamp($db, 'aliases', $repl_from, 'name = ?', $row->{name});
 }
 
 1;

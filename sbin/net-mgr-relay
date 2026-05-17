@@ -273,7 +273,7 @@ sub apply_election {
         _kill_child();
     }
     unless ($child{pid}) {
-        _spawn_child($w->{ip});
+        _spawn_child($w->{ip}, $w->{member});
         _log_status("following $w->{member} ($w->{ip}) score=$w->{score} "
                   . "quorum=$r->{reachable}/$r->{roster_n}");
     }
@@ -284,7 +284,7 @@ sub apply_election {
 # =====================================================================
 
 sub _spawn_child {
-    my ($peer) = @_;
+    my ($peer, $repl_from) = @_;
     my $pid = fork; die "fork: $!" unless defined $pid;
     if ($pid == 0) {
         my $db = NetMgr::DB->new(
@@ -293,7 +293,12 @@ sub _spawn_child {
             db            => $cfg->{mysql}{db}      // 'netmgr',
         );
         $db->connect;
-        NetMgr::Relay::run(peer => $peer, db => $db, log_fh => \*STDERR);
+        NetMgr::Relay::run(
+            peer            => $peer,
+            db              => $db,
+            log_fh          => \*STDERR,
+            replicated_from => $repl_from,
+        );
         exit 0;
     }
     %child = (pid => $pid, peer => $peer, started_at => time);

@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 20;
+our $SCHEMA_VERSION = 21;
 
 sub new {
     my ($class, %args) = @_;
@@ -507,6 +507,28 @@ SQL
         ) {
             eval { $self->{dbh}->do($alter) };
             if ($@ && $@ !~ /duplicate column|Duplicate column/i) {
+                die $@;
+            }
+        }
+        return;
+    }
+    if ($v == 21) {
+        # replicated_from: which cluster master a row came from,
+        # NULL = locally-observed. Relay sets it on every UPSERT;
+        # local OBSERVE writes don't touch it. Master's next
+        # replication tick overwrites local divergence, so this
+        # column is both an audit trail (where did this row come
+        # from?) and the mechanism behind "master's info takes
+        # precedence". Re-run safe.
+        for my $tbl (qw(machines hostnames interfaces addresses ports
+                        aps associations dhcp_leases aliases)) {
+            eval {
+                $self->{dbh}->do(
+                    "ALTER TABLE $tbl ADD COLUMN replicated_from VARCHAR(64) NULL");
+                $self->{dbh}->do(
+                    "ALTER TABLE $tbl ADD KEY idx_replicated_from (replicated_from)");
+            };
+            if ($@ && $@ !~ /duplicate column|Duplicate column|Duplicate key name/i) {
                 die $@;
             }
         }
