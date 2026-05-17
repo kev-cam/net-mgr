@@ -133,10 +133,24 @@ sub run_election {
         my $p = probe_member($m);
         push @probes, $p if $p;
     }
-    my @candidates = grep {
-        ($_->{role} // 'auto') ne 'excluded'
-        && ($_->{role} // 'auto') ne 'follower'
-    } @probes;
+    # Election eligibility = candidate is reachable, didn't opt out
+    # (role != excluded/follower), AND this daemon's local authority
+    # table grants them 'master'. If peer_caps is empty (no
+    # /etc/net-mgr/peers file present), fall back to allowing any
+    # reachable candidate — keeps single-node and "first time set up"
+    # cases working.
+    my @candidates;
+    my $caps_table = $cluster->{peer_caps} || {};
+    my $no_caps_configured = !keys %$caps_table;
+    for my $p (@probes) {
+        next if ($p->{role} // 'auto') eq 'excluded';
+        next if ($p->{role} // 'auto') eq 'follower';
+        if (!$no_caps_configured) {
+            my $granted = $caps_table->{ $p->{member} } || [];
+            next unless grep { $_ eq 'master' } @$granted;
+        }
+        push @candidates, $p;
+    }
     my $reachable_count = scalar @probes;
     my $roster_n        = scalar @{ $cluster->{members} };
     my $quorum_ok       = $roster_n <= 1

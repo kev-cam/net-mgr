@@ -87,8 +87,54 @@ sub _load_cluster_state {
         election_interval=> $c->{election_interval} // 60,
         self_name        => $self_name,
         is_member        => (!@members || grep { $_ eq $self_name } @members) ? 1 : 0,
+        # Self-declared capabilities — this daemon's claim of what
+        # it can do. Comma-separated tag list. Treated as advisory
+        # by peers (each peer's local %peer_caps is authoritative
+        # for what THEY grant — see _load_peer_caps).
+        capabilities     => _split_caps($c->{capabilities}),
+        # Local authority table: peer name → arrayref of capability
+        # tags this daemon grants. Source: /etc/net-mgr/peers (or
+        # the path given by [cluster] peers_file). This is THIS
+        # daemon's opinion of who's allowed to do what; election
+        # filters use it. Other daemons may have different opinions
+        # — operator's job to keep them in sync.
+        peers_file       => $c->{peers_file} // '/etc/net-mgr/peers',
+        peer_caps        => _load_peer_caps($c->{peers_file}
+                                            // '/etc/net-mgr/peers'),
     );
     return \%state;
+}
+
+sub _split_caps {
+    my ($s) = @_;
+    return [] unless defined $s && length $s;
+    return [ grep { length } map { s/^\s+|\s+$//gr } split /[,\s]+/, $s ];
+}
+
+# Load /etc/net-mgr/peers (or whatever path was configured).
+# Format is one peer per line, "name: cap1, cap2, ...". Lines
+# starting with # are comments; blank lines are ignored. An empty
+# capability list ("name:") means the peer is recognised but
+# granted nothing — useful for explicitly denying all capabilities.
+# Missing file = empty table (no peers granted anything; equivalent
+# to a one-node deployment).
+sub _load_peer_caps {
+    my ($path) = @_;
+    my %caps;
+    return \%caps unless -r $path;
+    open my $fh, '<', $path or return \%caps;
+    while (my $line = <$fh>) {
+        $line =~ s/[\r\n]+\z//;
+        $line =~ s/\s*#.*//;
+        $line =~ s/^\s+|\s+$//g;
+        next unless length $line;
+        if ($line =~ /^([\w.-]+)\s*:\s*(.*)$/) {
+            my ($name, $rest) = ($1, $2);
+            $caps{$name} = _split_caps($rest);
+        }
+    }
+    close $fh;
+    return \%caps;
 }
 
 # Identity used in cluster rosters. Hostname's first label (so the
@@ -402,6 +448,13 @@ sub _handle_status {
         cluster_internet_facing => $internet_facing,
         cluster_members    => join(',', @{ $cs->{members} // [] }),
         cluster_is_member  => $cs->{is_member},
+        # Self-declared (advisory; consumers may verify against
+        # their own peer_caps table before trusting it).
+        cluster_capabilities => join(',', @{ $cs->{capabilities} // [] }),
+        # Count of entries in this daemon's local /etc/net-mgr/peers
+        # table — operators can spot-check that peers agree on roster
+        # size and authority spread.
+        cluster_peer_auth_count => scalar(keys %{ $cs->{peer_caps} // {} }),
         reachable_members  => $reachable,
         quorum_ok          => $quorum_ok,
     ));
@@ -1425,6 +1478,10 @@ sub _handle_observe {
                                        { @events = $self->_obs_isp_link_delete($cli, $kv) }
         elsif ($kind eq 'lost_device_delete')
                                        { @events = $self->_obs_lost_device_delete($cli, $kv) }
+        elsif ($kind eq 'peer_cap_set')
+                                       { @events = $self->_obs_peer_cap_set($cli, $kv) }
+        elsif ($kind eq 'peer_cap_clear')
+                                       { @events = $self->_obs_peer_cap_clear($cli, $kv) }
         elsif ($kind eq 'event')       { @events = $self->_obs_event($cli, $kv) }
         elsif ($kind eq 'forward')     { @events = $self->_obs_forward($cli, $kv) }
         else {
@@ -1906,6 +1963,69 @@ sub _obs_lost_device_delete {
     $self->_emit_change(table => 'lost_devices', op => 'delete', row => $row)
         if $row;
     return ();
+}
+
+# kind=peer_cap_set peer=NAME caps=cap1,cap2[,...] — grant the
+# listed capabilities to a peer in THIS daemon's local authority
+# table. Persisted to /etc/net-mgr/peers. Requires AUTH (or
+# loopback) because changing who can be master is a privileged op.
+sub _obs_peer_cap_set {
+    my ($self, $cli, $kv) = @_;
+    unless (_peer_is_loopback($cli)
+         || ($cli->{auth} && $cli->{auth}{verified})) {
+        die "peer_cap_set: requires AUTH (or loopback peer)\n";
+    }
+    my $peer = $kv->{peer} or die "peer_cap_set: peer required\n";
+    die "peer_cap_set: bad peer name '$peer'\n"
+        unless $peer =~ /^[\w.-]+$/;
+    my $caps = _split_caps($kv->{caps});
+    $self->{cluster}{peer_caps}{$peer} = $caps;
+    my $err = _write_peers_file($self->{cluster}{peers_file},
+                                $self->{cluster}{peer_caps});
+    die "peer_cap_set: write failed: $err\n" if $err;
+    $self->_log("peer_cap_set $peer = " . join(',', @$caps));
+    return ();
+}
+
+# kind=peer_cap_clear peer=NAME — remove the peer from this
+# daemon's local authority table entirely. Same auth gate.
+sub _obs_peer_cap_clear {
+    my ($self, $cli, $kv) = @_;
+    unless (_peer_is_loopback($cli)
+         || ($cli->{auth} && $cli->{auth}{verified})) {
+        die "peer_cap_clear: requires AUTH (or loopback peer)\n";
+    }
+    my $peer = $kv->{peer} or die "peer_cap_clear: peer required\n";
+    delete $self->{cluster}{peer_caps}{$peer};
+    my $err = _write_peers_file($self->{cluster}{peers_file},
+                                $self->{cluster}{peer_caps});
+    die "peer_cap_clear: write failed: $err\n" if $err;
+    $self->_log("peer_cap_clear $peer");
+    return ();
+}
+
+# Atomic rewrite of the peers file. Writes to a sibling tempfile
+# and renames over the target, so a partial write can never leave
+# a corrupt table. Existing comments / formatting in the file are
+# NOT preserved — the daemon owns this file when it's writing it.
+# Operator hand-edits should happen with the daemon down (and would
+# need to be re-checked against any in-memory state on restart).
+# Returns undef on success, an error string otherwise.
+sub _write_peers_file {
+    my ($path, $caps) = @_;
+    my $tmp = "$path.tmp.$$";
+    open my $fh, '>', $tmp or return "open $tmp: $!";
+    print $fh "# /etc/net-mgr/peers — local authority table\n";
+    print $fh "# managed by net-mgr (OBSERVE kind=peer_cap_set/clear)\n";
+    print $fh "# format: name: cap1, cap2, ...\n\n";
+    for my $name (sort keys %$caps) {
+        my $list = join(', ', @{ $caps->{$name} || [] });
+        printf $fh "%-20s: %s\n", $name, $list;
+    }
+    close $fh or return "close $tmp: $!";
+    chmod 0644, $tmp;
+    rename $tmp, $path or return "rename $tmp $path: $!";
+    return undef;
 }
 
 sub _machine_id_by_name {
