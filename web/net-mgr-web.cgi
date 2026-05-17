@@ -674,6 +674,15 @@ sub render_peers {
     my @configured = configured_peers();
     my $discovered = eval { $cli->snapshot(13, 'peers') } || [];
 
+    # The local daemon (self) shows up neither in [peers] sources
+    # nor in the 'peers' table — it's never discovered or relayed
+    # from. But for the cluster view it's the most important row:
+    # it shows THIS server's role, priority, quorum, and capabilities
+    # alongside everyone else's. Prepend a synthetic 'self' entry
+    # at the head of the configured list.
+    unshift @configured,
+        { label => 'self', addr => '127.0.0.1:7531', is_self => 1 };
+
     # Look-up tables so we can map each peer IP back to a machine,
     # show its friendly name, group co-machine rows by colour, and
     # flag machines that have any non-RFC1918 (WAN-facing) address.
@@ -771,7 +780,14 @@ sub render_peers {
             my ($host)  = split /:/, $p->{addr}, 2;
             my $mid     = $ip_mid{$host};
             my $machine = $mid ? ($mid_label{$mid} // "machine $mid") : '';
+            # For the synthetic self row, label the machine column
+            # using the cluster_member name from STATUS so it lines
+            # up with what the rest of the table shows for everyone
+            # else (loopback host doesn't resolve via ip_mid).
+            $machine ||= ($r->{cluster}{cluster_member} // 'this host')
+                if $p->{is_self};
             my @cls     = ('peer-' . ($r->{ok} ? 'ok' : 'down'));
+            push @cls, 'peer-self' if $p->{is_self};
             my $is_wan  = $wan_router_ip{$host} || ($mid && $mid_has_wan{$mid});
             if ($is_wan)            { push @cls, 'wan-router' }
             elsif ($mid && $slot{$mid}) { push @cls, "machine-$slot{$mid}" }
@@ -1860,6 +1876,10 @@ table.peers tr.wan-router td.name { box-shadow: inset 4px 0 0 #f44; padding-left
 /* Provenance badge: a row whose authority is a cluster master. */
 .provenance { color: #99c; font-size: 0.85em; margin-left: 6px;
               font-style: italic; }
+/* Self row on the Peers page — slightly brighter background so the
+   reader sees their own daemon at a glance. */
+table.peers tr.peer-self td { background: rgba(100,160,240,0.18); }
+table.peers tr.peer-self td.name::before { content: "★ "; color: #fc6; }
 table.wifi-busy { max-width: 720px; font-size: 0.9em; }
 table.wifi-busy td.bar { position: relative; min-width: 220px;
                          background: #181818; padding: 0; }
