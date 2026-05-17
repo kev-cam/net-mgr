@@ -1,14 +1,31 @@
 #!/usr/bin/perl
-# net-mgr-relay — replicate from peer net-mgr instances into local DB.
+# net-mgr-relay — replicate cluster state from the elected master
+# into this host's local DB.
 #
-# Reads /etc/net-mgr/config for the [peers] section:
-#   [peers]
-#   sources = kc-qernel, nas3
+# Reads /etc/net-mgr/config for the [cluster] section:
+#   [cluster]
+#   members  = host1, host2, host3        # the roster
+#   role     = auto                        # auto | master | follower | excluded
+#   priority = 100                         # lower wins
 #
-# Forks one child per peer; each child opens a SUBSCRIBE+stream
-# connection and replays received ROWs into the local DB. The local
-# net-mgr daemon doesnt see (and doesnt re-emit) these — so peering
-# is safe to make bidirectional.
+# Every election_interval (default 60s):
+#   1. Probe STATUS on every roster member (and self).
+#   2. Score each reachable candidate (priority - prefer_lan bonus when
+#      not internet-facing); pick lowest, tiebreak by name.
+#   3. quorum_ok = reachable >= ceil(N/2).
+#
+# Then:
+#   - If self is the winner AND quorum_ok → act as master, kill any
+#     subscribe-child (we're the source of truth now).
+#   - If winner ≠ self AND quorum_ok → fork (or replace) a relay
+#     child subscribed to the winner's tables.
+#   - If !quorum_ok → no child, log isolated state. The local daemon
+#     keeps accepting OBSERVEs (mobile-host case: scan locally, sync
+#     when quorum returns).
+#
+# Legacy [peers] sources is ignored (the cluster roster supersedes
+# it). --peer host on the CLI still works as an override for ad-hoc
+# debug — disables election, just subscribes to the given peer.
 
 use strict;
 use warnings;
@@ -16,10 +33,13 @@ use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
 use POSIX qw(:sys_wait_h);
+use Time::HiRes qw(sleep);
 
 use NetMgr::Config;
 use NetMgr::DB;
 use NetMgr::Relay;
+use NetMgr::Manager;       # for _load_cluster_state
+use NetMgr::Client;
 
 my $conf_path  = $ENV{NET_MGR_CONF} // '/etc/net-mgr/config';
 my $foreground = 0;
@@ -31,28 +51,31 @@ GetOptions(
 ) or die "bad options\n";
 
 my $cfg = NetMgr::Config->load($conf_path);
+my $cluster = NetMgr::Manager::_load_cluster_state($cfg);
 
-# Peers: from config or --peer
-my @peers;
+# Mode selection.
+#   --peer host[,host…]  legacy/debug fixed-peer mode (no election)
+#   else                  cluster mode (election on the configured roster)
+my $fixed_peer;
 if (@peers_cli) {
-    @peers = @peers_cli;
-} elsif (my $list = $cfg->{peers}{sources}) {
-    @peers = grep { length } map { s/^\s+|\s+$//gr } split /,/, $list;
-}
-unless (@peers) {
-    die "no peers configured (set [peers] sources = host1, host2 in $conf_path "
-      . "or pass --peer host)\n";
+    $fixed_peer = (split /,/, $peers_cli[0])[0];
+    print STDERR "[net-mgr-relay] fixed-peer mode: $fixed_peer\n";
+} elsif (!@{ $cluster->{members} }) {
+    print STDERR "[net-mgr-relay] no roster ([cluster] members empty) and no "
+               . "--peer; nothing to do. Exiting.\n";
+    exit 0;
+} else {
+    print STDERR "[net-mgr-relay] cluster mode: self=$cluster->{self_name} "
+               . "roster=" . join(',', @{ $cluster->{members} }) . " "
+               . "role=$cluster->{role} priority=$cluster->{priority}\n";
 }
 
-# DB connection (one shared by all children — but actually each child
-# needs its own to avoid socket sharing issues across forks).
+# DB connection settings — each child opens its own connection.
 my $mycnf = $cfg->{mysql}{defaults} // '/root/.my.cnf';
 unless (-r $mycnf) {
     $mycnf = "$ENV{HOME}/.my.cnf" if -r "$ENV{HOME}/.my.cnf";
 }
 die "no readable .my.cnf for [net-mgr]\n" unless -r $mycnf;
-
-print STDERR "[net-mgr-relay] peers: @peers\n";
 
 unless ($foreground) {
     my $pid = fork; die "fork: $!" unless defined $pid;
@@ -62,8 +85,192 @@ unless ($foreground) {
     open STDOUT, '>>', '/dev/null';
 }
 
-my %children;
-for my $peer (@peers) {
+# Per-child state. In cluster mode there's at most one child at a
+# time (subscribing to the elected master); in fixed-peer mode the
+# single child stays put.
+my %child;     # { pid, peer, started_at }
+
+$SIG{TERM} = sub { _kill_child(); exit 0 };
+$SIG{INT}  = $SIG{TERM};
+
+if ($fixed_peer) {
+    # Legacy mode: spawn once, restart on death, no election.
+    while (1) {
+        _spawn_child($fixed_peer) unless $child{pid};
+        my $kid = waitpid(-1, 0);
+        if ($kid > 0 && $child{pid} && $kid == $child{pid}) {
+            print STDERR "[net-mgr-relay] child for $fixed_peer exited; "
+                . "restart in 10s\n";
+            %child = ();
+            sleep 10;
+        }
+    }
+    exit 0;
+}
+
+# Cluster mode: election loop.
+my $tick = $cluster->{election_interval} || 60;
+while (1) {
+    my $result = run_election();
+    apply_election($result);
+    # Reap any dead child; restart will happen on next election tick.
+    while ((my $kid = waitpid(-1, WNOHANG)) > 0) {
+        next unless $child{pid} && $kid == $child{pid};
+        print STDERR "[net-mgr-relay] subscribe-child died (peer=$child{peer});"
+            . " will re-elect on next tick\n";
+        %child = ();
+    }
+    sleep $tick;
+}
+
+# =====================================================================
+# Election
+# =====================================================================
+
+sub run_election {
+    my @probes;
+    for my $m (@{ $cluster->{members} }) {
+        my $p = probe_member($m);
+        push @probes, $p if $p;
+    }
+    my @candidates = grep {
+        ($_->{role} // 'auto') ne 'excluded'
+        && ($_->{role} // 'auto') ne 'follower'
+    } @probes;
+    my $reachable_count = scalar @probes;
+    my $roster_n        = scalar @{ $cluster->{members} };
+    my $quorum_ok       = $roster_n <= 1
+                        ? 1
+                        : ($reachable_count >= int($roster_n / 2) + 1);
+
+    return { winner => undef, quorum_ok => $quorum_ok,
+             reachable => $reachable_count, roster_n => $roster_n }
+        unless @candidates;
+
+    @candidates = sort {
+           $a->{score} <=> $b->{score}
+        || $a->{member} cmp $b->{member}
+    } @candidates;
+    my $winner = $candidates[0];
+    return {
+        winner    => $winner,
+        quorum_ok => $quorum_ok,
+        reachable => $reachable_count,
+        roster_n  => $roster_n,
+    };
+}
+
+# Probe one roster member. Returns a hashref with the relevant STATUS
+# fields, or undef if the member couldn't be probed. For self we
+# avoid the round-trip and load directly from the local config +
+# the local daemon (so an isolated host still elects itself).
+sub probe_member {
+    my ($name) = @_;
+    if ($name eq $cluster->{self_name}) {
+        return {
+            member          => $name,
+            role            => $cluster->{role},
+            priority        => $cluster->{priority},
+            prefer_lan      => $cluster->{prefer_lan},
+            internet_facing => defined $cluster->{internet_facing}
+                             ? $cluster->{internet_facing} : 0,
+            ip              => '127.0.0.1',
+            score           => _score($cluster->{priority},
+                                       $cluster->{prefer_lan},
+                                       $cluster->{internet_facing}),
+        };
+    }
+    my $ip = resolve_ip($name);
+    return undef unless $ip;
+    my $cli = eval { NetMgr::Client->new(listen => "$ip:7531", timeout => 4) };
+    return undef unless $cli;
+    eval { $cli->hello(consumer => "relay-election.$$") };
+    return undef if $@;
+    my $st = eval { $cli->status };
+    eval { $cli->bye };
+    return undef unless $st && $st->{cluster_member};
+    return {
+        member          => $st->{cluster_member},
+        role            => $st->{cluster_role}            // 'auto',
+        priority        => $st->{cluster_priority}        // 100,
+        prefer_lan      => $st->{cluster_prefer_lan}      // 1,
+        internet_facing => $st->{cluster_internet_facing} // 0,
+        ip              => $ip,
+        score           => _score($st->{cluster_priority},
+                                   $st->{cluster_prefer_lan},
+                                   $st->{cluster_internet_facing}),
+    };
+}
+
+sub _score {
+    my ($priority, $prefer_lan, $internet_facing) = @_;
+    my $s = $priority // 100;
+    $s -= 50 if $prefer_lan && !$internet_facing;
+    return $s;
+}
+
+# Resolve a cluster member name to an IP via net-lookup (which
+# already does the right thing — prefers wired, verifies reachable,
+# etc.). Cached for the lifetime of this process to avoid hammering
+# the local daemon every election tick.
+my %resolve_cache;
+sub resolve_ip {
+    my ($name) = @_;
+    return $resolve_cache{$name} if exists $resolve_cache{$name};
+    open my $fh, '-|', 'net-lookup', '--verify', $name
+        or return ($resolve_cache{$name} = undef);
+    my $ip;
+    while (my $line = <$fh>) {
+        chomp $line;
+        if ($line =~ /^(\d+\.\d+\.\d+\.\d+)$/) { $ip = $1; last }
+    }
+    close $fh;
+    return ($resolve_cache{$name} = $ip);
+}
+
+# =====================================================================
+# Acting on the election result
+# =====================================================================
+
+sub apply_election {
+    my ($r) = @_;
+    my $self_name = $cluster->{self_name};
+    if (!$r->{quorum_ok}) {
+        _log_status("isolated (no quorum: $r->{reachable}/$r->{roster_n})");
+        _kill_child();
+        return;
+    }
+    my $w = $r->{winner};
+    if (!$w) {
+        _log_status("no eligible candidates; "
+                  . "$r->{reachable}/$r->{roster_n} reachable");
+        _kill_child();
+        return;
+    }
+    if ($w->{member} eq $self_name) {
+        _log_status("self is master ($w->{member} score=$w->{score} "
+                  . "quorum=$r->{reachable}/$r->{roster_n})");
+        _kill_child();
+        return;
+    }
+    # Someone else is master — subscribe to them.
+    if ($child{pid} && $child{peer} ne $w->{ip}) {
+        _log_status("master changed to $w->{member}; restarting child");
+        _kill_child();
+    }
+    unless ($child{pid}) {
+        _spawn_child($w->{ip});
+        _log_status("following $w->{member} ($w->{ip}) score=$w->{score} "
+                  . "quorum=$r->{reachable}/$r->{roster_n}");
+    }
+}
+
+# =====================================================================
+# Child process management
+# =====================================================================
+
+sub _spawn_child {
+    my ($peer) = @_;
     my $pid = fork; die "fork: $!" unless defined $pid;
     if ($pid == 0) {
         my $db = NetMgr::DB->new(
@@ -75,32 +282,25 @@ for my $peer (@peers) {
         NetMgr::Relay::run(peer => $peer, db => $db, log_fh => \*STDERR);
         exit 0;
     }
-    $children{$pid} = $peer;
-    print STDERR "[net-mgr-relay] forked pid=$pid for $peer\n";
+    %child = (pid => $pid, peer => $peer, started_at => time);
+    return $pid;
 }
 
-# Reap + restart children if they exit
-$SIG{TERM} = sub {
-    for my $pid (keys %children) { kill 'TERM', $pid }
-    exit 0;
-};
-$SIG{INT} = $SIG{TERM};
-while (1) {
-    my $pid = waitpid -1, 0;
-    last if $pid <= 0;
-    my $peer = delete $children{$pid};
-    print STDERR "[net-mgr-relay] child for $peer (pid=$pid) exited; restarting in 10s\n";
-    sleep 10;
-    my $new_pid = fork; die "fork: $!" unless defined $new_pid;
-    if ($new_pid == 0) {
-        my $db = NetMgr::DB->new(
-            defaults_file => $mycnf,
-            section       => $cfg->{mysql}{section} // 'net-mgr',
-            db            => $cfg->{mysql}{db}      // 'netmgr',
-        );
-        $db->connect;
-        NetMgr::Relay::run(peer => $peer, db => $db, log_fh => \*STDERR);
-        exit 0;
-    }
-    $children{$new_pid} = $peer;
+sub _kill_child {
+    return unless $child{pid};
+    kill 'TERM', $child{pid};
+    waitpid $child{pid}, 0;
+    %child = ();
+}
+
+# Log + dedupe consecutive identical status lines so the daemon log
+# doesn't get spammed with the same "isolated" line every minute.
+my $last_status_msg = '';
+sub _log_status {
+    my ($msg) = @_;
+    return if $msg eq $last_status_msg;
+    $last_status_msg = $msg;
+    my @t = localtime;
+    printf STDERR "%04d-%02d-%02d %02d:%02d:%02d [net-mgr-relay] %s\n",
+        $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0], $msg;
 }
