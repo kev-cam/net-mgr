@@ -22,6 +22,7 @@ use POSIX ();
 use NetMgr::Protocol qw(parse_line format_ok format_err format_row format_eos format_ready);
 use NetMgr::Where    qw(parse eval_ast);
 use NetMgr::Auth     ();
+use NetMgr::Mesh     ();
 
 # Logical tables a SUBSCRIBE may target.
 my %SUBSCRIBABLE = map { $_ => 1 } qw(
@@ -192,7 +193,42 @@ sub start_listener {
         $self->_log("listening on $b->{host}:$b->{port}");
     }
     croak "no listeners could be bound from '$spec'" unless %{ $self->{listeners} };
+    $self->_start_mesh;
     return [ map { $_->{sock} } values %{ $self->{listeners} } ];
+}
+
+# Bring up the cluster mesh — one persistent outbound TCP connection
+# to every other [cluster] member, sharing our IO::Select. No-op when
+# the roster is empty (single-node deployment) or just contains self.
+sub _start_mesh {
+    my ($self) = @_;
+    my $cs = $self->{cluster} || {};
+    my @others = grep { $_ ne $cs->{self_name} } @{ $cs->{members} // [] };
+    if (!@others) {
+        $self->_log("mesh: roster has no peers, mesh disabled");
+        return;
+    }
+    $self->{mesh} = NetMgr::Mesh->new(
+        select    => $self->{select},
+        self_name => $cs->{self_name},
+        members   => $cs->{members},
+        log       => sub { $self->_log($_[0]) },
+        # State broadcast in every outbound HEARTBEAT — kept tight so
+        # peers can score us without a STATUS round-trip. Mirror the
+        # CLUSTER_ROLE runtime values when set; else fall back to the
+        # static [cluster] config.
+        state_fn  => sub {
+            my $cr = $self->{cluster_runtime} // {};
+            return (
+                role     => ($cr->{role}     // $cs->{role}),
+                priority => $cs->{priority},
+                master   => ($cr->{master_member} // ''),
+                schema_v => (eval { $self->{db}->current_schema_version } // 0),
+            );
+        },
+    );
+    $self->_log("mesh: started with " . scalar(@others) . " peer(s): "
+              . join(',', @others));
 }
 
 # Parse a manager.listen spec into a list of { host, port } entries.
@@ -272,17 +308,21 @@ sub run {
             my $fd = fileno($fh);
             if ($self->{listeners}{$fd}) {
                 $self->_accept($self->{listeners}{$fd}{sock});
+            } elsif ($self->{mesh} && $self->{mesh}->is_mesh_fd($fd)) {
+                $self->{mesh}->handle_readable($fh);
             } else {
                 $self->_handle_readable($fh);
             }
         }
-        $self->_reap_triggers          if %{ $self->{triggers} };
+        $self->{mesh}->tick                if $self->{mesh};
+        $self->_reap_triggers              if %{ $self->{triggers} };
         $self->_check_periodic_triggers;
         $self->_age_out_offline;
         $self->_purge_old_events;
         $self->_check_dnsmasq_listeners;
     }
     $self->_log("shutting down");
+    $self->{mesh}->shutdown if $self->{mesh};
     for my $c (values %{ $self->{clients} }) {
         eval { $c->{sock}->close };
     }
@@ -397,6 +437,7 @@ sub _handle_line {
     elsif ($verb eq 'BYE')       { $self->_drop_client(fileno($cli->{sock}), 'bye') }
     elsif ($verb eq 'STATUS')    { $self->_handle_status($cli) }
     elsif ($verb eq 'CLUSTER_ROLE') { $self->_handle_cluster_role($cli, $cmd) }
+    elsif ($verb eq 'HEARTBEAT') { $self->_handle_heartbeat($cli, $cmd) }
     elsif ($verb eq 'FORWARD')   { $self->_handle_forward($cli, $cmd) }
     elsif ($verb eq 'UNFORWARD') { $self->_handle_unforward($cli, $cmd) }
     elsif ($verb eq 'NAT_MASQUERADE') { $self->_handle_nat_masquerade($cli, $cmd) }
@@ -429,15 +470,15 @@ sub _handle_status {
     my $internet_facing = defined $cs->{internet_facing}
                         ? ($cs->{internet_facing} ? 1 : 0)
                         : _detect_internet_facing();
-    # Quorum is computed from roster size; if no roster the cluster
-    # is implicitly size 1 (this host alone) and always has quorum.
-    # Reachable-count tracking lands in commit 2 (election logic);
-    # for now expose the static lower bound: self is always reachable
-    # to itself.
+    # Reachable count: self is always reachable + however many
+    # cluster mesh peers have a live connection or recent heartbeat.
+    # Falls back to 1 when no mesh (single-node deployment).
     my $roster_n = scalar @{ $cs->{members} // [] };
-    my $reachable = $roster_n ? 1 : 1;
+    my $mesh_reach = $self->{mesh} ? $self->{mesh}->reachable : 0;
+    my $reachable = 1 + $mesh_reach;
     my $quorum_ok = ($roster_n <= 1) ? 1
                                      : ($reachable >= int($roster_n / 2) + 1);
+    my $mesh_summary = $self->{mesh} ? $self->{mesh}->summary : '';
     $self->_send($cli, format_ok(
         started_at         => $self->{started_at},
         now                => time(),
@@ -467,7 +508,27 @@ sub _handle_status {
         cluster_peer_auth_count => scalar(keys %{ $cs->{peer_caps} // {} }),
         reachable_members  => $reachable,
         quorum_ok          => $quorum_ok,
+        cluster_mesh       => $mesh_summary,
     ));
+}
+
+# Inbound HEARTBEAT from a peer over its outbound mesh socket — the
+# *receiving* daemon's side. We trust the `member=` field as the
+# sender's self-identification (cluster member names are how the
+# roster is keyed; spoofing requires presence on the bound iface,
+# which is a separate threat model). Updates the local mesh state
+# table so STATUS can surface "what does X think they are".
+#
+# No OK reply — heartbeats are fire-and-forget so neither side
+# blocks on the other's processing latency. The mesh's own retry
+# logic handles drops.
+sub _handle_heartbeat {
+    my ($self, $cli, $cmd) = @_;
+    return unless $self->{mesh};
+    my $kv = $cmd->{kv} || {};
+    my $member = $kv->{member};
+    return unless defined $member && length $member;
+    $self->{mesh}->record($member, $kv);
 }
 
 # Loopback-only control verb. net-mgr-relay calls this after its
