@@ -8,7 +8,9 @@
 #
 # Forward (name → IP): the pattern is a Perl regex; net-lookup wraps
 # it as ^(?:...)$ before matching, so 'nas3(|-.*)' matches nas3,
-# nas3-up, nas3-down, nas3-dwn2. Names searched:
+# nas3-up, nas3-down, nas3-dwn2. As a convenience, '=' anywhere in
+# the pattern is rewritten to '.*' before compilation, so 'clevo='
+# behaves like 'clevo.*' without needing shell quoting. Names searched:
 # machines.primary_name, friendly_names, hostnames, aliases.
 #
 # Reverse (IP → name): when the argument is a valid v4 or v6 address,
@@ -77,7 +79,12 @@ if (my $mac = _parse_mac($pattern)) {
     do_mac($mac);
 }
 
-my $rx = eval { qr/^(?:$pattern)$/ };
+# Shorthand: '=' in the pattern stands in for '.*'. Lets the common
+# prefix-match case ('clevo=' for 'clevo.*') skip the shell-quoting
+# you'd otherwise need around '.*'. '=' isn't a regex metacharacter
+# so the substitution is unambiguous.
+(my $rx_src = $pattern) =~ s/=/.*/g;
+my $rx = eval { qr/^(?:$rx_src)$/ };
 die "bad regex '$pattern': $@\n" if $@;
 
 # --- caller's local /24s --------------------------------------------
@@ -471,13 +478,16 @@ Usage:
 Forward (name → IP):
   net-lookup nas3                      # exact name
   net-lookup 'nas3(|-.*)'              # nas3, nas3-up, nas3-down, nas3-dwn2
+  net-lookup clevo=                    # shorthand for 'clevo.*'
   net-lookup --all 'wndr.*'            # every IP for every wndr-* host
-  net-lookup --verify 'gateway3.*'     # ping each candidate before picking
-  net-lookup --verbose 'nas3.*'        # IP<TAB>matched-name(s), one per line
+  net-lookup --verify gateway3=        # ping each candidate before picking
+  net-lookup --verbose nas3=           # IP<TAB>matched-name(s), one per line
 
 The pattern is a Perl regex; net-lookup wraps it as ^(?:...)\$ before
 matching against machines.primary_name, friendly_names, hostnames,
-and aliases.
+and aliases. As a shorthand, '=' anywhere in the pattern is rewritten
+to '.*' before compilation — handy because '.*' usually needs shell
+quoting.
 
 Scoring (highest wins; ties broken by min RTT, then dotted quad):
   +4  same /24 as one of this host's interfaces (direct L2)
