@@ -223,6 +223,18 @@ sub reachable {
     return $n;
 }
 
+# For a member with a live outbound socket, return "host:port"; else ''.
+# Used by Manager's STATUS so net-mgr-relay can subscribe to the
+# elected master without a DNS round-trip.
+sub address_for {
+    my ($self, $member) = @_;
+    my $p = $self->{peers}{$member} or return '';
+    my $s = $p->{sock} or return '';
+    my $host = eval { $s->peerhost } // '';
+    my $port = eval { $s->peerport } // $self->{port};
+    return $host ? "$host:$port" : '';
+}
+
 sub shutdown {
     my ($self) = @_;
     for my $name (sort keys %{ $self->{peers} }) {

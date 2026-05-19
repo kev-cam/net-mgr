@@ -23,6 +23,7 @@ use NetMgr::Protocol qw(parse_line format_ok format_err format_row format_eos fo
 use NetMgr::Where    qw(parse eval_ast);
 use NetMgr::Auth     ();
 use NetMgr::Mesh     ();
+use NetMgr::Election ();
 
 # Logical tables a SUBSCRIBE may target.
 my %SUBSCRIBABLE = map { $_ => 1 } qw(
@@ -315,6 +316,7 @@ sub run {
             }
         }
         $self->{mesh}->tick                if $self->{mesh};
+        $self->_run_election               if $self->{mesh};
         $self->_reap_triggers              if %{ $self->{triggers} };
         $self->_check_periodic_triggers;
         $self->_age_out_offline;
@@ -493,6 +495,9 @@ sub _handle_status {
         cluster_role       => $live_role,
         cluster_role_config => $cs->{role},
         cluster_master     => $cr->{master_member} // '',
+        cluster_master_addr=> ($cr->{master_member} && $self->{mesh})
+                              ? $self->{mesh}->address_for($cr->{master_member})
+                              : '',
         cluster_role_since => $cr->{since}         // 0,
         cluster_priority   => $cs->{priority},
         cluster_prefer_lan => $cs->{prefer_lan},
@@ -510,6 +515,59 @@ sub _handle_status {
         quorum_ok          => $quorum_ok,
         cluster_mesh       => $mesh_summary,
     ));
+}
+
+# Re-evaluate who should be master. Called every main-loop iteration
+# (cheap: a small in-memory sort + a hash compare). Updates
+# $self->{cluster_runtime} whenever the decision changes, and logs.
+# This makes the daemon's own election authoritative — the older
+# 60s-tick election in net-mgr-relay is now redundant (it still runs
+# and pushes CLUSTER_ROLE, but its value gets overwritten almost
+# immediately by the next election here).
+sub _run_election {
+    my ($self) = @_;
+    my $cs = $self->{cluster} // {};
+    return unless @{ $cs->{members} // [] };    # nothing to elect over
+
+    # When deciding, treat *self* as 'auto' (eligible) regardless of
+    # what the runtime override currently says — otherwise once we
+    # demote ourselves to follower we can never re-promote even if
+    # the master goes away.  The static [cluster] role value is what
+    # configured eligibility looks like; runtime is just the latest
+    # decision.
+    my $self_role_for_decide = $cs->{role};
+    $self_role_for_decide = 'auto'
+        if $self_role_for_decide && $self_role_for_decide eq 'follower'
+        && (!$self->{cluster_runtime}
+            || ($self->{cluster_runtime}{role} // '') ne 'follower');
+    my $decision = NetMgr::Election::decide(
+        self_name  => $cs->{self_name},
+        self_state => {
+            role            => $self_role_for_decide,
+            priority        => $cs->{priority},
+            prefer_lan      => $cs->{prefer_lan},
+            internet_facing => defined $cs->{internet_facing}
+                             ? $cs->{internet_facing}
+                             : _detect_internet_facing(),
+        },
+        mesh_snap => $self->{mesh}->snapshot,
+        peer_caps => $cs->{peer_caps},
+        roster_n  => scalar @{ $cs->{members} },
+    );
+
+    my $cur = $self->{cluster_runtime} // {};
+    my $cur_key = ($cur->{role}          // '') . '|'
+                . ($cur->{master_member} // '');
+    my $new_key = $decision->{role} . '|' . $decision->{master_member};
+    return if $cur_key eq $new_key;
+    $self->{cluster_runtime} = {
+        role          => $decision->{role},
+        master_member => $decision->{master_member},
+        since         => time(),
+    };
+    $self->_log("election: $decision->{reason} → role=$decision->{role} "
+              . "master=" . ($decision->{master_member} || '-')
+              . " quorum=$decision->{reachable}/$decision->{roster_n}");
 }
 
 # Inbound HEARTBEAT from a peer over its outbound mesh socket — the

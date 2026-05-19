@@ -108,19 +108,92 @@ if ($fixed_peer) {
     exit 0;
 }
 
-# Cluster mode: election loop.
-my $tick = $cluster->{election_interval} || 60;
+# Cluster mode: as of Slice D, the daemon runs its own election off
+# the persistent mesh heartbeats. The relay's job is simpler — watch
+# the local daemon's STATUS, and if it reports cluster_role=follower
+# with a master, subscribe to that master. If the master changes,
+# tear down + restart the child against the new one. If we're master
+# (or there's no quorum), no child runs.
+#
+# The relay still runs its legacy run_election() as a fallback so a
+# very old daemon (pre-Slice C) still gets a CLUSTER_ROLE push. The
+# daemon's own election will override almost immediately when present.
+my $tick = $cluster->{election_interval} || 10;
 while (1) {
-    my $result = run_election();
-    apply_election($result);
-    # Reap any dead child; restart will happen on next election tick.
+    my $watched = watch_local_status();
+    if (defined $watched) {
+        apply_watched($watched);
+    } else {
+        # Local daemon not reachable, or its STATUS doesn't carry the
+        # cluster_role field — fall back to the legacy election.
+        my $result = run_election();
+        apply_election($result);
+    }
     while ((my $kid = waitpid(-1, WNOHANG)) > 0) {
         next unless $child{pid} && $kid == $child{pid};
         print STDERR "[net-mgr-relay] subscribe-child died (peer=$child{peer});"
-            . " will re-elect on next tick\n";
+            . " will re-evaluate on next tick\n";
         %child = ();
     }
     sleep $tick;
+}
+
+# Returns a hashref of the local daemon's cluster_role / cluster_master /
+# cluster_master_addr fields, or undef if the daemon is unreachable or
+# the fields aren't populated yet (pre-Slice-C daemon).
+sub watch_local_status {
+    my $cli = eval {
+        NetMgr::Client->new(listen => '127.0.0.1:7531', timeout => 3);
+    };
+    return undef unless $cli;
+    eval { $cli->hello(consumer => "relay-watch.$$") };
+    if ($@) { eval { $cli->bye }; return undef }
+    my $st = eval { $cli->status };
+    eval { $cli->bye };
+    return undef unless $st;
+    return undef unless exists $st->{cluster_role};
+    return {
+        role        => $st->{cluster_role},
+        master      => $st->{cluster_master}      // '',
+        master_addr => $st->{cluster_master_addr} // '',
+        quorum_ok   => $st->{quorum_ok},
+    };
+}
+
+sub apply_watched {
+    my ($w) = @_;
+    my $role = $w->{role};
+    if ($role eq 'master' || $role eq 'auto') {
+        _log_status("daemon says role=$role; no subscribe-child needed");
+        _kill_child();
+        return;
+    }
+    if ($role eq 'follower' && length $w->{master}) {
+        my $addr = $w->{master_addr};
+        if (!length $addr) {
+            # daemon doesn't have a live mesh socket to the master
+            # yet — resolve by name as a fallback. resolve_ip() also
+            # net-lookup-verifies reachability.
+            $addr = resolve_ip($w->{master});
+            return _log_status("daemon says follow $w->{master} but no addr "
+                             . "(retry next tick)") unless $addr;
+            $addr .= ':7531';
+        }
+        my ($host) = split /:/, $addr, 2;
+        if ($child{pid} && $child{peer} ne $host) {
+            _log_status("master changed to $w->{master} ($addr); "
+                      . "restarting child");
+            _kill_child();
+        }
+        unless ($child{pid}) {
+            _spawn_child($host, $w->{master});
+            _log_status("following $w->{master} ($addr) "
+                      . "[via daemon election]");
+        }
+        return;
+    }
+    _log_status("daemon role=$role master=$w->{master}; idling");
+    _kill_child();
 }
 
 # =====================================================================
