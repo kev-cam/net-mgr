@@ -1,0 +1,710 @@
+#!/usr/bin/perl
+# net-cluster-gui — Tk frontend on top of NetMgr::Multi. Shows tables
+# across every peer in the cluster with per-row divergence highlighted,
+# and (for the auth-gated write kinds) lets you push fixes to N peers
+# at once.
+#
+# Read-only by default for everything; --auth turns on ssh-keygen -Y
+# signing per connection, which unlocks the write actions on:
+#   peers           (peer_cap_set / peer_cap_clear)
+#   isp_links       (isp_link / isp_link_delete)
+#   lost_devices    (lost_device_delete)
+#
+# Replicated tables (friendly_names, hostnames, aliases, dhcp_vars, …)
+# don't have OBSERVE handlers — they're written by direct DB through
+# net-name / net-alias / net-var on whichever node owns them, and
+# propagated by the relay. The GUI surfaces divergence on those too,
+# and gives you a "copy as net-cluster command" affordance you can
+# paste into a shell.
+#
+# Usage:
+#   net-cluster-gui [--listen HOST:PORT] [--peers H1,H2,…] [--auth]
+#                   [--timeout S]
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+BEGIN {
+    eval { require Tk; 1 } or die <<MSG;
+net-cluster-gui needs perl-Tk. Install with:
+  Debian/Ubuntu:  sudo apt install perl-tk
+  RHEL/Fedora:    sudo dnf install perl-Tk
+MSG
+}
+use Tk;
+use Tk::HList;
+use Tk::ItemStyle;
+use Tk::ROText;
+use Tk::DialogBox;
+use Tk::Optionmenu;
+
+use NetMgr::Multi;
+
+my $listen     = $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
+my $peers_opt;
+my $timeout    = 3;
+my $auth;
+my $help;
+GetOptions(
+    'listen=s'  => \$listen,
+    'peers=s'   => \$peers_opt,
+    'timeout=i' => \$timeout,
+    'auth'      => \$auth,
+    'help|h'    => \$help,
+) or usage(2);
+usage(0) if $help;
+
+# --- table catalog --------------------------------------------------
+# What we know how to display + (optionally) write. Add tables here as
+# new OBSERVE kinds land in Manager.pm. `key` = columns identifying a
+# logical row; `display` orders columns in the detail panel; `ignore`
+# columns don't count toward divergence (per-node IDs, etc); `write`
+# names the OBSERVE kinds available for set/delete.
+my %TABLES = (
+    friendly_names => {
+        key     => ['name'],
+        display => [qw(name machine_id notes updated_at)],
+        ignore  => [qw(machine_id notes)],
+        write   => undef,          # DB-direct via net-name
+    },
+    hostnames => {
+        key     => ['name'],
+        display => [qw(name machine_id source first_seen last_seen)],
+        ignore  => [qw(machine_id first_seen last_seen)],
+        write   => undef,
+    },
+    aliases => {
+        key     => ['name'],
+        display => [qw(name machine_id prefer_subnet_cidr)],
+        ignore  => [qw(machine_id)],
+        write   => undef,          # DB-direct via net-alias
+    },
+    machines => {
+        key     => ['primary_name'],
+        display => [qw(primary_name make model first_seen last_seen)],
+        ignore  => [qw(id first_seen last_seen)],
+        write   => undef,
+    },
+    peers => {
+        key     => ['host','port'],
+        display => [qw(host port last_status schema_version started_at rtt_ms)],
+        ignore  => [qw(last_seen first_seen rtt_ms started_at)],
+        write   => undef,          # peers table itself isn't OBSERVE-writable
+    },
+    peer_caps => {                 # virtual; sourced from net-peer POLL
+        key     => ['peer','cap'],
+        display => [qw(peer cap granted_at granted_by)],
+        ignore  => [qw(granted_at granted_by)],
+        write   => { set => 'peer_cap_set', clear => 'peer_cap_clear' },
+        virtual => 1,              # not a snapshot table; POLL instead
+    },
+    isp_links => {
+        key     => ['name'],
+        display => [qw(name role iface gateway active)],
+        ignore  => [],
+        write   => { set => 'isp_link', delete => 'isp_link_delete' },
+    },
+    lost_devices => {
+        key     => ['mac'],
+        display => [qw(mac last_subnet last_seen detail)],
+        ignore  => [qw(last_seen detail)],
+        write   => { delete => 'lost_device_delete' },
+    },
+);
+my @TABLE_ORDER = qw(friendly_names hostnames aliases machines peers
+                     peer_caps isp_links lost_devices);
+
+# --- Multi setup ----------------------------------------------------
+my %mk_args = (
+    timeout  => $timeout,
+    auth     => ($auth ? {} : undef),
+    consumer => "net-cluster-gui.$$",
+);
+
+# State held across UI events.
+my %S = (
+    multi          => undef,
+    table          => 'friendly_names',
+    snapshot       => {},     # { peer => { rows => [...] } | { error => '…' } }
+    diff           => [],     # arrayref of {key, values, diverges}
+    selected_key   => undef,
+    only_divergent => 1,
+    filter         => '',
+);
+
+# --- Tk -------------------------------------------------------------
+my $mw = MainWindow->new(-title => 'net-cluster-gui');
+$mw->geometry('1100x720');
+
+my $peer_bar    = $mw->Frame(-relief => 'groove', -bd => 1)
+                     ->pack(-side => 'top', -fill => 'x');
+my $ctrl_bar    = $mw->Frame->pack(-side => 'top', -fill => 'x', -pady => 2);
+my $grid_frame  = $mw->Frame->pack(-side => 'top', -fill => 'both', -expand => 1);
+my $detail_pane = $mw->Frame(-relief => 'sunken', -bd => 1)
+                     ->pack(-side => 'top', -fill => 'x', -pady => 2);
+my $action_bar  = $mw->Frame->pack(-side => 'bottom', -fill => 'x');
+my $status_lbl  = $mw->Label(-anchor => 'w', -relief => 'sunken')
+                     ->pack(-side => 'bottom', -fill => 'x');
+
+# control bar
+$ctrl_bar->Label(-text => 'Table:')->pack(-side => 'left');
+my $table_combo = $ctrl_bar->Optionmenu(
+    -options  => [ map { [ $_ => $_ ] } @TABLE_ORDER ],
+    -variable => \$S{table},
+    -command  => sub { refresh_table() },
+)->pack(-side => 'left', -padx => 4);
+$ctrl_bar->Label(-text => '   Filter:')->pack(-side => 'left');
+my $filter_entry = $ctrl_bar->Entry(-textvariable => \$S{filter}, -width => 16)
+                            ->pack(-side => 'left', -padx => 4);
+$filter_entry->bind('<KeyRelease>', sub { render_grid() });
+$ctrl_bar->Checkbutton(
+    -text     => 'only divergent',
+    -variable => \$S{only_divergent},
+    -command  => sub { render_grid() },
+)->pack(-side => 'left', -padx => 8);
+$ctrl_bar->Button(-text => 'Reload', -command => \&refresh_table)
+         ->pack(-side => 'right', -padx => 4);
+$ctrl_bar->Button(-text => 'Reconnect peers', -command => \&reconnect_peers)
+         ->pack(-side => 'right', -padx => 4);
+
+# grid (HList) — columns are built lazily once we know the peer set
+my $hlist;
+
+# detail pane — top label + scrolled Text
+$detail_pane->Label(-text => 'Selected row',
+                    -font => '{Helvetica} 9 bold',
+                    -anchor => 'w')
+            ->pack(-side => 'top', -fill => 'x');
+my $detail_text = $detail_pane->Scrolled('ROText',
+    -height     => 10,
+    -wrap       => 'none',
+    -scrollbars => 'osoe',
+    -font       => '{Monospace} 9',
+)->pack(-side => 'top', -fill => 'both', -expand => 1);
+$detail_text->tagConfigure('master', -foreground => '#005');
+$detail_text->tagConfigure('miss',   -foreground => '#a00');
+$detail_text->tagConfigure('diff',   -foreground => '#a60');
+$detail_text->tagConfigure('peer',   -font => '{Monospace} 9 bold');
+
+# action bar — buttons whose enable-state depends on the row + table
+my $btn_push    = $action_bar->Button(-text => 'Push from master to all',
+                                      -command => \&do_push_from_master)
+                              ->pack(-side => 'left', -padx => 4);
+my $btn_delete  = $action_bar->Button(-text => 'Delete everywhere',
+                                      -command => \&do_delete_everywhere)
+                              ->pack(-side => 'left', -padx => 4);
+my $btn_add     = $action_bar->Button(-text => 'Add row…',
+                                      -command => \&do_add_row)
+                              ->pack(-side => 'left', -padx => 4);
+my $btn_copy    = $action_bar->Button(-text => 'Copy net-cluster command',
+                                      -command => \&do_copy_command)
+                              ->pack(-side => 'right', -padx => 4);
+
+# --- bootstrap ------------------------------------------------------
+status("Connecting to peers…");
+$mw->after(50, sub { connect_peers(); refresh_table(); });
+MainLoop;
+exit 0;
+
+# --- connection management ------------------------------------------
+
+sub connect_peers {
+    my $m;
+    eval {
+        if ($peers_opt) {
+            my @peers = grep { length } split /[,\s]+/, $peers_opt;
+            $m = NetMgr::Multi->new(peers => \@peers, %mk_args);
+        } else {
+            $m = NetMgr::Multi->discover(seed => $listen, %mk_args);
+        }
+        $m->connect_all;
+    };
+    if ($@) {
+        my $e = $@; chomp $e;
+        status("connect failed: $e");
+        $mw->messageBox(-title => 'Connect failed',
+                        -message => $e, -type => 'OK', -icon => 'error');
+        return;
+    }
+    $S{multi} = $m;
+    render_peer_bar();
+    update_action_buttons();
+}
+
+sub reconnect_peers {
+    if ($S{multi}) { eval { $S{multi}->bye_all }; $S{multi} = undef; }
+    connect_peers();
+    refresh_table();
+}
+
+sub render_peer_bar {
+    $_->destroy for $peer_bar->children;
+    $peer_bar->Label(-text => 'Peers:',
+                     -font => '{Helvetica} 9 bold')
+             ->pack(-side => 'left', -padx => 4);
+    my $master = eval { $S{multi}->master };
+    my $master_name = $master ? $master->{name} : undef;
+    for my $p ($S{multi}->peers) {
+        my $star = (defined $master_name && $p->{name} eq $master_name) ? ' ★' : '';
+        my ($bg, $fg, $tip);
+        if ($p->{client}) {
+            if ($auth && $p->{auth_error}) {
+                $bg = '#f9d', $fg = '#600'; $tip = "auth failed: $p->{auth_error}";
+            } elsif ($auth && $p->{authed}) {
+                $bg = '#cfc', $fg = '#040'; $tip = "$p->{listen} (auth ok)";
+            } else {
+                $bg = '#cfd', $fg = '#040'; $tip = "$p->{listen}";
+            }
+        } else {
+            $bg = '#fcc', $fg = '#600'; $tip = $p->{error} // 'down';
+        }
+        my $lbl = $peer_bar->Label(
+            -text => " $p->{name}$star ",
+            -background => $bg,
+            -foreground => $fg,
+            -relief => 'ridge',
+            -bd => 1,
+        )->pack(-side => 'left', -padx => 2, -pady => 2);
+        # show tooltip-ish detail via right-click; simpler than Tk::Balloon
+        $lbl->bind('<Button-3>', sub {
+            $mw->messageBox(-title => $p->{name}, -message => $tip,
+                            -type => 'OK', -icon => 'info');
+        });
+    }
+    my $auth_state = $auth ? 'auth: on (--auth)' : 'auth: off';
+    $peer_bar->Label(-text => "   $auth_state", -foreground => '#666')
+             ->pack(-side => 'right', -padx => 8);
+}
+
+# --- table loading --------------------------------------------------
+
+sub refresh_table {
+    return unless $S{multi};
+    my $t = $S{table};
+    my $tdef = $TABLES{$t} or do { status("unknown table $t"); return };
+
+    status("Loading $t…");
+    $mw->update;
+
+    if ($tdef->{virtual}) {
+        load_virtual_table($t, $tdef);
+    } else {
+        $S{snapshot} = $S{multi}->snapshot_all($t);
+    }
+
+    # Build diff in the same shape diff_table returns.
+    $S{diff} = compute_diff($S{snapshot}, $tdef->{key}, $tdef->{ignore});
+    $S{selected_key} = undef;
+    render_grid();
+    status(sprintf("Loaded %s: %d rows, %d divergent",
+        $t, scalar(@{$S{diff}}),
+        scalar(grep { $_->{diverges} } @{$S{diff}})));
+    update_action_buttons();
+}
+
+# `peer_caps` isn't a snapshot table — it's exposed via POLL peer-caps.
+sub load_virtual_table {
+    my ($t, $tdef) = @_;
+    my %out;
+    for my $p ($S{multi}->peers) {
+        next unless $p->{client};
+        my $body = eval { $p->{client}->poll('peer-caps') };
+        if ($@) {
+            my $e = $@; chomp $e;
+            $out{ $p->{name} } = { error => $e };
+            next;
+        }
+        my @rows;
+        for my $line (split /\n/, ($body // '')) {
+            next if $line eq '' || $line =~ /^#/;
+            # format from net-peer POLL: peer<TAB>cap<TAB>granted_at<TAB>granted_by
+            my @c = split /\t/, $line;
+            push @rows, {
+                peer       => $c[0],
+                cap        => $c[1],
+                granted_at => $c[2],
+                granted_by => $c[3],
+            };
+        }
+        $out{ $p->{name} } = { rows => \@rows };
+    }
+    $S{snapshot} = \%out;
+}
+
+# Inline version of NetMgr::Multi::diff_table that takes a pre-fetched
+# snapshot hash so we can drive both real tables and virtual ones.
+sub compute_diff {
+    my ($snap, $key_cols, $ignore_cols) = @_;
+    my %ignore = (map { $_ => 1 } @{ $ignore_cols || [] });
+    $ignore{$_} = 1 for qw(last_observed first_observed observed_at
+                           created_at updated_at last_seen first_seen
+                           last_reply min_rtt_ms last_rtt_ms loss_pct
+                           link_speed_mbps replicated_from);
+    my %grid;
+    for my $peer_name (sort keys %$snap) {
+        my $r = $snap->{$peer_name};
+        next if !$r || $r->{error};
+        for my $row (@{ $r->{rows} || [] }) {
+            my $k = join("\0", map { defined $row->{$_} ? $row->{$_} : '' } @$key_cols);
+            $grid{$k}{$peer_name} = $row;
+        }
+    }
+    my @connected = map { $_->{name} } grep { $_->{client} } $S{multi}->peers;
+    my @out;
+    for my $k (sort keys %grid) {
+        my %cells;
+        my $missing = 0;
+        for my $n (@connected) {
+            if (exists $grid{$k}{$n}) { $cells{$n} = $grid{$k}{$n} }
+            else                       { $cells{$n} = undef; $missing++ }
+        }
+        my @rows = grep { defined } values %cells;
+        my $diff_cols = $missing > 0 || _vals_differ(\@rows, \%ignore, $key_cols);
+        push @out, {
+            key      => $k,
+            key_cols => $key_cols,
+            values   => \%cells,
+            diverges => $diff_cols ? 1 : 0,
+        };
+    }
+    return \@out;
+}
+
+sub _vals_differ {
+    my ($rows, $ignore, $keys) = @_;
+    return 0 if @$rows < 2;
+    my %key_col = map { $_ => 1 } @$keys;
+    my $first = $rows->[0];
+    for my $r (@{$rows}[1 .. $#$rows]) {
+        my %seen;
+        for my $c (keys %$first, keys %$r) {
+            next if $seen{$c}++;
+            next if $key_col{$c} || $ignore->{$c};
+            my $a = $first->{$c} // '';
+            my $b = $r->{$c} // '';
+            return 1 if $a ne $b;
+        }
+    }
+    return 0;
+}
+
+# --- grid rendering -------------------------------------------------
+
+sub render_grid {
+    $hlist->destroy if $hlist;
+    return unless $S{multi};
+    my @peers = grep { $_->{client} } $S{multi}->peers;
+    my @peer_names = map { $_->{name} } @peers;
+
+    $hlist = $grid_frame->Scrolled('HList',
+        -columns    => 1 + scalar @peer_names,
+        -header     => 1,
+        -scrollbars => 'osoe',
+        -selectmode => 'single',
+        -browsecmd  => sub { on_select($_[0]) },
+        -font       => '{Helvetica} 10',
+    )->pack(-fill => 'both', -expand => 1);
+
+    my $h = $hlist->Subwidget('scrolled');
+    $h->headerCreate(0, -text => 'key', -borderwidth => 1);
+    for my $i (0 .. $#peer_names) {
+        $h->headerCreate($i + 1, -text => $peer_names[$i], -borderwidth => 1);
+    }
+    # rough column sizing
+    $h->columnWidth(0, -char => 36);
+    for my $i (0 .. $#peer_names) {
+        $h->columnWidth($i + 1, -char => 14);
+    }
+
+    my $filter = lc $S{filter};
+    my $rows = 0;
+    my $idx = 0;
+    for my $d (@{ $S{diff} }) {
+        next if $S{only_divergent} && !$d->{diverges};
+        my $key_str = join(',', split /\0/, $d->{key}, -1);
+        next if length $filter && index(lc $key_str, $filter) < 0;
+
+        # status glyph + key in col 0
+        my $glyph = $d->{diverges} ? '⚠ ' : '   ';
+        $h->add($idx, -text => $glyph . $key_str);
+        # per-peer cells
+        for my $i (0 .. $#peer_names) {
+            my $cell = $d->{values}{ $peer_names[$i] };
+            my ($txt, $fg);
+            if (!defined $cell) {
+                $txt = 'MISSING';
+                $fg  = '#a00';
+            } else {
+                # Was this row "different" from the others (not missing,
+                # but a non-ignored column disagrees)?
+                my @others = grep { defined && $_ ne $cell }
+                             values %{ $d->{values} };
+                my $differs = _vals_differ([$cell, @others],
+                                           {map {$_=>1} @{ $TABLES{$S{table}}{ignore}||[] }},
+                                           $d->{key_cols});
+                $txt = $differs ? 'DIFF' : '✓';
+                $fg  = $differs ? '#a60' : '#070';
+            }
+            $h->itemCreate($idx, $i + 1, -text => $txt,
+                                          -style => $h->ItemStyle('text', -foreground => $fg));
+        }
+        $idx++;
+        $rows++;
+    }
+    status(sprintf("%d row(s) shown%s",
+        $rows, ($S{only_divergent} ? ' (filtered to divergent)' : '')));
+}
+
+# --- selection / detail ---------------------------------------------
+
+sub on_select {
+    my ($idx) = @_;
+    my $key_visible = idx_to_key($idx);
+    $S{selected_key} = $key_visible;
+    render_detail();
+    update_action_buttons();
+}
+
+# Walk diff in render-order and pick the Nth visible row.
+sub idx_to_key {
+    my ($want) = @_;
+    my $filter = lc $S{filter};
+    my $n = 0;
+    for my $d (@{ $S{diff} }) {
+        next if $S{only_divergent} && !$d->{diverges};
+        my $ks = join(',', split /\0/, $d->{key}, -1);
+        next if length $filter && index(lc $ks, $filter) < 0;
+        return $d->{key} if $n == $want;
+        $n++;
+    }
+    return undef;
+}
+
+sub render_detail {
+    $detail_text->delete('1.0', 'end');
+    my $key = $S{selected_key};
+    return unless defined $key;
+    my ($d) = grep { $_->{key} eq $key } @{ $S{diff} } or return;
+    my @kparts = split /\0/, $key, -1;
+    my @kv = map { "$d->{key_cols}[$_]=" . ($kparts[$_] // '') } 0 .. $#{$d->{key_cols}};
+    $detail_text->insert('end', "Key: " . join(' ', @kv) . "\n\n");
+
+    my $master = eval { $S{multi}->master };
+    my $master_name = $master ? $master->{name} : '';
+
+    for my $p ($S{multi}->peers) {
+        next unless $p->{client};
+        $detail_text->insert('end',
+            sprintf("%-20s", $p->{name}),
+            ['peer', ($p->{name} eq $master_name ? 'master' : ())]);
+        my $cell = $d->{values}{ $p->{name} };
+        if (!defined $cell) {
+            $detail_text->insert('end', " MISSING\n", 'miss');
+            next;
+        }
+        my @cols = @{ $TABLES{ $S{table} }{display} || [ sort keys %$cell ] };
+        my @parts;
+        for my $c (@cols) {
+            next unless defined $cell->{$c};
+            push @parts, "$c=" . _kvf_val($cell->{$c});
+        }
+        $detail_text->insert('end', ' ' . join(' ', @parts) . "\n");
+    }
+}
+
+sub _kvf_val {
+    my ($v) = @_;
+    $v = '' unless defined $v;
+    return ($v =~ /[\s=]/) ? "\"$v\"" : $v;
+}
+
+# --- actions --------------------------------------------------------
+
+sub update_action_buttons {
+    my $writeable = $TABLES{ $S{table} }{write};
+    my $has_sel   = defined $S{selected_key};
+    $btn_push->configure(  -state => 'disabled');   # only auth + writable
+    $btn_delete->configure(-state => 'disabled');
+    $btn_add->configure(   -state => 'disabled');
+    $btn_copy->configure(  -state => ($has_sel ? 'normal' : 'disabled'));
+    return unless $writeable && $auth;
+    $btn_push->configure(  -state => ($has_sel ? 'normal' : 'disabled'))
+        if $writeable->{set};
+    $btn_delete->configure(-state => ($has_sel ? 'normal' : 'disabled'))
+        if $writeable->{delete} || $writeable->{clear};
+    $btn_add->configure(   -state => 'normal')
+        if $writeable->{set};
+}
+
+sub do_push_from_master {
+    my $key = $S{selected_key} or return;
+    my ($d) = grep { $_->{key} eq $key } @{ $S{diff} } or return;
+    my $master = $S{multi}->master
+        or return msg('No master', 'No peer reports cluster_role=master.');
+    my $source = $d->{values}{ $master->{name} }
+        or return msg('Master has no row',
+                      "$master->{name} doesn't have this row to push.");
+
+    my $kind = $TABLES{ $S{table} }{write}{set};
+    my @args = map { "$_=$source->{$_}" }
+               grep { defined $source->{$_} && length $source->{$_} }
+               grep { $_ ne 'id' } keys %$source;
+
+    confirm("Push from $master->{name} to "
+          . join(', ', map { $_->{name} }
+                       grep { $_->{name} ne $master->{name} && $_->{client} }
+                       $S{multi}->peers)
+          . "?\n\nOBSERVE kind=$kind " . join(' ', @args),
+        sub {
+            my %res;
+            for my $p ($S{multi}->peers) {
+                next unless $p->{client};
+                next if $p->{name} eq $master->{name};
+                $res{ $p->{name} } = $S{multi}->observe_one($p->{name},
+                    kind => $kind,
+                    map { my ($k,$v) = split /=/, $_, 2; ($k => $v) } @args);
+            }
+            show_result_dialog("Push from $master->{name}", \%res);
+            refresh_table();
+        });
+}
+
+sub do_delete_everywhere {
+    my $key = $S{selected_key} or return;
+    my ($d) = grep { $_->{key} eq $key } @{ $S{diff} } or return;
+    my $w = $TABLES{ $S{table} }{write};
+    my $kind = $w->{delete} || $w->{clear} or return;
+
+    my @kv;
+    for my $i (0 .. $#{ $d->{key_cols} }) {
+        my $v = (split /\0/, $key, -1)[$i] // '';
+        push @kv, $d->{key_cols}[$i] => $v;
+    }
+    my %kh = @kv;
+    my $kv_str = join(' ', map { "$_=$kh{$_}" } keys %kh);
+
+    confirm("Delete row everywhere?\n\nOBSERVE kind=$kind $kv_str",
+        sub {
+            my $res = $S{multi}->observe_all(kind => $kind, %kh);
+            show_result_dialog("Delete $kv_str", $res);
+            refresh_table();
+        });
+}
+
+sub do_add_row {
+    my $w = $TABLES{ $S{table} }{write};
+    my $kind = $w->{set} or return;
+    my @cols = @{ $TABLES{ $S{table} }{display} || [] };
+    return msg('Add', 'No column list defined for this table.') unless @cols;
+
+    my $d = $mw->DialogBox(-title => "Add to $S{table}",
+                           -buttons => ['OK', 'Cancel']);
+    my %vals;
+    for my $c (@cols) {
+        next if $c eq 'id';
+        my $f = $d->add('Frame')->pack(-side => 'top', -fill => 'x');
+        $f->Label(-text => $c, -width => 18, -anchor => 'w')->pack(-side => 'left');
+        $f->Entry(-textvariable => \$vals{$c}, -width => 40)->pack(-side => 'left', -fill => 'x');
+    }
+    my $r = $d->Show;
+    return unless $r eq 'OK';
+    my %kv;
+    for my $c (keys %vals) {
+        next unless defined $vals{$c} && length $vals{$c};
+        $kv{$c} = $vals{$c};
+    }
+    return msg('Add', 'No values entered.') unless %kv;
+
+    confirm("Add row to every peer?\n\nOBSERVE kind=$kind "
+          . join(' ', map { "$_=$kv{$_}" } keys %kv),
+        sub {
+            my $res = $S{multi}->observe_all(kind => $kind, %kv);
+            show_result_dialog("Add row", $res);
+            refresh_table();
+        });
+}
+
+sub do_copy_command {
+    my $key = $S{selected_key} or return;
+    my ($d) = grep { $_->{key} eq $key } @{ $S{diff} } or return;
+    my $peers_arg = $peers_opt
+        ? "--peers='$peers_opt'"
+        : '';
+    my @kparts = split /\0/, $key, -1;
+    my $where = join(' AND ',
+        map { my $c = $d->{key_cols}[$_];
+              my $v = $kparts[$_] // '';
+              $v =~ s/'/''/g;
+              "$c='$v'" } 0 .. $#{ $d->{key_cols} });
+    my $cmd = "net-cluster $peers_arg snapshot $S{table} --where=\"$where\"";
+    $cmd =~ s/  +/ /g;
+    $mw->clipboardClear;
+    $mw->clipboardAppend($cmd);
+    status("Copied: $cmd");
+}
+
+# --- small dialog helpers -------------------------------------------
+
+sub confirm {
+    my ($msg, $cb) = @_;
+    my $r = $mw->messageBox(-title => 'Confirm', -message => $msg,
+                            -type => 'OKCancel', -icon => 'question',
+                            -default => 'cancel');
+    $cb->() if $r eq 'Ok' || $r eq 'OK';
+}
+
+sub msg {
+    my ($title, $msg) = @_;
+    $mw->messageBox(-title => $title, -message => $msg, -type => 'OK',
+                    -icon => 'info');
+}
+
+sub show_result_dialog {
+    my ($title, $res) = @_;
+    my $body = '';
+    for my $p ($S{multi}->peers) {
+        my $r = $res->{ $p->{name} };
+        next unless defined $r || $p->{client};
+        $body .= sprintf "%-20s %s\n", $p->{name}, ($r // 'no reply');
+    }
+    $mw->messageBox(-title => $title, -message => $body, -type => 'OK',
+                    -icon => ($body =~ /\bERR\b/ ? 'warning' : 'info'));
+}
+
+sub status {
+    my ($t) = @_;
+    $status_lbl->configure(-text => " $t");
+}
+
+sub usage {
+    my ($code) = @_;
+    print <<'USAGE';
+net-cluster-gui — Tk frontend for multi-peer net-mgr admin.
+
+Usage:
+  net-cluster-gui [--listen HOST:PORT] [--peers H1,H2,…] [--auth]
+                  [--timeout S]
+
+  --listen HOST:PORT     local seed daemon for discovery (127.0.0.1:7531)
+  --peers H1,H2,…        skip discovery; "name", "host:port", or
+                         "name=host:port" entries
+  --auth                 ssh-keygen -Y sign each connection — required
+                         for write actions on peers/isp_links/lost_devices
+  --timeout SECS         per-peer connect timeout (default 3)
+
+Read-only for everything; with --auth, write buttons unlock for the
+tables that have OBSERVE handlers in Manager.pm:
+  peer_caps        (peer_cap_set, peer_cap_clear)
+  isp_links        (isp_link, isp_link_delete)
+  lost_devices     (lost_device_delete)
+
+For replicated tables (friendly_names, hostnames, aliases, …) the
+divergence view is fully functional but writes go through net-name /
+net-alias on the master node; the "Copy net-cluster command" button
+gives you the snapshot incantation as a starting point.
+USAGE
+    exit($code // 0);
+}
