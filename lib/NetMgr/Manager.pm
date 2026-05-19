@@ -420,6 +420,15 @@ sub _send {
 
 sub _handle_line {
     my ($self, $cli, $line) = @_;
+
+    # Intercept FORWARD_TO before parse_line — parse_line croaks on
+    # unknown verbs, and this one wraps an inner command we don't want
+    # this daemon to parse in its own context. Syntax:
+    #   FORWARD_TO peer=NAME <verb> <args ...>
+    if ($line =~ /^\s*FORWARD_TO\s+peer=(\S+)\s+(.+)$/i) {
+        return $self->_handle_forward_to($cli, $1, $2);
+    }
+
     my $cmd = eval { parse_line($line) };
     if ($@) {
         $self->_send($cli, format_err("parse: $@"));
@@ -570,6 +579,100 @@ sub _run_election {
               . " quorum=$decision->{reachable}/$decision->{roster_n}");
 }
 
+# FORWARD_TO peer=NAME <inner verb...>
+# — proxy the inner command to NAME's daemon, pump replies back
+# verbatim. Single-hop only (the inner request goes out tagged with
+# hop=1, and the destination's HELLO handler records that so it
+# refuses to FORWARD_TO again).
+#
+# Synchronous: blocks the daemon's run loop until the inner exchange
+# completes (or the per-line timeout fires). Acceptable v1 for
+# single-reply verbs and snapshot subscriptions on a LAN. Streaming
+# subscriptions through forwarding aren't supported — the destination
+# would keep sending ROW lines indefinitely and we'd never know to
+# stop reading.
+sub _handle_forward_to {
+    my ($self, $cli, $peer, $inner) = @_;
+    if (($cli->{hop} // 0) > 0) {
+        return $self->_send($cli,
+            format_err("FORWARD_TO: nested forwarding rejected (hop=$cli->{hop})"));
+    }
+    # Pick the destination address. Prefer a live mesh socket's
+    # peerhost — that's a peer we've already proved we can reach.
+    # Fall back to "name:7531" and let the kernel resolve.
+    my $addr = '';
+    $addr = $self->{mesh}->address_for($peer) if $self->{mesh};
+    $addr = "$peer:7531" unless length $addr;
+    my ($host, $port) = split /:/, $addr, 2;
+    $port = ($port && $port =~ /^\d+$/) ? $port + 0 : 7531;
+
+    my $sock = IO::Socket::INET->new(
+        PeerAddr => $host,
+        PeerPort => $port,
+        Proto    => 'tcp',
+        Timeout  => 5,
+    );
+    if (!$sock) {
+        return $self->_send($cli,
+            format_err("FORWARD_TO: connect $addr failed: $!"));
+    }
+
+    my $orig_ident = $cli->{ident} // 'anon';
+    eval {
+        syswrite($sock, "HELLO consumer=fwd:$orig_ident hop=1\n");
+        my $hello_reply = _read_one_line($sock, 5);
+        die "HELLO failed: " . ($hello_reply // 'no reply') . "\n"
+            unless $hello_reply && $hello_reply =~ /^OK\b/;
+
+        syswrite($sock, "$inner\n");
+
+        # Pump reply lines. End on OK or ERR at line start — single-
+        # reply verbs (STATUS, OBSERVE, POLL, TRIGGER) reply with one
+        # such line; snapshot subscriptions emit ROW…ROW…EOS then
+        # an OK ack we use as the stop signal.
+        while (defined(my $line = _read_one_line($sock, 60))) {
+            $self->_send($cli, $line);
+            last if $line =~ /^\s*(OK|ERR)\b/;
+        }
+    };
+    if ($@) {
+        my $err = $@; chomp $err;
+        $self->_send($cli, format_err("FORWARD_TO: $err"));
+    }
+    eval { close $sock };
+    return;
+}
+
+# Small synchronous line reader for FORWARD_TO. Returns the next \n-
+# terminated line (without the newline) or undef on timeout/eof.
+# Uses a per-socket buffer attached to the file handle via Perl's
+# fileno-keyed hash so a multi-line reply isn't chopped between
+# reads.
+my %_fwd_bufs;
+sub _read_one_line {
+    my ($sock, $timeout) = @_;
+    my $fd = fileno($sock);
+    $_fwd_bufs{$fd} //= '';
+    while (1) {
+        if ($_fwd_bufs{$fd} =~ s/^([^\n]*)\n//) {
+            my $line = $1;
+            return $line;
+        }
+        my $vec = ''; vec($vec, $fd, 1) = 1;
+        my $rv = select(my $r = $vec, undef, undef, $timeout);
+        if ($rv <= 0) {
+            delete $_fwd_bufs{$fd};
+            return undef;
+        }
+        my $n = sysread($sock, my $chunk, 4096);
+        if (!defined $n || $n == 0) {
+            delete $_fwd_bufs{$fd};
+            return undef;
+        }
+        $_fwd_bufs{$fd} .= $chunk;
+    }
+}
+
 # Inbound HEARTBEAT from a peer over its outbound mesh socket — the
 # *receiving* daemon's side. We trust the `member=` field as the
 # sender's self-identification (cluster member names are how the
@@ -678,7 +781,11 @@ sub _handle_hello {
     } else {
         return $self->_send($cli, format_err("HELLO needs source= or consumer="));
     }
-    $self->_log("hello $cli->{peer} $cli->{kind}=$cli->{ident}");
+    # hop=N marks a forwarded request — block transitive FORWARD_TO.
+    # Mesh is single-hop by design.
+    $cli->{hop} = ($kv->{hop} // 0) + 0;
+    $self->_log("hello $cli->{peer} $cli->{kind}=$cli->{ident}"
+              . ($cli->{hop} ? " hop=$cli->{hop}" : ''));
     $self->_send($cli, format_ok());
 }
 

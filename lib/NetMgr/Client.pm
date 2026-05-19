@@ -207,6 +207,23 @@ sub set_gateway {
     return $cmd->{kv} || {};
 }
 
+# FORWARD_TO peer=NAME <inner verb...> — proxy a command to NAME's
+# daemon via *this* connection's daemon. Returns the list of raw
+# reply lines from the destination (in order, including the final
+# OK/ERR). Single-hop only on the daemon side.
+sub forward_to {
+    my ($self, $peer, $inner_line) = @_;
+    croak "forward_to needs peer" unless defined $peer && length $peer;
+    croak "forward_to needs inner_line" unless defined $inner_line && length $inner_line;
+    $self->send_line("FORWARD_TO peer=$peer $inner_line");
+    my @lines;
+    while (defined(my $line = $self->recv_line)) {
+        push @lines, $line;
+        last if $line =~ /^\s*(OK|ERR)\b/;
+    }
+    return \@lines;
+}
+
 # CLUSTER_ROLE role=master|follower|auto [member=NAME] [master=NAME]
 # Loopback-only on the server side; used by net-mgr-relay to push
 # elected role into the daemon so STATUS reports cluster_role
