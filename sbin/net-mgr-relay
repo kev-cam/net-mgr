@@ -251,6 +251,7 @@ sub apply_election {
     my $self_name = $cluster->{self_name};
     if (!$r->{quorum_ok}) {
         _log_status("isolated (no quorum: $r->{reachable}/$r->{roster_n})");
+        _push_local_role('auto');
         _kill_child();
         return;
     }
@@ -258,12 +259,14 @@ sub apply_election {
     if (!$w) {
         _log_status("no eligible candidates; "
                   . "$r->{reachable}/$r->{roster_n} reachable");
+        _push_local_role('auto');
         _kill_child();
         return;
     }
     if ($w->{member} eq $self_name) {
         _log_status("self is master ($w->{member} score=$w->{score} "
                   . "quorum=$r->{reachable}/$r->{roster_n})");
+        _push_local_role('master');
         _kill_child();
         return;
     }
@@ -272,11 +275,40 @@ sub apply_election {
         _log_status("master changed to $w->{member}; restarting child");
         _kill_child();
     }
+    _push_local_role('follower', master => $w->{member});
     unless ($child{pid}) {
         _spawn_child($w->{ip}, $w->{member});
         _log_status("following $w->{member} ($w->{ip}) score=$w->{score} "
                   . "quorum=$r->{reachable}/$r->{roster_n}");
     }
+}
+
+# Push the elected role into the local daemon so its STATUS reports
+# cluster_role accurately. Loopback-only on the daemon side; the
+# daemon refuses non-loopback CLUSTER_ROLE writes. Best-effort —
+# if the daemon's down or restarting, we silently skip and try
+# again next tick.
+my $last_pushed = '';
+sub _push_local_role {
+    my ($role, %args) = @_;
+    my $key = $role . '|' . ($args{master} // '');
+    return if $key eq $last_pushed;     # nothing new to say
+    my $cli = eval {
+        NetMgr::Client->new(listen => '127.0.0.1:7531', timeout => 3);
+    };
+    return unless $cli;
+    eval { $cli->hello(consumer => "relay-cluster-role.$$") };
+    if ($@) { eval { $cli->bye }; return }
+    eval {
+        $cli->cluster_role(
+            role   => $role,
+            member => $cluster->{self_name},
+            ($args{master} ? (master => $args{master}) : ()),
+        );
+    };
+    eval { $cli->bye };
+    return if $@;
+    $last_pushed = $key;
 }
 
 # =====================================================================

@@ -396,6 +396,7 @@ sub _handle_line {
     elsif ($verb eq 'POLL')      { $self->_handle_poll($cli, $cmd) }
     elsif ($verb eq 'BYE')       { $self->_drop_client(fileno($cli->{sock}), 'bye') }
     elsif ($verb eq 'STATUS')    { $self->_handle_status($cli) }
+    elsif ($verb eq 'CLUSTER_ROLE') { $self->_handle_cluster_role($cli, $cmd) }
     elsif ($verb eq 'FORWARD')   { $self->_handle_forward($cli, $cmd) }
     elsif ($verb eq 'UNFORWARD') { $self->_handle_unforward($cli, $cmd) }
     elsif ($verb eq 'NAT_MASQUERADE') { $self->_handle_nat_masquerade($cli, $cmd) }
@@ -419,6 +420,12 @@ sub _handle_status {
     }
     my $schema_v = eval { $self->{db}->current_schema_version } // 0;
     my $cs = $self->{cluster} // {};
+    # Runtime role override pushed by net-mgr-relay's election. When
+    # set, it wins over the static [cluster] role in the config — that
+    # static value is the *eligibility* declaration (auto/master/
+    # follower/excluded), this is what was actually elected.
+    my $cr = $self->{cluster_runtime} // {};
+    my $live_role = $cr->{role} // $cs->{role};
     my $internet_facing = defined $cs->{internet_facing}
                         ? ($cs->{internet_facing} ? 1 : 0)
                         : _detect_internet_facing();
@@ -442,7 +449,10 @@ sub _handle_status {
         triggers_pending   => scalar(keys %{ $self->{triggers} }),
         schema_version     => $schema_v,
         cluster_member     => $cs->{self_name},
-        cluster_role       => $cs->{role},
+        cluster_role       => $live_role,
+        cluster_role_config => $cs->{role},
+        cluster_master     => $cr->{master_member} // '',
+        cluster_role_since => $cr->{since}         // 0,
         cluster_priority   => $cs->{priority},
         cluster_prefer_lan => $cs->{prefer_lan},
         cluster_internet_facing => $internet_facing,
@@ -457,6 +467,63 @@ sub _handle_status {
         cluster_peer_auth_count => scalar(keys %{ $cs->{peer_caps} // {} }),
         reachable_members  => $reachable,
         quorum_ok          => $quorum_ok,
+    ));
+}
+
+# Loopback-only control verb. net-mgr-relay calls this after its
+# election picks a winner so STATUS starts reporting cluster_role
+# accurately to the rest of the cluster.
+#
+#   CLUSTER_ROLE role=master|follower|auto member=NAME [master=NAME]
+#
+# 'member' is the role-bearer's own member name (sanity-checked
+# against cluster.self_name). 'master' is the elected master's name
+# — required on role=follower, ignored on role=master (the role
+# bearer is the master), cleared on role=auto.
+#
+# Restricted to loopback peers; the relay always runs on the same
+# host as the daemon. Any other peer trying to assert cluster role
+# is ignored.
+sub _handle_cluster_role {
+    my ($self, $cli, $cmd) = @_;
+    unless (_peer_is_loopback($cli)) {
+        return $self->_send($cli,
+            format_err("CLUSTER_ROLE restricted to loopback peers"));
+    }
+    my $kv = $cmd->{kv} || {};
+    my $role = lc($kv->{role} // '');
+    unless ($role =~ /^(master|follower|auto)$/) {
+        return $self->_send($cli,
+            format_err("CLUSTER_ROLE: role must be master|follower|auto"));
+    }
+    my $cs = $self->{cluster} // {};
+    if (defined $kv->{member} && length $kv->{member}
+        && defined $cs->{self_name} && $kv->{member} ne $cs->{self_name}) {
+        return $self->_send($cli, format_err(
+            "CLUSTER_ROLE: member='$kv->{member}' != self_name='$cs->{self_name}'"));
+    }
+    my $master = $kv->{master};
+    if ($role eq 'master') {
+        $master = $cs->{self_name};
+    } elsif ($role eq 'auto') {
+        $master = '';
+    } else {
+        return $self->_send($cli,
+            format_err("CLUSTER_ROLE role=follower needs master=NAME"))
+            unless defined $master && length $master;
+    }
+    $self->{cluster_runtime} = {
+        role          => $role,
+        master_member => $master,
+        since         => time(),
+    };
+    $self->_log("cluster_role=$role"
+              . ($master ? " master=$master" : '')
+              . " (set by $cli->{peer})");
+    return $self->_send($cli, format_ok(
+        role   => $role,
+        master => ($master // ''),
+        since  => $self->{cluster_runtime}{since},
     ));
 }
 

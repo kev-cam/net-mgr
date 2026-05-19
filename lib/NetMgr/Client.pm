@@ -207,6 +207,24 @@ sub set_gateway {
     return $cmd->{kv} || {};
 }
 
+# CLUSTER_ROLE role=master|follower|auto [member=NAME] [master=NAME]
+# Loopback-only on the server side; used by net-mgr-relay to push
+# elected role into the daemon so STATUS reports cluster_role
+# accurately. Returns the OK kv hashref or croaks on ERR.
+sub cluster_role {
+    my ($self, %args) = @_;
+    croak "cluster_role needs role=" unless defined $args{role};
+    my %kv = (role => $args{role});
+    $kv{member} = $args{member} if defined $args{member};
+    $kv{master} = $args{master} if defined $args{master};
+    my $r = $self->send_recv("CLUSTER_ROLE " . format_kv(%kv));
+    croak "cluster_role: no reply from daemon" unless defined $r;
+    my $cmd = parse_line($r);
+    croak "cluster_role: $cmd->{msg}" if $cmd->{verb} eq 'ERR';
+    croak "cluster_role: unexpected reply '$r'" unless $cmd->{verb} eq 'OK';
+    return $cmd->{kv} || {};
+}
+
 # auth(key_id => 'me@host', key_file => '~/.ssh/id_rsa') — drive the
 # AUTH / AUTH_RESPONSE handshake. Returns 1 on success or croaks
 # with the daemon's error message. After success the connection is
