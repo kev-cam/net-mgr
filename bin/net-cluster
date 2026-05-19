@@ -1,0 +1,302 @@
+#!/usr/bin/perl
+# net-cluster — multi-daemon admin tool. Snapshots/diffs tables and
+# fans out OBSERVEs across every peer in the cluster, so you can see
+# (and converge) divergence without ssh-ing host to host.
+#
+# Peer list is autodiscovered from the local daemon's STATUS (its
+# [cluster] members), or set explicitly with --peers.
+#
+# Usage:
+#   net-cluster peers                           — show peer connect status
+#   net-cluster status                          — STATUS line per peer
+#   net-cluster snapshot <table> [--where=…]    — dump rows per peer
+#   net-cluster diff <table> [--key=col,…]      — show only divergent rows
+#   net-cluster observe kind=K k=v ...          — fan out one OBSERVE
+#   net-cluster master kind=K k=v ...           — OBSERVE on master only
+#
+# Common flags:
+#   --listen HOST:PORT     local seed daemon for discovery (default 127.0.0.1)
+#   --peers  H1,H2,...     skip discovery, use these peers verbatim
+#                          (each "name", "host:port", or "name=host:port")
+#   --where  SQL           server-side WHERE clause for snapshot/diff
+#   --key    col1,col2     row-identity columns for diff (default 'id')
+#   --auth                 ssh-keygen -Y sign every connection (needed
+#                          for auth-gated OBSERVEs: peer_cap_set/clear,
+#                          isp_link_set, lost_device_delete, …)
+#   --timeout SECS         per-peer connect timeout (default 3)
+#   --json                 machine-readable output (snapshot/diff/observe)
+#
+# Exit codes:
+#   0  success
+#   1  no peers connected, or 'diff' found divergence (set --quiet-diff
+#      to suppress that — useful when scripting)
+#   2  bad arguments
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+use NetMgr::Multi;
+
+my $listen     = $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
+my $peers_opt;
+my $timeout    = 3;
+my $key_opt;
+my $where_opt;
+my $ignore_opt;
+my $auth;
+my $json;
+my $quiet_diff;
+my $help;
+GetOptions(
+    'listen=s'   => \$listen,
+    'peers=s'    => \$peers_opt,
+    'timeout=i'  => \$timeout,
+    'key=s'      => \$key_opt,
+    'where=s'    => \$where_opt,
+    'ignore=s'   => \$ignore_opt,
+    'auth'       => \$auth,
+    'json'       => \$json,
+    'quiet-diff' => \$quiet_diff,
+    'help|h'     => \$help,
+) or usage(2);
+usage(0) if $help;
+
+my $cmd = shift @ARGV;
+usage(2) unless defined $cmd;
+
+# Build the Multi. Auth is wired as an empty hash so NetMgr::Client
+# falls back to its default key_id / key_file detection.
+my %mk_args = (
+    timeout  => $timeout,
+    auth     => ($auth ? {} : undef),
+    consumer => "net-cluster.$$",
+);
+my $multi;
+if ($peers_opt) {
+    my @peers = grep { length } split /[,\s]+/, $peers_opt;
+    $multi = NetMgr::Multi->new(peers => \@peers, %mk_args);
+} else {
+    $multi = NetMgr::Multi->discover(seed => $listen, %mk_args);
+}
+$multi->connect_all;
+
+my $connected = grep { $_->{client} } $multi->peers;
+if (!$connected) {
+    warn "net-cluster: no peers connected\n";
+    for my $p ($multi->peers) {
+        warn "  $p->{name} ($p->{listen}): " . ($p->{error} // 'no client') . "\n";
+    }
+    exit 1;
+}
+
+my $rc = 0;
+if    ($cmd eq 'peers')    { cmd_peers($multi) }
+elsif ($cmd eq 'status')   { cmd_status($multi) }
+elsif ($cmd eq 'snapshot') { cmd_snapshot($multi) }
+elsif ($cmd eq 'diff')     { $rc = cmd_diff($multi) }
+elsif ($cmd eq 'observe')  { $rc = cmd_observe($multi) }
+elsif ($cmd eq 'master')   { $rc = cmd_master($multi) }
+else { warn "net-cluster: unknown command '$cmd'\n"; usage(2) }
+
+$multi->bye_all;
+exit $rc;
+
+# --- commands -------------------------------------------------------
+
+sub cmd_peers {
+    my ($m) = @_;
+    for my $p ($m->peers) {
+        my $state = $p->{client}
+                  ? ($p->{authed} ? 'connected+auth'
+                                  : ($p->{auth_error} ? "auth-FAILED ($p->{auth_error})"
+                                                     : 'connected'))
+                  : "down: " . ($p->{error} // 'unknown');
+        printf "%-20s  %-30s  %s\n", $p->{name}, $p->{listen}, $state;
+    }
+}
+
+sub cmd_status {
+    my ($m) = @_;
+    my $st = $m->status_all;
+    printf "%-20s %-8s %-4s %-7s %-7s %s\n",
+        'PEER', 'ROLE', 'PRI', 'REACH', 'QUORUM', 'MEMBERS';
+    for my $p ($m->peers) {
+        my $s = $st->{ $p->{name} };
+        if (!$s) {
+            printf "%-20s %s\n", $p->{name},
+                ($p->{error} // 'no status');
+            next;
+        }
+        printf "%-20s %-8s %-4s %-7s %-7s %s\n",
+            $p->{name},
+            $s->{cluster_role}      // '?',
+            $s->{cluster_priority}  // '?',
+            $s->{reachable_members} // '?',
+            ($s->{quorum_ok} ? 'yes' : 'no'),
+            $s->{cluster_members}   // '';
+    }
+}
+
+sub cmd_snapshot {
+    my ($m) = @_;
+    my $table = shift @ARGV or die "snapshot: need <table>\n";
+    my $snap = $m->snapshot_all($table,
+                                ($where_opt ? (where => $where_opt) : ()));
+    if ($json) {
+        require JSON::PP;
+        print JSON::PP->new->canonical(1)->pretty->encode($snap);
+        return;
+    }
+    for my $p ($m->peers) {
+        my $r = $snap->{ $p->{name} };
+        print "── $p->{name} ──\n";
+        if (!$r) {
+            print "  (not connected)\n";
+            next;
+        }
+        if ($r->{error}) {
+            print "  ERR $r->{error}\n";
+            next;
+        }
+        my $rows = $r->{rows} || [];
+        if (!@$rows) {
+            print "  (no rows)\n";
+            next;
+        }
+        for my $row (@$rows) {
+            print "  ",
+                  join(' ', map { _kvf($_, $row->{$_}) } sort keys %$row),
+                  "\n";
+        }
+    }
+}
+
+sub cmd_diff {
+    my ($m) = @_;
+    my $table = shift @ARGV or die "diff: need <table>\n";
+    my @keys = $key_opt ? (grep { length } split /,/, $key_opt) : ('id');
+    my @ignore = $ignore_opt ? (grep { length } split /,/, $ignore_opt) : ();
+    my $diffs = $m->diff_table($table,
+                               key => \@keys,
+                               (@ignore     ? (ignore => \@ignore)    : ()),
+                               ($where_opt  ? (where  => $where_opt)  : ()));
+    my @div = grep { $_->{diverges} } @$diffs;
+
+    if ($json) {
+        require JSON::PP;
+        print JSON::PP->new->canonical(1)->pretty->encode(\@div);
+        return $quiet_diff ? 0 : (@div ? 1 : 0);
+    }
+
+    if (!@div) {
+        print "no divergence\n" unless $quiet_diff;
+        return 0;
+    }
+
+    my @connected = grep { $_->{client} } $m->peers;
+    for my $d (@div) {
+        my @kparts = split /\0/, $d->{key}, -1;
+        my @kv = map { _kvf($keys[$_], $kparts[$_]) } 0 .. $#keys;
+        print "── ", join(' ', @kv), " ──\n";
+        for my $p (@connected) {
+            my $v = $d->{values}{ $p->{name} };
+            if (!defined $v) {
+                printf "  %-20s MISSING\n", $p->{name};
+                next;
+            }
+            printf "  %-20s %s\n",
+                $p->{name},
+                join(' ', map { _kvf($_, $v->{$_}) } sort keys %$v);
+        }
+    }
+    return $quiet_diff ? 0 : 1;
+}
+
+sub cmd_observe {
+    my ($m) = @_;
+    my %kv = _parse_kv(@ARGV) or do { warn "observe: need kind=… …\n"; return 2 };
+    my $res = $m->observe_all(%kv);
+    my $any_err = 0;
+    if ($json) {
+        require JSON::PP;
+        print JSON::PP->new->canonical(1)->pretty->encode($res);
+    } else {
+        for my $p ($m->peers) {
+            my $r = $res->{ $p->{name} } // ($p->{error} // 'down');
+            printf "%-20s %s\n", $p->{name}, $r;
+            $any_err = 1 if $r !~ /^OK\b/;
+        }
+    }
+    return $any_err ? 1 : 0;
+}
+
+sub cmd_master {
+    my ($m) = @_;
+    my %kv = _parse_kv(@ARGV) or do { warn "master: need kind=… …\n"; return 2 };
+    my $master = $m->master;
+    if (!$master) {
+        warn "master: no peer reports cluster_role=master\n";
+        return 1;
+    }
+    my $r = $m->observe_one($master->{name}, %kv);
+    if ($json) {
+        require JSON::PP;
+        print JSON::PP->new->canonical(1)->pretty->encode(
+            { master => $master->{name}, reply => $r });
+    } else {
+        printf "%-20s %s\n", $master->{name} . ' (master)', $r;
+    }
+    return ($r =~ /^OK\b/) ? 0 : 1;
+}
+
+# --- helpers --------------------------------------------------------
+
+sub _parse_kv {
+    my %kv;
+    for my $a (@_) {
+        return () unless $a =~ /^([\w.-]+)=(.*)$/;
+        $kv{$1} = $2;
+    }
+    return %kv;
+}
+
+# k=v formatter that quotes values containing whitespace or '=' so the
+# output round-trips back through _parse_kv-style consumers.
+sub _kvf {
+    my ($k, $v) = @_;
+    $v = '' unless defined $v;
+    if ($v =~ /[\s=]/) {
+        $v =~ s/"/\\"/g;
+        return qq{$k="$v"};
+    }
+    return "$k=$v";
+}
+
+sub usage {
+    my ($code) = @_;
+    print <<'USAGE';
+net-cluster — fan-out admin across the net-mgr cluster.
+
+Usage:
+  net-cluster peers
+  net-cluster status
+  net-cluster snapshot <table> [--where=SQL]
+  net-cluster diff <table> [--key=col1,col2] [--ignore=col,col]
+                           [--where=SQL] [--quiet-diff]
+  net-cluster observe kind=K k=v ...    (fan out to every connected peer)
+  net-cluster master  kind=K k=v ...    (send only to cluster master)
+
+Common flags:
+  --listen HOST:PORT     local seed daemon for discovery (127.0.0.1:7531)
+  --peers H1,H2,...      skip discovery; "name", "host:port", or "name=host:port"
+  --auth                 ssh-keygen -Y sign each connection (auth-gated writes)
+  --timeout SECS         per-peer connect timeout (default 3)
+  --json                 machine-readable output for snapshot/diff/observe
+
+Exit:  0=ok · 1=divergence (diff) or per-peer failure · 2=bad args
+USAGE
+    exit($code // 0);
+}
