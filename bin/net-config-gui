@@ -467,6 +467,13 @@ sub do_test {
 # Returns (1, undef) on full pass, (0, error) on any failure.
 sub ssh_test_writable {
     my ($peer, $path) = @_;
+    if (_is_self_peer($peer)) {
+        return (0, "NOT_READABLE: $path") unless -r $path;
+        (my $dir = $path) =~ s|/[^/]*$||;
+        $dir = '.' unless length $dir;
+        return (0, "DIR_NOT_WRITABLE: $dir") unless -w $dir;
+        return (1, undef);
+    }
     my $qp = shellq($path);
     my $remote = qq{
         if [ ! -r $qp ]; then echo "NOT_READABLE: $path"; exit 1; fi;
@@ -628,6 +635,53 @@ sub text_diff {
 
 # --- SSH helpers ----------------------------------------------------
 
+# True if this peer name refers to the host we're running on. Lets
+# the four SSH helpers short-circuit to local file/proc ops — sshing
+# to localhost is needlessly fragile (often no key configured) and
+# slower than just doing the work directly.
+my $_self_cached;
+sub _is_self_peer {
+    my ($peer) = @_;
+    return 0 unless defined $peer;
+    $_self_cached //= _local_short_name();
+    return lc($peer) eq $_self_cached;
+}
+
+# Read a file locally. Returns ($content, $err); $err undef on success.
+sub _local_read {
+    my ($path) = @_;
+    open my $fh, '<', $path or return (undef, "open $path: $!");
+    my $content = do { local $/; <$fh> };
+    close $fh;
+    return ($content, undef);
+}
+
+# Atomic local write with .bak. Returns undef on success or err string.
+sub _local_write_atomic {
+    my ($path, $content) = @_;
+    my $tmp = "$path.tmp.$$";
+    open my $fh, '>', $tmp or return "open $tmp: $!";
+    print {$fh} $content;
+    close $fh or do { my $e = "$!"; unlink $tmp; return "close $tmp: $e" };
+    if (-e $path) {
+        require File::Copy;
+        File::Copy::copy($path, "$path.bak")
+            or do { my $e = "$!"; unlink $tmp; return "backup: $e" };
+    }
+    rename $tmp, $path
+        or do { my $e = "$!"; unlink $tmp; return "rename: $e" };
+    return undef;
+}
+
+# Local systemctl reload. Returns undef on success or err string.
+sub _local_reload {
+    my $out = `systemctl reload net-mgr 2>&1 || systemctl restart net-mgr 2>&1`;
+    my $rc = $? >> 8;
+    return undef if $rc == 0;
+    chomp $out;
+    return length $out ? $out : "local reload exit $rc";
+}
+
 sub ssh_args {
     my ($peer, @rest) = @_;
     return ('ssh',
@@ -641,6 +695,7 @@ sub ssh_args {
 # Returns ($content, $err). On success, $err is undef.
 sub ssh_read {
     my ($peer, $path) = @_;
+    return _local_read($path) if _is_self_peer($peer);
     my ($in_fh, $out_fh, $err_fh) = (undef, undef, gensym);
     my $pid = eval {
         open3($in_fh, $out_fh, $err_fh,
@@ -665,6 +720,7 @@ sub ssh_read {
 # a .bak of the previous version.
 sub ssh_write_atomic {
     my ($peer, $path, $content) = @_;
+    return _local_write_atomic($path, $content) if _is_self_peer($peer);
     my $qp = shellq($path);
     my $remote = join(' && ',
         "umask 077",
@@ -693,6 +749,7 @@ sub ssh_write_atomic {
 # Returns undef on success or error string.
 sub ssh_reload {
     my ($peer) = @_;
+    return _local_reload() if _is_self_peer($peer);
     my $cmd = "systemctl reload net-mgr 2>&1 || systemctl restart net-mgr 2>&1";
     my ($in_fh, $out_fh, $err_fh) = (undef, undef, gensym);
     my $pid = eval { open3($in_fh, $out_fh, $err_fh, ssh_args($peer, $cmd)) };
