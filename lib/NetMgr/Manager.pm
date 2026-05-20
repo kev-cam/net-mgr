@@ -563,6 +563,7 @@ sub _handle_status {
         cluster_member     => $cs->{self_name},
         cluster_role       => $live_role,
         cluster_role_config => $cs->{role},
+        cluster_role_reason => $cr->{reason} // '',
         cluster_master     => $cr->{master_member} // '',
         cluster_master_addr=> ($cr->{master_member} && $self->{mesh})
                               ? $self->{mesh}->address_for($cr->{master_member})
@@ -571,7 +572,17 @@ sub _handle_status {
         cluster_priority   => $cs->{priority},
         cluster_prefer_lan => $cs->{prefer_lan},
         cluster_internet_facing => $internet_facing,
+        # Static config roster (empty in auto mode); see cluster_mesh
+        # for the live mesh roster discovered at runtime.
         cluster_members    => join(',', @{ $cs->{members} // [] }),
+        # Auto-discovery directive when [cluster] members is auto:…;
+        # empty when the operator passed a static comma list.
+        cluster_auto_spec  => $cs->{auto_spec} ? _auto_spec_desc($cs->{auto_spec}) : '',
+        # Whether THIS daemon's local peer_caps table is gating
+        # eligibility (and how many entries it has) — the most
+        # frequent reason role stays 'auto' in a healthy mesh.
+        cluster_peer_caps_active =>
+            scalar(keys %{ $cs->{peer_caps} // {} }) ? 1 : 0,
         cluster_is_member  => $cs->{is_member},
         # Self-declared (advisory; consumers may verify against
         # their own peer_caps table before trusting it).
@@ -633,6 +644,7 @@ sub _run_election {
         role          => $decision->{role},
         master_member => $decision->{master_member},
         since         => time(),
+        reason        => $decision->{reason},
     };
     $self->_log("election: $decision->{reason} → role=$decision->{role} "
               . "master=" . ($decision->{master_member} || '-')

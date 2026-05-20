@@ -121,8 +121,8 @@ sub cmd_peers {
 sub cmd_status {
     my ($m) = @_;
     my $st = $m->status_all;
-    printf "%-20s %-8s %-4s %-7s %-7s %s\n",
-        'PEER', 'ROLE', 'PRI', 'REACH', 'QUORUM', 'MEMBERS';
+    printf "%-20s %-9s %-4s %-7s %-7s %-10s %s\n",
+        'PEER', 'ROLE', 'PRI', 'REACH', 'QUORUM', 'MASTER', 'MESH';
     for my $p ($m->peers) {
         my $s = $st->{ $p->{name} };
         if (!$s) {
@@ -130,13 +130,26 @@ sub cmd_status {
                 ($p->{error} // 'no status');
             next;
         }
-        printf "%-20s %-8s %-4s %-7s %-7s %s\n",
+        printf "%-20s %-9s %-4s %-7s %-7s %-10s %s\n",
             $p->{name},
             $s->{cluster_role}      // '?',
             $s->{cluster_priority}  // '?',
             $s->{reachable_members} // '?',
             ($s->{quorum_ok} ? 'yes' : 'no'),
-            $s->{cluster_members}   // '';
+            ($s->{cluster_master} // '-') || '-',
+            $s->{cluster_mesh}      // '';
+        # Diagnostics under the row — only printed when present so
+        # healthy clusters stay quiet. These are what you need when
+        # role stays 'auto' on a peer you expect to be electable.
+        if (my $r = $s->{cluster_role_reason}) {
+            print "    reason: $r\n" if length $r;
+        }
+        if (my $a = $s->{cluster_auto_spec}) {
+            print "    auto-spec: $a\n";
+        }
+        if ($s->{cluster_peer_caps_active}) {
+            print "    peer_caps: ACTIVE (this daemon's /etc/net-mgr/peers gates eligibility)\n";
+        }
     }
 }
 
