@@ -272,6 +272,8 @@ $actions->Button(-text => 'Test',    -command => \&do_test)
         ->pack(-side => 'left',  -padx => 4);
 $actions->Button(-text => 'Diff vs targets', -command => \&do_diff)
         ->pack(-side => 'left',  -padx => 4);
+$actions->Button(-text => 'Reset',   -command => \&do_reset)
+        ->pack(-side => 'left',  -padx => 4);
 $actions->Button(-text => 'Quit',    -command => sub { exit 0 })
         ->pack(-side => 'right', -padx => 4);
 
@@ -504,6 +506,122 @@ sub ssh_test_writable {
     }
     return (0, "unexpected reply: $stdout") unless $stdout =~ /^OK\s*$/;
     return (1, undef);
+}
+
+# Reset: replace the editor with smart defaults for the current
+# section, derived from the source peer's own state (its STATUS +
+# interface_zones). Currently specialised for [cluster] — the
+# others fall back to the static template if there's one.
+my %RESET_HEURISTICS = (
+    cluster => \&_reset_cluster,
+);
+
+sub do_reset {
+    my $section = $S{section};
+    return msg('No section', 'Pick a section first.')
+        unless defined $section && length $section && $section ne '(load first)';
+    my $peer = $S{source_peer} or return msg('No source', 'Pick a source peer.');
+
+    my $r = $mw->messageBox(
+        -title   => 'Reset section',
+        -message => "Replace editor contents with defaults for [$section]"
+                  . " derived from peer ${peer}?",
+        -type    => 'OKCancel',
+        -icon    => 'question',
+        -default => 'cancel',
+    );
+    return unless $r eq 'Ok' || $r eq 'OK';
+
+    my $body;
+    if (my $fn = $RESET_HEURISTICS{$section}) {
+        $body = $fn->($peer);
+    } else {
+        $body = $SECTION_TEMPLATES{$section}
+              // "# No reset heuristic for [$section]. Edit as needed.\n";
+    }
+    $editor->delete('1.0', 'end');
+    $editor->insert('end', "[$section]\n");
+    $editor->insert('end', $body);
+    status("Reset [$section] from $peer.");
+}
+
+# [cluster] heuristic — pull cluster_internet_facing + interface_zones
+# from the source peer's daemon and pick priority/role accordingly.
+#
+#   Internet-facing (gateway behind a modem): role=follower, pri=200.
+#       Keep master internal; gateways are vulnerable + churnier.
+#   DMZ-only:                                  role=auto,     pri=150.
+#   Private (LAN):                             role=auto,     pri=50.
+#       Preferred candidate for master.
+#
+# If we can't reach the source peer's daemon (firewall, off net,
+# wrong port), fall back to the neutral SECTION_TEMPLATES{cluster}.
+sub _reset_cluster {
+    my ($peer) = @_;
+
+    my $cli = eval {
+        NetMgr::Client->new(listen => "$peer:7531", timeout => 3);
+    };
+    return $SECTION_TEMPLATES{cluster} unless $cli;
+
+    my ($st, $izones);
+    eval {
+        $cli->hello(consumer => "net-config-gui-reset.$$");
+        $st = $cli->status;
+        $izones = $cli->snapshot(999, 'interface_zones');
+        $cli->bye;
+    };
+    return $SECTION_TEMPLATES{cluster} if $@ || !$st;
+
+    my $self_name = $st->{cluster_member} // $peer;
+    my $internet  = $st->{cluster_internet_facing} ? 1 : 0;
+
+    # Filter interface_zones to rows belonging to this host. host
+    # column is free-form text; try both the cluster member name and
+    # the literal $peer argument in case they differ.
+    my %seen_class;
+    for my $r (@{ $izones || [] }) {
+        my $h = $r->{host} // '';
+        next unless $h eq $self_name || $h eq $peer;
+        my $c = $r->{zone_class} // '';
+        $seen_class{$c} = 1 if length $c;
+    }
+    $internet = 1 if $seen_class{Internet};
+
+    my ($role, $priority, $reason);
+    if ($internet) {
+        $role     = 'follower';
+        $priority = 200;
+        $reason   = 'internet-facing — never master';
+    } elsif ($seen_class{DMZ} && !$seen_class{Private}) {
+        $role     = 'auto';
+        $priority = 150;
+        $reason   = 'DMZ — secondary candidate';
+    } else {
+        $role     = 'auto';
+        $priority = 50;
+        $reason   = 'internal/Private — preferred master';
+    }
+
+    # Suggest a scoped members spec when the peer lives in exactly
+    # one zone class (cleanest scoping); else bare auto.
+    my @real_classes = grep { $_ ne 'Internet' } sort keys %seen_class;
+    my $members = (@real_classes == 1) ? "auto:$real_classes[0]" : 'auto';
+
+    my $zones_list = (keys %seen_class) ? join(',', sort keys %seen_class) : '(none seen)';
+    my $internet_line = $internet ? "internet_facing = 1\n" : '';
+
+    return <<"EOT";
+# Defaults generated from peer $peer (its state):
+#   detected zones:   $zones_list
+#   internet-facing:  $internet
+#   chosen profile:   $reason
+members    = $members
+role       = $role
+priority   = $priority
+prefer_lan = 1
+${internet_line}# Edit before pushing if any of the above is wrong.
+EOT
 }
 
 sub do_diff {
