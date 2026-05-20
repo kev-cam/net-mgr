@@ -635,14 +635,17 @@ sub _run_election {
         },
         mesh_snap => $self->{mesh}->snapshot,
         peer_caps => $cs->{peer_caps},
-        # In auto-discovery mode there's no fixed roster — use the
-        # live mesh size + self. Without this the quorum check
-        # would always pass trivially (roster_n=0 → quorum_ok=1),
-        # which is fine for liveness but masks real cluster splits.
-        roster_n  => $cs->{auto_spec}
-                     ? 1 + scalar(grep { !$_->{unconfigured} }
-                                  values %{ $self->{mesh}->snapshot })
-                     : scalar @{ $cs->{members} },
+        # In auto-discovery mode there is no known "expected
+        # cluster size" — we only know what's reachable right now.
+        # Quorum's job is split-brain detection ("I can see N of
+        # M, am I isolated?"), which is meaningless without M.
+        # Skip the roster_n arg so decide() defaults to reachable
+        # count and quorum trivially passes. Static-list mode
+        # still uses the configured size, where split-brain is
+        # detectable.
+        ($cs->{auto_spec}
+            ? ()
+            : (roster_n => scalar @{ $cs->{members} })),
     );
 
     my $cur = $self->{cluster_runtime} // {};
