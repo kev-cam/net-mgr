@@ -210,6 +210,67 @@ find-peers = 0
 EOT
 );
 
+# Standard [cluster] profiles. Picked from the dropdown + Set
+# replaces the editor with the chosen one. Operator should still
+# tweak (e.g. priority offsets when multiple hosts share a profile).
+# Adding a profile is just an entry here.
+my %CLUSTER_PROFILES = (
+    'Gateway' => <<'EOT',
+# Internet-facing host (modem-side). Never master — gateways are
+# the most exposed and the most churny (link flaps, reboots).
+members         = auto
+role            = follower
+priority        = 200
+prefer_lan      = 1
+internet_facing = 1
+EOT
+
+    'DMZ' => <<'EOT',
+# Host bridging DMZ ↔ Private (typically an AP / fileserver on a
+# semi-public subnet). Secondary master candidate.
+members    = auto:DMZ
+role       = auto
+priority   = 150
+prefer_lan = 1
+EOT
+
+    'Private' => <<'EOT',
+# Internal LAN host. Preferred master — lowest score wins.
+members    = auto:Private
+role       = auto
+priority   = 50
+prefer_lan = 1
+EOT
+
+    'NAS / Server' => <<'EOT',
+# Internal server (NAS, build host) — capable of being master but
+# we'd rather it focus on its workload. Available as fallback.
+members    = auto:Private
+role       = auto
+priority   = 100
+prefer_lan = 1
+EOT
+
+    'Mobile / Laptop' => <<'EOT',
+# Mobile host that roams (laptop, tablet). Opted out of being
+# master so it can't claim leadership while disconnected from the
+# main LAN. Still participates as a follower for read replication.
+members    = auto
+role       = excluded
+priority   = 300
+prefer_lan = 1
+EOT
+);
+
+# Section → { profile_name => body } map. Add more sections here as
+# they get standard profiles.
+my %SECTION_PROFILES = (
+    cluster => \%CLUSTER_PROFILES,
+);
+my %SECTION_PROFILE_ORDER = (
+    cluster => [ 'Private', 'NAS / Server', 'DMZ', 'Gateway', 'Mobile / Laptop' ],
+);
+
 my %S = (
     section          => '',         # currently-selected section name
     sections_known   => [ @KNOWN_SECTIONS ],
@@ -264,6 +325,16 @@ $targets_frame->Checkbutton(
     -variable => \$S{reload_after},
 )->pack(-side => 'right', -padx => 8);
 
+# Profile picker — only meaningful for sections that have profiles
+# defined ([cluster] today). The combo + Set button rebuild whenever
+# the section changes; for sections without profiles the row hides.
+my $profile_frame = $mw->Frame->pack(-side => 'top', -fill => 'x', -pady => 2);
+my $profile_label = $profile_frame->Label(-text => 'Profile:')
+                                  ->pack(-side => 'left', -padx => 4);
+my $profile_combo;     # rebuilt by rebuild_profile_combo()
+my $profile_set_btn;
+$S{profile} = '';
+
 # Action bar
 my $actions = $mw->Frame->pack(-side => 'bottom', -fill => 'x', -pady => 2);
 $actions->Button(-text => 'Push',    -command => \&do_push)
@@ -271,8 +342,6 @@ $actions->Button(-text => 'Push',    -command => \&do_push)
 $actions->Button(-text => 'Test',    -command => \&do_test)
         ->pack(-side => 'left',  -padx => 4);
 $actions->Button(-text => 'Diff vs targets', -command => \&do_diff)
-        ->pack(-side => 'left',  -padx => 4);
-$actions->Button(-text => 'Reset',   -command => \&do_reset)
         ->pack(-side => 'left',  -padx => 4);
 $actions->Button(-text => 'Quit',    -command => sub { exit 0 })
         ->pack(-side => 'right', -padx => 4);
@@ -325,12 +394,59 @@ sub rebuild_section_combo {
     $section_combo = $top->Optionmenu(
         -options  => [ map { [ $_ => $_ ] } @secs ],
         -variable => \$S{section},
-        -command  => sub { load_section_into_editor($S{section}) },
+        -command  => sub {
+            load_section_into_editor($S{section});
+            rebuild_profile_combo();
+        },
     )->pack(-side => 'left', -padx => 4, -after => $top->children->[3]);
     # Trigger the editor for the currently-selected section so the
     # text area reflects what the picker shows.
     $S{section} = $secs[0] unless defined $S{section} && length $S{section};
     load_section_into_editor($S{section});
+    rebuild_profile_combo();
+}
+
+sub rebuild_profile_combo {
+    $profile_combo->destroy   if $profile_combo;
+    $profile_set_btn->destroy if $profile_set_btn;
+    my $section = $S{section} // '';
+    my $profiles = $SECTION_PROFILES{$section};
+    if (!$profiles) {
+        # No profiles for this section — show a hint, no combo.
+        $profile_combo = $profile_frame->Label(
+            -text => "(no standard profiles for [$section])",
+            -foreground => '#666',
+        )->pack(-side => 'left', -padx => 4);
+        $profile_set_btn = $profile_frame->Frame->pack(-side => 'left');
+        return;
+    }
+    my @ordered = @{ $SECTION_PROFILE_ORDER{$section}
+                     || [ sort keys %$profiles ] };
+    $S{profile} = $ordered[0] unless $S{profile} && $profiles->{$S{profile}};
+    $profile_combo = $profile_frame->Optionmenu(
+        -options  => [ map { [ $_ => $_ ] } @ordered ],
+        -variable => \$S{profile},
+    )->pack(-side => 'left', -padx => 4);
+    $profile_set_btn = $profile_frame->Button(
+        -text    => 'Set from profile',
+        -command => \&do_set_profile,
+    )->pack(-side => 'left', -padx => 4);
+}
+
+# Replace the editor body with the chosen profile's text for the
+# current section. No SSH, no daemon query — it's pure boilerplate
+# the operator can then tweak (typically the priority offset when
+# multiple hosts share a profile).
+sub do_set_profile {
+    my $section = $S{section} // '';
+    my $profile = $S{profile} // '';
+    my $body    = ($SECTION_PROFILES{$section} || {})->{$profile};
+    return msg('No profile', "No profile '$profile' for [$section].")
+        unless defined $body;
+    $editor->delete('1.0', 'end');
+    $editor->insert('end', "[$section]\n");
+    $editor->insert('end', $body);
+    status("[$section] set from profile '$profile'.");
 }
 
 sub load_section_into_editor {
@@ -506,122 +622,6 @@ sub ssh_test_writable {
     }
     return (0, "unexpected reply: $stdout") unless $stdout =~ /^OK\s*$/;
     return (1, undef);
-}
-
-# Reset: replace the editor with smart defaults for the current
-# section, derived from the source peer's own state (its STATUS +
-# interface_zones). Currently specialised for [cluster] — the
-# others fall back to the static template if there's one.
-my %RESET_HEURISTICS = (
-    cluster => \&_reset_cluster,
-);
-
-sub do_reset {
-    my $section = $S{section};
-    return msg('No section', 'Pick a section first.')
-        unless defined $section && length $section && $section ne '(load first)';
-    my $peer = $S{source_peer} or return msg('No source', 'Pick a source peer.');
-
-    my $r = $mw->messageBox(
-        -title   => 'Reset section',
-        -message => "Replace editor contents with defaults for [$section]"
-                  . " derived from peer ${peer}?",
-        -type    => 'OKCancel',
-        -icon    => 'question',
-        -default => 'cancel',
-    );
-    return unless $r eq 'Ok' || $r eq 'OK';
-
-    my $body;
-    if (my $fn = $RESET_HEURISTICS{$section}) {
-        $body = $fn->($peer);
-    } else {
-        $body = $SECTION_TEMPLATES{$section}
-              // "# No reset heuristic for [$section]. Edit as needed.\n";
-    }
-    $editor->delete('1.0', 'end');
-    $editor->insert('end', "[$section]\n");
-    $editor->insert('end', $body);
-    status("Reset [$section] from $peer.");
-}
-
-# [cluster] heuristic — pull cluster_internet_facing + interface_zones
-# from the source peer's daemon and pick priority/role accordingly.
-#
-#   Internet-facing (gateway behind a modem): role=follower, pri=200.
-#       Keep master internal; gateways are vulnerable + churnier.
-#   DMZ-only:                                  role=auto,     pri=150.
-#   Private (LAN):                             role=auto,     pri=50.
-#       Preferred candidate for master.
-#
-# If we can't reach the source peer's daemon (firewall, off net,
-# wrong port), fall back to the neutral SECTION_TEMPLATES{cluster}.
-sub _reset_cluster {
-    my ($peer) = @_;
-
-    my $cli = eval {
-        NetMgr::Client->new(listen => "$peer:7531", timeout => 3);
-    };
-    return $SECTION_TEMPLATES{cluster} unless $cli;
-
-    my ($st, $izones);
-    eval {
-        $cli->hello(consumer => "net-config-gui-reset.$$");
-        $st = $cli->status;
-        $izones = $cli->snapshot(999, 'interface_zones');
-        $cli->bye;
-    };
-    return $SECTION_TEMPLATES{cluster} if $@ || !$st;
-
-    my $self_name = $st->{cluster_member} // $peer;
-    my $internet  = $st->{cluster_internet_facing} ? 1 : 0;
-
-    # Filter interface_zones to rows belonging to this host. host
-    # column is free-form text; try both the cluster member name and
-    # the literal $peer argument in case they differ.
-    my %seen_class;
-    for my $r (@{ $izones || [] }) {
-        my $h = $r->{host} // '';
-        next unless $h eq $self_name || $h eq $peer;
-        my $c = $r->{zone_class} // '';
-        $seen_class{$c} = 1 if length $c;
-    }
-    $internet = 1 if $seen_class{Internet};
-
-    my ($role, $priority, $reason);
-    if ($internet) {
-        $role     = 'follower';
-        $priority = 200;
-        $reason   = 'internet-facing — never master';
-    } elsif ($seen_class{DMZ} && !$seen_class{Private}) {
-        $role     = 'auto';
-        $priority = 150;
-        $reason   = 'DMZ — secondary candidate';
-    } else {
-        $role     = 'auto';
-        $priority = 50;
-        $reason   = 'internal/Private — preferred master';
-    }
-
-    # Suggest a scoped members spec when the peer lives in exactly
-    # one zone class (cleanest scoping); else bare auto.
-    my @real_classes = grep { $_ ne 'Internet' } sort keys %seen_class;
-    my $members = (@real_classes == 1) ? "auto:$real_classes[0]" : 'auto';
-
-    my $zones_list = (keys %seen_class) ? join(',', sort keys %seen_class) : '(none seen)';
-    my $internet_line = $internet ? "internet_facing = 1\n" : '';
-
-    return <<"EOT";
-# Defaults generated from peer $peer (its state):
-#   detected zones:   $zones_list
-#   internet-facing:  $internet
-#   chosen profile:   $reason
-members    = $members
-role       = $role
-priority   = $priority
-prefer_lan = 1
-${internet_line}# Edit before pushing if any of the above is wrong.
-EOT
 }
 
 sub do_diff {
