@@ -341,8 +341,21 @@ $actions->Button(-text => 'Push',    -command => \&do_push)
         ->pack(-side => 'left',  -padx => 4);
 $actions->Button(-text => 'Test',    -command => \&do_test)
         ->pack(-side => 'left',  -padx => 4);
-$actions->Button(-text => 'Diff vs targets', -command => \&do_diff)
-        ->pack(-side => 'left',  -padx => 4);
+my $diff_menu = $actions->Menubutton(
+    -text       => 'Diff vs ▾',
+    -relief     => 'raised',
+    -direction  => 'above',
+)->pack(-side => 'left',  -padx => 4);
+{
+    my $m = $diff_menu->menu;
+    $m->command(-label => 'All ticked targets',
+                -command => \&do_diff_all);
+    $m->separator;
+    for my $peer (@PEERS) {
+        $m->command(-label => $peer,
+                    -command => sub { do_diff_one($peer) });
+    }
+}
 $actions->Button(-text => 'Quit',    -command => sub { exit 0 })
         ->pack(-side => 'right', -padx => 4);
 
@@ -624,37 +637,52 @@ sub ssh_test_writable {
     return (1, undef);
 }
 
-sub do_diff {
-    my $section = $S{section};
-    return msg('Nothing to diff', 'Pick a section first.')
-        unless defined $section && $section ne '' && $section ne '(load first)';
-    my $body = editor_body();
-    return msg('Nothing to diff', 'The editor is empty.')
-        unless defined $body && length $body;
+sub do_diff_all {
     my @targets = grep { $S{push_targets}{$_} } @PEERS;
     return msg('No targets', 'Tick at least one peer to diff against.')
         unless @targets;
-
+    my ($section, $body, $err) = _diff_prep();
+    return msg('Nothing to diff', $err) if $err;
     my $report = '';
     for my $peer (@targets) {
-        my ($content, $err) = ssh_read($peer, $cfg_path);
         $report .= "── $peer ──\n";
-        if (!defined $content) {
-            $report .= "  ERR $err\n";
-            next;
-        }
-        my $there = extract_section($content, $section);
-        my $here  = extract_section_from_text($body, $section);
-        # Drop the [section] header so we compare just the body
-        $there =~ s/^\s*\[[^\]]+\]\s*\n//;
-        $here  =~ s/^\s*\[[^\]]+\]\s*\n//;
-        if ($there eq $here) {
-            $report .= "  (identical)\n";
-        } else {
-            $report .= text_diff($there, $here);
-        }
+        $report .= _diff_chunk($peer, $section, $body);
     }
-    show_text_dialog("Diff [$section]", $report);
+    show_text_dialog("Diff [$section] vs ticked targets", $report);
+}
+
+sub do_diff_one {
+    my ($peer) = @_;
+    my ($section, $body, $err) = _diff_prep();
+    return msg('Nothing to diff', $err) if $err;
+    show_text_dialog("Diff [$section] vs $peer",
+                     _diff_chunk($peer, $section, $body));
+}
+
+# Common prep: returns (section, body, err). err is set when the
+# editor / section state isn't ready to diff.
+sub _diff_prep {
+    my $section = $S{section};
+    return (undef, undef, 'Pick a section first.')
+        unless defined $section && $section ne '' && $section ne '(load first)';
+    my $body = editor_body();
+    return (undef, undef, 'The editor is empty.')
+        unless defined $body && length $body;
+    return ($section, $body, undef);
+}
+
+# Produce the per-peer report chunk (already-indented; caller wraps
+# with its own header).
+sub _diff_chunk {
+    my ($peer, $section, $body) = @_;
+    my ($content, $err) = ssh_read($peer, $cfg_path);
+    return "  ERR $err\n" unless defined $content;
+    my $there = extract_section($content, $section);
+    my $here  = extract_section_from_text($body, $section);
+    $there =~ s/^\s*\[[^\]]+\]\s*\n//;
+    $here  =~ s/^\s*\[[^\]]+\]\s*\n//;
+    return "  (identical)\n" if $there eq $here;
+    return text_diff($there, $here);
 }
 
 # --- Editor body helpers -------------------------------------------
