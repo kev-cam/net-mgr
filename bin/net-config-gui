@@ -43,6 +43,7 @@ use Tk::DialogBox;
 use Tk::Optionmenu;
 
 use NetMgr::Multi;
+use NetMgr::Client;
 
 my $listen     = $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
 my $peers_opt;
@@ -59,31 +60,159 @@ GetOptions(
 usage(0) if $help;
 
 # --- Peer discovery -------------------------------------------------
-# We don't need a live daemon connection for the editor itself — SSH
-# is the transport. But we use NetMgr::Multi just to discover the
-# member-name list (from --peers or local daemon's cluster_members).
-my $multi;
-{
-    my %mk_args = (timeout => 3, consumer => "net-config-gui.$$");
-    if ($peers_opt) {
-        my @p = grep { length } split /[,\s]+/, $peers_opt;
-        $multi = NetMgr::Multi->new(peers => \@p, %mk_args);
-    } else {
-        $multi = eval {
-            NetMgr::Multi->discover(seed => $listen, %mk_args);
-        };
-    }
-}
-# Don't bother connecting — we only need the names. Names are the
-# SSH targets too (cluster member names == hostnames, by design).
-my @PEERS = $multi ? map { $_->{name} } $multi->peers : ();
+# Order of preference for building the peer list:
+#   1. --peers H1,H2,…  explicit list, used verbatim
+#   2. [cluster] members on the local daemon (NetMgr::Multi::discover)
+#   3. local peers table (populated by net-find-peers) — covers the
+#      bootstrap case where the user hasn't configured [cluster] yet
+#      and is using this GUI precisely to set it up.
+# Names are also SSH targets — cluster member names == hostnames by
+# design.
+my @PEERS = discover_peers();
 if (!@PEERS) {
-    die "no peers found (use --peers or run a local daemon)\n";
+    die "no peers found. Set --peers, or run net-find-peers first to "
+      . "populate the daemon's peers table, or start a local daemon.\n";
 }
+
+sub discover_peers {
+    if ($peers_opt) {
+        return grep { length } split /[,\s]+/, $peers_opt;
+    }
+
+    # Try [cluster] members via Multi::discover.
+    my $multi = eval {
+        NetMgr::Multi->discover(
+            seed     => $listen,
+            timeout  => 3,
+            consumer => "net-config-gui.$$",
+        );
+    };
+    if ($multi) {
+        my @names = map { $_->{name} } $multi->peers;
+        # discover() always seeds with at least self; only worth using
+        # if it found additional peers (>1) or if it has a non-self
+        # entry. Otherwise fall through to the peers-table scan.
+        if (@names > 1) {
+            return @names;
+        }
+    }
+
+    # Fall back: snapshot the local daemon's peers table and resolve
+    # each IP to a hostname's first label. Skip unresolvable hosts.
+    my $cli = eval {
+        NetMgr::Client->new(listen => $listen, timeout => 3);
+    };
+    return () unless $cli;
+    eval { $cli->hello(consumer => "net-config-gui-bootstrap.$$") };
+    if ($@) { eval { $cli->bye }; return () }
+
+    my $peers_rows = eval { $cli->snapshot(1, 'peers') } || [];
+    my $addrs      = eval { $cli->snapshot(2, 'addresses',
+                                           where => "family = 'v4'") } || [];
+    my $hostnames  = eval { $cli->snapshot(3, 'hostnames') } || [];
+    my $machines   = eval { $cli->snapshot(4, 'machines') } || [];
+    my $ifaces     = eval { $cli->snapshot(5, 'interfaces') } || [];
+    my $st = eval { $cli->status } || {};
+    eval { $cli->bye };
+
+    # Build IP → machine_id → primary_name map.
+    my %mac_of_addr  = map { $_->{addr} => $_->{mac} } @$addrs;
+    my %mid_of_mac   = map { $_->{mac}  => $_->{machine_id} } @$ifaces;
+    my %name_of_mid;
+    $name_of_mid{$_->{id}} = $_->{primary_name}
+        for grep { defined $_->{id} && defined $_->{primary_name} } @$machines;
+    # hostnames fallback when primary_name is empty
+    for my $h (@$hostnames) {
+        next unless $h->{machine_id} && $h->{name};
+        $name_of_mid{ $h->{machine_id} } //= $h->{name};
+    }
+
+    my $self_name = $st->{cluster_member} // _local_short_name();
+    my %seen;
+    my @names = ($self_name);
+    $seen{$self_name} = 1;
+
+    for my $row (@$peers_rows) {
+        my $ip   = $row->{host}                      or next;
+        my $mac  = $mac_of_addr{$ip}                 or next;
+        my $mid  = $mid_of_mac{$mac};
+        my $name = $mid ? $name_of_mid{$mid} : undef;
+        $name //= _ptr_lookup($ip);
+        next unless defined $name && length $name;
+        $name = lc $name;
+        $name =~ s/\..*//;
+        next if $seen{$name}++;
+        push @names, $name;
+    }
+    return @names;
+}
+
+sub _local_short_name {
+    require Sys::Hostname;
+    my $h = Sys::Hostname::hostname();
+    $h =~ s/\..*//;
+    return lc $h;
+}
+
+sub _ptr_lookup {
+    my ($ip) = @_;
+    require Socket;
+    my $packed = Socket::inet_aton($ip) or return undef;
+    my $name = gethostbyaddr($packed, Socket::AF_INET());
+    return undef unless defined $name && length $name;
+    return $name;
+}
+
+# Sections we always offer in the dropdown even before a Load, so the
+# user can create a fresh section (notably [cluster]) on a peer whose
+# config doesn't have it yet. Order matches the conceptual reading
+# order; sections seen on the source after Load are merged in.
+my @KNOWN_SECTIONS = qw(
+    cluster manager mysql scanner ap_poll timeouts paths bindings
+    dns scheduling dhcp uplinks peers forward
+);
+
+# Starter text when the user picks a section that didn't exist on
+# the source peer. Trailing newline matters — replace_section trims
+# but the editor display reads better with one.
+my %SECTION_TEMPLATES = (
+    cluster => <<'EOT',
+# Roster source. Use either a comma list or auto-discovery:
+#   members = host1, host2, host3
+#   members = auto              # all reachable net-mgr peers
+#   members = auto:DMZ          # peers on a DMZ-zone interface
+#   members = auto:Private/lab  # zone_class Private, zone_name 'lab'
+members = auto
+
+# auto = participate normally; master = always claim; follower =
+# never claim; excluded = ignored by election.
+role = auto
+
+# Lower wins. Score = priority − 50 when prefer_lan and not
+# internet_facing.
+priority   = 100
+prefer_lan = 1
+# internet_facing = 1   # set on gateway nodes; suppresses LAN bonus
+EOT
+
+    manager => <<'EOT',
+# 'auto' = bind to every 192.168.*.* address + 127.0.0.1.
+listen        = auto
+log           = /var/log/net-mgr.log
+offline_after = 300
+EOT
+
+    scheduling => <<'EOT',
+scan-ap    = 0
+presence   = 0
+discover   = 0
+find-peers = 0
+EOT
+);
 
 my %S = (
     section          => '',         # currently-selected section name
-    sections_known   => [],         # list of section names seen in source
+    sections_known   => [ @KNOWN_SECTIONS ],
     source_peer      => $PEERS[0],
     source_text      => '',         # last-loaded full config from source
     push_targets     => {},         # peer => 1 if ticked
@@ -104,7 +233,9 @@ my $src_combo = $top->Optionmenu(
 $top->Button(-text => 'Load', -command => \&do_load)
    ->pack(-side => 'left', -padx => 4);
 $top->Label(-text => '    Section:')->pack(-side => 'left');
-my $section_combo;     # built after first Load
+my $section_combo;     # populated below in rebuild_section_combo
+$top->Button(-text => '+ New…', -command => \&do_new_section)
+   ->pack(-side => 'left', -padx => 4);
 $top->Button(-text => 'Reload list', -command => \&rebuild_section_combo)
    ->pack(-side => 'right', -padx => 4);
 
@@ -145,7 +276,8 @@ $actions->Button(-text => 'Quit',    -command => sub { exit 0 })
 my $status = $mw->Label(-anchor => 'w', -relief => 'sunken')
                 ->pack(-side => 'bottom', -fill => 'x');
 
-status("Pick a source peer, then Load to populate the section list.");
+rebuild_section_combo();
+status("Pick a section to edit, or Load a source peer to see its config.");
 MainLoop;
 exit 0;
 
@@ -177,22 +309,60 @@ sub do_load {
 
 sub rebuild_section_combo {
     $section_combo->destroy if $section_combo;
-    my @secs = @{ $S{sections_known} || [] };
-    @secs = ('(load first)') unless @secs;
+    # Merge known sections with whatever was seen on the source (if
+    # Load has happened). cluster goes first when present so it's the
+    # default landing for the most common edit.
+    my %seen;
+    my @secs;
+    for my $s ('cluster', @{ $S{sections_known} || [] }, @KNOWN_SECTIONS) {
+        next if $seen{$s}++;
+        push @secs, $s;
+    }
     $section_combo = $top->Optionmenu(
         -options  => [ map { [ $_ => $_ ] } @secs ],
         -variable => \$S{section},
         -command  => sub { load_section_into_editor($S{section}) },
     )->pack(-side => 'left', -padx => 4, -after => $top->children->[3]);
+    # Trigger the editor for the currently-selected section so the
+    # text area reflects what the picker shows.
+    $S{section} = $secs[0] unless defined $S{section} && length $S{section};
+    load_section_into_editor($S{section});
 }
 
 sub load_section_into_editor {
     my ($section) = @_;
-    return unless defined $section && $section ne '(load first)';
+    return unless defined $section && length $section;
     my $body = extract_section($S{source_text}, $section);
+    if (!length $body && exists $SECTION_TEMPLATES{$section}) {
+        # Source has no such section — offer a starter template so
+        # the user isn't typing from scratch. The Push path will
+        # splice this in alongside whatever else the target has.
+        $body = $SECTION_TEMPLATES{$section};
+    }
     $editor->delete('1.0', 'end');
     $editor->insert('end', "[$section]\n");
     $editor->insert('end', $body);
+}
+
+# "+ New…" button — let the user type an arbitrary section name
+# (handy for [uplinks], [bindings] entries we don't pre-template).
+sub do_new_section {
+    my $d = $mw->DialogBox(-title => 'New section',
+                           -buttons => ['OK','Cancel']);
+    my $name = '';
+    $d->add('Label', -text => 'Section name (e.g. cluster, uplinks):')
+      ->pack(-anchor => 'w', -padx => 8, -pady => 4);
+    my $entry = $d->add('Entry', -textvariable => \$name, -width => 32)
+                 ->pack(-padx => 8, -pady => 4);
+    $entry->focus;
+    return unless ($d->Show // '') =~ /^OK$/i;
+    $name =~ s/^\s+|\s+$//g;
+    return if $name eq '';
+    push @{ $S{sections_known} }, $name
+        unless grep { $_ eq $name } @{ $S{sections_known} };
+    rebuild_section_combo();
+    $S{section} = $name;
+    load_section_into_editor($name);
 }
 
 sub do_push {
@@ -464,7 +634,7 @@ sub ssh_reload {
 sub shellq {
     my ($s) = @_;
     return "''" unless defined $s && length $s;
-    return $s if $s =~ m{^[A-Za-z0-9_./=,@:+-]+$};
+    return $s if $s =~ m{^[A-Za-z0-9_./=,\@:+-]+$};
     (my $q = $s) =~ s/'/'\\''/g;
     return "'$q'";
 }
