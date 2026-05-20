@@ -1,0 +1,512 @@
+#!/usr/bin/perl
+# net-config-gui — Tk section editor for /etc/net-mgr/config across
+# the cluster. Workflow:
+#
+#   1. Pick a section ([cluster], [manager], [mysql], …) from the
+#      dropdown. The list is populated from the source peer's config
+#      once you Load.
+#   2. Pick a source peer to pull the section from (or skip and type
+#      a section from scratch).
+#   3. Edit the section body in the text area.
+#   4. Tick the peers to push to. "All" toggles every reachable peer.
+#   5. Push — each ticked peer gets the section spliced into its
+#      existing config (atomic write + .bak), with optional reload.
+#
+# SSH transport: plain `ssh -o BatchMode=yes root@HOST …`. Assumes
+# you already have key-based auth to root on every cluster member.
+# No new Perl deps. Net::OpenSSH would be marginally faster but a
+# config edit happens at human-typing cadence so the per-call TCP
+# handshake doesn't matter.
+#
+# Usage:
+#   net-config-gui [--listen HOST:PORT] [--peers H1,H2,…]
+#                  [--user USER] [--path /etc/net-mgr/config]
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use IPC::Open3 qw(open3);
+use Symbol qw(gensym);
+
+BEGIN {
+    eval { require Tk; 1 } or die <<MSG;
+net-config-gui needs perl-Tk. Install with:
+  Debian/Ubuntu:  sudo apt install perl-tk
+  RHEL/Fedora:    sudo dnf install perl-Tk
+MSG
+}
+use Tk;
+use Tk::ROText;
+use Tk::DialogBox;
+use Tk::Optionmenu;
+
+use NetMgr::Multi;
+
+my $listen     = $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
+my $peers_opt;
+my $ssh_user   = 'root';
+my $cfg_path   = '/etc/net-mgr/config';
+my $help;
+GetOptions(
+    'listen=s' => \$listen,
+    'peers=s'  => \$peers_opt,
+    'user=s'   => \$ssh_user,
+    'path=s'   => \$cfg_path,
+    'help|h'   => \$help,
+) or usage(2);
+usage(0) if $help;
+
+# --- Peer discovery -------------------------------------------------
+# We don't need a live daemon connection for the editor itself — SSH
+# is the transport. But we use NetMgr::Multi just to discover the
+# member-name list (from --peers or local daemon's cluster_members).
+my $multi;
+{
+    my %mk_args = (timeout => 3, consumer => "net-config-gui.$$");
+    if ($peers_opt) {
+        my @p = grep { length } split /[,\s]+/, $peers_opt;
+        $multi = NetMgr::Multi->new(peers => \@p, %mk_args);
+    } else {
+        $multi = eval {
+            NetMgr::Multi->discover(seed => $listen, %mk_args);
+        };
+    }
+}
+# Don't bother connecting — we only need the names. Names are the
+# SSH targets too (cluster member names == hostnames, by design).
+my @PEERS = $multi ? map { $_->{name} } $multi->peers : ();
+if (!@PEERS) {
+    die "no peers found (use --peers or run a local daemon)\n";
+}
+
+my %S = (
+    section          => '',         # currently-selected section name
+    sections_known   => [],         # list of section names seen in source
+    source_peer      => $PEERS[0],
+    source_text      => '',         # last-loaded full config from source
+    push_targets     => {},         # peer => 1 if ticked
+    reload_after     => 0,
+);
+
+# --- Tk -------------------------------------------------------------
+my $mw = MainWindow->new(-title => "net-config-gui ($cfg_path)");
+$mw->geometry('900x650');
+
+# Top: source + section picker
+my $top = $mw->Frame->pack(-side => 'top', -fill => 'x', -pady => 2);
+$top->Label(-text => 'Pull from:')->pack(-side => 'left');
+my $src_combo = $top->Optionmenu(
+    -options  => [ map { [ $_ => $_ ] } @PEERS ],
+    -variable => \$S{source_peer},
+)->pack(-side => 'left', -padx => 4);
+$top->Button(-text => 'Load', -command => \&do_load)
+   ->pack(-side => 'left', -padx => 4);
+$top->Label(-text => '    Section:')->pack(-side => 'left');
+my $section_combo;     # built after first Load
+$top->Button(-text => 'Reload list', -command => \&rebuild_section_combo)
+   ->pack(-side => 'right', -padx => 4);
+
+# Middle: text editor
+my $editor = $mw->Scrolled('Text',
+    -height     => 18,
+    -wrap       => 'none',
+    -scrollbars => 'osoe',
+    -font       => '{Monospace} 10',
+)->pack(-side => 'top', -fill => 'both', -expand => 1, -pady => 2);
+
+# Push targets
+my $targets_frame = $mw->Frame(-relief => 'groove', -bd => 1)
+                       ->pack(-side => 'top', -fill => 'x', -pady => 2);
+$targets_frame->Label(-text => 'Push to:',
+                      -font => '{Helvetica} 9 bold')
+              ->pack(-side => 'left', -padx => 4);
+for my $p (@PEERS) {
+    $S{push_targets}{$p} = 1;     # default: all
+    $targets_frame->Checkbutton(
+        -text => $p, -variable => \$S{push_targets}{$p},
+    )->pack(-side => 'left', -padx => 2);
+}
+$targets_frame->Checkbutton(
+    -text     => 'also reload net-mgr after push',
+    -variable => \$S{reload_after},
+)->pack(-side => 'right', -padx => 8);
+
+# Action bar
+my $actions = $mw->Frame->pack(-side => 'bottom', -fill => 'x', -pady => 2);
+$actions->Button(-text => 'Push',    -command => \&do_push)
+        ->pack(-side => 'left',  -padx => 4);
+$actions->Button(-text => 'Diff vs targets', -command => \&do_diff)
+        ->pack(-side => 'left',  -padx => 4);
+$actions->Button(-text => 'Quit',    -command => sub { exit 0 })
+        ->pack(-side => 'right', -padx => 4);
+
+my $status = $mw->Label(-anchor => 'w', -relief => 'sunken')
+                ->pack(-side => 'bottom', -fill => 'x');
+
+status("Pick a source peer, then Load to populate the section list.");
+MainLoop;
+exit 0;
+
+# --- Actions --------------------------------------------------------
+
+sub do_load {
+    my $peer = $S{source_peer} or return;
+    status("Loading $cfg_path from $peer …");
+    $mw->update;
+    my ($content, $err) = ssh_read($peer, $cfg_path);
+    if (!defined $content) {
+        msg('Load failed', "Could not read $cfg_path on $peer:\n$err");
+        status("Load failed: $err");
+        return;
+    }
+    $S{source_text} = $content;
+    my @secs = list_sections($content);
+    $S{sections_known} = \@secs;
+    rebuild_section_combo();
+    # Auto-pick [cluster] if present (the most likely thing you came
+    # here to edit), else first section.
+    my $pick = (grep { $_ eq 'cluster' } @secs)[0] // $secs[0];
+    if (defined $pick) {
+        $S{section} = $pick;
+        load_section_into_editor($pick);
+    }
+    status("Loaded $cfg_path from $peer (" . scalar(@secs) . " section(s))");
+}
+
+sub rebuild_section_combo {
+    $section_combo->destroy if $section_combo;
+    my @secs = @{ $S{sections_known} || [] };
+    @secs = ('(load first)') unless @secs;
+    $section_combo = $top->Optionmenu(
+        -options  => [ map { [ $_ => $_ ] } @secs ],
+        -variable => \$S{section},
+        -command  => sub { load_section_into_editor($S{section}) },
+    )->pack(-side => 'left', -padx => 4, -after => $top->children->[3]);
+}
+
+sub load_section_into_editor {
+    my ($section) = @_;
+    return unless defined $section && $section ne '(load first)';
+    my $body = extract_section($S{source_text}, $section);
+    $editor->delete('1.0', 'end');
+    $editor->insert('end', "[$section]\n");
+    $editor->insert('end', $body);
+}
+
+sub do_push {
+    my $section = $S{section};
+    return msg('Nothing to push', 'Pick a section first.')
+        unless defined $section && $section ne '' && $section ne '(load first)';
+    my $body = editor_body();
+    return msg('Nothing to push', 'The editor is empty.')
+        unless defined $body && length $body;
+    my @targets = grep { $S{push_targets}{$_} } @PEERS;
+    return msg('No targets', 'Tick at least one peer to push to.')
+        unless @targets;
+
+    my $r = $mw->messageBox(
+        -title   => 'Confirm push',
+        -message => "Push [$section] to:\n  "
+                  . join("\n  ", @targets)
+                  . ($S{reload_after} ? "\n\nAlso reload net-mgr." : ''),
+        -type    => 'OKCancel',
+        -icon    => 'question',
+        -default => 'cancel',
+    );
+    return unless $r eq 'Ok' || $r eq 'OK';
+
+    my %results;
+    for my $peer (@targets) {
+        status("Pushing to $peer …");
+        $mw->update;
+        my ($existing, $rerr) = ssh_read($peer, $cfg_path);
+        if (!defined $existing) {
+            $results{$peer} = "READ FAILED: $rerr";
+            next;
+        }
+        my $new = replace_section($existing, $section, $body);
+        my $werr = ssh_write_atomic($peer, $cfg_path, $new);
+        if (defined $werr) {
+            $results{$peer} = "WRITE FAILED: $werr";
+            next;
+        }
+        if ($S{reload_after}) {
+            my $rrerr = ssh_reload($peer);
+            $results{$peer} = defined $rrerr
+                ? "wrote + RELOAD FAILED: $rrerr"
+                : "wrote + reloaded";
+        } else {
+            $results{$peer} = "wrote";
+        }
+    }
+    my $report = '';
+    for my $p (@targets) {
+        $report .= sprintf "%-20s %s\n", $p, $results{$p};
+    }
+    $mw->messageBox(-title => "Push results",
+                    -message => $report, -type => 'OK',
+                    -icon => ($report =~ /FAILED/ ? 'warning' : 'info'));
+    status("Push complete.");
+}
+
+sub do_diff {
+    my $section = $S{section};
+    return msg('Nothing to diff', 'Pick a section first.')
+        unless defined $section && $section ne '' && $section ne '(load first)';
+    my $body = editor_body();
+    return msg('Nothing to diff', 'The editor is empty.')
+        unless defined $body && length $body;
+    my @targets = grep { $S{push_targets}{$_} } @PEERS;
+    return msg('No targets', 'Tick at least one peer to diff against.')
+        unless @targets;
+
+    my $report = '';
+    for my $peer (@targets) {
+        my ($content, $err) = ssh_read($peer, $cfg_path);
+        $report .= "── $peer ──\n";
+        if (!defined $content) {
+            $report .= "  ERR $err\n";
+            next;
+        }
+        my $there = extract_section($content, $section);
+        my $here  = extract_section_from_text($body, $section);
+        # Drop the [section] header so we compare just the body
+        $there =~ s/^\s*\[[^\]]+\]\s*\n//;
+        $here  =~ s/^\s*\[[^\]]+\]\s*\n//;
+        if ($there eq $here) {
+            $report .= "  (identical)\n";
+        } else {
+            $report .= text_diff($there, $here);
+        }
+    }
+    show_text_dialog("Diff [$section]", $report);
+}
+
+# --- Editor body helpers -------------------------------------------
+
+# Returns the editor text excluding the leading "[section]\n" header
+# we inserted in load_section_into_editor (so replace_section can
+# splice cleanly).
+sub editor_body {
+    my $all = $editor->get('1.0', 'end-1c');
+    $all =~ s/^\s*\[[^\]]+\]\s*\n//;
+    return $all;
+}
+
+# --- Section parse / replace ---------------------------------------
+
+sub list_sections {
+    my ($text) = @_;
+    my @secs;
+    for my $line (split /\n/, $text) {
+        push @secs, $1 if $line =~ /^\s*\[([^\]]+)\]\s*$/;
+    }
+    my %seen;
+    return grep { !$seen{$_}++ } @secs;
+}
+
+sub extract_section {
+    my ($text, $section) = @_;
+    my @body;
+    my $in = 0;
+    for my $line (split /\n/, $text, -1) {
+        if ($line =~ /^\s*\[([^\]]+)\]\s*$/) {
+            if ($1 eq $section) { $in = 1; next }
+            elsif ($in)         { $in = 0; last }
+            else                { next }
+        }
+        push @body, $line if $in;
+    }
+    return join("\n", @body) . (@body ? "\n" : '');
+}
+
+# Same as extract_section but treats the input as a section body that
+# already has the [section] header line. (Editor content shape.)
+sub extract_section_from_text {
+    my ($text, $section) = @_;
+    return extract_section("[$section]\n$text", $section);
+}
+
+sub replace_section {
+    my ($text, $section, $new_body) = @_;
+    $new_body =~ s/\n*\z//;
+    my @out;
+    my $in = 0;
+    my $found = 0;
+    for my $line (split /\n/, $text, -1) {
+        if ($line =~ /^\s*\[([^\]]+)\]\s*$/) {
+            if ($1 eq $section) {
+                push @out, $line;
+                push @out, split(/\n/, $new_body, -1) if length $new_body;
+                $in = 1; $found = 1;
+                next;
+            } elsif ($in) {
+                $in = 0;
+            }
+        }
+        next if $in;
+        push @out, $line;
+    }
+    if (!$found) {
+        push @out, '', "[$section]";
+        push @out, split(/\n/, $new_body, -1) if length $new_body;
+    }
+    my $joined = join("\n", @out);
+    $joined .= "\n" unless $joined =~ /\n\z/;
+    return $joined;
+}
+
+sub text_diff {
+    my ($there, $here) = @_;
+    # Minimal line-by-line diff — good enough for config sections.
+    my @t = split /\n/, $there, -1;
+    my @h = split /\n/, $here,  -1;
+    my $out = '';
+    my $max = ($#t > $#h) ? $#t : $#h;
+    for my $i (0 .. $max) {
+        my $tl = $t[$i] // '';
+        my $hl = $h[$i] // '';
+        if ($tl eq $hl) {
+            $out .= "    $tl\n";
+        } else {
+            $out .= "  - $tl\n" if defined $t[$i];
+            $out .= "  + $hl\n" if defined $h[$i];
+        }
+    }
+    return $out;
+}
+
+# --- SSH helpers ----------------------------------------------------
+
+sub ssh_args {
+    my ($peer, @rest) = @_;
+    return ('ssh',
+            '-o', 'BatchMode=yes',
+            '-o', 'ConnectTimeout=5',
+            '-o', 'StrictHostKeyChecking=accept-new',
+            $ssh_user . '@' . $peer,
+            @rest);
+}
+
+# Returns ($content, $err). On success, $err is undef.
+sub ssh_read {
+    my ($peer, $path) = @_;
+    my ($in_fh, $out_fh, $err_fh) = (undef, undef, gensym);
+    my $pid = eval {
+        open3($in_fh, $out_fh, $err_fh,
+              ssh_args($peer, "cat -- " . shellq($path)));
+    };
+    if (!$pid) {
+        return (undef, "open3: $@");
+    }
+    close $in_fh if $in_fh;
+    my $content = do { local $/; <$out_fh> } // '';
+    my $err     = do { local $/; <$err_fh> } // '';
+    waitpid $pid, 0;
+    my $rc = $? >> 8;
+    if ($rc != 0) {
+        chomp $err;
+        return (undef, length $err ? $err : "ssh exit $rc");
+    }
+    return ($content, undef);
+}
+
+# Returns undef on success or an error string. Writes atomically with
+# a .bak of the previous version.
+sub ssh_write_atomic {
+    my ($peer, $path, $content) = @_;
+    my $qp = shellq($path);
+    my $remote = join(' && ',
+        "umask 077",
+        "cat > $qp.tmp",
+        "cp -p $qp $qp.bak 2>/dev/null || true",
+        "mv -f $qp.tmp $qp",
+    );
+    my ($in_fh, $out_fh, $err_fh) = (undef, undef, gensym);
+    my $pid = eval {
+        open3($in_fh, $out_fh, $err_fh, ssh_args($peer, $remote));
+    };
+    if (!$pid) { return "open3: $@" }
+    print {$in_fh} $content;
+    close $in_fh;
+    1 while <$out_fh>;
+    my $err = do { local $/; <$err_fh> } // '';
+    waitpid $pid, 0;
+    my $rc = $? >> 8;
+    if ($rc != 0) {
+        chomp $err;
+        return length $err ? $err : "ssh exit $rc";
+    }
+    return undef;
+}
+
+# Returns undef on success or error string.
+sub ssh_reload {
+    my ($peer) = @_;
+    my $cmd = "systemctl reload net-mgr 2>&1 || systemctl restart net-mgr 2>&1";
+    my ($in_fh, $out_fh, $err_fh) = (undef, undef, gensym);
+    my $pid = eval { open3($in_fh, $out_fh, $err_fh, ssh_args($peer, $cmd)) };
+    if (!$pid) { return "open3: $@" }
+    close $in_fh if $in_fh;
+    my $combined = (do { local $/; <$out_fh> } // '')
+                 . (do { local $/; <$err_fh> } // '');
+    waitpid $pid, 0;
+    my $rc = $? >> 8;
+    if ($rc != 0) {
+        chomp $combined;
+        return length $combined ? $combined : "ssh exit $rc";
+    }
+    return undef;
+}
+
+sub shellq {
+    my ($s) = @_;
+    return "''" unless defined $s && length $s;
+    return $s if $s =~ m{^[A-Za-z0-9_./=,@:+-]+$};
+    (my $q = $s) =~ s/'/'\\''/g;
+    return "'$q'";
+}
+
+# --- small UI helpers -----------------------------------------------
+
+sub status { $status->configure(-text => " $_[0]") }
+
+sub msg {
+    my ($title, $body) = @_;
+    $mw->messageBox(-title => $title, -message => $body, -type => 'OK', -icon => 'info');
+}
+
+sub show_text_dialog {
+    my ($title, $body) = @_;
+    my $d = $mw->Toplevel(-title => $title);
+    $d->geometry('800x500');
+    my $t = $d->Scrolled('ROText', -font => '{Monospace} 9',
+                         -wrap => 'none', -scrollbars => 'osoe')
+              ->pack(-fill => 'both', -expand => 1);
+    $t->insert('end', $body);
+    $d->Button(-text => 'Close', -command => sub { $d->destroy })
+      ->pack(-side => 'bottom', -pady => 4);
+}
+
+sub usage {
+    my ($code) = @_;
+    print <<'USAGE';
+net-config-gui — Tk section editor for /etc/net-mgr/config across the cluster.
+
+Usage:
+  net-config-gui [--listen HOST:PORT] [--peers H1,H2,…]
+                 [--user USER] [--path /etc/net-mgr/config]
+
+  --listen HOST:PORT  local daemon for peer discovery (127.0.0.1:7531)
+  --peers H1,H2,…     skip discovery; use this list (member names)
+  --user USER         SSH login user (default 'root')
+  --path PATH         config file to edit (default /etc/net-mgr/config)
+
+Workflow: pick a source peer + Load → pick section → edit → tick
+push targets → Push (with optional reload). Writes are atomic with
+a .bak of the previous version on each target.
+USAGE
+    exit($code // 0);
+}
