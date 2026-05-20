@@ -108,26 +108,19 @@ sub _spec_desc {
     return "auto:$c" . (defined $n ? "/$n" : '');
 }
 
-# Look up a name for an IP. Strategy:
-#   1. addresses → interfaces → hostnames join (canonical)
-#   2. addresses → interfaces → machines.primary_name fallback
-#   3. PTR DNS lookup, take the first label
+# Look up a *canonical* name for an IP. The point is to dedupe peers
+# that have multiple interfaces (e.g. nas3 has nas3-up + nas3-down +
+# nas3-dwn2; we want one mesh entry "nas3", not three). Strategy:
+#   1. machines.primary_name           — definitive single name per box
+#   2. shortest hostnames.name         — bias toward bare 'nas3' over
+#                                        the interface-suffix variants
+#   3. PTR DNS reverse, first label    — last resort
 sub _name_for_ip {
     my ($db, $ip) = @_;
     my $dbh = $db->dbh;
 
-    # hostnames table — preferred (multiple names per machine; pick one)
+    # 1. machines.primary_name
     my $row = $dbh->selectrow_arrayref(
-        "SELECT h.name FROM hostnames h
-         JOIN interfaces i ON h.machine_id = i.machine_id
-         JOIN addresses a  ON i.mac        = a.mac
-         WHERE a.addr = ? AND h.name IS NOT NULL AND h.name <> ''
-         ORDER BY h.last_seen DESC
-         LIMIT 1", undef, $ip);
-    return _first_label($row->[0]) if $row && defined $row->[0];
-
-    # machines.primary_name fallback
-    $row = $dbh->selectrow_arrayref(
         "SELECT m.primary_name FROM machines m
          JOIN interfaces i ON i.machine_id = m.id
          JOIN addresses a  ON i.mac        = a.mac
@@ -136,8 +129,19 @@ sub _name_for_ip {
          LIMIT 1", undef, $ip);
     return _first_label($row->[0]) if $row && defined $row->[0];
 
-    # PTR — DNS reverse. May time out; gethostbyaddr is synchronous so
-    # we accept the (usually small) cost.
+    # 2. Shortest hostname — collapses nas3 / nas3-up / nas3-down /
+    # nas3-dwn2 down to nas3. CHAR_LENGTH works on both MySQL and
+    # MariaDB; SQLite would need LENGTH but that's not a concern here.
+    $row = $dbh->selectrow_arrayref(
+        "SELECT h.name FROM hostnames h
+         JOIN interfaces i ON h.machine_id = i.machine_id
+         JOIN addresses a  ON i.mac        = a.mac
+         WHERE a.addr = ? AND h.name IS NOT NULL AND h.name <> ''
+         ORDER BY CHAR_LENGTH(h.name) ASC, h.last_seen DESC
+         LIMIT 1", undef, $ip);
+    return _first_label($row->[0]) if $row && defined $row->[0];
+
+    # 3. PTR — gethostbyaddr is synchronous; usually a DNS cache hit.
     my $packed = inet_aton($ip) or return undef;
     my $ptr = gethostbyaddr($packed, AF_INET);
     return _first_label($ptr) if defined $ptr && length $ptr;

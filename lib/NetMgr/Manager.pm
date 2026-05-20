@@ -607,7 +607,10 @@ sub _handle_status {
 sub _run_election {
     my ($self) = @_;
     my $cs = $self->{cluster} // {};
-    return unless @{ $cs->{members} // [] };    # nothing to elect over
+    # Eligible to elect when we have either a static roster OR an
+    # auto-discovery directive in effect. Without that, this is a
+    # single-node deploy with no cluster intent — leave role alone.
+    return unless @{ $cs->{members} // [] } || $cs->{auto_spec};
 
     # When deciding, treat *self* as 'auto' (eligible) regardless of
     # what the runtime override currently says — otherwise once we
@@ -632,7 +635,14 @@ sub _run_election {
         },
         mesh_snap => $self->{mesh}->snapshot,
         peer_caps => $cs->{peer_caps},
-        roster_n  => scalar @{ $cs->{members} },
+        # In auto-discovery mode there's no fixed roster — use the
+        # live mesh size + self. Without this the quorum check
+        # would always pass trivially (roster_n=0 → quorum_ok=1),
+        # which is fine for liveness but masks real cluster splits.
+        roster_n  => $cs->{auto_spec}
+                     ? 1 + scalar(grep { !$_->{unconfigured} }
+                                  values %{ $self->{mesh}->snapshot })
+                     : scalar @{ $cs->{members} },
     );
 
     my $cur = $self->{cluster_runtime} // {};
