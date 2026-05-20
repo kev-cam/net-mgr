@@ -235,6 +235,52 @@ sub address_for {
     return $host ? "$host:$port" : '';
 }
 
+# Reconcile the active peer set with a new authoritative list. Used
+# by Manager._auto_discover to push fresh results from zone-based
+# discovery. New names get a fresh down-state entry (will be dialed
+# on the next tick); names not in the list are dropped + their
+# sockets closed. self_name is never added or removed.
+sub set_members {
+    my ($self, $members) = @_;
+    my %wanted = map { $_ => 1 } @$members;
+    delete $wanted{ $self->{self_name} };
+
+    for my $name (@$members) {
+        next if $name eq $self->{self_name};
+        next if $self->{peers}{$name};
+        $self->{peers}{$name} = {
+            conn_state => 'down',
+            sock       => undef,
+            buffer     => '',
+            backoff    => $self->{backoff_min},
+            next_try   => 0,
+            last_hb_tx => 0,
+            last_hb_rx => 0,
+            remote     => {},
+        };
+        $self->{log}->("mesh: added peer $name (auto-discovered)");
+    }
+    for my $name (sort keys %{ $self->{peers} }) {
+        next if $wanted{$name};
+        my $p = $self->{peers}{$name};
+        # Preserve entries created via inbound HBs but never dialed —
+        # they're still useful diagnostic markers. Only prune ones
+        # we actively dialed (have or had a sock).
+        next if $p->{unconfigured};
+        if ($p->{sock}) {
+            eval { $self->{select}->remove($p->{sock}) } if $self->{select};
+            eval { $p->{sock}->close };
+        }
+        delete $self->{peers}{$name};
+        $self->{log}->("mesh: removed peer $name (no longer in roster)");
+    }
+    $self->{members} = [
+        $self->{self_name},
+        sort grep { !($self->{peers}{$_}{unconfigured} // 0) }
+             keys %{ $self->{peers} },
+    ];
+}
+
 sub shutdown {
     my ($self) = @_;
     for my $name (sort keys %{ $self->{peers} }) {

@@ -24,6 +24,7 @@ use NetMgr::Where    qw(parse eval_ast);
 use NetMgr::Auth     ();
 use NetMgr::Mesh     ();
 use NetMgr::Election ();
+use NetMgr::AutoDiscover ();
 
 # Logical tables a SUBSCRIBE may target.
 my %SUBSCRIBABLE = map { $_ => 1 } qw(
@@ -76,12 +77,26 @@ sub _load_cluster_state {
     my ($cfg) = @_;
     my $c = $cfg->{cluster} // {};
     my @members;
+    my $auto_spec;
     if (defined $c->{members}) {
-        @members = grep { length } map { s/^\s+|\s+$//gr } split /,/, $c->{members};
+        # The directive may be a literal comma-list ("kc-qernel,nas3")
+        # or an auto-discovery directive ("auto:DMZ", "auto:Private/lab",
+        # bare "auto"). Auto-mode starts with an empty members list;
+        # the daemon fills it in periodically via NetMgr::AutoDiscover.
+        my $raw = $c->{members};
+        $raw =~ s/^\s+|\s+$//g;
+        if (my $spec = NetMgr::AutoDiscover::parse_spec($raw)) {
+            $auto_spec = $spec;
+        } else {
+            @members = grep { length }
+                       map  { s/^\s+|\s+$//gr }
+                       split /,/, $raw;
+        }
     }
     my $self_name = _local_member_name();
     my %state = (
         members          => \@members,
+        auto_spec        => $auto_spec,        # undef = static members
         role             => $c->{role}        // 'auto',  # auto|master|follower|excluded
         priority         => $c->{priority}    // 100,
         prefer_lan       => exists $c->{prefer_lan} ? ($c->{prefer_lan} ? 1 : 0) : 1,
@@ -205,7 +220,7 @@ sub _start_mesh {
     my ($self) = @_;
     my $cs = $self->{cluster} || {};
     my @others = grep { $_ ne $cs->{self_name} } @{ $cs->{members} // [] };
-    if (!@others) {
+    if (!@others && !$cs->{auto_spec}) {
         $self->_log("mesh: roster has no peers, mesh disabled");
         return;
     }
@@ -228,8 +243,48 @@ sub _start_mesh {
             );
         },
     );
-    $self->_log("mesh: started with " . scalar(@others) . " peer(s): "
-              . join(',', @others));
+    if ($cs->{auto_spec}) {
+        $self->_log("mesh: started in auto-discovery mode ("
+                  . _auto_spec_desc($cs->{auto_spec}) . ")");
+        # Prime immediately so the first mesh tick has peers to dial.
+        $self->_auto_discover;
+        $self->{next_auto_discover} = time + 300;    # 5 min cadence
+    } else {
+        $self->_log("mesh: started with " . scalar(@others) . " peer(s): "
+                  . join(',', @others));
+    }
+}
+
+# Pull a fresh members list from NetMgr::AutoDiscover and reconcile
+# Mesh's peer table. Best-effort: errors are logged and the
+# previously-discovered list stays in effect.
+sub _auto_discover {
+    my ($self) = @_;
+    my $cs = $self->{cluster} or return;
+    my $spec = $cs->{auto_spec} or return;
+    return unless $self->{mesh};
+    my $names = eval {
+        NetMgr::AutoDiscover::discover(
+            db        => $self->{db},
+            spec      => $spec,
+            self_name => $cs->{self_name},
+            log       => sub { $self->_log($_[0]) },
+        );
+    };
+    if ($@) {
+        my $e = $@; chomp $e;
+        $self->_log("auto-discover failed: $e");
+        return;
+    }
+    $self->{mesh}->set_members($names || []);
+}
+
+sub _auto_spec_desc {
+    my ($s) = @_;
+    my $c = $s->{zone_class};
+    my $n = $s->{zone_name};
+    return 'auto (no zone filter)' unless defined $c;
+    return "auto:$c" . (defined $n ? "/$n" : '');
 }
 
 # Parse a manager.listen spec into a list of { host, port } entries.
@@ -317,6 +372,11 @@ sub run {
         }
         $self->{mesh}->tick                if $self->{mesh};
         $self->_run_election               if $self->{mesh};
+        if ($self->{next_auto_discover}
+            && time >= $self->{next_auto_discover}) {
+            $self->_auto_discover;
+            $self->{next_auto_discover} = time + 300;
+        }
         $self->_reap_triggers              if %{ $self->{triggers} };
         $self->_check_periodic_triggers;
         $self->_age_out_offline;
