@@ -268,6 +268,8 @@ $targets_frame->Checkbutton(
 my $actions = $mw->Frame->pack(-side => 'bottom', -fill => 'x', -pady => 2);
 $actions->Button(-text => 'Push',    -command => \&do_push)
         ->pack(-side => 'left',  -padx => 4);
+$actions->Button(-text => 'Test',    -command => \&do_test)
+        ->pack(-side => 'left',  -padx => 4);
 $actions->Button(-text => 'Diff vs targets', -command => \&do_diff)
         ->pack(-side => 'left',  -padx => 4);
 $actions->Button(-text => 'Quit',    -command => sub { exit 0 })
@@ -419,6 +421,82 @@ sub do_push {
                     -message => $report, -type => 'OK',
                     -icon => ($report =~ /FAILED/ ? 'warning' : 'info'));
     status("Push complete.");
+}
+
+# Test each ticked peer: SSH login works AND the config file is
+# writable (we need read on the file and write on its parent dir
+# so the atomic-rename push can succeed). Peers that fail are
+# unticked and the result reported.
+sub do_test {
+    my @targets = grep { $S{push_targets}{$_} } @PEERS;
+    return msg('No targets', 'Tick at least one peer to test.')
+        unless @targets;
+
+    my %results;
+    for my $peer (@targets) {
+        status("Testing $peer …");
+        $mw->update;
+        my ($ok, $why) = ssh_test_writable($peer, $cfg_path);
+        $results{$peer} = { ok => $ok, why => $why };
+        unless ($ok) {
+            $S{push_targets}{$peer} = 0;
+        }
+    }
+    my @passed = grep { $results{$_}{ok} } @targets;
+    my @failed = grep { !$results{$_}{ok} } @targets;
+
+    my $report = '';
+    for my $p (@targets) {
+        my $r = $results{$p};
+        $report .= sprintf "%-20s %s%s\n",
+            $p,
+            ($r->{ok} ? 'OK (writable)' : 'FAIL — unticked'),
+            ($r->{ok} ? '' : "  [$r->{why}]");
+    }
+    status(sprintf "Test: %d ok, %d failed (unticked)",
+                  scalar @passed, scalar @failed);
+    $mw->messageBox(-title => 'Test results',
+                    -message => $report, -type => 'OK',
+                    -icon => (@failed ? 'warning' : 'info'));
+}
+
+# Single SSH round-trip:
+#   - command runs at all → login + sudo (if needed) works
+#   - file is readable                  → we can Pull / preserve other sections
+#   - parent dir is writable            → we can write the .tmp + rename
+# Returns (1, undef) on full pass, (0, error) on any failure.
+sub ssh_test_writable {
+    my ($peer, $path) = @_;
+    my $qp = shellq($path);
+    my $remote = qq{
+        if [ ! -r $qp ]; then echo "NOT_READABLE: $path"; exit 1; fi;
+        d=\$(dirname $qp);
+        if [ ! -w "\$d" ]; then echo "DIR_NOT_WRITABLE: \$d"; exit 1; fi;
+        echo OK
+    };
+    my ($in_fh, $out_fh, $err_fh) = (undef, undef, gensym);
+    my $pid = eval {
+        open3($in_fh, $out_fh, $err_fh, ssh_args($peer, $remote));
+    };
+    return (0, "open3 failed: $@") unless $pid;
+    close $in_fh if $in_fh;
+    my $stdout = do { local $/; <$out_fh> } // '';
+    my $stderr = do { local $/; <$err_fh> } // '';
+    waitpid $pid, 0;
+    my $rc = $? >> 8;
+    chomp $stdout; chomp $stderr;
+    if ($rc != 0) {
+        # ssh-side failure (auth, network, etc) — stderr has the why.
+        # If stdout has our remote-side rejection (NOT_READABLE etc),
+        # prefer that since it's specific.
+        my $reason = (length $stdout && $stdout ne 'OK')
+                   ? $stdout
+                   : ($stderr || "ssh exit $rc");
+        $reason =~ s/^\s+|\s+$//g;
+        return (0, $reason);
+    }
+    return (0, "unexpected reply: $stdout") unless $stdout =~ /^OK\s*$/;
+    return (1, undef);
 }
 
 sub do_diff {
