@@ -144,6 +144,24 @@ if (is_cygwin() && $spec->{cygwin_candidates} && defined $resolved_host) {
     }
 }
 
+# Remmina override: if remmina is installed and this is a VNC connection,
+# convert the vncviewer host:display / host::port syntax to a remmina URI.
+if ($spec->{layout} eq 'vnc' && !is_cygwin() && defined $resolved_host) {
+    my $remmina = _find_exe('remmina');
+    if (defined $remmina) {
+        my ($h, $port);
+        if ($resolved_host =~ /^([^:]+)::(\d+)$/) {
+            ($h, $port) = ($1, $2);
+        } elsif ($resolved_host =~ /^([^:]+):(\d+)$/) {
+            ($h, $port) = ($1, 5900 + $2);
+        } else {
+            ($h, $port) = ($resolved_host, 5900);
+        }
+        exec $remmina, '-c', "vnc://$h:$port";
+        die "exec $remmina: $!\n";
+    }
+}
+
 exec $spec->{cmd}, @new_argv;
 die "exec $spec->{cmd}: $!\n";
 
@@ -436,6 +454,17 @@ sub split_cmd {
         push @out, defined $1 ? $1 : $2;
     }
     return @out;
+}
+
+# ---- helpers -------------------------------------------------------
+
+sub _find_exe {
+    my ($name) = @_;
+    for my $d (split /:/, $ENV{PATH} // '') {
+        my $p = "$d/$name";
+        return $p if -x $p;
+    }
+    return undef;
 }
 
 # ---- net-lookup wrapper --------------------------------------------
