@@ -522,11 +522,8 @@ sub _x11vnc_connect {
     }
     sleep 1;
 
-    # Launch viewer; when it exits, clean up.
-    my $viewer_cmd = _find_exe('remmina')
-        ? [_find_exe('remmina'), '-c', "vnc://localhost:$local_port"]
-        : ['vncviewer', "localhost::$local_port"];
-    system @$viewer_cmd;
+    # Launch viewer via net-vnc so Cygwin/remmina detection kicks in.
+    system 'net-vnc', "localhost::$local_port";
 
     # Tear down.
     kill 'TERM', $tun_pid;
