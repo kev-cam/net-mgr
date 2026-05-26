@@ -119,6 +119,13 @@ if (@ARGV && $ARGV[0] eq '--rescan') {
     print STDERR "$self: cleared saved launcher (will re-probe)\n";
 }
 
+# --x11vnc: SSH to host, start x11vnc on :display, tunnel back, connect viewer.
+if ($self eq 'net-vnc' && @ARGV && $ARGV[0] eq '--x11vnc') {
+    shift @ARGV;
+    _x11vnc_connect(@ARGV);
+    exit 0;
+}
+
 my @new_argv = @ARGV;       # mutated in place by the rewriters
 my $resolved_host;          # set by vnc rewriter for cygwin override
 if    ($spec->{layout} eq 'ssh')   { rewrite_ssh_like(\@new_argv, $spec, 0) }
@@ -454,6 +461,78 @@ sub split_cmd {
         push @out, defined $1 ? $1 : $2;
     }
     return @out;
+}
+
+# ---- x11vnc mode ---------------------------------------------------
+#
+# net-vnc --x11vnc [user@]host:display [ssh-opts...]
+#
+# SSH to the host, start x11vnc on the given display with -autoport so
+# it picks a free rfb port, read that port from x11vnc's output, set up
+# an SSH tunnel, and launch the local viewer.
+
+sub _x11vnc_connect {
+    my @args = @_;
+    my ($dest, @ssh_extra) = @args;
+    die "net-vnc --x11vnc: need [user\@]host:display\n" unless defined $dest;
+    my ($user_at, $host, $disp_n) = $dest =~ /^((?:[^\@]+\@)?)([^:]+):(\d+)$/
+        or die "net-vnc --x11vnc: bad destination '$dest' "
+             . "(expected [user\@]host:display)\n";
+    my $ip = ($host =~ /^\d+\.\d+\.\d+\.\d+$/) ? $host : lookup_host($host);
+    my $ssh_host = defined $ip ? $ip : $host;
+    my $login = length $user_at ? "$user_at$ssh_host" : $ssh_host;
+
+    require IO::Socket::INET;
+    # x11vnc with -autoport: it prints "PORT=NNNN" to stderr.
+    # Run via SSH, merge stderr into stdout so we can read the port.
+    my @ssh = ('ssh', @ssh_extra, $login,
+               "x11vnc -display :$disp_n -autoport 5900 -nopw -once 2>&1");
+    my $pid = open my $fh, '-|', @ssh
+        or die "net-vnc --x11vnc: ssh: $!\n";
+
+    my $rfb_port;
+    while (my $line = <$fh>) {
+        if ($line =~ /^PORT=(\d+)/) {
+            $rfb_port = $1; last;
+        }
+    }
+    unless ($rfb_port) {
+        kill 'TERM', $pid;
+        waitpid $pid, 0;
+        die "net-vnc --x11vnc: x11vnc didn't report a port\n";
+    }
+
+    # Find a free local port for the tunnel.
+    my $local_port;
+    for my $try ($rfb_port, $rfb_port + 10000, 0) {
+        my $s = IO::Socket::INET->new(
+            LocalAddr => '127.0.0.1', LocalPort => $try,
+            Proto => 'tcp', Listen => 1, ReuseAddr => 1);
+        if ($s) { $local_port = $s->sockport; close $s; last }
+    }
+    $local_port //= $rfb_port;
+
+    # SSH tunnel in the background.
+    my $tun_pid = fork;
+    die "fork: $!\n" unless defined $tun_pid;
+    if (!$tun_pid) {
+        exec 'ssh', @ssh_extra, '-N',
+             '-L', "$local_port:localhost:$rfb_port", $login;
+        die "exec ssh: $!\n";
+    }
+    sleep 1;
+
+    # Launch viewer; when it exits, clean up.
+    my $viewer_cmd = _find_exe('remmina')
+        ? [_find_exe('remmina'), '-c', "vnc://localhost:$local_port"]
+        : ['vncviewer', "localhost::$local_port"];
+    system @$viewer_cmd;
+
+    # Tear down.
+    kill 'TERM', $tun_pid;
+    kill 'TERM', $pid;
+    waitpid $tun_pid, 0;
+    waitpid $pid, 0;
 }
 
 # ---- helpers -------------------------------------------------------
