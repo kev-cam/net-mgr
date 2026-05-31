@@ -151,21 +151,47 @@ if (is_cygwin() && $spec->{cygwin_candidates} && defined $resolved_host) {
     }
 }
 
-# Remmina override: if remmina is installed and this is a VNC connection,
-# convert the vncviewer host:display / host::port syntax to a remmina URI.
+# Viewer backend selection for VNC connections.
+#
+# NET_VNC_VIEWER lets the caller force a specific viewer:
+#   - unset / "auto" : prefer remmina if installed, else vncviewer (legacy)
+#   - "remmina"      : force the remmina URI handoff
+#   - any other name : exec that viewer with vncviewer-style host::port argv
+#
+# Why this matters: remmina's `-c` handoff returns immediately (it hands
+# the connection to the background remmina service rather than blocking).
+# Callers that tunnel via `ssh -L ... -N & viewer; kill $ssh` therefore
+# tear the tunnel down the instant remmina detaches, so the connection
+# dies.  Forcing a *blocking* viewer (vncviewer/xtigervnc/...) keeps the
+# tunnel up for the life of the viewer window.
 if ($spec->{layout} eq 'vnc' && !is_cygwin() && defined $resolved_host) {
-    my $remmina = _find_exe('remmina');
-    if (defined $remmina) {
-        my ($h, $port);
-        if ($resolved_host =~ /^([^:]+)::(\d+)$/) {
-            ($h, $port) = ($1, $2);
-        } elsif ($resolved_host =~ /^([^:]+):(\d+)$/) {
-            ($h, $port) = ($1, 5900 + $2);
-        } else {
-            ($h, $port) = ($resolved_host, 5900);
+    my $viewer = $ENV{NET_VNC_VIEWER};
+    $viewer = undef if defined $viewer && (!length $viewer || $viewer eq 'auto');
+
+    # Explicit non-remmina viewer: exec it directly with the already-
+    # rewritten vncviewer-style argv (host::port / host:display).
+    if (defined $viewer && $viewer ne 'remmina') {
+        my $bin = _find_exe($viewer) // $viewer;
+        exec { $bin } $bin, @new_argv;
+        die "exec $bin: $!\n";
+    }
+
+    # Remmina (forced via "remmina", or auto-detected when not forced):
+    # convert the host:display / host::port syntax to a remmina URI.
+    if (!defined $viewer || $viewer eq 'remmina') {
+        my $remmina = _find_exe('remmina');
+        if (defined $remmina) {
+            my ($h, $port);
+            if ($resolved_host =~ /^([^:]+)::(\d+)$/) {
+                ($h, $port) = ($1, $2);
+            } elsif ($resolved_host =~ /^([^:]+):(\d+)$/) {
+                ($h, $port) = ($1, 5900 + $2);
+            } else {
+                ($h, $port) = ($resolved_host, 5900);
+            }
+            exec $remmina, '-c', "vnc://$h:$port";
+            die "exec $remmina: $!\n";
         }
-        exec $remmina, '-c', "vnc://$h:$port";
-        die "exec $remmina: $!\n";
     }
 }
 
