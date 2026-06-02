@@ -515,8 +515,12 @@ sub _x11vnc_connect {
     # session and is exactly the leftover this mode used to strand.
     # `|| true` so a no-match pkill (exit 1) doesn't fail the command;
     # the brief sleep lets its rfb port free up before we re-bind.
+    # -once: serve one client then exit (so x11vnc's lifetime == the VNC
+    # session). -timeout 60: also exit if no client connects within 60s,
+    # so a viewer that never connects can't strand x11vnc/the tunnel.
     my $remote = 'pkill -x x11vnc 2>/dev/null || true; sleep 0.3; '
-               . "x11vnc -display :$disp_n -autoport 5900 -nopw -once 2>&1";
+               . "x11vnc -display :$disp_n -autoport 5900 -nopw "
+               . "-once -timeout 60 2>&1";
     # x11vnc with -autoport: it prints "PORT=NNNN" to stderr.
     # Run via SSH, merge stderr into stdout so we can read the port.
     my @ssh = ('ssh', @ssh_extra, $login, $remote);
@@ -545,42 +549,37 @@ sub _x11vnc_connect {
     }
     $local_port //= $rfb_port;
 
-    # SSH tunnel in the background.
+    # SSH tunnel in the background.  Forward to 127.0.0.1, NOT "localhost":
+    # x11vnc reliably binds IPv4 0.0.0.0:$rfb_port, but its IPv6 bind fails
+    # intermittently ("listen6: Address already in use" when a prior ::
+    # socket is still in TIME_WAIT).  On hosts where "localhost" resolves to
+    # ::1 first, the forward then hits an unbound [::1]:$rfb_port and is
+    # refused — exactly the "works sometimes" flakiness.  127.0.0.1 always
+    # lands on x11vnc's IPv4 listener.
     my $tun_pid = fork;
     die "fork: $!\n" unless defined $tun_pid;
     if (!$tun_pid) {
         exec 'ssh', @ssh_extra, '-N',
-             '-L', "$local_port:localhost:$rfb_port", $login;
+             '-L', "$local_port:127.0.0.1:$rfb_port", $login;
         die "exec ssh: $!\n";
     }
     sleep 1;
 
     # Launch viewer via net-vnc so Cygwin/remmina detection kicks in.
-    # BUT: this mode tears the tunnel down the instant the viewer exits,
-    # and remmina's `-c` handoff detaches immediately — so remmina would
-    # drop the tunnel before anything paints (the classic "connects then
-    # nothing" failure).  We always tunnel here, so never let the viewer
-    # detach: if the caller left NET_VNC_VIEWER unset / "auto" / "remmina",
-    # force the first *blocking* viewer on PATH instead.
-    my $vv = $ENV{NET_VNC_VIEWER};
-    if (!defined $vv || !length $vv || $vv eq 'auto' || $vv eq 'remmina') {
-        my @blocking = qw(vncviewer xtigervncviewer xvncviewer
-                          xtightvncviewer gvncviewer);
-        my ($pick) = grep { _find_exe($_) } @blocking;
-        if (defined $pick) {
-            $ENV{NET_VNC_VIEWER} = $pick;
-        } else {
-            warn "net-vnc --x11vnc: no blocking VNC viewer found (tried "
-               . "@blocking); the connection may drop immediately.\n";
-        }
-    }
+    # remmina's `-c` handoff detaches immediately, so don't tear the tunnel
+    # down when this returns — that's the bug behind "works sometimes": the
+    # tunnel was killed before remmina's background connect won the race.
     system 'net-vnc', "localhost::$local_port";
 
-    # Tear down.  Killing the local ssh ($pid) doesn't reliably reap the
-    # remote x11vnc (no -t, so the disconnect doesn't HUP it), which is
-    # how it got left running.  -once exits once the viewer disconnects,
-    # but if the viewer never connected it's still waiting — so kill it on
-    # the host explicitly.
+    # Keep the tunnel up for the life of the VNC session.  x11vnc is -once,
+    # so it exits when the client disconnects, which closes this pipe —
+    # reading it to EOF both blocks us until then and drains its output so
+    # it can't wedge on a full pipe mid-session.  (-timeout 60 caps the
+    # wait if no client ever connects, so a failed viewer can't hang us.)
+    1 while defined readline($fh);
+
+    # Tear down: x11vnc has exited (that's why we got EOF); drop the tunnel
+    # and reap. pkill is belt-and-braces for any straggler.
     system 'ssh', @ssh_extra, $login, 'pkill -x x11vnc 2>/dev/null || true';
     kill 'TERM', $tun_pid;
     kill 'TERM', $pid;
