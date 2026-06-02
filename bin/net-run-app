@@ -509,10 +509,17 @@ sub _x11vnc_connect {
     my $login = length $user_at ? "$user_at$ssh_host" : $ssh_host;
 
     require IO::Socket::INET;
+    # Kill any x11vnc already running on the host before starting ours.
+    # A stale x11vnc (e.g. a previous -once that the viewer never
+    # connected to, so it's still waiting) blocks/confuses the new
+    # session and is exactly the leftover this mode used to strand.
+    # `|| true` so a no-match pkill (exit 1) doesn't fail the command;
+    # the brief sleep lets its rfb port free up before we re-bind.
+    my $remote = 'pkill -x x11vnc 2>/dev/null || true; sleep 0.3; '
+               . "x11vnc -display :$disp_n -autoport 5900 -nopw -once 2>&1";
     # x11vnc with -autoport: it prints "PORT=NNNN" to stderr.
     # Run via SSH, merge stderr into stdout so we can read the port.
-    my @ssh = ('ssh', @ssh_extra, $login,
-               "x11vnc -display :$disp_n -autoport 5900 -nopw -once 2>&1");
+    my @ssh = ('ssh', @ssh_extra, $login, $remote);
     my $pid = open my $fh, '-|', @ssh
         or die "net-vnc --x11vnc: ssh: $!\n";
 
@@ -551,7 +558,12 @@ sub _x11vnc_connect {
     # Launch viewer via net-vnc so Cygwin/remmina detection kicks in.
     system 'net-vnc', "localhost::$local_port";
 
-    # Tear down.
+    # Tear down.  Killing the local ssh ($pid) doesn't reliably reap the
+    # remote x11vnc (no -t, so the disconnect doesn't HUP it), which is
+    # how it got left running.  -once exits once the viewer disconnects,
+    # but if the viewer never connected it's still waiting — so kill it on
+    # the host explicitly.
+    system 'ssh', @ssh_extra, $login, 'pkill -x x11vnc 2>/dev/null || true';
     kill 'TERM', $tun_pid;
     kill 'TERM', $pid;
     waitpid $tun_pid, 0;
