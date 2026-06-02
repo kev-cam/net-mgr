@@ -556,6 +556,24 @@ sub _x11vnc_connect {
     sleep 1;
 
     # Launch viewer via net-vnc so Cygwin/remmina detection kicks in.
+    # BUT: this mode tears the tunnel down the instant the viewer exits,
+    # and remmina's `-c` handoff detaches immediately — so remmina would
+    # drop the tunnel before anything paints (the classic "connects then
+    # nothing" failure).  We always tunnel here, so never let the viewer
+    # detach: if the caller left NET_VNC_VIEWER unset / "auto" / "remmina",
+    # force the first *blocking* viewer on PATH instead.
+    my $vv = $ENV{NET_VNC_VIEWER};
+    if (!defined $vv || !length $vv || $vv eq 'auto' || $vv eq 'remmina') {
+        my @blocking = qw(vncviewer xtigervncviewer xvncviewer
+                          xtightvncviewer gvncviewer);
+        my ($pick) = grep { _find_exe($_) } @blocking;
+        if (defined $pick) {
+            $ENV{NET_VNC_VIEWER} = $pick;
+        } else {
+            warn "net-vnc --x11vnc: no blocking VNC viewer found (tried "
+               . "@blocking); the connection may drop immediately.\n";
+        }
+    }
     system 'net-vnc', "localhost::$local_port";
 
     # Tear down.  Killing the local ssh ($pid) doesn't reliably reap the
