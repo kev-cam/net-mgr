@@ -44,6 +44,22 @@ package NetMgr::Protocol;
 #                                              is privileged for
 #                                              FORWARD / NAT_MASQUERADE
 #                                              / SET_GATEWAY.
+#   CHAT_OPEN  name=N [mode=open|list|request] [topic="..."]
+#                                            -- create a named chat
+#                                              session (authorized
+#                                              peers only). Creator
+#                                              becomes owner.
+#   CHAT_SET   name=N [mode=...] [topic="..."]  -- owner edits a session
+#   CHAT_CLOSE name=N                           -- owner closes a session
+#   CHAT_JOIN  session=N                         -- join; reply OK or
+#                                              OK state=requested on a
+#                                              request-mode session
+#   CHAT_LEAVE session=N                         -- drop presence
+#   CHAT_ALLOW   session=N principal=ID          -- owner: add to list
+#   CHAT_DENY    session=N principal=ID          -- owner: revoke
+#   CHAT_APPROVE session=N principal=ID          -- owner: OK a request
+#   CHAT_REJECT  session=N principal=ID          -- owner: deny a request
+#   (messages are posted with OBSERVE kind=chat_msg session=N body="...")
 #   BYE
 #
 # Replies (server → client):
@@ -102,6 +118,17 @@ sub parse_line {
     elsif ($verb eq 'SET_GATEWAY')    { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'AUTH')           { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'AUTH_RESPONSE')  { $cmd->{kv} = _parse_kv_only(\@toks) }
+    # net-chat session control. All kv-only; message body (CHAT-less,
+    # it rides OBSERVE kind=chat_msg) and topics travel as quoted values.
+    elsif ($verb eq 'CHAT_OPEN')      { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'CHAT_CLOSE')     { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'CHAT_SET')       { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'CHAT_JOIN')      { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'CHAT_LEAVE')     { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'CHAT_ALLOW')     { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'CHAT_DENY')      { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'CHAT_APPROVE')   { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'CHAT_REJECT')    { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'BYE')       { croak "BYE takes no args" if @toks }
     elsif ($verb eq 'STATUS')    { croak "STATUS takes no args" if @toks }
     elsif ($verb eq 'UNSUB') {

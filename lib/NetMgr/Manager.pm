@@ -34,6 +34,7 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
     peers uplinks isp_links
     forwarding_rules zone_classes interface_zones wifi_zones
     audit_annotations wifi_scan_results wifi_radio_state
+    chat_sessions chat_members chat_messages chat_presence
 );
 
 # Tables whose contents are sensitive (credentials etc.); SUBSCRIBE
@@ -354,6 +355,11 @@ sub run {
     my ($self) = @_;
     $self->start_listener unless %{ $self->{listeners} };
 
+    # Every connection that was joined to a chat session before the
+    # last restart is gone; clear stale presence so the roster starts
+    # empty (re-populated as clients CHAT_JOIN again).
+    eval { $self->{db}->clear_chat_presence } if $self->{db};
+
     local $SIG{INT}  = sub { $self->stop };
     local $SIG{TERM} = sub { $self->stop };
     local $SIG{PIPE} = 'IGNORE';
@@ -444,6 +450,14 @@ sub _handle_readable {
 sub _drop_client {
     my ($self, $fd, $why) = @_;
     my $cli = delete $self->{clients}{$fd} or return;
+    # Drop this connection's chat presence and tell roster subscribers.
+    # conn_id is the fd, so any rows this connection left behind go now.
+    if ($self->{db}) {
+        my $gone = eval { $self->{db}->delete_presence_for_conn($fd) } || [];
+        for my $row (@$gone) {
+            $self->_emit_change(table => 'chat_presence', op => 'delete', row => $row);
+        }
+    }
     # Tear down any port forwards this connection still owns. Same
     # rationale as for subscriptions, but FORWARDs leave kernel side-
     # effects (iptables rules, socat children) so we have to do it
@@ -515,6 +529,15 @@ sub _handle_line {
     elsif ($verb eq 'SET_GATEWAY')    { $self->_handle_set_gateway($cli, $cmd) }
     elsif ($verb eq 'AUTH')           { $self->_handle_auth($cli, $cmd) }
     elsif ($verb eq 'AUTH_RESPONSE')  { $self->_handle_auth_response($cli, $cmd) }
+    elsif ($verb eq 'CHAT_OPEN')      { $self->_handle_chat_open($cli, $cmd) }
+    elsif ($verb eq 'CHAT_SET')       { $self->_handle_chat_set($cli, $cmd) }
+    elsif ($verb eq 'CHAT_CLOSE')     { $self->_handle_chat_close($cli, $cmd) }
+    elsif ($verb eq 'CHAT_JOIN')      { $self->_handle_chat_join($cli, $cmd) }
+    elsif ($verb eq 'CHAT_LEAVE')     { $self->_handle_chat_leave($cli, $cmd) }
+    elsif ($verb eq 'CHAT_ALLOW')     { $self->_handle_chat_member_op($cli, $cmd, 'allow') }
+    elsif ($verb eq 'CHAT_DENY')      { $self->_handle_chat_member_op($cli, $cmd, 'deny') }
+    elsif ($verb eq 'CHAT_APPROVE')   { $self->_handle_chat_member_op($cli, $cmd, 'approve') }
+    elsif ($verb eq 'CHAT_REJECT')    { $self->_handle_chat_member_op($cli, $cmd, 'reject') }
     else {
         $self->_send($cli, format_err("verb $verb not handled"));
     }
@@ -1862,6 +1885,249 @@ sub _log_event {
 }
 
 
+# ---- net-chat --------------------------------------------------------
+#
+# Named chat sessions hosted by the daemon. Control verbs (CHAT_OPEN /
+# SET / CLOSE / JOIN / LEAVE / ALLOW / DENY / APPROVE / REJECT) flow
+# through the handlers below; message posting rides OBSERVE
+# kind=chat_msg (_obs_chat_msg). Reading history / listing sessions /
+# streaming a roster all use the generic SUBSCRIBE machinery against
+# the chat_* tables (registered in %SUBSCRIBABLE).
+
+# Resolve the caller's chat identity. A verified-AUTH connection is its
+# key_id (an 'agent'); a loopback connection is trusted to self-declare
+# `as=NAME` (a 'human', used by the web GUI passing REMOTE_USER) and
+# falls back to 'local'. Anyone else is unauthenticated → (undef,undef).
+sub _chat_identity {
+    my ($self, $cli, $kv) = @_;
+    if ($cli->{auth} && $cli->{auth}{verified}) {
+        return ($cli->{auth}{key_id}, 'agent');
+    }
+    if (_peer_is_loopback($cli)) {
+        my $as = (defined $kv && length($kv->{as} // '')) ? $kv->{as} : 'local';
+        return ($as, 'human');
+    }
+    return (undef, undef);
+}
+
+# Session names: a short safe token usable bare in WHERE clauses and URLs.
+sub _chat_valid_name {
+    my ($n) = @_;
+    return defined $n && $n =~ /\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z/;
+}
+
+# May $principal administer $session_row (edit/close/manage membership)?
+# Loopback is trusted as an admin (matches net-mgr's loopback model);
+# otherwise only the creator or an 'owner'-role member qualifies.
+sub _chat_may_admin {
+    my ($self, $cli, $session_row, $principal) = @_;
+    return 1 if _peer_is_loopback($cli);
+    return 0 unless defined $principal;
+    return 1 if $session_row->{created_by} eq $principal;
+    my $m = $self->{db}->get_chat_member($session_row->{name}, $principal);
+    return $m && $m->{role} eq 'owner';
+}
+
+# Add this connection to a session's live roster + emit to subscribers.
+sub _chat_presence_add {
+    my ($self, $cli, $session, $principal) = @_;
+    my $conn_id = fileno($cli->{sock});
+    return unless defined $conn_id;
+    my $r = $self->{db}->upsert_chat_presence(
+        session => $session, conn_id => $conn_id, principal => $principal);
+    $self->_emit_change(table => 'chat_presence', op => $r->{op}, row => $r->{now})
+        if $r->{op} ne 'noop' && $r->{now};
+}
+
+sub _handle_chat_open {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my ($who) = $self->_chat_identity($cli, $kv);
+    return $self->_send($cli, format_err("CHAT_OPEN: not authorized"))
+        unless defined $who;
+    my $name = $kv->{name};
+    return $self->_send($cli, format_err("CHAT_OPEN: bad/missing name="))
+        unless _chat_valid_name($name);
+    my $mode = $kv->{mode} // 'open';
+    return $self->_send($cli, format_err("CHAT_OPEN: bad mode '$mode'"))
+        unless $mode =~ /\A(open|list|request)\z/;
+
+    my $r = eval {
+        $self->{db}->open_chat_session(
+            name => $name, created_by => $who,
+            access_mode => $mode, topic => $kv->{topic});
+    };
+    return $self->_send($cli, format_err("CHAT_OPEN: $@")) if $@;
+    return $self->_send($cli, format_err("CHAT_OPEN: session '$name' exists"))
+        if $r->{op} eq 'exists';
+
+    # Creator becomes owner-member, then stream both new rows.
+    my $m = $self->{db}->set_chat_member(
+        session => $name, principal => $who, role => 'owner',
+        state => 'member', added_by => $who);
+    $self->_emit_change(table => 'chat_sessions', op => 'insert', row => $r->{now});
+    $self->_emit_change(table => 'chat_members',  op => 'insert', row => $m->{now})
+        if $m->{now};
+    $self->_log("chat open $name by $who mode=$mode");
+    $self->_send($cli, format_ok(name => $name, mode => $mode));
+}
+
+sub _handle_chat_set {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my ($who) = $self->_chat_identity($cli, $kv);
+    my $name = $kv->{name};
+    my $s = $self->{db}->get_chat_session($name)
+        or return $self->_send($cli, format_err("CHAT_SET: no such session '".($name//'')."'"));
+    return $self->_send($cli, format_err("CHAT_SET: not authorized"))
+        unless $self->_chat_may_admin($cli, $s, $who);
+    if (defined $kv->{mode} && $kv->{mode} !~ /\A(open|list|request)\z/) {
+        return $self->_send($cli, format_err("CHAT_SET: bad mode '$kv->{mode}'"));
+    }
+    my $r = eval {
+        $self->{db}->set_chat_session(
+            name => $name,
+            (defined $kv->{mode}  ? (access_mode => $kv->{mode})  : ()),
+            (exists  $kv->{topic} ? (topic       => $kv->{topic}) : ()));
+    };
+    return $self->_send($cli, format_err("CHAT_SET: $@")) if $@;
+    $self->_emit_change(table => 'chat_sessions', op => 'update', row => $r->{now})
+        if $r->{now};
+    $self->_send($cli, format_ok(name => $name));
+}
+
+sub _handle_chat_close {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my ($who) = $self->_chat_identity($cli, $kv);
+    my $name = $kv->{name};
+    my $s = $self->{db}->get_chat_session($name)
+        or return $self->_send($cli, format_err("CHAT_CLOSE: no such session '".($name//'')."'"));
+    return $self->_send($cli, format_err("CHAT_CLOSE: not authorized"))
+        unless $self->_chat_may_admin($cli, $s, $who);
+    my $r = $self->{db}->close_chat_session($name);
+    $self->_emit_change(table => 'chat_sessions', op => 'update', row => $r->{now})
+        if $r->{now};
+    $self->_log("chat close $name by ".($who//'?'));
+    $self->_send($cli, format_ok(name => $name, status => 'closed'));
+}
+
+sub _handle_chat_join {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my ($who) = $self->_chat_identity($cli, $kv);
+    return $self->_send($cli, format_err("CHAT_JOIN: not authorized"))
+        unless defined $who;
+    my $name = $kv->{session} // $kv->{name};
+    my $s = $self->{db}->get_chat_session($name)
+        or return $self->_send($cli, format_err("CHAT_JOIN: no such session '".($name//'')."'"));
+    return $self->_send($cli, format_err("CHAT_JOIN: session '$name' is closed"))
+        if $s->{status} eq 'closed';
+
+    my $mode = $s->{access_mode};
+    my $existing = $self->{db}->get_chat_member($name, $who);
+    my $is_member = $existing && $existing->{state} eq 'member';
+
+    if ($mode eq 'request' && !$is_member && !$self->_chat_may_admin($cli, $s, $who)) {
+        # Not yet allowed — record/refresh the join request and notify
+        # owners (anyone subscribed WHERE state="requested" sees it).
+        my $m = $self->{db}->set_chat_member(
+            session => $name, principal => $who, state => 'requested', added_by => $who);
+        $self->_emit_change(table => 'chat_members', op => 'update', row => $m->{now})
+            if $m->{now};
+        $self->_log("chat join-request $name by $who");
+        return $self->_send($cli, format_ok(session => $name, state => 'requested'));
+    }
+    if ($mode eq 'list' && !$is_member
+        && !($existing && $existing->{state} eq 'invited')
+        && !$self->_chat_may_admin($cli, $s, $who)) {
+        return $self->_send($cli,
+            format_err("CHAT_JOIN: '$name' is allow-list only; ask an owner to CHAT_ALLOW you"));
+    }
+
+    # Allowed: ensure a member row (idempotent) and add live presence.
+    if (!$is_member) {
+        my $m = $self->{db}->set_chat_member(
+            session => $name, principal => $who, state => 'member', added_by => $who);
+        $self->_emit_change(table => 'chat_members', op => 'update', row => $m->{now})
+            if $m->{now};
+    }
+    $self->_chat_presence_add($cli, $name, $who);
+    $self->_log("chat join $name by $who");
+    $self->_send($cli, format_ok(session => $name, state => 'member'));
+}
+
+sub _handle_chat_leave {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my $name = $kv->{session} // $kv->{name};
+    return $self->_send($cli, format_err("CHAT_LEAVE: missing session="))
+        unless defined $name;
+    my $conn_id = fileno($cli->{sock});
+    my $row = defined $conn_id
+        ? $self->{db}->delete_chat_presence($name, $conn_id) : undef;
+    $self->_emit_change(table => 'chat_presence', op => 'delete', row => $row) if $row;
+    $self->_send($cli, format_ok(session => $name));
+}
+
+# CHAT_ALLOW / DENY / APPROVE / REJECT — owner edits to the membership
+# list. allow/approve → state 'member'; deny/reject → state 'denied'.
+sub _handle_chat_member_op {
+    my ($self, $cli, $cmd, $op) = @_;
+    my $kv = $cmd->{kv} || {};
+    my ($who) = $self->_chat_identity($cli, $kv);
+    my $name = $kv->{session} // $kv->{name};
+    my $principal = $kv->{principal};
+    my $verb = "CHAT_" . uc $op;
+    my $s = $self->{db}->get_chat_session($name)
+        or return $self->_send($cli, format_err("$verb: no such session '".($name//'')."'"));
+    return $self->_send($cli, format_err("$verb: not authorized"))
+        unless $self->_chat_may_admin($cli, $s, $who);
+    return $self->_send($cli, format_err("$verb: missing principal="))
+        unless defined $principal && length $principal;
+    my $state = ($op eq 'allow' || $op eq 'approve') ? 'member' : 'denied';
+    my $m = $self->{db}->set_chat_member(
+        session => $name, principal => $principal, state => $state, added_by => $who);
+    $self->_emit_change(table => 'chat_members', op => 'update', row => $m->{now})
+        if $m->{now};
+    $self->_log("chat $op $name principal=$principal by ".($who//'?'));
+    $self->_send($cli, format_ok(session => $name, principal => $principal, state => $state));
+}
+
+# OBSERVE kind=chat_msg session=N body="..." [in_reply_to=ID] [as=NAME]
+# Posts one message. Identity is server-stamped from the verified key
+# (or loopback `as`); a closed session or a non-member (on list/request
+# sessions) is rejected. Returns no events — it does its own emit.
+sub _obs_chat_msg {
+    my ($self, $cli, $kv) = @_;
+    my ($who, $kind) = $self->_chat_identity($cli, $kv);
+    die "not authorized to post\n" unless defined $who;
+    my $name = $kv->{session} // $kv->{name};
+    my $body = $kv->{body};
+    die "chat_msg: missing session=\n" unless defined $name && length $name;
+    die "chat_msg: missing body=\n"    unless defined $body && length $body;
+    my $s = $self->{db}->get_chat_session($name)
+        or die "chat_msg: no such session '$name'\n";
+    die "chat_msg: session '$name' is closed\n" if $s->{status} eq 'closed';
+
+    if ($s->{access_mode} ne 'open' && !_peer_is_loopback($cli)) {
+        my $m = $self->{db}->get_chat_member($name, $who);
+        die "chat_msg: not a member of '$name'\n"
+            unless $m && $m->{state} eq 'member';
+    }
+
+    my $row = $self->{db}->insert_chat_message(
+        session => $name, sender => $who, sender_kind => $kind,
+        body => $body, in_reply_to => $kv->{in_reply_to});
+    $self->{db}->touch_chat_activity($name);
+    $self->_emit_change(table => 'chat_messages', op => 'insert', row => $row);
+    # Stream the bumped last_activity so session lists re-sort live.
+    my $fresh = $self->{db}->get_chat_session($name);
+    $self->_emit_change(table => 'chat_sessions', op => 'update', row => $fresh)
+        if $fresh;
+    return ();   # not a network event; no events-table row
+}
+
 # ---- OBSERVE dispatch ------------------------------------------------
 
 sub _handle_observe {
@@ -1890,6 +2156,7 @@ sub _handle_observe {
                                        { @events = $self->_obs_peer_cap_clear($cli, $kv) }
         elsif ($kind eq 'event')       { @events = $self->_obs_event($cli, $kv) }
         elsif ($kind eq 'forward')     { @events = $self->_obs_forward($cli, $kv) }
+        elsif ($kind eq 'chat_msg')    { @events = $self->_obs_chat_msg($cli, $kv) }
         else {
             die "unknown observation kind '$kind'\n";
         }

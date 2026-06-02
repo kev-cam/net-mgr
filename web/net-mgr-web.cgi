@@ -103,6 +103,11 @@ if (defined $q{view} && $q{view} eq 'wifi-survey') {
     $cli->bye;
     exit 0;
 }
+if (defined $q{view} && $q{view} eq 'chat') {
+    chat_route();
+    eval { $cli->bye };
+    exit 0;
+}
 
 my $machines  = $cli->snapshot(1, 'machines');
 my $hostnames = $cli->snapshot(2, 'hostnames');
@@ -1756,6 +1761,376 @@ sub render_dhcp {
     return wrap_page("DHCP grants — net-mgr", $body, "DHCP grants");
 }
 
+# ---- chat -----------------------------------------------------------
+#
+# Human front-end to net-chat. Sessions, message history, a live
+# roster and a post box. The browser polls a JSON endpoint for new
+# messages (no new server deps). Posting + owner controls go to the
+# daemon over the same loopback socket; the human's identity is
+# REMOTE_USER (Apache basic-auth) or 'web'.
+
+my $chat_error;   # set by chat_do_action, shown on the re-rendered page
+
+sub chat_human {
+    my $u = $ENV{REMOTE_USER};
+    return (defined $u && length $u) ? $u : 'web';
+}
+
+sub chat_safe_name {
+    my ($n) = @_;
+    $n //= '';
+    $n =~ s/[^A-Za-z0-9._-]//g;
+    return substr($n, 0, 64);
+}
+
+sub json_str {
+    my ($s) = @_;
+    $s = '' unless defined $s;
+    $s =~ s/([\\"])/\\$1/g;
+    $s =~ s/\n/\\n/g; $s =~ s/\r/\\r/g; $s =~ s/\t/\\t/g;
+    $s =~ s/([\x00-\x1f])/sprintf('\\u%04x', ord $1)/ge;
+    return '"' . $s . '"';
+}
+
+sub read_post {
+    my $len  = $ENV{CONTENT_LENGTH} || 0;
+    my $data = '';
+    read(STDIN, $data, $len) if $len > 0;
+    my %p;
+    for my $kv (split /&/, $data) {
+        my ($k, $v) = split /=/, $kv, 2;
+        next unless defined $k;
+        $v //= '';
+        for ($k, $v) { tr/+/ /; s/%([0-9A-Fa-f]{2})/chr hex $1/ge; }
+        $p{$k} = $v;
+    }
+    return \%p;
+}
+
+sub chat_route {
+    my $name   = $q{session};
+    my $action = $q{action} // '';
+
+    # Live-poll JSON endpoint (GET). Header is already text/html; the
+    # client JSON.parse()s the body, so the content-type doesn't matter.
+    if ($action eq 'json' && defined $name) {
+        chat_json($name, $q{since} // 0);
+        return;
+    }
+
+    # Mutating actions arrive as POST.
+    if (($ENV{REQUEST_METHOD} // '') eq 'POST') {
+        my $p = read_post();
+        # The session usually rides the action URL's query string; fall
+        # back to it so forms don't need a hidden session field.
+        $p->{session} = $q{session}
+            if !length($p->{session} // '') && defined $q{session};
+        my $redirect = chat_do_action($p);
+        $name = $redirect if defined $redirect;
+        if (($p->{ajax} // '') eq '1') {
+            print $chat_error ? '{"ok":0}' : '{"ok":1}';
+            return;
+        }
+    }
+
+    if (defined $name && length $name) {
+        print render_chat_session($name);
+    } else {
+        print render_chat_list();
+    }
+}
+
+# Run one mutating chat action over the loopback socket. Returns a
+# session name to render afterwards (or undef). Sets $chat_error on
+# failure.
+sub chat_do_action {
+    my ($p) = @_;
+    my $action = $p->{action} // '';
+    my $who    = chat_human();
+    $cli->{as} = $who;   # attribute control verbs + posts to this human
+    eval {
+        if ($action eq 'post') {
+            die "empty message\n" unless length($p->{body} // '');
+            $cli->chat_post(session => $p->{session}, body => $p->{body}, as => $who);
+        }
+        elsif ($action eq 'open') {
+            die "name required\n" unless length($p->{name} // '');
+            $cli->chat_open(name => $p->{name},
+                (length($p->{mode}  // '') ? (mode  => $p->{mode})  : ()),
+                (length($p->{topic} // '') ? (topic => $p->{topic}) : ()));
+            return;   # rendered by caller; new session name returned below
+        }
+        elsif ($action eq 'set') {
+            $cli->chat_set(name => $p->{session},
+                (length($p->{mode}  // '') ? (mode  => $p->{mode})  : ()),
+                (exists  $p->{topic}       ? (topic => $p->{topic}) : ()));
+        }
+        elsif ($action eq 'close') {
+            $cli->chat_close(name => $p->{session});
+        }
+        elsif ($action =~ /^(approve|reject|allow|deny)$/) {
+            $cli->chat_member($action,
+                session => $p->{session}, principal => $p->{principal});
+        }
+        else {
+            die "unknown action '$action'\n";
+        }
+    };
+    if ($@) { ($chat_error = $@) =~ s/\s+\z//; }
+    return $p->{name} if $action eq 'open' && !$chat_error;
+    return $p->{session};
+}
+
+sub chat_json {
+    my ($name, $since) = @_;
+    $name  = chat_safe_name($name);
+    $since = ($since // 0) + 0;
+    my $where = "session = '$name'";
+    $where .= " AND id > $since" if $since;
+    my $rows = eval { $cli->snapshot(40, 'chat_messages', where => $where) } || [];
+    @$rows = sort { ($a->{id} // 0) <=> ($b->{id} // 0) } @$rows;
+    my @j = map {
+        '{"id":' . (($_->{id} // 0) + 0)
+        . ',"ts":'     . json_str($_->{ts})
+        . ',"sender":' . json_str($_->{sender})
+        . ',"kind":'   . json_str($_->{sender_kind})
+        . ',"body":'   . json_str($_->{body}) . '}'
+    } @$rows;
+    print '[' . join(',', @j) . ']';
+}
+
+sub render_chat_list {
+    my $rows = eval { $cli->snapshot(41, 'chat_sessions', where => "status = 'open'") };
+    if ($@) {
+        return wrap_page("chat — net-mgr",
+            qq{<p class=note>chat tables not available — is the daemon on schema 22+?</p>}
+          . qq{<pre>@{[escapeHTML($@)]}</pre>}, "chat");
+    }
+    $rows ||= [];
+    @$rows = sort { ($b->{last_activity}//'') cmp ($a->{last_activity}//'') } @$rows;
+    my $body = '';
+    $body .= qq{<p style="color:#f55;">@{[escapeHTML($chat_error)]}</p>} if $chat_error;
+    if (@$rows) {
+        $body .= '<table><tr><th>session</th><th>mode</th><th>owner</th>'
+               . '<th>topic</th><th>active</th></tr>';
+        for my $s (@$rows) {
+            my $n = escapeHTML($s->{name});
+            my $link = '?view=chat&session=' . uri_escape($s->{name});
+            $body .= sprintf
+                '<tr><td class=name><a class=hostlink href="%s">%s</a></td>'
+              . '<td>%s</td><td>%s</td><td>%s</td><td><code>%s</code></td></tr>',
+                $link, $n,
+                escapeHTML($s->{access_mode} // ''),
+                escapeHTML($s->{created_by}  // ''),
+                escapeHTML($s->{topic}       // ''),
+                escapeHTML($s->{last_activity} // '');
+        }
+        $body .= '</table>';
+    } else {
+        $body .= '<p class=note>no open chat sessions yet.</p>';
+    }
+    # New-session form.
+    $body .= <<'FORM';
+<h2>open a session</h2>
+<form method="post" action="?view=chat">
+<input type="hidden" name="action" value="open">
+<p>
+  name: <input name="name" size="20" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" required>
+  mode:
+  <select name="mode">
+    <option value="open">open</option>
+    <option value="list">allow-list</option>
+    <option value="request">request</option>
+  </select>
+</p>
+<p>topic: <input name="topic" size="50"></p>
+<p><button type="submit">create</button></p>
+</form>
+FORM
+    return wrap_page("chat — net-mgr", $body, "chat");
+}
+
+sub render_chat_session {
+    my ($name) = @_;
+    $name = chat_safe_name($name);
+    my $sessions = eval { $cli->snapshot(42, 'chat_sessions', where => "name = '$name'") };
+    if ($@) {
+        return wrap_page("chat — net-mgr",
+            qq{<p class=note>chat unavailable</p><pre>@{[escapeHTML($@)]}</pre>}, "chat");
+    }
+    my ($s) = @{ $sessions || [] };
+    return wrap_page("chat — net-mgr",
+        qq{<p class=note>no such session '@{[escapeHTML($name)]}'</p>}
+      . qq{<p><a href="?view=chat">&larr; all sessions</a></p>}, "chat")
+        unless $s;
+
+    my $msgs     = eval { $cli->snapshot(43, 'chat_messages', where => "session = '$name'") } || [];
+    my $presence = eval { $cli->snapshot(44, 'chat_presence', where => "session = '$name'") } || [];
+    my $requests = eval { $cli->snapshot(45, 'chat_members',
+                            where => "session = '$name' AND state = 'requested'") } || [];
+
+    @$msgs = sort { ($a->{id} // 0) <=> ($b->{id} // 0) } @$msgs;
+    @$msgs = @$msgs[ -100 .. -1 ] if @$msgs > 100;
+    my $last_id = @$msgs ? ($msgs->[-1]{id} // 0) : 0;
+
+    my %seen;
+    my @roster = grep { !$seen{$_}++ } map { $_->{principal} } @$presence;
+
+    my $jname = json_str($name);
+    my $closed = ($s->{status} // '') eq 'closed';
+
+    my $body = '';
+    $body .= qq{<p><a href="?view=chat">&larr; all sessions</a></p>};
+    $body .= qq{<p style="color:#f55;">@{[escapeHTML($chat_error)]}</p>} if $chat_error;
+    $body .= sprintf '<p class=meta>mode <b>%s</b> · owner %s · %s%s</p>',
+        escapeHTML($s->{access_mode} // ''),
+        escapeHTML($s->{created_by}  // ''),
+        escapeHTML($s->{status} // 'open'),
+        ($s->{topic} && length $s->{topic})
+            ? ' · ' . escapeHTML($s->{topic}) : '';
+    $body .= '<p class=meta>here now: '
+           . (@roster ? join(', ', map { escapeHTML($_) } @roster)
+                      : '<span class=note>nobody</span>') . '</p>';
+
+    # Pending join requests (owner controls; loopback is trusted admin).
+    if (@$requests) {
+        $body .= '<h3>pending requests</h3>';
+        for my $r (@$requests) {
+            my $pr = escapeHTML($r->{principal});
+            $body .= sprintf
+                '<form method="post" action="?view=chat&session=%s" style="display:inline">'
+              . '<input type=hidden name=session value="%s">'
+              . '<input type=hidden name=principal value="%s">'
+              . '%s '
+              . '<button name=action value=approve>approve</button> '
+              . '<button name=action value=reject>reject</button>'
+              . '</form><br>',
+                uri_escape($name), escapeHTML($name), $pr, $pr;
+        }
+    }
+
+    # Message log + post box.
+    my $log = '';
+    for my $m (@$msgs) {
+        $log .= sprintf
+            '<div class=cmsg><span class=cts>%s</span> '
+          . '<span class=cwho>%s</span>: <span class=cbody>%s</span></div>',
+            escapeHTML(_chat_short_ts($m->{ts})),
+            escapeHTML($m->{sender} // '?'),
+            escapeHTML($m->{body}   // '');
+    }
+    $body .= qq{<div id="msgs" class="chatlog">$log</div>};
+
+    unless ($closed) {
+        $body .= sprintf <<'FORM', uri_escape($name);
+<form id="postform" method="post" action="?view=chat&session=%s">
+<input type="hidden" name="action" value="post">
+<input id="postbody" name="body" size="70" autocomplete="off" placeholder="message…">
+<button type="submit">send</button>
+</form>
+FORM
+    } else {
+        $body .= '<p class=note>session is closed — read-only.</p>';
+    }
+
+    # Owner controls.
+    $body .= sprintf <<'CTRL', uri_escape($name), escapeHTML($name);
+<h3>manage</h3>
+<form method="post" action="?view=chat&session=%s" style="display:inline">
+<input type="hidden" name="action" value="set">
+<input type="hidden" name="session" value="%s">
+mode <select name="mode">
+<option value="open">open</option>
+<option value="list">allow-list</option>
+<option value="request">request</option>
+</select>
+<button type="submit">set</button>
+</form>
+CTRL
+    unless ($closed) {
+        $body .= sprintf
+            '<form method="post" action="?view=chat&session=%s" style="display:inline">'
+          . '<input type=hidden name=session value="%s">'
+          . '<button name=action value=close onclick="return confirm(\'Close this session?\')">close</button>'
+          . '</form>',
+            uri_escape($name), escapeHTML($name);
+    }
+
+    # Live-update + AJAX post script.
+    $body .= <<JS;
+<style>
+.chatlog { background:#181818; border:1px solid #2a2a2a; border-radius:4px;
+           padding:8px; height:55vh; overflow-y:auto; margin:0.5em 0; }
+.cmsg { padding:1px 0; }
+.cts  { color:#666; font-size:0.85em; }
+.cwho { color:#6cf; }
+.cbody { color:#ddd; white-space:pre-wrap; }
+#postbody { background:#111; color:#eee; border:1px solid #444;
+            border-radius:3px; padding:4px 6px; }
+</style>
+<script>
+(function() {
+  var SESSION = $jname;
+  var lastId = $last_id;
+  var box = document.getElementById('msgs');
+  function esc(s){ var d=document.createElement('div'); d.textContent=s==null?'':s; return d.innerHTML; }
+  function append(m){
+    var div=document.createElement('div'); div.className='cmsg';
+    div.innerHTML='<span class="cts">'+esc(m.ts)+'</span> '
+                 +'<span class="cwho">'+esc(m.sender)+'</span>: '
+                 +'<span class="cbody">'+esc(m.body)+'</span>';
+    box.appendChild(div);
+  }
+  function poll(){
+    fetch('?view=chat&session='+encodeURIComponent(SESSION)+'&action=json&since='+lastId)
+      .then(function(r){return r.text();})
+      .then(function(t){
+        var rows; try { rows=JSON.parse(t); } catch(e){ return; }
+        var grew=false;
+        for (var i=0;i<rows.length;i++){
+          if (rows[i].id>lastId){ append(rows[i]); lastId=rows[i].id; grew=true; }
+        }
+        if (grew) box.scrollTop=box.scrollHeight;
+      }).catch(function(){});
+  }
+  if (box) box.scrollTop=box.scrollHeight;
+  setInterval(poll, 2000);
+  var form=document.getElementById('postform');
+  if (form) form.addEventListener('submit', function(e){
+    e.preventDefault();
+    var inp=document.getElementById('postbody');
+    var v=inp.value; if(!v) return;
+    var data='action=post&ajax=1&session='+encodeURIComponent(SESSION)
+            +'&body='+encodeURIComponent(v);
+    fetch('?view=chat&session='+encodeURIComponent(SESSION),
+          {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data})
+      .then(function(){ inp.value=''; poll(); })
+      .catch(function(){});
+  });
+})();
+</script>
+JS
+
+    return wrap_page("chat: $name — net-mgr", $body, "chat: $name");
+}
+
+sub _chat_short_ts {
+    my ($ts) = @_;
+    $ts //= '';
+    $ts =~ s/\.\d+$//;     # drop microseconds
+    $ts =~ s/^\d{4}-//;    # drop year
+    return $ts;
+}
+
+# Minimal percent-encoder for query-string values (session names are
+# already restricted to [A-Za-z0-9._-], but be safe for the attribute).
+sub uri_escape {
+    my ($s) = @_;
+    $s //= '';
+    $s =~ s/([^A-Za-z0-9._-])/sprintf('%%%02X', ord $1)/ge;
+    return $s;
+}
+
 sub wrap_page {
     my ($title, $body, $h1) = @_;
     $h1 //= 'net-mgr';
@@ -1912,7 +2287,7 @@ p.reco a:hover, table.reco-summary a:hover, p.meta a:hover {
 </style>
 </head>
 <body>
-<nav><a href="?">&larr; hosts</a><a href="?view=tools">tools</a></nav>
+<nav><a href="?">&larr; hosts</a><a href="?view=chat">chat</a><a href="?view=tools">tools</a></nav>
 <h1>@{[escapeHTML($h1)]}</h1>
 $body
 </body></html>

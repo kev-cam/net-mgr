@@ -23,7 +23,10 @@ sub new {
         Proto    => 'tcp',
         Timeout  => $timeout,
     ) or croak "connect $host:$port: $!";
-    return bless { sock => $sock, buf => '', listen => "$host:$port" }, $class;
+    # `as` is a loopback-only self-declared identity stamped onto chat
+    # control verbs / posts (the daemon ignores it once AUTH'd).
+    return bless { sock => $sock, buf => '', listen => "$host:$port",
+                   as => $args{as} }, $class;
 }
 
 sub send_line {
@@ -314,6 +317,96 @@ sub _shq {
     return $s if $s =~ m{^[A-Za-z0-9_./=,\@:-]+$};
     (my $q = $s) =~ s/'/'\\''/g;
     return "'$q'";
+}
+
+# ---- net-chat --------------------------------------------------------
+#
+# Thin wrappers over the CHAT_* control verbs and OBSERVE kind=chat_msg.
+# Both net-chat and the web CGI go through these so there's one code
+# path. Each returns the OK kv hashref or croaks with the daemon's
+# error. Reading history / listing sessions / the roster all reuse the
+# generic snapshot()/SUBSCRIBE machinery against the chat_* tables.
+
+# Internal: send a CHAT_* line, parse the reply, croak on ERR.
+sub _chat_cmd {
+    my ($self, $verb, %kv) = @_;
+    # Carry the loopback identity on control verbs too, so session
+    # ownership / membership match what the caller posts as.
+    $kv{as} = $self->{as} if defined $self->{as} && !exists $kv{as};
+    my $line = $verb;
+    $line .= " " . format_kv(%kv) if %kv;
+    my $r = $self->send_recv($line);
+    croak "$verb: no reply from daemon" unless defined $r;
+    my $cmd = parse_line($r);
+    croak "$verb: $cmd->{msg}" if $cmd->{verb} eq 'ERR';
+    croak "$verb: unexpected reply '$r'" unless $cmd->{verb} eq 'OK';
+    return $cmd->{kv} || {};
+}
+
+sub chat_open {
+    my ($self, %a) = @_;
+    croak "chat_open needs name" unless defined $a{name};
+    return $self->_chat_cmd('CHAT_OPEN',
+        name => $a{name},
+        (defined $a{mode}  ? (mode  => $a{mode})  : ()),
+        (defined $a{topic} ? (topic => $a{topic}) : ()));
+}
+
+sub chat_set {
+    my ($self, %a) = @_;
+    croak "chat_set needs name" unless defined $a{name};
+    return $self->_chat_cmd('CHAT_SET',
+        name => $a{name},
+        (defined $a{mode}  ? (mode  => $a{mode})  : ()),
+        (exists  $a{topic} ? (topic => $a{topic}) : ()));
+}
+
+sub chat_close {
+    my ($self, %a) = @_;
+    croak "chat_close needs name" unless defined $a{name};
+    return $self->_chat_cmd('CHAT_CLOSE', name => $a{name});
+}
+
+sub chat_join {
+    my ($self, %a) = @_;
+    croak "chat_join needs session" unless defined $a{session};
+    return $self->_chat_cmd('CHAT_JOIN', session => $a{session});
+}
+
+sub chat_leave {
+    my ($self, %a) = @_;
+    croak "chat_leave needs session" unless defined $a{session};
+    return $self->_chat_cmd('CHAT_LEAVE', session => $a{session});
+}
+
+# Membership ops: $op is one of allow|deny|approve|reject.
+sub chat_member {
+    my ($self, $op, %a) = @_;
+    my %verb = (allow => 'CHAT_ALLOW', deny => 'CHAT_DENY',
+                approve => 'CHAT_APPROVE', reject => 'CHAT_REJECT');
+    croak "chat_member: bad op '$op'" unless $verb{$op};
+    croak "chat_member needs session + principal"
+        unless defined $a{session} && defined $a{principal};
+    return $self->_chat_cmd($verb{$op},
+        session => $a{session}, principal => $a{principal});
+}
+
+# Post a message via OBSERVE kind=chat_msg. `as` is honoured only for
+# loopback connections (server stamps verified key_id otherwise).
+sub chat_post {
+    my ($self, %a) = @_;
+    croak "chat_post needs session + body"
+        unless defined $a{session} && defined $a{body};
+    my %kv = (kind => 'chat_msg', session => $a{session}, body => $a{body});
+    my $as = defined $a{as} ? $a{as} : $self->{as};
+    $kv{as}          = $as             if defined $as;
+    $kv{in_reply_to} = $a{in_reply_to} if defined $a{in_reply_to};
+    my $r = $self->send_recv("OBSERVE " . format_kv(%kv));
+    croak "chat_post: no reply from daemon" unless defined $r;
+    my $cmd = parse_line($r);
+    croak "chat_post: $cmd->{msg}" if $cmd->{verb} eq 'ERR';
+    croak "chat_post: unexpected reply '$r'" unless $cmd->{verb} eq 'OK';
+    return $cmd->{kv} || {};
 }
 
 sub bye {

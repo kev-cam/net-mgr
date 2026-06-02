@@ -1,0 +1,156 @@
+.TH NET-CHAT 1 "2026-06-02" "net-mgr" "User Commands"
+.SH NAME
+net-chat \- talk in named chat sessions hosted by net-mgr
+.SH SYNOPSIS
+.B net-chat
+.RI [ options ]
+.I COMMAND
+.RI [ args ]
+.SH DESCRIPTION
+.B net-chat
+is the command-line client for the chat/coordination service hosted by the
+.BR net-mgr (7)
+daemon. Authorized parties create named sessions; the daemon records every
+message durably. Software identifies itself with an SSH key (the same AUTH
+handshake the daemon uses elsewhere) and the server stamps each message with
+the verified identity, so senders cannot be spoofed. Humans normally use the
+web UI (the
+.B chat
+tab of net-mgr-web), but every operation is also available here.
+.PP
+Each session has an access
+.IR mode ,
+chosen by its creator and changeable later:
+.RS
+.TP
+.B open
+any authorized client may join and post.
+.TP
+.B list
+only principals on the allow-list (see
+.BR allow )
+may post.
+.TP
+.B request
+others
+.B join
+into a pending state and an owner
+.B approve\fRs
+them.
+.RE
+.SH CONNECTION AND IDENTITY
+A loopback daemon (the default,
+.BR 127.0.0.1:7531 )
+is trusted: posts are labelled with
+.B \-\-as
+(or
+.BR $NET_CHAT_AS / $USER ).
+A non-loopback daemon is authenticated automatically with the SSH-key
+handshake; the verified key id becomes the sender.
+.TP
+\fB\-\-listen\fR \fIHOST:PORT\fR
+Manager address (default
+.BR 127.0.0.1:7531 ).
+.TP
+\fB\-\-as\fR \fINAME\fR
+Display name for posts on a loopback daemon. Ignored once AUTH'd.
+.TP
+.B \-\-auth
+Force the SSH-key handshake even on loopback (identify by key).
+.TP
+.B \-\-no\-auth
+Never AUTH (loopback / read-only use).
+.TP
+\fB\-\-key\-id\fR \fIID\fR, \fB\-\-key\-file\fR \fIPATH\fR
+Override the key used for AUTH (see
+.BR NetMgr::Client ).
+.SH COMMANDS
+.TP
+.B ls \fR[\fB\-\-all\fR]
+List open sessions (or all with
+.BR \-\-all ).
+.TP
+.B open \fINAME\fR \fR[\fB\-\-mode\fR \fIM\fR] [\fB\-\-topic\fR \fIT\fR]
+Create a session.
+.I M
+is
+.BR open ", " list ", or " request
+(default
+.BR open ).
+The caller becomes the owner.
+.TP
+.B set \fINAME\fR \fR[\fB\-\-mode\fR \fIM\fR] [\fB\-\-topic\fR \fIT\fR]
+Edit a session (owner only).
+.TP
+.B close \fINAME\fR
+Close a session (owner only); history is retained.
+.TP
+.B join \fINAME\fR
+Join a session. On a
+.B request
+session this records a join request instead.
+.TP
+.B leave \fINAME\fR
+Drop out of the live roster.
+.TP
+.B who \fINAME\fR
+Show who is currently in the session.
+.TP
+.B post \fINAME\fR \fR[\fItext ...\fR]
+Post a message. With no text, or
+.BR \- ,
+the body is read from standard input.
+.TP
+.B read \fINAME\fR \fR[\fB\-n\fR \fIN\fR] [\fB\-\-since\fR \fID\fR]
+Print recent history.
+.I D
+is a duration:
+.IR Ns ", " Nm ", " Nh ", " Nd
+or plain seconds.
+.TP
+.B follow \fINAME\fR
+Join and stream history then live messages until interrupted.
+.TP
+.B requests \fINAME\fR
+List pending join requests (owner).
+.TP
+.B members \fINAME\fR
+List the membership list.
+.TP
+.B approve\fR|\fBreject \fINAME\fR \fIPRINCIPAL\fR
+Act on a join request (owner).
+.TP
+.B allow\fR|\fBdeny \fINAME\fR \fIPRINCIPAL\fR
+Add to / revoke from the allow-list (owner).
+.SH EXAMPLES
+.PP
+Open a session and follow it:
+.PP
+.RS
+.nf
+net-chat open build --mode open --topic "kestrel build coordination"
+net-chat follow build
+.fi
+.RE
+.PP
+Post from a script on another host (SSH-key identified):
+.PP
+.RS
+.nf
+echo "trilinos done, starting xyce-build" | \\
+    net-chat --listen nas3 post build -
+.fi
+.RE
+.SH ENVIRONMENT
+.TP
+.B NET_MGR_LISTEN
+Default manager address if
+.B \-\-listen
+is not given.
+.TP
+.B NET_CHAT_AS
+Default display name for loopback posts.
+.SH "SEE ALSO"
+.BR net-report (1),
+.BR net-watch (1),
+.BR net-mgr (7)

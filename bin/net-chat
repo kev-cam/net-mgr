@@ -1,0 +1,371 @@
+#!/usr/bin/perl
+# net-chat — talk in named chat sessions hosted by the net-mgr daemon.
+#
+# The daemon records every message; software identifies itself with an
+# SSH key (the AUTH handshake) and humans use the web GUI. This is the
+# command-line client agents use to open/join sessions, post, and watch.
+#
+# Usage:
+#   net-chat ls [--all]                     List open chat sessions
+#   net-chat open <name> [--mode M] [--topic T]
+#                                           Create a session (M = open|
+#                                           list|request; default open)
+#   net-chat set  <name> [--mode M] [--topic T]   Edit a session (owner)
+#   net-chat close <name>                   Close a session (owner)
+#   net-chat join <name>                    Join (request-mode → asks)
+#   net-chat leave <name>                   Drop out of the live roster
+#   net-chat who  <name>                    Show the live roster
+#   net-chat post <name> [text ...]         Post a message ('-'/empty =
+#                                           read body from stdin)
+#   net-chat read <name> [-n N] [--since D] Print recent history
+#   net-chat follow <name>                  Join + stream live (Ctrl-C)
+#   net-chat requests <name>                List pending join requests
+#   net-chat members  <name>                List the membership list
+#   net-chat approve|reject <name> <who>    Act on a join request (owner)
+#   net-chat allow|deny     <name> <who>    Edit the allow-list   (owner)
+#
+# Connection / identity:
+#   --listen HOST:PORT    Manager address (default 127.0.0.1:7531).
+#   --as NAME             Display name for posts on a loopback daemon
+#                         (default $NET_CHAT_AS or $USER). Ignored once
+#                         AUTH'd — the server stamps the verified key.
+#   --auth                Force the SSH-key handshake even on loopback.
+#   --no-auth             Never AUTH (loopback-only / read-only use).
+#   --key-id ID --key-file PATH   Override AUTH key (see NetMgr::Client).
+#
+# A non-loopback daemon is AUTH'd automatically; --key-id/--key-file
+# pick the key, otherwise the NetMgr::Client defaults are used.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling pass_through);
+use NetMgr::Client;
+use NetMgr::Protocol qw(parse_line);
+
+# --describe — for tooling that enumerates the net-* commands.
+if (@ARGV && $ARGV[0] eq '--describe') {
+    print "name: net-chat\n";
+    print "description: talk in named chat sessions hosted by net-mgr\n";
+    exit 0;
+}
+
+my $listen;
+my $as;
+my $force_auth;
+my $no_auth;
+my $key_id;
+my $key_file;
+my $mode;
+my $topic;
+my $limit;
+my $since;
+my $show_all;
+GetOptions(
+    'listen=s'   => \$listen,
+    'as=s'       => \$as,
+    'auth'       => \$force_auth,
+    'no-auth'    => \$no_auth,
+    'key-id=s'   => \$key_id,
+    'key-file=s' => \$key_file,
+    'mode=s'     => \$mode,
+    'topic=s'    => \$topic,
+    'n=i'        => \$limit,
+    'since=s'    => \$since,
+    'all'        => \$show_all,
+) or die "bad options\n";
+
+my $cmd = shift @ARGV;
+usage() unless defined $cmd;
+
+$listen //= $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
+$as     //= $ENV{NET_CHAT_AS} // $ENV{USER} // 'local';
+
+# ---- dispatch --------------------------------------------------------
+
+my %DISPATCH = (
+    ls       => \&cmd_ls,
+    open     => \&cmd_open,
+    set      => \&cmd_set,
+    close    => \&cmd_close,
+    join     => \&cmd_join,
+    leave    => \&cmd_leave,
+    who      => \&cmd_who,
+    post     => \&cmd_post,
+    read     => \&cmd_read,
+    follow   => \&cmd_follow,
+    tail     => \&cmd_follow,    # alias
+    requests => \&cmd_requests,
+    members  => \&cmd_members,
+    approve  => sub { cmd_member('approve', @_) },
+    reject   => sub { cmd_member('reject',  @_) },
+    allow    => sub { cmd_member('allow',   @_) },
+    deny     => sub { cmd_member('deny',    @_) },
+);
+
+my $handler = $DISPATCH{$cmd} or usage("unknown command '$cmd'");
+$handler->();
+exit 0;
+
+# ---- connection ------------------------------------------------------
+
+sub connect_client {
+    my %opt = @_;          # want_auth => bool override
+    my $cli = eval { NetMgr::Client->new(listen => $listen, timeout => 10,
+                                         as => $as) }
+        or die "net-chat: cannot reach daemon at $listen: $@";
+
+    my $host = (split /:/, $listen, 2)[0] // '';
+    my $is_loopback = $host =~ /^(?:127\.\d+\.\d+\.\d+|::1|localhost)$/;
+
+    my $do_auth = $force_auth || (!$is_loopback && !$no_auth);
+    $do_auth = $opt{want_auth} if exists $opt{want_auth};
+    $do_auth = 0 if $no_auth;
+
+    if ($do_auth) {
+        eval {
+            $cli->auth(
+                (defined $key_id   ? (key_id   => $key_id)   : ()),
+                (defined $key_file ? (key_file => $key_file) : ()),
+            );
+        };
+        die "net-chat: AUTH failed: $@" if $@;
+    }
+    return $cli;
+}
+
+# ---- commands --------------------------------------------------------
+
+sub cmd_ls {
+    my $cli = connect_client(want_auth => 0);
+    my $where = $show_all ? undef : "status = 'open'";
+    my $rows = $cli->snapshot(1, 'chat_sessions', ($where ? (where => $where) : ()));
+    @$rows = sort { ($b->{last_activity}//'') cmp ($a->{last_activity}//'') } @$rows;
+    unless (@$rows) { print "no chat sessions\n"; return }
+    printf "%-20s %-8s %-7s %-20s %s\n",
+        'NAME', 'MODE', 'STATUS', 'OWNER', 'TOPIC';
+    for my $s (@$rows) {
+        printf "%-20s %-8s %-7s %-20s %s\n",
+            $s->{name}, $s->{access_mode} // '?', $s->{status} // '?',
+            trunc($s->{created_by} // '', 20), $s->{topic} // '';
+    }
+}
+
+sub cmd_open {
+    my $name = need_name(shift @ARGV);
+    die "net-chat: --mode must be open|list|request\n"
+        if defined $mode && $mode !~ /^(open|list|request)$/;
+    my $cli = connect_client();
+    my $r = eval { $cli->chat_open(name => $name,
+        (defined $mode  ? (mode  => $mode)  : ()),
+        (defined $topic ? (topic => $topic) : ())) };
+    die "net-chat: $@" if $@;
+    print "opened '$name' (mode=", $r->{mode} // $mode // 'open', ")\n";
+}
+
+sub cmd_set {
+    my $name = need_name(shift @ARGV);
+    die "net-chat: --mode must be open|list|request\n"
+        if defined $mode && $mode !~ /^(open|list|request)$/;
+    my $cli = connect_client();
+    eval { $cli->chat_set(name => $name,
+        (defined $mode  ? (mode  => $mode)  : ()),
+        (defined $topic ? (topic => $topic) : ())) };
+    die "net-chat: $@" if $@;
+    print "updated '$name'\n";
+}
+
+sub cmd_close {
+    my $name = need_name(shift @ARGV);
+    my $cli = connect_client();
+    eval { $cli->chat_close(name => $name) };
+    die "net-chat: $@" if $@;
+    print "closed '$name'\n";
+}
+
+sub cmd_join {
+    my $name = need_name(shift @ARGV);
+    my $cli = connect_client();
+    my $r = eval { $cli->chat_join(session => $name) };
+    die "net-chat: $@" if $@;
+    my $state = $r->{state} // 'member';
+    if ($state eq 'requested') {
+        print "join request sent for '$name' — waiting for an owner to approve\n";
+    } else {
+        print "joined '$name'\n";
+    }
+}
+
+sub cmd_leave {
+    my $name = need_name(shift @ARGV);
+    my $cli = connect_client(want_auth => 0);
+    eval { $cli->chat_leave(session => $name) };
+    die "net-chat: $@" if $@;
+    print "left '$name'\n";
+}
+
+sub cmd_who {
+    my $name = need_name(shift @ARGV);
+    my $cli = connect_client(want_auth => 0);
+    my $rows = $cli->snapshot(1, 'chat_presence',
+        where => "session = '$name'");
+    my %seen;
+    my @who = grep { !$seen{$_}++ } map { $_->{principal} } @$rows;
+    unless (@who) { print "nobody in '$name'\n"; return }
+    print "in '$name': ", join(', ', @who), "\n";
+}
+
+sub cmd_post {
+    my $name = need_name(shift @ARGV);
+    my $body = join ' ', @ARGV;
+    if (!length $body || $body eq '-') {
+        local $/; $body = <STDIN>;
+        $body = '' unless defined $body;
+    }
+    $body =~ s/\s+\z//;
+    die "net-chat: empty message\n" unless length $body;
+    my $cli = connect_client();
+    eval { $cli->chat_post(session => $name, body => $body, as => $as) };
+    die "net-chat: $@" if $@;
+}
+
+sub cmd_read {
+    my $name = need_name(shift @ARGV);
+    my $cli = connect_client(want_auth => 0);
+    my $where = "session = '$name'";
+    if (defined $since) {
+        my $secs = parse_duration($since);
+        $where .= " AND ts > ago($secs)";
+    }
+    my $rows = $cli->snapshot(1, 'chat_messages', where => $where);
+    @$rows = sort { ($a->{id}//0) <=> ($b->{id}//0) } @$rows;
+    if (defined $limit && @$rows > $limit) {
+        @$rows = @$rows[ -$limit .. -1 ];
+    }
+    print_msg($_) for @$rows;
+}
+
+sub cmd_follow {
+    my $name = need_name(shift @ARGV);
+    my $cli = connect_client();
+    # Join first so we appear in the roster, then stream history+live.
+    eval { $cli->chat_join(session => $name) };
+    die "net-chat: $@" if $@;
+    $SIG{INT} = $SIG{TERM} = sub {
+        eval { $cli->chat_leave(session => $name) };
+        eval { $cli->bye };
+        exit 0;
+    };
+    $cli->send_line("SUBSCRIBE sub=1 mode=snapshot+stream FROM chat_messages"
+                  . " WHERE session = '$name'");
+    $| = 1;
+    my $live = 0;
+    while (defined(my $line = $cli->recv_line(60))) {
+        my $c = parse_line($line) or next;
+        if ($c->{verb} eq 'ROW' && ($c->{kv}{table} // '') eq 'chat_messages') {
+            print_msg($c->{kv});
+        } elsif ($c->{verb} eq 'EOS') {
+            print "-- live (Ctrl-C to leave) --\n" unless $live++;
+        } elsif ($c->{verb} eq 'ERR') {
+            die "net-chat: $c->{msg}\n";
+        }
+    }
+}
+
+sub cmd_requests {
+    my $name = need_name(shift @ARGV);
+    my $cli = connect_client(want_auth => 0);
+    my $rows = $cli->snapshot(1, 'chat_members',
+        where => "session = '$name' AND state = 'requested'");
+    unless (@$rows) { print "no pending requests for '$name'\n"; return }
+    print "pending requests for '$name':\n";
+    print "  $_->{principal}\n" for @$rows;
+}
+
+sub cmd_members {
+    my $name = need_name(shift @ARGV);
+    my $cli = connect_client(want_auth => 0);
+    my $rows = $cli->snapshot(1, 'chat_members', where => "session = '$name'");
+    unless (@$rows) { print "no members for '$name'\n"; return }
+    printf "%-24s %-8s %s\n", 'PRINCIPAL', 'ROLE', 'STATE';
+    for my $m (sort { $a->{principal} cmp $b->{principal} } @$rows) {
+        printf "%-24s %-8s %s\n",
+            $m->{principal}, $m->{role} // '?', $m->{state} // '?';
+    }
+}
+
+sub cmd_member {
+    my ($op) = @_;
+    my $name      = need_name(shift @ARGV);
+    my $principal = shift @ARGV
+        or die "net-chat: $op needs a principal\n";
+    my $cli = connect_client();
+    eval { $cli->chat_member($op, session => $name, principal => $principal) };
+    die "net-chat: $@" if $@;
+    print "$op: $principal on '$name'\n";
+}
+
+# ---- helpers ---------------------------------------------------------
+
+sub need_name {
+    my ($n) = @_;
+    die "net-chat: missing session name\n" unless defined $n && length $n;
+    die "net-chat: bad session name '$n' (use A-Z a-z 0-9 . _ -)\n"
+        unless $n =~ /\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z/;
+    return $n;
+}
+
+sub print_msg {
+    my ($kv) = @_;
+    my $ts = $kv->{ts} // '';
+    $ts =~ s/\.\d+$//;             # drop microseconds
+    $ts =~ s/^\d{4}-//;           # drop year for compactness
+    my $who = $kv->{sender} // '?';
+    my $body = $kv->{body} // '';
+    printf "%s  %s: %s\n", $ts, $who, $body;
+}
+
+sub parse_duration {
+    my ($s) = @_;
+    return $1            if $s =~ /^(\d+)$/;
+    return $1            if $s =~ /^(\d+)s$/;
+    return $1 * 60       if $s =~ /^(\d+)m$/;
+    return $1 * 3600     if $s =~ /^(\d+)h$/;
+    return $1 * 86400    if $s =~ /^(\d+)d$/;
+    die "net-chat: bad --since '$s' (use Ns/Nm/Nh/Nd or seconds)\n";
+}
+
+sub trunc {
+    my ($s, $w) = @_;
+    return $s if length($s) <= $w;
+    return substr($s, 0, $w - 1) . '…';
+}
+
+sub usage {
+    my ($msg) = @_;
+    print STDERR "net-chat: $msg\n\n" if $msg;
+    print STDERR <<'USAGE';
+usage: net-chat <command> [args]
+
+  ls [--all]                       list chat sessions
+  open  <name> [--mode M] [--topic T]   create (M=open|list|request)
+  set   <name> [--mode M] [--topic T]   edit (owner)
+  close <name>                     close (owner)
+  join  <name>                     join a session
+  leave <name>                     drop out of the roster
+  who   <name>                     show who's in a session
+  post  <name> [text ...]          post a message ('-' = stdin)
+  read  <name> [-n N] [--since D]  show recent history
+  follow <name>                    join + stream live (Ctrl-C)
+  requests <name>                  list pending join requests
+  members  <name>                  list the membership list
+  approve|reject <name> <who>      act on a join request (owner)
+  allow|deny     <name> <who>      edit the allow-list (owner)
+
+  --listen HOST:PORT   daemon address (default 127.0.0.1:7531)
+  --as NAME            display name on a loopback daemon
+  --auth / --no-auth   force / suppress the SSH-key handshake
+USAGE
+    exit($msg ? 2 : 0);
+}

@@ -496,3 +496,75 @@ ALTER TABLE dhcp_leases  ADD KEY idx_replicated_from (replicated_from);
 ALTER TABLE aliases      ADD COLUMN replicated_from VARCHAR(64) NULL;
 ALTER TABLE aliases      ADD KEY idx_replicated_from (replicated_from);
 INSERT IGNORE INTO schema_version (version) VALUES (21);
+
+-- net-chat: named chat sessions hosted by the daemon (schema 22).
+-- Agents (SSH-key-identified over the socket) and humans (web GUI) talk
+-- in named sessions; the server records every message. The session
+-- creator picks an access_mode: 'open' (any authorized client),
+-- 'list' (only chat_members.state='member'), or 'request' (others
+-- join state='requested' and an owner APPROVEs them).
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    name          VARCHAR(64)  NOT NULL PRIMARY KEY,
+    topic         TEXT,
+    created_by    VARCHAR(128) NOT NULL,            -- verified key_id / 'local'
+    access_mode   ENUM('open','list','request') NOT NULL DEFAULT 'open',
+    status        ENUM('open','closed')         NOT NULL DEFAULT 'open',
+    created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_activity DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    closed_at     DATETIME     NULL,
+    KEY idx_status        (status),
+    KEY idx_last_activity (last_activity)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Persistent membership + ACL. 'owner' is the creator (and anyone they
+-- promote). state drives the access_mode gate: 'member' may post,
+-- 'requested' is awaiting approval, 'invited' is pre-authorised on a
+-- 'list' session, 'denied' was rejected.
+CREATE TABLE IF NOT EXISTS chat_members (
+    session      VARCHAR(64)  NOT NULL,
+    principal    VARCHAR(128) NOT NULL,
+    role         ENUM('owner','member')                        NOT NULL DEFAULT 'member',
+    state        ENUM('member','requested','invited','denied') NOT NULL DEFAULT 'member',
+    added_by     VARCHAR(128),
+    requested_at DATETIME     NULL,
+    joined_at    DATETIME     NULL,
+    PRIMARY KEY (session, principal),
+    KEY idx_member_state (state),
+    CONSTRAINT fk_chat_members_session
+        FOREIGN KEY (session) REFERENCES chat_sessions(name) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Append-only message log. ts is microsecond-resolution so a windowed
+-- snapshot (ts > ago(N)) and strict ordering both work. sender is
+-- server-stamped from the verified identity; clients cannot spoof it.
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id           BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    session      VARCHAR(64)  NOT NULL,
+    ts           DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    sender       VARCHAR(128) NOT NULL,
+    sender_kind  ENUM('agent','human','system') NOT NULL DEFAULT 'agent',
+    body         TEXT         NOT NULL,
+    in_reply_to  BIGINT       NULL,
+    KEY idx_session_ts (session, ts),
+    KEY idx_ts         (ts),
+    CONSTRAINT fk_chat_messages_session
+        FOREIGN KEY (session) REFERENCES chat_sessions(name) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Live roster (ephemeral). One row per connection currently joined to
+-- a session; the daemon clears it on startup and deletes a connection's
+-- rows on disconnect. The same principal on two connections is deduped
+-- by the consumer.
+CREATE TABLE IF NOT EXISTS chat_presence (
+    session      VARCHAR(64)  NOT NULL,
+    conn_id      BIGINT       NOT NULL,
+    principal    VARCHAR(128) NOT NULL,
+    since        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (session, conn_id),
+    KEY idx_presence_session   (session),
+    KEY idx_presence_principal (principal),
+    CONSTRAINT fk_chat_presence_session
+        FOREIGN KEY (session) REFERENCES chat_sessions(name) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO schema_version (version) VALUES (22);

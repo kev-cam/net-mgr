@@ -9,7 +9,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 21;
+our $SCHEMA_VERSION = 22;
 
 sub new {
     my ($class, %args) = @_;
@@ -532,6 +532,68 @@ SQL
                 die $@;
             }
         }
+        return;
+    }
+    if ($v == 22) {
+        # net-chat: named chat sessions hosted by the daemon. See the
+        # matching block in sql/schema.sql for column docs.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    name          VARCHAR(64)  NOT NULL PRIMARY KEY,
+    topic         TEXT,
+    created_by    VARCHAR(128) NOT NULL,
+    access_mode   ENUM('open','list','request') NOT NULL DEFAULT 'open',
+    status        ENUM('open','closed')         NOT NULL DEFAULT 'open',
+    created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_activity DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    closed_at     DATETIME     NULL,
+    KEY idx_status        (status),
+    KEY idx_last_activity (last_activity)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS chat_members (
+    session      VARCHAR(64)  NOT NULL,
+    principal    VARCHAR(128) NOT NULL,
+    role         ENUM('owner','member')                        NOT NULL DEFAULT 'member',
+    state        ENUM('member','requested','invited','denied') NOT NULL DEFAULT 'member',
+    added_by     VARCHAR(128),
+    requested_at DATETIME     NULL,
+    joined_at    DATETIME     NULL,
+    PRIMARY KEY (session, principal),
+    KEY idx_member_state (state),
+    CONSTRAINT fk_chat_members_session
+        FOREIGN KEY (session) REFERENCES chat_sessions(name) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id           BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    session      VARCHAR(64)  NOT NULL,
+    ts           DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    sender       VARCHAR(128) NOT NULL,
+    sender_kind  ENUM('agent','human','system') NOT NULL DEFAULT 'agent',
+    body         TEXT         NOT NULL,
+    in_reply_to  BIGINT       NULL,
+    KEY idx_session_ts (session, ts),
+    KEY idx_ts         (ts),
+    CONSTRAINT fk_chat_messages_session
+        FOREIGN KEY (session) REFERENCES chat_sessions(name) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS chat_presence (
+    session      VARCHAR(64)  NOT NULL,
+    conn_id      BIGINT       NOT NULL,
+    principal    VARCHAR(128) NOT NULL,
+    since        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (session, conn_id),
+    KEY idx_presence_session   (session),
+    KEY idx_presence_principal (principal),
+    CONSTRAINT fk_chat_presence_session
+        FOREIGN KEY (session) REFERENCES chat_sessions(name) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
         return;
     }
     croak "no migration for schema v$v";
@@ -1650,6 +1712,171 @@ sub upsert_wifi_scan_result {
     );
 }
 
+# ---- net-chat ---------------------------------------------------------
+#
+# Session control + message log + ephemeral presence. The UPSERT-style
+# methods return the same { op, now } shape the daemon's _emit_change
+# expects, so chat rows stream to subscribers exactly like every other
+# table.
+
+sub get_chat_session {
+    my ($self, $name) = @_;
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM chat_sessions WHERE name = ?", undef, $name);
+}
+
+# Create a session. op => 'insert' on success, 'exists' if the name is
+# already taken (caller reports ERR). access_mode defaults to 'open'.
+sub open_chat_session {
+    my ($self, %f) = @_;
+    croak "name required"       unless defined $f{name} && length $f{name};
+    croak "created_by required" unless defined $f{created_by} && length $f{created_by};
+    my $mode = $f{access_mode} // 'open';
+    croak "bad access_mode '$mode'" unless $mode =~ /^(open|list|request)$/;
+    if (my $was = $self->get_chat_session($f{name})) {
+        return { op => 'exists', now => $was };
+    }
+    $self->{dbh}->do(
+        "INSERT INTO chat_sessions (name, topic, created_by, access_mode)
+         VALUES (?, ?, ?, ?)",
+        undef, $f{name}, $f{topic}, $f{created_by}, $mode);
+    return { op => 'insert', now => $self->get_chat_session($f{name}) };
+}
+
+# Update topic and/or access_mode on an existing session.
+sub set_chat_session {
+    my ($self, %f) = @_;
+    croak "name required" unless defined $f{name};
+    my @set; my @bind;
+    if (exists $f{access_mode} && defined $f{access_mode}) {
+        croak "bad access_mode '$f{access_mode}'"
+            unless $f{access_mode} =~ /^(open|list|request)$/;
+        push @set, "access_mode = ?"; push @bind, $f{access_mode};
+    }
+    if (exists $f{topic}) { push @set, "topic = ?"; push @bind, $f{topic}; }
+    return { op => 'noop', now => $self->get_chat_session($f{name}) } unless @set;
+    $self->{dbh}->do(
+        "UPDATE chat_sessions SET " . join(', ', @set) . " WHERE name = ?",
+        undef, @bind, $f{name});
+    return { op => 'update', now => $self->get_chat_session($f{name}) };
+}
+
+sub close_chat_session {
+    my ($self, $name) = @_;
+    my $was = $self->get_chat_session($name) or return { op => 'noop' };
+    return { op => 'noop', now => $was } if $was->{status} eq 'closed';
+    $self->{dbh}->do(
+        "UPDATE chat_sessions SET status = 'closed', closed_at = CURRENT_TIMESTAMP
+          WHERE name = ?", undef, $name);
+    return { op => 'update', now => $self->get_chat_session($name) };
+}
+
+sub touch_chat_activity {
+    my ($self, $name) = @_;
+    $self->{dbh}->do(
+        "UPDATE chat_sessions SET last_activity = CURRENT_TIMESTAMP WHERE name = ?",
+        undef, $name);
+}
+
+sub get_chat_member {
+    my ($self, $session, $principal) = @_;
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM chat_members WHERE session = ? AND principal = ?",
+        undef, $session, $principal);
+}
+
+# Upsert a membership row. Pass role/state/added_by as wanted; the
+# requested_at / joined_at stamps are filled in for the relevant state.
+sub set_chat_member {
+    my ($self, %f) = @_;
+    croak "session + principal required"
+        unless defined $f{session} && defined $f{principal};
+    my $role  = $f{role}  // 'member';
+    my $state = $f{state} // 'member';
+    my $req_at  = $state eq 'requested' ? 'CURRENT_TIMESTAMP' : 'NULL';
+    my $join_at = $state eq 'member'    ? 'CURRENT_TIMESTAMP' : 'NULL';
+    $self->{dbh}->do(
+        "INSERT INTO chat_members
+            (session, principal, role, state, added_by, requested_at, joined_at)
+         VALUES (?, ?, ?, ?, ?, $req_at, $join_at)
+         ON DUPLICATE KEY UPDATE
+            role         = VALUES(role),
+            state        = VALUES(state),
+            added_by     = VALUES(added_by),
+            requested_at = COALESCE(VALUES(requested_at), requested_at),
+            joined_at    = COALESCE(VALUES(joined_at),    joined_at)",
+        undef, $f{session}, $f{principal}, $role, $state, $f{added_by});
+    return { op => 'update', now => $self->get_chat_member($f{session}, $f{principal}) };
+}
+
+# Append a message. Returns the persisted row (with id + ts) so the
+# daemon can emit it to subscribers.
+sub insert_chat_message {
+    my ($self, %f) = @_;
+    croak "session + sender + body required"
+        unless defined $f{session} && defined $f{sender} && defined $f{body};
+    my $kind = $f{sender_kind} // 'agent';
+    $self->{dbh}->do(
+        "INSERT INTO chat_messages (session, sender, sender_kind, body, in_reply_to)
+         VALUES (?, ?, ?, ?, ?)",
+        undef, $f{session}, $f{sender}, $kind, $f{body}, $f{in_reply_to});
+    my $id = $self->{dbh}->{mysql_insertid};
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM chat_messages WHERE id = ?", undef, $id);
+}
+
+# Presence join. op => 'insert' for a new (session, conn) pair, else
+# 'noop'. now is the row (for emit).
+sub upsert_chat_presence {
+    my ($self, %f) = @_;
+    croak "session + conn_id + principal required"
+        unless defined $f{session} && defined $f{conn_id} && defined $f{principal};
+    my $was = $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM chat_presence WHERE session = ? AND conn_id = ?",
+        undef, $f{session}, $f{conn_id});
+    return { op => 'noop', now => $was } if $was;
+    $self->{dbh}->do(
+        "INSERT INTO chat_presence (session, conn_id, principal) VALUES (?, ?, ?)",
+        undef, $f{session}, $f{conn_id}, $f{principal});
+    my $now = $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM chat_presence WHERE session = ? AND conn_id = ?",
+        undef, $f{session}, $f{conn_id});
+    return { op => 'insert', now => $now };
+}
+
+# Remove one (session, conn) presence row. Returns the removed row (for
+# a 'delete' emit) or undef if there was none.
+sub delete_chat_presence {
+    my ($self, $session, $conn_id) = @_;
+    my $row = $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM chat_presence WHERE session = ? AND conn_id = ?",
+        undef, $session, $conn_id) or return undef;
+    $self->{dbh}->do(
+        "DELETE FROM chat_presence WHERE session = ? AND conn_id = ?",
+        undef, $session, $conn_id);
+    return $row;
+}
+
+# Remove every presence row for a connection (on disconnect). Returns
+# the arrayref of removed rows so the caller can emit one delete each.
+sub delete_presence_for_conn {
+    my ($self, $conn_id) = @_;
+    my $rows = $self->{dbh}->selectall_arrayref(
+        "SELECT * FROM chat_presence WHERE conn_id = ?",
+        { Slice => {} }, $conn_id);
+    if (@$rows) {
+        $self->{dbh}->do("DELETE FROM chat_presence WHERE conn_id = ?",
+                         undef, $conn_id);
+    }
+    return $rows;
+}
+
+# Wipe all presence (daemon startup — every prior connection is gone).
+sub clear_chat_presence {
+    my ($self) = @_;
+    $self->{dbh}->do("DELETE FROM chat_presence");
+}
+
 sub query_table {
     my ($self, $table, %opts) = @_;
     my %allowed = map { $_ => 1 } qw(
@@ -1659,6 +1886,7 @@ sub query_table {
         peers uplinks isp_links isp_secrets forwarding_rules
         zone_classes interface_zones wifi_zones
         audit_annotations wifi_scan_results wifi_radio_state
+        chat_sessions chat_members chat_messages chat_presence
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};
@@ -1676,7 +1904,7 @@ sub query_table {
     return $self->{dbh}->selectall_arrayref($sql, { Slice => {} }, @bind);
 }
 
-sub _has_ts_column { $_[0] eq 'events' }
+sub _has_ts_column { $_[0] eq 'events' || $_[0] eq 'chat_messages' }
 
 # Delete events older than $days. Returns rowcount.
 sub purge_events {
