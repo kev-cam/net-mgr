@@ -164,6 +164,7 @@ sub cmd_status {
     my $st = $cli->status;
     return (warn "STATUS failed\n"), 1 unless $st;
     print "=== local cluster view ===\n";
+    printf "  %-26s %s\n", 'version', ($st->{version} // '?');
     for my $k (qw(cluster_member cluster_role cluster_priority
                   cluster_prefer_lan cluster_internet_facing
                   cluster_capabilities cluster_members

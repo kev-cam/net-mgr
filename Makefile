@@ -245,6 +245,8 @@ install: .version
 	done
 	@echo "  sql/schema.sql → $(DESTDIR)$(SHAREDIR)/sql/schema.sql"
 	@$(INSTALL) -m 644 sql/schema.sql $(DESTDIR)$(SHAREDIR)/sql/schema.sql
+	@echo "  .version → $(DESTDIR)$(SHAREDIR)/version"
+	@$(INSTALL) -m 644 .version $(DESTDIR)$(SHAREDIR)/version
 	$(INSTALL) -d $(DESTDIR)$(MANDIR)/man1
 	$(INSTALL) -d $(DESTDIR)$(MANDIR)/man7
 	@for f in $(MAN1S); do \
@@ -408,6 +410,7 @@ uninstall:
 	@rm -fv $(DESTDIR)$(CGIDIR)/net-mgr-web.cgi 2>/dev/null || true
 	@rm -fv $(DESTDIR)$(APACHE_CONF_DIR)/net-mgr.conf 2>/dev/null || true
 	@rm -fv $(DESTDIR)$(SHAREDIR)/sql/schema.sql
+	@rm -fv $(DESTDIR)$(SHAREDIR)/version
 	-@rmdir $(DESTDIR)$(PERL5DIR)/NetMgr/Producer 2>/dev/null || true
 	-@rmdir $(DESTDIR)$(PERL5DIR)/NetMgr          2>/dev/null || true
 	-@rmdir $(DESTDIR)$(SHAREDIR)/sql             2>/dev/null || true

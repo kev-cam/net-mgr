@@ -75,9 +75,25 @@ sub new {
             signers_path    => '/etc/net-mgr/allowed_chat',
             authorized_keys => undef,
         ),
+        version => _read_version(),
         cluster => _load_cluster_state($args{config}),
     }, $class;
     return $self;
+}
+
+# The code version reported by STATUS — the git describe string stamped
+# into share/net-mgr/version at `make install` (falls back to the source
+# tree's .version for from-source runs, else 'unknown').
+sub _read_version {
+    for my $f ('/usr/local/share/net-mgr/version',
+               (__FILE__ =~ m{(.*)/lib/NetMgr/Manager\.pm$} ? "$1/.version" : ())) {
+        next unless defined $f && -r $f;
+        open my $fh, '<', $f or next;
+        chomp(my $v = <$fh> // '');
+        close $fh;
+        return $v if length $v;
+    }
+    return 'unknown';
 }
 
 # Parse [cluster] config into a normalised state hash. Returns a
@@ -584,6 +600,7 @@ sub _handle_status {
                                      : ($reachable >= int($roster_n / 2) + 1);
     my $mesh_summary = $self->{mesh} ? $self->{mesh}->summary : '';
     $self->_send($cli, format_ok(
+        version            => $self->{version} // 'unknown',
         started_at         => $self->{started_at},
         now                => time(),
         listeners          => join(',', sort @listeners),
