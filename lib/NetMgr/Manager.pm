@@ -65,6 +65,16 @@ sub new {
             authorized_keys => $> == 0 ? '/root/.ssh/authorized_keys'
                                        : ((getpwuid($>))[7] // '') . '/.ssh/authorized_keys',
         ),
+        # Chat-only authorization: a dedicated, lower-privilege key list.
+        # A key here may use the chat verbs but gets scope='chat' — NO
+        # mesh-mutation rights (FORWARD/NAT/SET_GATEWAY) and no access to
+        # auth-gated tables. Independent of ~/.ssh/authorized_keys (no
+        # fallback) so chat access is decoupled from SSH login, and being on
+        # allowed_signers is not required (that grants far more than chat needs).
+        chat_auth_state => NetMgr::Auth::new_state(
+            signers_path    => '/etc/net-mgr/allowed_chat',
+            authorized_keys => undef,
+        ),
         cluster => _load_cluster_state($args{config}),
     }, $class;
     return $self;
@@ -907,11 +917,9 @@ sub _handle_subscribe {
     my $where = $cmd->{where};
     return $self->_send($cli, format_err("unknown table '$table'"))
         unless $SUBSCRIBABLE{$table} || $SUBSCRIBABLE_AUTH{$table};
-    if ($SUBSCRIBABLE_AUTH{$table}
-     && !( ($cli->{auth} && $cli->{auth}{verified})
-        || _peer_is_loopback($cli) )) {
+    if ($SUBSCRIBABLE_AUTH{$table} && !$self->_auth_is_full($cli)) {
         return $self->_send($cli,
-            format_err("table '$table' requires AUTH (or loopback peer)"));
+            format_err("table '$table' requires full-scope AUTH (or loopback peer)"));
     }
 
     my $where_ast = eval { NetMgr::Where::parse($where) };
@@ -1306,8 +1314,19 @@ sub _handle_auth_response {
     return $self->_send($cli, format_err("AUTH_RESPONSE requires sig="))
         unless defined $sig && length $sig;
 
+    # Tier 1: the full allowlist (allowed_signers + authorized_keys) grants
+    # scope='full' — mesh mutation + chat + auth-gated reads. Tier 2: the
+    # chat-only allowlist (allowed_chat) grants scope='chat'. verify() is
+    # stateless w.r.t. the nonce, so trying both with the same nonce is safe.
     my ($ok, $err) = NetMgr::Auth::verify(
         $self->{auth_state}, $auth->{key_id}, $auth->{nonce}, $sig);
+    my $scope = 'full';
+    if (!$ok) {
+        my ($cok, $cerr) = NetMgr::Auth::verify(
+            $self->{chat_auth_state}, $auth->{key_id}, $auth->{nonce}, $sig);
+        if ($cok) { $ok = 1; $scope = 'chat'; }
+        else      { $err = $cerr // $err; }
+    }
     # Always invalidate the nonce — one-shot regardless of outcome.
     delete $auth->{nonce};
     if (!$ok) {
@@ -1315,19 +1334,31 @@ sub _handle_auth_response {
         $self->_log("auth FAIL $cli->{peer} key-id=$auth->{key_id}: $err");
         return $self->_send($cli, format_err("AUTH failed: $err"));
     }
-    $cli->{auth} = { key_id => $auth->{key_id}, verified => 1 };
-    $self->_log("auth OK $cli->{peer} key_id=$auth->{key_id}");
-    $self->_send($cli, format_ok(key_id => $auth->{key_id}));
+    $cli->{auth} = { key_id => $auth->{key_id}, verified => 1, scope => $scope };
+    $self->_log("auth OK $cli->{peer} key_id=$auth->{key_id} scope=$scope");
+    $self->_send($cli, format_ok(key_id => $auth->{key_id}, scope => $scope));
 }
 
 # True if this connection is allowed to mutate (FORWARD,
 # NAT_MASQUERADE, SET_GATEWAY). Loopback peers always allowed;
 # verified-auth connections always allowed regardless of source IP;
 # otherwise fall through to the legacy allow_peers IP check.
-sub _peer_may_mutate {
+# True iff the connection holds FULL-scope authority — a loopback peer, or
+# an auth'd connection whose key is on allowed_signers/authorized_keys
+# (scope='full'). Required for mesh mutation, ISP secrets, and peer-authority
+# changes. A chat-only connection (scope='chat', from allowed_chat) is
+# verified but NOT full, so it is excluded from every privileged op below.
+sub _auth_is_full {
     my ($self, $cli) = @_;
     return 1 if _peer_is_loopback($cli);
-    return 1 if $cli->{auth} && $cli->{auth}{verified};
+    return 1 if $cli->{auth} && $cli->{auth}{verified}
+             && ($cli->{auth}{scope} // 'full') eq 'full';
+    return 0;
+}
+
+sub _peer_may_mutate {
+    my ($self, $cli) = @_;
+    return 1 if $self->_auth_is_full($cli);
     return $self->_peer_may_forward($cli);
 }
 
@@ -2592,9 +2623,8 @@ sub _obs_isp_link_delete {
 # on isp_secrets).
 sub _obs_isp_secret {
     my ($self, $cli, $kv) = @_;
-    unless (_peer_is_loopback($cli)
-         || ($cli->{auth} && $cli->{auth}{verified})) {
-        die "isp_secret: requires AUTH (or loopback peer)\n";
+    unless ($self->_auth_is_full($cli)) {
+        die "isp_secret: requires full-scope AUTH (or loopback peer)\n";
     }
     my $gw     = $kv->{gateway} or die "isp_secret: gateway required\n";
     my $isp    = $kv->{isp}     or die "isp_secret: isp required\n";
@@ -2644,9 +2674,8 @@ sub _obs_lost_device_delete {
 # loopback) because changing who can be master is a privileged op.
 sub _obs_peer_cap_set {
     my ($self, $cli, $kv) = @_;
-    unless (_peer_is_loopback($cli)
-         || ($cli->{auth} && $cli->{auth}{verified})) {
-        die "peer_cap_set: requires AUTH (or loopback peer)\n";
+    unless ($self->_auth_is_full($cli)) {
+        die "peer_cap_set: requires full-scope AUTH (or loopback peer)\n";
     }
     my $peer = $kv->{peer} or die "peer_cap_set: peer required\n";
     die "peer_cap_set: bad peer name '$peer'\n"
@@ -2664,9 +2693,8 @@ sub _obs_peer_cap_set {
 # daemon's local authority table entirely. Same auth gate.
 sub _obs_peer_cap_clear {
     my ($self, $cli, $kv) = @_;
-    unless (_peer_is_loopback($cli)
-         || ($cli->{auth} && $cli->{auth}{verified})) {
-        die "peer_cap_clear: requires AUTH (or loopback peer)\n";
+    unless ($self->_auth_is_full($cli)) {
+        die "peer_cap_clear: requires full-scope AUTH (or loopback peer)\n";
     }
     my $peer = $kv->{peer} or die "peer_cap_clear: peer required\n";
     delete $self->{cluster}{peer_caps}{$peer};
