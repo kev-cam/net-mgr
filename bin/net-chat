@@ -372,6 +372,7 @@ sub cmd_gui {
 
     my $set_status = sub { $statusvar = $_[0] };
     my $min_shown;     # smallest message id on screen — the History cursor
+    my %shown;         # ids already displayed — dedup live/seed/history overlap
     my $fmt = sub {
         my ($kv) = @_;
         my $ts = $kv->{ts} // ''; $ts =~ s/\.\d+$//; $ts =~ s/^\d{4}-//;
@@ -387,6 +388,7 @@ sub cmd_gui {
     };
     my $append = sub {                 # live message -> bottom
         my ($kv) = @_;
+        return if defined $kv->{id} && $shown{$kv->{id}}++;
         $txt->configure(-state => 'normal');
         $txt->insert('end', $fmt->($kv));
         $txt->configure(-state => 'disabled');
@@ -395,6 +397,7 @@ sub cmd_gui {
     };
     my $prepend = sub {                # older message -> top
         my ($kv) = @_;
+        return if defined $kv->{id} && $shown{$kv->{id}}++;
         $txt->configure(-state => 'normal');
         $txt->insert('1.0', $fmt->($kv));
         $txt->configure(-state => 'disabled');
@@ -405,6 +408,7 @@ sub cmd_gui {
         $txt->delete('1.0', 'end');
         $txt->configure(-state => 'disabled');
         $min_shown = undef;
+        %shown = ();
     };
 
     my $req_popup = sub {
@@ -432,6 +436,18 @@ sub cmd_gui {
            ->pack(-side => 'left', -padx => 6);
     };
 
+    # Show the last N messages of the current session (one snapshot), oldest
+    # first, so joining a chat isn't a blank window. History extends further
+    # back from there; dedup keeps these from doubling with the live stream.
+    my $seed_recent = sub {
+        my $n = shift // 10;
+        my $rows = eval { $ctrl->snapshot(8, 'chat_messages',
+                                          where => "session = '$cur'") } || [];
+        my @s = sort { ($a->{id} // 0) <=> ($b->{id} // 0) } @$rows;
+        @s = @s[-$n .. -1] if @s > $n;
+        $append->($_) for @s;
+    };
+
     my $follow = sub {
         my ($name) = @_;
         return unless defined $name && length $name;
@@ -447,7 +463,8 @@ sub cmd_gui {
         # doesn't dump the whole backlog.
         $stream->send_line("SUBSCRIBE sub=1 mode=stream"
                          . " FROM chat_messages WHERE session = '$name'");
-        $set_status->("following $name — click History for past messages");
+        $seed_recent->(10);                 # last 10 lines for context
+        $set_status->("following $name — History for older messages");
         $entry->focus;
     };
 
