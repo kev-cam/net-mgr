@@ -44,6 +44,12 @@ use Getopt::Long qw(:config no_ignore_case bundling pass_through);
 use NetMgr::Client;
 use NetMgr::Protocol qw(parse_line);
 
+# Writing to a daemon that has gone away must not kill us with SIGPIPE — the
+# one-shot CLI rarely hit this, but the long-lived --gui would die (e.g. on
+# Refresh) the moment the connection dropped. Treat writes to a dead socket
+# as ordinary errors instead.
+$SIG{PIPE} = 'IGNORE';
+
 # --describe — for tooling that enumerates the net-* commands.
 if (@ARGV && $ARGV[0] eq '--describe') {
     print "name: net-chat\n";
@@ -425,10 +431,19 @@ sub cmd_gui {
 
     my $refresh = sub {
         my $rows = eval { $ctrl->snapshot(9, 'chat_sessions',
-                                          where => "status = 'open'") } || [];
+                                          where => "status = 'open'") };
+        if ($@) { $set_status->("refresh failed: $@"); return }
+        $rows ||= [];
         %created_by = map { ($_->{name} => ($_->{created_by} // '')) } @$rows;
         my @names = sort map { $_->{name} } @$rows;
+        # Repopulate the menu WITHOUT firing -command (which would re-follow /
+        # switch sessions mid-refresh), and keep the current selection if it
+        # still exists.
+        my $keep = $sessvar;
+        $om->configure(-command => undef);
         $om->configure(-options => [ @names ? @names : ('(no open chats)') ]);
+        $sessvar = $keep if defined $keep && grep { $_ eq $keep } @names;
+        $om->configure(-command => sub { $follow->($sessvar) });
         $set_status->(scalar(@names) . ' open chat(s)');
     };
     $om->configure(-command => sub { $follow->($sessvar) });
@@ -448,7 +463,9 @@ sub cmd_gui {
 
     # live reader: drain all complete lines without blocking the event loop
     $mw->fileevent($stream->{sock}, 'readable', sub {
+        my $got = 0;
         while (defined(my $line = $stream->recv_line(0))) {
+            $got++;
             my $c = parse_line($line) or next;
             if ($c->{verb} eq 'ROW') {
                 my $t = $c->{kv}{table} // '';
@@ -459,6 +476,17 @@ sub cmd_gui {
                 }
             } elsif ($c->{verb} eq 'ERR') {
                 $set_status->('err: ' . ($c->{msg} // ''));
+            }
+        }
+        # Readable but no complete line drained: distinguish EOF (daemon gone)
+        # from a partial line, so a closed socket doesn't busy-loop the GUI.
+        if (!$got) {
+            my $n = sysread($stream->{sock}, my $b, 4096);
+            if (defined $n && $n == 0) {
+                $mw->fileevent($stream->{sock}, 'readable', '');
+                $set_status->('disconnected (daemon gone) -- restart to reconnect');
+            } elsif (defined $n) {
+                $stream->{buf} .= $b;
             }
         }
     });
