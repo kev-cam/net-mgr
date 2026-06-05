@@ -2000,6 +2000,27 @@ sub _handle_chat_open {
     return $self->_send($cli, format_err("CHAT_OPEN: bad mode '$mode'"))
         unless $mode =~ /\A(open|list|request)\z/;
 
+    # A previously-closed session is reopened (not rejected as 'exists') by an
+    # owner/admin — otherwise CHAT_CLOSE is irreversible and follow/post stay
+    # blocked forever. mode/topic are updated only if explicitly supplied.
+    if (my $existing = $self->{db}->get_chat_session($name)) {
+        if ($existing->{status} eq 'closed') {
+            return $self->_send($cli,
+                format_err("CHAT_OPEN: not authorized to reopen '$name'"))
+                unless $self->_chat_may_admin($cli, $existing, $who);
+            my $rr = $self->{db}->reopen_chat_session($name,
+                (defined $kv->{mode}  ? (access_mode => $mode)        : ()),
+                (defined $kv->{topic} ? (topic       => $kv->{topic}) : ()));
+            $self->_emit_change(table => 'chat_sessions', op => 'update',
+                                row => $rr->{now}) if $rr->{now};
+            $self->_log("chat reopen $name by $who");
+            return $self->_send($cli, format_ok(name => $name,
+                mode => ($rr->{now}{access_mode} // $mode),
+                status => 'open', reopened => 1));
+        }
+        return $self->_send($cli, format_err("CHAT_OPEN: session '$name' exists"));
+    }
+
     my $r = eval {
         $self->{db}->open_chat_session(
             name => $name, created_by => $who,

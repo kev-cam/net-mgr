@@ -168,6 +168,24 @@ sub last_reply { (grep { /^(OK|ERR|READY)\b/ } lines($_[0]))[-1] // '' }
     like(last_reply($owner), qr/^ERR.*closed/, 'no posting to a closed session');
 }
 
+# --- reopen: closed session reopened by owner, joinable again ---------
+{
+    # a non-owner/non-admin cannot reopen
+    feed($member, "CHAT_OPEN name=${PFX}open");
+    like(last_reply($member), qr/^ERR.*not authorized to reopen/,
+         'non-owner cannot reopen a closed session');
+
+    # the owner reopens it
+    feed($owner, "CHAT_OPEN name=${PFX}open");
+    my $rep = last_reply($owner);
+    like($rep, qr/reopened=1/,  'owner reopen marks reopened');
+    like($rep, qr/status=open/, 'status back to open');
+
+    # CHAT_JOIN (what `follow` does) is no longer blocked
+    feed($owner, "CHAT_JOIN session=${PFX}open");
+    unlike(last_reply($owner), qr/closed/, 'join works after reopen');
+}
+
 # --- unauthorized create ----------------------------------------------
 {
     my $anon = mkclient('anon', undef);   # no auth, not loopback

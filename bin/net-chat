@@ -161,7 +161,8 @@ sub cmd_open {
         (defined $mode  ? (mode  => $mode)  : ()),
         (defined $topic ? (topic => $topic) : ())) };
     die "net-chat: $@" if $@;
-    print "opened '$name' (mode=", $r->{mode} // $mode // 'open', ")\n";
+    print +($r->{reopened} ? "reopened" : "opened"),
+          " '$name' (mode=", $r->{mode} // $mode // 'open', ")\n";
 }
 
 sub cmd_set {

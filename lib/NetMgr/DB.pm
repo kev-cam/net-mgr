@@ -1771,6 +1771,27 @@ sub close_chat_session {
     return { op => 'update', now => $self->get_chat_session($name) };
 }
 
+# Reopen a closed session: flip status back to 'open', clear closed_at, and
+# optionally update access_mode/topic. The inverse of close_chat_session.
+sub reopen_chat_session {
+    my ($self, $name, %f) = @_;
+    croak "name required" unless defined $name && length $name;
+    my @set  = ("status = 'open'", "closed_at = NULL");
+    my @bind;
+    if (exists $f{access_mode} && defined $f{access_mode}) {
+        croak "bad access_mode '$f{access_mode}'"
+            unless $f{access_mode} =~ /^(open|list|request)$/;
+        push @set, "access_mode = ?"; push @bind, $f{access_mode};
+    }
+    if (exists $f{topic} && defined $f{topic}) {
+        push @set, "topic = ?"; push @bind, $f{topic};
+    }
+    $self->{dbh}->do(
+        "UPDATE chat_sessions SET " . join(', ', @set) . " WHERE name = ?",
+        undef, @bind, $name);
+    return { op => 'reopen', now => $self->get_chat_session($name) };
+}
+
 sub touch_chat_activity {
     my ($self, $name) = @_;
     $self->{dbh}->do(
