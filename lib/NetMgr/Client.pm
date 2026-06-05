@@ -31,7 +31,9 @@ sub new {
 
 sub send_line {
     my ($self, $line) = @_;
-    print { $self->{sock} } "$line\n";
+    my $data = "$line\n";
+    utf8::encode($data) if utf8::is_utf8($data);   # wide chars -> UTF-8 bytes
+    print { $self->{sock} } $data;
 }
 
 sub recv_line {

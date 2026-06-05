@@ -505,6 +505,11 @@ sub _send {
     my ($self, $cli, $line) = @_;
     return unless $cli && $cli->{sock};
     my $data = "$line\n";
+    # Serialize wide chars to UTF-8 bytes before syswrite. A chat body with
+    # non-ASCII (e.g. an em-dash) comes back from the DB as a Perl wide
+    # string; syswrite on it not only warns "Wide character" but desyncs the
+    # byte-vs-char length/offset arithmetic below and aborts the daemon.
+    utf8::encode($data) if utf8::is_utf8($data);
     my $left = length $data;
     my $off  = 0;
     while ($left > 0) {

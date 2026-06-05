@@ -368,9 +368,11 @@ sub cmd_gui {
     my $append = sub {
         my ($kv) = @_;
         my $ts = $kv->{ts} // ''; $ts =~ s/\.\d+$//; $ts =~ s/^\d{4}-//;
+        my $who  = $kv->{sender} // '?';
+        my $body = $kv->{body} // '';
+        utf8::decode($who); utf8::decode($body);   # UTF-8 wire bytes -> chars
         $txt->configure(-state => 'normal');
-        $txt->insert('end', sprintf("%s  %s: %s\n",
-            $ts, $kv->{sender} // '?', $kv->{body} // ''));
+        $txt->insert('end', sprintf("%s  %s: %s\n", $ts, $who, $body));
         $txt->configure(-state => 'disabled');
         $txt->see('end');
     };
