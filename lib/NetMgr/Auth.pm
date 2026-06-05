@@ -95,6 +95,17 @@ sub merged_signers_path {
         while ($fh && (my $line = <$fh>)) {
             chomp $line;
             next if $line =~ /^\s*(?:#|$)/;
+            # Accept raw pubkey / authorized_keys lines (key-type first, no
+            # principal) as well as native allowed_signers lines, so a plain
+            # `cat id_rsa.pub >> allowed_chat` works without hand-formatting.
+            # Native lines (principal first) pass through unchanged; the
+            # converted principal comes from the pubkey comment, which is the
+            # key_id ($USER@$(hostname)) the client AUTHs as.
+            if ($line =~ /^\s*(?:ssh-(?:rsa|ed25519|dss)|ecdsa-sha2-\S+|sk-\S+)\s/) {
+                my $converted = _authorized_to_allowed($line);
+                next unless defined $converted;
+                $line = $converted;
+            }
             print $tmp "$line\n";
             $count++;
         }
