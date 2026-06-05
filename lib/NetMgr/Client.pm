@@ -63,6 +63,7 @@ sub hello {
     my ($self, %args) = @_;
     my $r = $self->send_recv("HELLO " . format_kv(%args));
     croak "HELLO failed: $r" unless defined $r && $r =~ /^OK\b/;
+    $self->{greeted} = 1;
     return 1;
 }
 
@@ -260,6 +261,11 @@ sub auth {
     my $key_file = $args{key_file} // _default_key_file();
     croak "auth: no key_id"   unless defined $key_id   && length $key_id;
     croak "auth: no key_file" unless defined $key_file && -r $key_file;
+
+    # The daemon requires a HELLO (which sets the connection kind/ident)
+    # before it will accept AUTH. Send one if the caller hasn't already.
+    $self->hello(consumer => $args{as} // $self->{as} // $key_id)
+        unless $self->{greeted};
 
     # Step 1: AUTH key_id=ID  →  READY nonce=...
     $self->send_line("AUTH " . format_kv(key_id => $key_id));
