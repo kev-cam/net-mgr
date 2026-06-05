@@ -371,21 +371,40 @@ sub cmd_gui {
        ->pack(-fill => 'x', -side => 'bottom');
 
     my $set_status = sub { $statusvar = $_[0] };
-    my $append = sub {
+    my $min_shown;     # smallest message id on screen — the History cursor
+    my $fmt = sub {
         my ($kv) = @_;
         my $ts = $kv->{ts} // ''; $ts =~ s/\.\d+$//; $ts =~ s/^\d{4}-//;
         my $who  = $kv->{sender} // '?';
         my $body = $kv->{body} // '';
         utf8::decode($who); utf8::decode($body);   # UTF-8 wire bytes -> chars
+        return sprintf("%s  %s: %s\n", $ts, $who, $body);
+    };
+    my $note_id = sub {
+        my ($id) = @_;
+        $min_shown = $id if defined $id
+                         && (!defined $min_shown || $id < $min_shown);
+    };
+    my $append = sub {                 # live message -> bottom
+        my ($kv) = @_;
         $txt->configure(-state => 'normal');
-        $txt->insert('end', sprintf("%s  %s: %s\n", $ts, $who, $body));
+        $txt->insert('end', $fmt->($kv));
         $txt->configure(-state => 'disabled');
         $txt->see('end');
+        $note_id->($kv->{id});
+    };
+    my $prepend = sub {                # older message -> top
+        my ($kv) = @_;
+        $txt->configure(-state => 'normal');
+        $txt->insert('1.0', $fmt->($kv));
+        $txt->configure(-state => 'disabled');
+        $note_id->($kv->{id});
     };
     my $clear = sub {
         $txt->configure(-state => 'normal');
         $txt->delete('1.0', 'end');
         $txt->configure(-state => 'disabled');
+        $min_shown = undef;
     };
 
     my $req_popup = sub {
@@ -423,9 +442,12 @@ sub cmd_gui {
         $mw->title("net-chat — $name");
         $topiclbl->configure(-text => ($created_by{$name} ? "owner: $created_by{$name}" : ''));
         eval { $ctrl->chat_join(session => $name) };   # roster + post rights
-        $stream->send_line("SUBSCRIBE sub=1 mode=snapshot+stream"
+        # Stream new messages only; past messages are pulled in on demand with
+        # the History button (one older line per click), so joining a busy chat
+        # doesn't dump the whole backlog.
+        $stream->send_line("SUBSCRIBE sub=1 mode=stream"
                          . " FROM chat_messages WHERE session = '$name'");
-        $set_status->("following $name");
+        $set_status->("following $name — click History for past messages");
         $entry->focus;
     };
 
@@ -446,8 +468,23 @@ sub cmd_gui {
         $om->configure(-command => sub { $follow->($sessvar) });
         $set_status->(scalar(@names) . ' open chat(s)');
     };
+    # History: each click pulls in the single next-older message (the newest one
+    # below what's already shown) and prepends it at the top.
+    my $load_history = sub {
+        unless (defined $cur) { $set_status->('pick a chat first'); return }
+        my $where = "session = '$cur'";
+        $where .= " AND id < $min_shown" if defined $min_shown;
+        my $rows = eval { $ctrl->snapshot(8, 'chat_messages', where => $where) };
+        if ($@) { $set_status->("history failed: $@"); return }
+        my ($msg) = sort { ($b->{id} // 0) <=> ($a->{id} // 0) } @{ $rows || [] };
+        unless ($msg) { $set_status->('no older history'); return }
+        $prepend->($msg);
+        $set_status->("history: + 1 older line (id $msg->{id})");
+    };
+
     $om->configure(-command => sub { $follow->($sessvar) });
     $top->Button(-text => 'Refresh', -command => $refresh)->pack(-side => 'right');
+    $top->Button(-text => 'History', -command => $load_history)->pack(-side => 'right');
 
     my $send = sub {
         my $body = $entry->get;
