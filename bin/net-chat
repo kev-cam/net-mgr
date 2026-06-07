@@ -323,7 +323,11 @@ sub cmd_member {
 # ---- GUI (Perl/Tk) ---------------------------------------------------
 # net-chat --gui [session]: a desktop chat window — pick a session, watch
 # it live, type to post, and get approve/reject pop-ups for join requests
-# on sessions you own. Uses two connections: one read via Tk fileevent for
+# on sessions you own. Multi-line messages fold to their first line (a " [+]"
+# marker; left-click to open, right-click to close) and older/seeded lines
+# start folded; the search box reveals and highlights matches across the whole
+# loaded log; each sender gets a light background tint. Uses two connections:
+# one read via Tk fileevent for
 # subscriptions, one for blocking control ops (snapshot/post/join/member).
 sub cmd_gui {
     my ($session) = @_;
@@ -399,30 +403,149 @@ sub cmd_gui {
         $min_shown = $id if defined $id
                          && (!defined $min_shown || $id < $min_shown);
     };
-    my $append = sub {                 # live message -> bottom
-        my ($kv) = @_;
+
+    # Folding + search bookkeeping. Each message gets a unique ordinal $ord and a
+    # clickable tag "i$ord"; a multi-line message also gets a body tag "b$ord"
+    # (everything past the first line) and a marker tag "k$ord" (the " [+]" shown
+    # only while folded). Folding just toggles -elide on those two tags. @order
+    # keeps the on-screen ordinals top->bottom and %otext their text, so Search
+    # can scan the full (even folded) content without the widget's own search.
+    my $mseq = 0;
+    my @order;         # message ordinals, top -> bottom
+    my %otext;         # ord -> decoded full text (for Search)
+    my %folded;        # ord -> bool
+    my $last_hit;      # ord the last Search hit landed in
+    my $last_q = '';   # query that produced $last_hit
+
+    # Light per-sender row tint: each new sender claims the next palette colour
+    # (cycling), kept stable across session switches so a person reads the same.
+    my @PALETTE = ('#fde7e9', '#e7f3fe', '#e9f9ec', '#fff6df', '#f1eafc',
+                   '#e4f7f7', '#fbe6f2', '#eef2e0', '#f6e8df', '#e9ecf8');
+    my %ucolor;        # sender -> tag name ("u<n>")
+    my $unext = 0;
+    my $user_tag = sub {
+        my ($who) = @_;
+        return $ucolor{$who} if exists $ucolor{$who};
+        my $tag = 'u' . $unext;
+        $txt->tagConfigure($tag, -background => $PALETTE[$unext % @PALETTE]);
+        $unext++;
+        return $ucolor{$who} = $tag;
+    };
+
+    my $set_fold = sub {
+        my ($ord, $f) = @_;
+        return unless defined $ord && $txt->tagRanges("b$ord");   # foldable only
+        $folded{$ord} = $f ? 1 : 0;
+        $txt->tagConfigure("b$ord", -elide => $f ? 1 : 0);
+        $txt->tagConfigure("k$ord", -elide => $f ? 0 : 1);
+    };
+
+    my $insert_msg = sub {
+        my ($where, $kv, $fold) = @_;        # $where = 'end' or '1.0'
         return if defined $kv->{id} && $shown{$kv->{id}}++;
+        my $ord = $mseq++;
+        my $t = $fmt->($kv);
+        chomp $t;
+        # Fold boundary: the first newline or column 100, whichever comes first.
+        # A folded message shows head + " [+]"; expanding reveals head + rest
+        # contiguously (no inserted newline) so a long line wraps as written.
+        my $cut = length $t;
+        my $nl  = index($t, "\n");
+        $cut = $nl if $nl >= 0 && $nl < $cut;
+        $cut = 100 if 100 < $cut;
+        my $head = substr($t, 0, $cut);
+        my $rest = substr($t, $cut);
+        my $who  = $kv->{sender} // '?'; utf8::decode($who);
+        my $ut   = $user_tag->($who);        # per-sender background tint
         $txt->configure(-state => 'normal');
-        $txt->insert('end', $fmt->($kv));
+        if (length $rest) {                  # long / multi-line -> foldable
+            $txt->insert($where,
+                $head,  ['msg', $ut, "i$ord"],
+                ' [+]', ['msg', $ut, "i$ord", "k$ord"],
+                $rest,  ['msg', $ut, "i$ord", "b$ord"],
+                "\n",   ['msg', $ut, "i$ord"]);
+            $txt->tagConfigure("b$ord", -elide => $fold ? 1 : 0);
+            $txt->tagConfigure("k$ord", -elide => $fold ? 0 : 1);
+            $folded{$ord} = $fold ? 1 : 0;
+        } else {                             # single line -> nothing to fold
+            $txt->insert($where, $head."\n", ['msg', $ut, "i$ord"]);
+        }
         $txt->configure(-state => 'disabled');
-        $txt->see('end');
+        if ($where eq '1.0') { unshift @order, $ord } else { push @order, $ord }
+        $otext{$ord} = $t;
+        $txt->see('end') if $where eq 'end';
         $note_id->($kv->{id});
     };
-    my $prepend = sub {                # older message -> top
-        my ($kv) = @_;
-        return if defined $kv->{id} && $shown{$kv->{id}}++;
-        $txt->configure(-state => 'normal');
-        $txt->insert('1.0', $fmt->($kv));
-        $txt->configure(-state => 'disabled');
-        $note_id->($kv->{id});
-    };
+    my $append  = sub { $insert_msg->('end', $_[0], $_[1]) };  # live  (unfolded)
+    my $prepend = sub { $insert_msg->('1.0', $_[0], 1) };      # older (folded)
+
     my $clear = sub {
         $txt->configure(-state => 'normal');
         $txt->delete('1.0', 'end');
         $txt->configure(-state => 'disabled');
         $min_shown = undef;
-        %shown = ();
+        %shown = (); @order = (); %otext = (); %folded = ();
+        $last_hit = undef; $last_q = '';
     };
+
+    # Click handling: left-click opens a folded message, right-click folds it.
+    # The ordinal is read back from the "i<n>" tag under the pointer.
+    $txt->tagConfigure('hit', -background => '#ffd54a', -foreground => 'black');
+    my $ord_at = sub {
+        my ($idx) = @_;
+        for my $tag ($txt->tagNames($idx)) { return $1 if $tag =~ /^i(\d+)$/ }
+        return undef;
+    };
+    $txt->tagBind('msg', '<Button-1>',
+        sub { $set_fold->($ord_at->($txt->index('current')), 0) });
+    $txt->tagBind('msg', '<Button-3>',
+        sub { $set_fold->($ord_at->($txt->index('current')), 1) });
+    $txt->tagBind('msg', '<Enter>', sub { $txt->configure(-cursor => 'hand2') });
+    $txt->tagBind('msg', '<Leave>', sub { $txt->configure(-cursor => 'xterm') });
+
+    # -- search row: scan all loaded messages, reveal + highlight the match ----
+    my $srch = $mw->Frame;
+    $srch->pack(-before => $txt, -fill => 'x', -padx => 4, -pady => 2);
+    $srch->Label(-text => 'search:')->pack(-side => 'left');
+    my $searchvar = '';
+    my $se = $srch->Entry(-textvariable => \$searchvar)
+                  ->pack(-side => 'left', -fill => 'x', -expand => 1);
+    my $find = sub {
+        my ($dir) = @_;                      # +1 next match, -1 previous
+        my $q = $searchvar;
+        $txt->tagRemove('hit', '1.0', 'end');
+        return unless length $q;
+        if ($q ne $last_q) { $last_hit = undef; $last_q = $q }
+        my $n = @order or return $set_status->('no messages');
+        my $lc = lc $q;
+        my $from = $dir > 0 ? -1 : 0;        # first search starts at the top
+        if (defined $last_hit) {
+            for my $j (0 .. $n-1) { $from = $j, last if $order[$j] == $last_hit }
+        }
+        for my $step (1 .. $n) {
+            my $j = ($from + $dir*$step) % $n; $j += $n if $j < 0;
+            my $ord = $order[$j];
+            next unless index(lc($otext{$ord}), $lc) >= 0;
+            $last_hit = $ord;
+            $set_fold->($ord, 0);            # reveal the matching message
+            my @r = $txt->tagRanges("i$ord") or last;
+            my $hit = $txt->search('-nocase', '--', $q, $r[0], $r[1]);
+            if ($hit) {
+                $txt->tagAdd('hit', $hit, "$hit + ".length($q)." chars");
+                $txt->tagRaise('hit');       # stay above per-user tint
+                $txt->see($hit);
+            } else { $txt->see($r[0]) }
+            return $set_status->("match ".($j+1)."/$n for '$q'"
+                               . " — Enter=next, Shift-Enter=prev");
+        }
+        $set_status->("no match for '$q'");
+    };
+    $se->bind('<Return>',       sub { $find->( 1) });
+    $se->bind('<Shift-Return>', sub { $find->(-1) });
+    $srch->Button(-text => '›', -width => 2, -command => sub { $find->( 1) })
+         ->pack(-side => 'right');
+    $srch->Button(-text => '‹', -width => 2, -command => sub { $find->(-1) })
+         ->pack(-side => 'right');
 
     my $req_popup = sub {
         my ($kv) = @_;
@@ -458,7 +581,7 @@ sub cmd_gui {
                                           where => "session = '$cur'") } || [];
         my @s = sort { ($a->{id} // 0) <=> ($b->{id} // 0) } @$rows;
         @s = @s[-$n .. -1] if @s > $n;
-        $append->($_) for @s;
+        $append->($_, 1) for @s;            # seeded context starts folded
     };
 
     my $follow = sub {
