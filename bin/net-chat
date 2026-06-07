@@ -345,6 +345,14 @@ sub cmd_gui {
     $mw->title('net-chat');
     $mw->geometry('660x480');
 
+    # Shared named fonts so A+/A- scale the WHOLE UI (buttons, labels, dropdown,
+    # entry) not just the message pane. optionAdd (high priority) makes every
+    # widget created below inherit 'ncui'; the pane uses the monospace 'ncmono'.
+    my $fontsize = 10;
+    $mw->fontCreate('ncui',   -size => $fontsize);
+    $mw->fontCreate('ncmono', -family => 'Courier', -size => $fontsize);
+    $mw->optionAdd('*font' => 'ncui', 81);
+
     my %created_by;          # session -> created_by (for request ownership)
     my $cur;                 # session currently followed
     my %seen_req;            # "$session/$principal" -> 1 (dedupe pop-ups)
@@ -353,7 +361,6 @@ sub cmd_gui {
     # -- top: session picker + refresh -----------------------------------
     my $top = $mw->Frame->pack(-fill => 'x', -padx => 4, -pady => 3);
     $top->Label(-text => 'chat:')->pack(-side => 'left');
-    my $fontsize = 10;                       # chat pane font size (A+/A- adjust)
     my $sessvar = $session // 'select';      # placeholder until a chat is picked
     my $om = $top->Optionmenu(-variable => \$sessvar, -options => ['select'])
                  ->pack(-side => 'left');
@@ -363,7 +370,7 @@ sub cmd_gui {
     # -- middle: message log (read-only) ---------------------------------
     my $txt = $mw->Scrolled('Text', -scrollbars => 'oe', -wrap => 'word',
                             -state => 'disabled', -height => 22,
-                            -font => ['Courier', $fontsize])
+                            -font => 'ncmono')
                  ->pack(-fill => 'both', -expand => 1, -padx => 4);
 
     # -- bottom: input + send --------------------------------------------
@@ -373,7 +380,10 @@ sub cmd_gui {
        ->pack(-fill => 'x', -side => 'bottom');
 
     my $set_status = sub { $statusvar = $_[0] };
-    my $set_font = sub { $txt->configure(-font => ['Courier', $fontsize]) };
+    my $set_font = sub {
+        $mw->fontConfigure('ncui',   -size => $fontsize);
+        $mw->fontConfigure('ncmono', -size => $fontsize);
+    };
     my $min_shown;     # smallest message id on screen — the History cursor
     my %shown;         # ids already displayed — dedup live/seed/history overlap
     my $fmt = sub {
