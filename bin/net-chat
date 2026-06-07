@@ -353,15 +353,17 @@ sub cmd_gui {
     # -- top: session picker + refresh -----------------------------------
     my $top = $mw->Frame->pack(-fill => 'x', -padx => 4, -pady => 3);
     $top->Label(-text => 'chat:')->pack(-side => 'left');
-    my $sessvar = $session // '';
-    my $om = $top->Optionmenu(-variable => \$sessvar, -options => [])
+    my $fontsize = 10;                       # chat pane font size (A+/A- adjust)
+    my $sessvar = $session // 'select';      # placeholder until a chat is picked
+    my $om = $top->Optionmenu(-variable => \$sessvar, -options => ['select'])
                  ->pack(-side => 'left');
     my $topiclbl = $top->Label(-text => '', -anchor => 'w')
                        ->pack(-side => 'left', -fill => 'x', -expand => 1);
 
     # -- middle: message log (read-only) ---------------------------------
     my $txt = $mw->Scrolled('Text', -scrollbars => 'oe', -wrap => 'word',
-                            -state => 'disabled', -height => 22)
+                            -state => 'disabled', -height => 22,
+                            -font => ['Courier', $fontsize])
                  ->pack(-fill => 'both', -expand => 1, -padx => 4);
 
     # -- bottom: input + send --------------------------------------------
@@ -371,6 +373,7 @@ sub cmd_gui {
        ->pack(-fill => 'x', -side => 'bottom');
 
     my $set_status = sub { $statusvar = $_[0] };
+    my $set_font = sub { $txt->configure(-font => ['Courier', $fontsize]) };
     my $min_shown;     # smallest message id on screen — the History cursor
     my %shown;         # ids already displayed — dedup live/seed/history overlap
     my $fmt = sub {
@@ -451,6 +454,7 @@ sub cmd_gui {
     my $follow = sub {
         my ($name) = @_;
         return unless defined $name && length $name;
+        return if $name eq 'select' || $name eq '(no open chats)';
         return if defined $cur && $cur eq $name;
         $stream->send_line('UNSUB sub=1') if defined $cur;
         $clear->();
@@ -480,8 +484,8 @@ sub cmd_gui {
         # still exists.
         my $keep = $sessvar;
         $om->configure(-command => undef);
-        $om->configure(-options => [ @names ? @names : ('(no open chats)') ]);
-        $sessvar = $keep if defined $keep && grep { $_ eq $keep } @names;
+        $om->configure(-options => [ 'select', @names ]);
+        $sessvar = (defined $keep && grep { $_ eq $keep } @names) ? $keep : 'select';
         $om->configure(-command => sub { $follow->($sessvar) });
         $set_status->(scalar(@names) . ' open chat(s)');
     };
@@ -502,6 +506,13 @@ sub cmd_gui {
     $om->configure(-command => sub { $follow->($sessvar) });
     $top->Button(-text => 'Refresh', -command => $refresh)->pack(-side => 'right');
     $top->Button(-text => 'History', -command => $load_history)->pack(-side => 'right');
+    # font size controls
+    $top->Button(-text => 'A+', -width => 2,
+                 -command => sub { $fontsize++ if $fontsize < 32; $set_font->() })
+        ->pack(-side => 'right');
+    $top->Button(-text => 'A-', -width => 2,
+                 -command => sub { $fontsize-- if $fontsize > 6; $set_font->() })
+        ->pack(-side => 'right');
 
     my $send = sub {
         my $body = $entry->get;
@@ -539,6 +550,9 @@ sub cmd_gui {
             if (defined $n && $n == 0) {
                 $mw->fileevent($stream->{sock}, 'readable', '');
                 $set_status->('disconnected (daemon gone) -- restart to reconnect');
+                $cur = undef;
+                $sessvar = 'select';
+                $om->configure(-options => ['select']);
             } elsif (defined $n) {
                 $stream->{buf} .= $b;
             }
