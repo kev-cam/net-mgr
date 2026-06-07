@@ -71,7 +71,7 @@ if (@peers_cli) {
 }
 
 # DB connection settings — each child opens its own connection.
-my $mycnf = $cfg->{mysql}{defaults} // '/root/.my.cnf';
+my $mycnf = NetMgr::Config->mysql_defaults_file($cfg);
 unless (-r $mycnf) {
     $mycnf = "$ENV{HOME}/.my.cnf" if -r "$ENV{HOME}/.my.cnf";
 }

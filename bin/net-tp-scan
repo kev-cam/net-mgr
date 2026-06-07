@@ -124,8 +124,7 @@ unless ($dry_run) {
     my $cfg = NetMgr::Config->load(
         $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
     my $mycnf = (-r "$ENV{HOME}/.my.cnf") ? "$ENV{HOME}/.my.cnf"
-              : (-r '/root/.my.cnf')      ? '/root/.my.cnf'
-              : die "no readable .my.cnf for the [net-mgr] section\n";
+              : NetMgr::Config->mysql_defaults_file($cfg);
     $db = NetMgr::DB->new(
         defaults_file => $mycnf,
         section       => $cfg->{mysql}{section},

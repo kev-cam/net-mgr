@@ -1,7 +1,9 @@
 package NetMgr::DB;
-# DBI wrapper for net-mgr. Connects via /root/.my.cnf [<section>],
-# bootstraps the schema if absent, and exposes UPSERT helpers that
-# return change-info so the daemon can emit transition events.
+# DBI wrapper for net-mgr. Connects via the [<section>] group of an option
+# file (default /etc/net-mgr/root.conf; callers usually resolve this with
+# NetMgr::Config->mysql_defaults_file), bootstraps the schema if absent, and
+# exposes UPSERT helpers that return change-info so the daemon can emit
+# transition events.
 
 use strict;
 use warnings;
@@ -14,7 +16,7 @@ our $SCHEMA_VERSION = 22;
 sub new {
     my ($class, %args) = @_;
     my $self = bless {
-        defaults_file => $args{defaults_file} // '/root/.my.cnf',
+        defaults_file => $args{defaults_file} // '/etc/net-mgr/root.conf',
         section       => $args{section}       // 'net-mgr',
         db            => $args{db}            // 'netmgr',
         schema_dir    => $args{schema_dir}    // "$FindBin::Bin/../sql",

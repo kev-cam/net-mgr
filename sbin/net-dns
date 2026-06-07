@@ -49,7 +49,7 @@ $lhost //= '0.0.0.0';
 $lport //= 53;
 
 # ---- DB connection --------------------------------------------------
-my $mycnf = $cfg->{mysql}{defaults} // '/root/.my.cnf';
+my $mycnf = NetMgr::Config->mysql_defaults_file($cfg);
 unless (-r $mycnf) {
     $mycnf = "$ENV{HOME}/.my.cnf" if -r "$ENV{HOME}/.my.cnf";
 }

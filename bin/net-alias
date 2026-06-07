@@ -36,13 +36,12 @@ my $cmd = shift @ARGV or die "usage: net-alias add|list|remove|resolve\n";
 
 # `add` and `remove` go through the daemon (TRIGGER alias-add / alias-remove)
 # … but those triggers don't exist. Easier: open a direct DB connection.
-# That requires being on the host with /root/.my.cnf or ~/.my.cnf.
+# That requires being on the host with /etc/net-mgr/root.conf or ~/.my.cnf.
 
 my $cfg = NetMgr::Config->load(
     $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
 my $mycnf = (-r "$ENV{HOME}/.my.cnf") ? "$ENV{HOME}/.my.cnf"
-          : (-r '/root/.my.cnf')      ? '/root/.my.cnf'
-          : die "no readable .my.cnf for the [net-mgr] section\n";
+          : NetMgr::Config->mysql_defaults_file($cfg);
 my $db = NetMgr::DB->new(
     defaults_file => $mycnf,
     section       => $cfg->{mysql}{section},

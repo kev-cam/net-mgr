@@ -36,7 +36,10 @@ my %DEFAULTS = (
     },
     mysql => {
         db       => 'netmgr',
-        defaults => '/root/.my.cnf',
+        # Canonical location (alongside the rest of /etc/net-mgr). The generic
+        # /root/.my.cnf is deprecated; mysql_defaults_file() still falls back
+        # to it with a one-time warning so existing installs keep working.
+        defaults => '/etc/net-mgr/root.conf',
         section  => 'net-mgr',
     },
     scanner => {
@@ -259,6 +262,28 @@ sub dead_keys {
     close $fh;
     my %seen;
     return grep { !$seen{$_}++ } @dead;
+}
+
+# Resolve the root MySQL option file a caller should hand to NetMgr::DB.
+# The generic /root/.my.cnf is deprecated in favour of /etc/net-mgr/root.conf
+# (next to the rest of net-mgr's config). Returns the configured/default path
+# if readable; else the legacy /root/.my.cnf with a one-time deprecation
+# warning; else the canonical path (so a later "not readable" error names it).
+my %_mycnf_warned;
+sub mysql_defaults_file {
+    my ($class, $cfg) = @_;
+    my $path = (ref $cfg eq 'HASH' && defined $cfg->{mysql}{defaults})
+             ? $cfg->{mysql}{defaults}
+             : '/etc/net-mgr/root.conf';
+    return $path if -r $path;
+    my $legacy = '/root/.my.cnf';
+    if ($path ne $legacy && -r $legacy) {
+        warn "net-mgr: '$path' not found; falling back to legacy '$legacy' "
+           . "(deprecated — move it to '/etc/net-mgr/root.conf')\n"
+            unless $_mycnf_warned{$legacy}++;
+        return $legacy;
+    }
+    return $path;
 }
 
 # Path to the per-user config (XDG: $XDG_CONFIG_HOME/net-mgr/config, else

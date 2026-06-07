@@ -408,8 +408,8 @@ sub open_db {
         my $cfg = NetMgr::Config::load(
             $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
         my $mycnf = (-r "$ENV{HOME}/.my.cnf") ? "$ENV{HOME}/.my.cnf"
-                  : (-r '/root/.my.cnf')      ? '/root/.my.cnf'
-                  : return undef;
+                  : NetMgr::Config->mysql_defaults_file($cfg);
+        return undef unless -r $mycnf;
         my $db = NetMgr::DB->new(
             defaults_file => $mycnf,
             section       => $cfg->{mysql}{section},

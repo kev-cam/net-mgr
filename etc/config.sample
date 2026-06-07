@@ -42,7 +42,11 @@ offline_after = 300s
 
 [mysql]
 db       = netmgr
-defaults = /root/.my.cnf
+# MySQL option file holding the [net-mgr] credentials group. net-mgr-setup
+# writes this. The generic /root/.my.cnf is deprecated — net-mgr now defaults
+# to /etc/net-mgr/root.conf and only falls back to /root/.my.cnf (with a
+# one-time warning) when the new file is absent.
+defaults = /etc/net-mgr/root.conf
 section  = net-mgr
 
 [scanner]

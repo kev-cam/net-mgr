@@ -51,7 +51,7 @@ unless (%$uplinks) {
 }
 
 # DB connection.
-my $mycnf = $cfg->{mysql}{defaults} // '/root/.my.cnf';
+my $mycnf = NetMgr::Config->mysql_defaults_file($cfg);
 die "no readable $mycnf — run net-mgr-setup first\n" unless -r $mycnf;
 my $db = NetMgr::DB->new(
     defaults_file => $mycnf,

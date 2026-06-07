@@ -1,26 +1,39 @@
 #!/usr/bin/perl
-# net-mgr-setup — interactive first-time DB setup.
+# net-mgr-setup — interactive first-time DB (and relay) setup.
 #
-# Must be run as root (needs to talk to mysql via unix_socket and
-# write /root/.my.cnf).
+# Must be run as root (needs to talk to mysql via unix_socket and write the
+# credentials file + a systemd drop-in).
 #
 # Asks whether to use the existing root account (unix_socket auth, no
 # password) or create a dedicated MySQL user, then creates the database,
-# the user (if needed), writes /root/.my.cnf with a [net-mgr] section,
-# and verifies the connection.
+# the user (if needed), writes /etc/net-mgr/root.conf with a [net-mgr]
+# section, and verifies the connection. Finally it configures how this node
+# replicates from the fleet (relay mode + master).
+#
+# Non-interactive overrides:
+#   --relay-mode none|peer|cluster   how net-mgr-relay runs (else prompts)
+#   --master HOST[:PORT]             master for peer mode (else prompts)
+#   --allow-existing                 proceed even if other databases exist
 
 use strict;
 use warnings;
 use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
+use NetMgr::Client;   # split_hostport/join_hostport for the master endpoint
 
-my $MYCNF    = '/root/.my.cnf';
+my $MYCNF    = '/etc/net-mgr/root.conf';
 my $SECTION  = 'net-mgr';
 my $DBNAME   = 'netmgr';
 
-my $allow_existing;
-GetOptions('allow-existing' => \$allow_existing) or die "bad options\n";
+my ($allow_existing, $relay_mode, $master);
+GetOptions(
+    'allow-existing' => \$allow_existing,
+    'relay-mode=s'   => \$relay_mode,
+    'master=s'       => \$master,
+) or die "bad options\n";
+die "invalid --relay-mode '$relay_mode' (want none|peer|cluster)\n"
+    if defined $relay_mode && $relay_mode !~ /^(none|peer|cluster)$/i;
 
 die "must run as root\n" if $> != 0;
 
@@ -114,7 +127,7 @@ print "  ok\n";
     }
 }
 
-# ---- 2. existing /root/.my.cnf ---------------------------------------
+# ---- 2. existing credentials file -----------------------------------
 if (-d $MYCNF) {
     die "$MYCNF exists but is a directory — fix that first:\n"
       . "  rmdir $MYCNF   # or rm -rf if it has content\n";
@@ -181,7 +194,8 @@ mysql_root("GRANT ALL ON $DBNAME.* TO '$user'\@'localhost'")
     or die "GRANT failed\n";
 print "Privileges granted on $DBNAME.* to '$user'\@'localhost'.\n";
 
-# ---- 6. write /root/.my.cnf -----------------------------------------
+# ---- 6. write credentials file --------------------------------------
+mkdir '/etc/net-mgr' unless -d '/etc/net-mgr';   # alongside the main config
 my @existing;
 if (-e $MYCNF) {
     open my $fh, '<', $MYCNF or die "read $MYCNF: $!";
@@ -221,5 +235,58 @@ $db->connect;
 my $v = $db->bootstrap_schema;
 print "Schema bootstrapped to v$v.\n";
 $db->disconnect;
+
+# ---- 8. relay mode ---------------------------------------------------
+# How this node replicates fleet state from another net-mgr:
+#   none    — standalone; net-mgr-relay stays disabled.
+#   peer    — pin to a single master with no election (a NAT'd / tunneled /
+#             forward-only spoke, e.g. this VM reaching nas3 via 10.0.2.2).
+#   cluster — join a [cluster] roster and elect a master.
+my $DROPIN_DIR  = '/etc/systemd/system/net-mgr-relay.service.d';
+my $DROPIN_FILE = "$DROPIN_DIR/peer.conf";
+
+unless (defined $relay_mode) {
+    print "\nnet-mgr-relay replicates fleet state from another net-mgr.\n";
+    $relay_mode = prompt("Relay mode (none/peer/cluster)", 'none');
+}
+$relay_mode = lc $relay_mode;
+die "invalid relay mode '$relay_mode' (want none|peer|cluster)\n"
+    unless $relay_mode =~ /^(none|peer|cluster)$/;
+
+if ($relay_mode eq 'peer') {
+    $master = prompt("Master net-mgr IP/host[:port]", '127.0.0.1:7531')
+        unless defined $master && length $master;
+    die "peer mode needs a master (--master HOST[:PORT])\n"
+        unless defined $master && length $master;
+    # Default the port when the master is a bare host or bare IPv6 literal.
+    my ($h, $p) = NetMgr::Client::split_hostport($master);
+    $master = NetMgr::Client::join_hostport($h, $p // 7531);
+    mkdir $DROPIN_DIR unless -d $DROPIN_DIR;
+    open my $df, '>', $DROPIN_FILE or die "write $DROPIN_FILE: $!";
+    print {$df} <<"EOF";
+# Written by net-mgr-setup. Pin net-mgr-relay to a single master: no cluster
+# election, no LAN-IP discovery — the relay only ever tries this connection.
+# Suits a NAT'd / tunneled / forward-only spoke. Re-run net-mgr-setup (or edit
+# / remove this file) to change.
+[Service]
+ExecStart=
+ExecStart=/usr/local/sbin/net-mgr-relay --foreground --peer $master
+EOF
+    close $df;
+    print "Wrote $DROPIN_FILE — relay pinned to $master.\n";
+    print "Enable it with:\n";
+    print "  systemctl daemon-reload && systemctl enable --now net-mgr-relay\n";
+}
+elsif ($relay_mode eq 'cluster') {
+    unlink $DROPIN_FILE if -e $DROPIN_FILE;   # drop any single-master pin
+    print "Cluster mode: set '[cluster] members = host1, host2, ...' in\n";
+    print "/etc/net-mgr/config, then:\n";
+    print "  systemctl daemon-reload && systemctl enable --now net-mgr-relay\n";
+}
+else {  # none
+    unlink $DROPIN_FILE if -e $DROPIN_FILE;
+    print "Relay left standalone (net-mgr-relay disabled). Re-run setup to "
+        . "enable replication later.\n";
+}
 
 print "\nDone. You can now run:  prove -Ilib t/db.t\n";
