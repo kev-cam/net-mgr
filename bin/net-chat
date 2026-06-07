@@ -150,7 +150,7 @@ sub connect_client {
                                          as => $as) }
         or die "net-chat: cannot reach daemon at $listen: $@";
 
-    my $host = (split /:/, $listen, 2)[0] // '';
+    my ($host) = NetMgr::Client::split_hostport($listen); $host //= '';
     my $is_loopback = $host =~ /^(?:127\.\d+\.\d+\.\d+|::1|localhost)$/;
 
     my $do_auth = $force_auth || (!$is_loopback && !$no_auth);
@@ -356,7 +356,7 @@ sub cmd_gui {
     require Tk;   # loaded on demand; fully-qualified below so non-gui use
                   # of net-chat never needs Perl/Tk installed.
 
-    my $host = (split /:/, $listen, 2)[0] // '';
+    my ($host) = NetMgr::Client::split_hostport($listen); $host //= '';
     my $is_loopback = $host =~ /^(?:127\.\d+\.\d+\.\d+|::1|localhost)$/;
     my $authed = $force_auth || (!$is_loopback && !$no_auth);
     $authed = 0 if $no_auth;

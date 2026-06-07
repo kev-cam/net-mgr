@@ -177,9 +177,9 @@ sub apply_watched {
             $addr = resolve_ip($w->{master});
             return _log_status("daemon says follow $w->{master} but no addr "
                              . "(retry next tick)") unless $addr;
-            $addr .= ':7531';
+            $addr = NetMgr::Client::join_hostport($addr, 7531);
         }
-        my ($host) = split /:/, $addr, 2;
+        my ($host) = NetMgr::Client::split_hostport($addr);
         if ($child{pid} && $child{peer} ne $host) {
             _log_status("master changed to $w->{master} ($addr); "
                       . "restarting child");
@@ -269,7 +269,8 @@ sub probe_member {
     }
     my $ip = resolve_ip($name);
     return undef unless $ip;
-    my $cli = eval { NetMgr::Client->new(listen => "$ip:7531", timeout => 4) };
+    my $cli = eval { NetMgr::Client->new(
+        listen => NetMgr::Client::join_hostport($ip, 7531), timeout => 4) };
     return undef unless $cli;
     eval { $cli->hello(consumer => "relay-election.$$") };
     return undef if $@;

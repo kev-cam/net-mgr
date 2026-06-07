@@ -5,27 +5,52 @@ package NetMgr::Client;
 use strict;
 use warnings;
 use Carp qw(croak);
-use IO::Socket::INET;
+use IO::Socket::IP;     # both IPv4 and IPv6, unlike IO::Socket::INET
 use NetMgr::Protocol qw(parse_line format_kv);
+
+# Split an endpoint into ($host, $port), $port undef when absent. Handles:
+#   host:port      -> (host, port)
+#   [v6]:port      -> (v6,   port)    brackets stripped
+#   [v6]           -> (v6,   undef)
+#   bare-host      -> (host, undef)
+#   bare IPv6      -> (v6,   undef)    2+ colons and no brackets (e.g. ::1)
+# The bracket form is the only way to attach a port to an IPv6 literal —
+# an unbracketed value with multiple colons is taken as a portless v6 host.
+sub split_hostport {
+    my ($s) = @_;
+    return (undef, undef) unless defined $s && length $s;
+    return ($1, $2) if $s =~ /^\[([^\]]*)\](?::(\d+))?$/;   # [v6] / [v6]:port
+    return ($1, $2) if $s =~ /^([^:]+):(\d+)$/;             # host:port
+    return ($s, undef);                                     # bare host / bare v6
+}
+
+# Inverse of split_hostport: format ($host, $port) as an endpoint string,
+# bracketing an IPv6 host (one containing ':'). Port omitted when undef.
+sub join_hostport {
+    my ($host, $port) = @_;
+    my $h = (defined $host && $host =~ /:/) ? "[$host]" : ($host // '');
+    return defined $port && length $port ? "$h:$port" : $h;
+}
 
 sub new {
     my ($class, %args) = @_;
     my $listen = $args{listen} // $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
-    # Default port to 7531 so '--listen zmc1' / '--listen zmc1.grfx.com'
-    # both work without spelling out the port every time.
-    my ($host, $port) = split /:/, $listen, 2;
-    $port //= 7531;
-    $port  =  7531 if $port eq '';
+    # Default port to 7531 so '--listen zmc1' / '--listen zmc1.grfx.com' /
+    # '--listen [fd00::1]' all work without spelling out the port. IPv6
+    # literals must be bracketed to carry a port ('[fd00::1]:7531').
+    my ($host, $port) = split_hostport($listen);
+    $host = '127.0.0.1' unless defined $host && length $host;
+    $port = 7531        unless defined $port && length $port;
     my $timeout = $args{timeout} // 10;
-    my $sock = IO::Socket::INET->new(
-        PeerAddr => $host,
+    my $sock = IO::Socket::IP->new(
+        PeerHost => $host,
         PeerPort => $port,
         Proto    => 'tcp',
         Timeout  => $timeout,
-    ) or croak "connect $host:$port: $!";
+    ) or croak "connect " . join_hostport($host, $port) . ": $!";
     # `as` is a loopback-only self-declared identity stamped onto chat
     # control verbs / posts (the daemon ignores it once AUTH'd).
-    return bless { sock => $sock, buf => '', listen => "$host:$port",
+    return bless { sock => $sock, buf => '', listen => join_hostport($host, $port),
                    as => $args{as} }, $class;
 }
 
