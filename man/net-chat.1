@@ -1,4 +1,4 @@
-.TH NET-CHAT 1 "2026-06-02" "net-mgr" "User Commands"
+.TH NET-CHAT 1 "2026-06-07" "net-mgr" "User Commands"
 .SH NAME
 net-chat \- talk in named chat sessions hosted by net-mgr
 .SH SYNOPSIS
@@ -39,18 +39,55 @@ into a pending state and an owner
 them.
 .RE
 .SH CONNECTION AND IDENTITY
-A loopback daemon (the default,
-.BR 127.0.0.1:7531 )
+A loopback daemon
+.RB ( 127.0.0.1:7531 )
 is trusted: posts are labelled with
 .B \-\-as
 (or
 .BR $NET_CHAT_AS / $USER ).
 A non-loopback daemon is authenticated automatically with the SSH-key
 handshake; the verified key id becomes the sender.
+.PP
+The manager address is chosen by the first of these that is set:
+.BR \-\-listen ,
+then
+.BR \-\-server ,
+then
+.BR $NET_MGR_LISTEN ,
+then the
+.B default
+server from the
+.B [servers]
+config section, then
+.BR 127.0.0.1:7531 .
+Servers are named in the per-user file
+.I ~/.config/net-mgr/config
+(which overlays the system
+.IR /etc/net-mgr/config ),
+for example:
+.PP
+.RS
+.nf
+[servers]
+default = vmhost
+vmhost  = 10.0.2.2:7531
+nas3    = 192.168.15.9:7531
+.fi
+.RE
 .TP
 \fB\-\-listen\fR \fIHOST:PORT\fR
-Manager address (default
-.BR 127.0.0.1:7531 ).
+Manager address. Overrides
+.B \-\-server
+and the config.
+.TP
+\fB\-\-server\fR \fINAME\fR
+Connect to the server named
+.I NAME
+in the
+.B [servers]
+config section. The
+.B \-\-gui
+shows a drop-down to switch between configured servers.
 .TP
 \fB\-\-as\fR \fINAME\fR
 Display name for posts on a loopback daemon. Ignored once AUTH'd.
@@ -144,13 +181,34 @@ echo "trilinos done, starting xyce-build" | \\
 .SH ENVIRONMENT
 .TP
 .B NET_MGR_LISTEN
-Default manager address if
+Manager address used when neither
 .B \-\-listen
-is not given.
+nor
+.B \-\-server
+is given; takes precedence over the configured
+.B default
+server.
 .TP
 .B NET_CHAT_AS
 Default display name for loopback posts.
+.TP
+.B NET_MGR_CONF
+Path to the system config (default
+.IR /etc/net-mgr/config ).
+.SH FILES
+.TP
+.I ~/.config/net-mgr/config
+Per-user config. Its
+.B [servers]
+section names the daemons reachable via
+.BR \-\-server ;
+honors
+.BR $XDG_CONFIG_HOME .
+.TP
+.I /etc/net-mgr/config
+System config, overlaid by the per-user file.
 .SH "SEE ALSO"
+.BR net-lookup (1),
 .BR net-report (1),
 .BR net-watch (1),
 .BR net-mgr (7)

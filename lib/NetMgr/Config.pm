@@ -1,5 +1,7 @@
 package NetMgr::Config;
-# Loads /etc/net-mgr/config (INI-style) into a nested hashref.
+# Loads /etc/net-mgr/config (INI-style) into a nested hashref. A per-user file
+# (~/.config/net-mgr/config) overlays it for the parts client tools read —
+# notably [servers]; see user_path() and servers().
 #
 # Sections:
 #   [manager]   listen, log
@@ -9,6 +11,7 @@ package NetMgr::Config;
 #   [timeouts]  ap, fping, nmap, dhcp     (dhcp may be 'lease')
 #   [paths]     dnsmasq_conf_glob, oui_csv
 #   [bindings]  machine "<name>" = mac1, mac2, ...
+#   [servers]   <name> = host[:port], plus default = <name>  (client tools)
 #
 # Durations: '90s', '5m', '24h', '7d', '2w' → seconds. 'lease' kept as-is.
 # Defaults are merged so callers can rely on every documented key existing.
@@ -79,6 +82,11 @@ my %DEFAULTS = (
     dhcp => {
         out_dir => '/etc/net-mgr/dnsmasq.d',
     },
+    # Named net-mgr daemons client tools can connect to. Each key is a short
+    # name mapped to host[:port]; the special key 'default' names the preferred
+    # entry. Usually set in the per-user file (~/.config/net-mgr/config) and
+    # read via NetMgr::Config->servers; pick one with `--server NAME`.
+    servers => {},
 );
 
 # Per-section, which keys should be coerced to integer seconds.
@@ -220,6 +228,7 @@ my %ACTIVE = (
     uplinks    => '*',                        # consumed by net-uplink-probe
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
     forward    => [qw(method allow_peers)],   # net-connect FORWARD backend
+    servers    => '*',                        # client server list (see servers())
 );
 
 # Returns a list of "[section] key" strings for entries in $path that
@@ -250,6 +259,52 @@ sub dead_keys {
     close $fh;
     my %seen;
     return grep { !$seen{$_}++ } @dead;
+}
+
+# Path to the per-user config (XDG: $XDG_CONFIG_HOME/net-mgr/config, else
+# ~/.config/net-mgr/config). Undef if HOME is unset and XDG isn't given.
+sub user_path {
+    my $base = $ENV{XDG_CONFIG_HOME};
+    $base ||= "$ENV{HOME}/.config" if defined $ENV{HOME} && length $ENV{HOME};
+    return undef unless defined $base && length $base;
+    return "$base/net-mgr/config";
+}
+
+# Merged [servers] from the system config then the per-user config (user wins).
+# In list context returns (\%name_to_addr, $default_addr, $default_name);
+# %name_to_addr maps a short name to "host:port" and excludes the special
+# 'default' key, whose value names the preferred entry.
+sub servers {
+    my ($class) = @_;
+    my %srv;
+    my $default_name;
+    for my $path ($ENV{NET_MGR_CONF} // '/etc/net-mgr/config', $class->user_path) {
+        next unless defined $path && -e $path && -r _;
+        my $cfg = eval { $class->load($path) };
+        if ($@) { warn "net-mgr: skipping config $path: $@"; next }
+        my $s = $cfg->{servers} or next;
+        for my $k (keys %$s) {
+            if ($k eq 'default') { $default_name = $s->{$k} }
+            else                 { $srv{$k}      = $s->{$k} }
+        }
+    }
+    my $default;
+    $default = $srv{$default_name}
+        if defined $default_name && exists $srv{$default_name};
+    return wantarray ? (\%srv, $default, $default_name) : \%srv;
+}
+
+# Resolve a server selection to a "host:port" string. $sel may be a name from
+# [servers], a literal host[:port], or undef. Returns undef if a given name is
+# unknown (caller decides how to complain); undef $sel yields the configured
+# default (or undef when none is set).
+sub resolve_server {
+    my ($class, $sel) = @_;
+    my ($srv, $default) = $class->servers;
+    return $srv->{$sel} if defined $sel && exists $srv->{$sel};
+    return undef        if defined $sel && $sel !~ /[.:]/;   # bare unknown name
+    return $sel         if defined $sel && length $sel;      # literal host[:port]
+    return $default;                                          # default (maybe undef)
 }
 
 1;

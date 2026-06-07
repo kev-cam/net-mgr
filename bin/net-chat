@@ -25,7 +25,11 @@
 #   net-chat allow|deny     <name> <who>    Edit the allow-list   (owner)
 #
 # Connection / identity:
-#   --listen HOST:PORT    Manager address (default 127.0.0.1:7531).
+#   --listen HOST:PORT    Manager address (overrides --server and config).
+#   --server NAME         A server named in [servers] in the config file
+#                         (~/.config/net-mgr/config). With neither flag, the
+#                         configured default server is used, else loopback.
+#                         The --gui shows a server menu to switch between them.
 #   --as NAME             Display name for posts on a loopback daemon
 #                         (default $NET_CHAT_AS or $USER). Ignored once
 #                         AUTH'd — the server stamps the verified key.
@@ -42,6 +46,7 @@ use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling pass_through);
 use NetMgr::Client;
+use NetMgr::Config;
 use NetMgr::Protocol qw(parse_line);
 
 # Writing to a daemon that has gone away must not kill us with SIGPIPE — the
@@ -58,6 +63,7 @@ if (@ARGV && $ARGV[0] eq '--describe') {
 }
 
 my $listen;
+my $server;
 my $as;
 my $force_auth;
 my $no_auth;
@@ -71,6 +77,7 @@ my $show_all;
 my $gui;
 GetOptions(
     'listen=s'   => \$listen,
+    'server=s'   => \$server,
     'as=s'       => \$as,
     'auth'       => \$force_auth,
     'no-auth'    => \$no_auth,
@@ -86,8 +93,22 @@ GetOptions(
 
 my $cmd = shift @ARGV;
 
-$listen //= $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
-$as     //= $ENV{NET_CHAT_AS} // $ENV{USER} // 'local';
+# Server resolution: an explicit --listen address wins; otherwise --server
+# names an entry in the [servers] config (see NetMgr::Config), then
+# $NET_MGR_LISTEN, then the configured default server, then loopback.
+if (!defined $listen) {
+    if (defined $server) {
+        $listen = NetMgr::Config->resolve_server($server)
+            or die "net-chat: unknown server '$server' (configure it in "
+                 . (NetMgr::Config->user_path // '~/.config/net-mgr/config')
+                 . " [servers])\n";
+    } else {
+        $listen = $ENV{NET_MGR_LISTEN}
+               // NetMgr::Config->resolve_server(undef)
+               // '127.0.0.1:7531';
+    }
+}
+$as //= $ENV{NET_CHAT_AS} // $ENV{USER} // 'local';
 
 # --gui launches the Tk front-end; the leftover arg (if any) is the session
 # to open initially. No subcommand is required in this mode.
@@ -362,8 +383,38 @@ sub cmd_gui {
     my %seen_req;            # "$session/$principal" -> 1 (dedupe pop-ups)
     my $statusvar = 'connecting…';
 
-    # -- top: session picker + refresh -----------------------------------
+    # -- top: server + session picker + refresh --------------------------
     my $top = $mw->Frame->pack(-fill => 'x', -padx => 4, -pady => 3);
+
+    # Server picker — shown only when the config lists servers. Switching
+    # rebuilds both sockets, the fileevent, and identity (loopback vs remote
+    # auth differ), so we just re-exec with the new --listen: clean and
+    # state-free. See ~/.config/net-mgr/config [servers].
+    my ($srvmap) = NetMgr::Config->servers;
+    if (%$srvmap) {
+        my $cursrv = $listen;          # reverse-map the active addr to a name
+        for (keys %$srvmap) { $cursrv = $_, last if ($srvmap->{$_}//'') eq $listen }
+        my @opts = sort keys %$srvmap;
+        push @opts, $cursrv unless grep { $_ eq $cursrv } @opts;   # unnamed addr
+        my $srvvar = $cursrv;
+        $top->Label(-text => 'server:')->pack(-side => 'left');
+        $top->Optionmenu(-variable => \$srvvar, -options => \@opts,
+            -command => sub {
+                my $addr = $srvmap->{$srvvar} // $srvvar;
+                return if $addr eq $listen;
+                eval { $ctrl->chat_leave(session => $cur) } if defined $cur;
+                eval { $ctrl->bye }; eval { $stream->bye };
+                my @argv = ('--gui', '--listen', $addr);
+                push @argv, '--auth'                  if $force_auth;
+                push @argv, '--no-auth'               if $no_auth;
+                push @argv, '--key-id',   $key_id     if defined $key_id;
+                push @argv, '--key-file', $key_file   if defined $key_file;
+                push @argv, '--as',       $as         if defined $as;
+                push @argv, $cur                      if defined $cur;
+                exec $^X, $0, @argv;
+            })->pack(-side => 'left');
+    }
+
     $top->Label(-text => 'chat:')->pack(-side => 'left');
     my $sessvar = $session // 'select';      # placeholder until a chat is picked
     my $om = $top->Optionmenu(-variable => \$sessvar, -options => ['select'])
@@ -768,9 +819,14 @@ usage: net-chat <command> [args]
                                    post, approve/reject join requests via
                                    pop-ups (Perl/Tk required)
 
-  --listen HOST:PORT   daemon address (default 127.0.0.1:7531)
+  --listen HOST:PORT   daemon address (overrides --server and config)
+  --server NAME        a server from [servers] in the config file
+                       (~/.config/net-mgr/config); default = its 'default'
   --as NAME            display name on a loopback daemon
   --auth / --no-auth   force / suppress the SSH-key handshake
+
+  Address precedence: --listen, then --server, then $NET_MGR_LISTEN, then
+  the configured default server, then 127.0.0.1:7531.
 USAGE
     exit($msg ? 2 : 0);
 }

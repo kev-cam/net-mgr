@@ -4,7 +4,7 @@
 # returns the host's name(s).
 #
 # Usage:
-#   net-lookup [--all] [--family v4|v6] [--listen HOST:PORT] <name-regex|IP>
+#   net-lookup [--all] [--family v4|v6] [--listen HOST:PORT|--server NAME] <name-regex|IP>
 #
 # Forward (name → IP): the pattern is a Perl regex; net-lookup wraps
 # it as ^(?:...)$ before matching, so 'nas3(|-.*)' matches nas3,
@@ -43,8 +43,10 @@ use Getopt::Long qw(:config no_ignore_case bundling);
 use Socket qw(inet_pton inet_ntop AF_INET AF_INET6);
 
 use NetMgr::Client;
+use NetMgr::Config;
 
-my $listen = $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
+my $listen;
+my $server;
 my $all;
 my $family = 'v4';
 my $verify;
@@ -53,6 +55,7 @@ my $verbose;
 my $help;
 GetOptions(
     'listen=s'      => \$listen,
+    'server=s'      => \$server,
     'all|a'         => \$all,
     'family=s'      => \$family,
     'verify|v'      => \$verify,
@@ -61,6 +64,22 @@ GetOptions(
     'help|h'        => \$help,
 ) or usage(2);
 usage(0) if $help;
+
+# Server resolution mirrors net-chat: --listen wins, else --server names a
+# [servers] entry, else $NET_MGR_LISTEN, else the configured default, else
+# loopback. (~/.config/net-mgr/config — see NetMgr::Config.)
+if (!defined $listen) {
+    if (defined $server) {
+        $listen = NetMgr::Config->resolve_server($server)
+            or die "net-lookup: unknown server '$server' (configure it in "
+                 . (NetMgr::Config->user_path // '~/.config/net-mgr/config')
+                 . " [servers])\n";
+    } else {
+        $listen = $ENV{NET_MGR_LISTEN}
+               // NetMgr::Config->resolve_server(undef)
+               // '127.0.0.1:7531';
+    }
+}
 usage(2) if @ARGV != 1;
 
 my $pattern = $ARGV[0];
@@ -473,7 +492,8 @@ net-lookup — resolve a regex name to the best IP for this caller, or
 
 Usage:
   net-lookup [--all] [--verify] [--include-stale] [--verbose]
-             [--family v4|v6] [--listen HOST:PORT] <name-regex|IP>
+             [--family v4|v6] [--listen HOST:PORT | --server NAME]
+             <name-regex|IP>
 
 Forward (name → IP):
   net-lookup nas3                      # exact name

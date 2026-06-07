@@ -2,6 +2,23 @@
 # Install to /etc/net-mgr/config (or set NET_MGR_CONF env var).
 # Other files in /etc/net-mgr/ are loaded by their own components
 # (e.g. /etc/net-mgr/dhcp for the dhcp/dnsmasq integration).
+#
+# Client tools (net-chat, net-lookup, net-ssh/net-vnc, ...) also read a
+# per-user file at ~/.config/net-mgr/config that overlays this one. The
+# [servers] section below is most useful there.
+
+# Named net-mgr daemons that client tools can connect to. Each entry is
+#   <name> = <host>[:<port>]      (port defaults to 7531)
+# and `default = <name>` picks the one used when no --server / --listen and
+# no $NET_MGR_LISTEN is given. Select one with `net-chat --server NAME`,
+# `net-lookup --server NAME`, or `net-ssh --server NAME host`; the net-chat
+# --gui shows a server menu. Handy inside a VM, where the host daemon is
+# reachable at 10.0.2.2 (QEMU/VirtualBox NAT).
+[servers]
+# default = vmhost
+# vmhost  = 10.0.2.2:7531
+# local   = 127.0.0.1:7531
+# nas3    = 192.168.15.9:7531
 
 [manager]
 # Where the manager binds. Comma-separated list of host[:port] entries,

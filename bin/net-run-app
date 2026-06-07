@@ -28,7 +28,10 @@
 #   vnc-style    — host[:display|::port].
 #
 # The host alias is resolved with `net-lookup --verify $host.*` so a
-# dead candidate IP doesn't get handed to the app. If the original
+# dead candidate IP doesn't get handed to the app. A leading
+# `--server NAME` or `--listen HOST:PORT` (before the host token) is
+# forwarded to that net-lookup call, picking which net-mgr daemon does
+# the resolving (see ~/.config/net-mgr/config [servers]). If the original
 # token had no user@ prefix and the corresponding ssh_config(5) entry
 # has a User= directive, we look it up via `ssh -G` and put it back
 # (otherwise `ssh some-alias` and `ssh some-alias-IP` would behave
@@ -124,6 +127,22 @@ if ($self eq 'net-vnc' && @ARGV && $ARGV[0] eq '--x11vnc') {
     shift @ARGV;
     _x11vnc_connect(@ARGV);
     exit 0;
+}
+
+# Leading --server NAME / --listen ADDR (before the host token) choose which
+# net-mgr daemon resolves the alias. They're forwarded verbatim to the
+# net-lookup child, so net-ssh/net-vnc honour ~/.config/net-mgr/config
+# [servers] exactly like net-lookup does. Anything else is left for the
+# underlying app (ssh/vnc/…).
+our @NM_LOOKUP_OPTS;
+while (@ARGV && $ARGV[0] =~ /^--(server|listen)(?:=(.*))?$/) {
+    my ($opt, $val) = ($1, $2);
+    shift @ARGV;
+    if (!defined $val) {
+        die "$self: --$opt needs a value\n" unless @ARGV;
+        $val = shift @ARGV;
+    }
+    push @NM_LOOKUP_OPTS, "--$opt", $val;
 }
 
 my @new_argv = @ARGV;       # mutated in place by the rewriters
@@ -602,7 +621,8 @@ sub _find_exe {
 
 sub lookup_host {
     my ($host) = @_;
-    open my $fh, '-|', 'net-lookup', '--verify', "$host.*" or return undef;
+    open my $fh, '-|', 'net-lookup', @NM_LOOKUP_OPTS, '--verify', "$host.*"
+        or return undef;
     my $ip;
     while (my $line = <$fh>) {
         chomp $line;
