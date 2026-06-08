@@ -89,7 +89,11 @@ sub send_recv {
 sub hello {
     my ($self, %args) = @_;
     my $r = $self->send_recv("HELLO " . format_kv(%args));
-    croak "HELLO failed: $r" unless defined $r && $r =~ /^OK\b/;
+    unless (defined $r && $r =~ /^OK\b/) {
+        croak "HELLO failed: "
+            . (defined $r ? $r : "no reply (peer closed the connection — "
+                                . "is the daemon up behind $self->{listen}?)");
+    }
     $self->{greeted} = 1;
     return 1;
 }
