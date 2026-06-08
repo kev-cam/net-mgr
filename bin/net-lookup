@@ -41,6 +41,7 @@ use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
 use Socket qw(inet_pton inet_ntop AF_INET AF_INET6);
+use Time::Local qw(timegm);
 
 use NetMgr::Client;
 use NetMgr::Config;
@@ -50,6 +51,8 @@ my $server;
 my $all;
 my $family = 'v4';
 my $verify;
+my $ping_only;
+my $within = 3600;
 my $include_stale;
 my $verbose;
 my $help;
@@ -59,6 +62,8 @@ GetOptions(
     'all|a'         => \$all,
     'family=s'      => \$family,
     'verify|v'      => \$verify,
+    'ping-only'     => \$ping_only,
+    'within=i'      => \$within,
     'include-stale' => \$include_stale,
     'verbose'       => \$verbose,
     'help|h'        => \$help,
@@ -193,10 +198,11 @@ for my $a (@$addresses) {
     next unless defined $a->{addr} && defined $a->{mac};
     push @{ $addrs_by_mac{ $a->{mac} } }, $a->{addr};
     $meta_by_addr{ $a->{addr} } = {
-        mac          => lc $a->{mac},
-        min_rtt_ms   => $a->{min_rtt_ms},
-        last_rtt_ms  => $a->{last_rtt_ms},
-        loss_pct     => $a->{loss_pct},
+        mac           => lc $a->{mac},
+        min_rtt_ms    => $a->{min_rtt_ms},
+        last_rtt_ms   => $a->{last_rtt_ms},
+        loss_pct      => $a->{loss_pct},
+        last_observed => $a->{last_observed},
     };
 }
 
@@ -225,13 +231,20 @@ if (!@candidates) {
     || _ipkey($a->[2]) cmp _ipkey($b->[2])
 } @candidates;
 
-# --verify: keep only IPs that respond to a 1s ping. Stops at the
-# first responder when --all isn't set, so the common case is one
-# extra ping; --all checks every candidate.
+# --verify: keep only IPs confirmed reachable. For a candidate on one of the
+# caller's own subnets a live 1 s ping is authoritative; for an off-subnet
+# candidate the caller often can't honestly reach it (NAT, slirp ICMP that
+# lies both ways), so we instead trust the fleet's last observation — keep it
+# only if the daemon saw it respond within --within seconds. --ping-only forces
+# a live ping for every candidate (the old behaviour). Stops at the first
+# responder unless --all is set.
 if ($verify) {
     my @alive;
     for my $c (@candidates) {
-        next unless _ping_ok($c->[2]);
+        my $ip = $c->[2];
+        my $ok = ($ping_only || _in_local_nets($ip)) ? _ping_ok($ip)
+                                                      : _fresh($ip);
+        next unless $ok;
         push @alive, $c;
         last unless $all;
     }
@@ -255,6 +268,29 @@ exit 0;
 sub _ping_ok {
     my ($ip) = @_;
     return system("ping -c 1 -W 1 -q -n $ip >/dev/null 2>&1") == 0;
+}
+
+# True when $ip falls in one of the caller's own /24s (from `ip addr` above) —
+# i.e. somewhere a live ping is actually meaningful.
+sub _in_local_nets {
+    my ($ip) = @_;
+    my $ipi = _ip2int($ip) // return 0;
+    for my $n (@local_nets) {
+        return 1 if ($ipi & $n->[1]) == $n->[0];
+    }
+    return 0;
+}
+
+# True when the daemon last observed $ip responding within --within seconds.
+# last_observed is stored UTC ("YYYY-MM-DD HH:MM:SS[.ffffff]"); a missing or
+# unparseable stamp counts as not-fresh.
+sub _fresh {
+    my ($ip) = @_;
+    my $lo = ($meta_by_addr{$ip} || {})->{last_observed} or return 0;
+    my @t = $lo =~ /^(\d+)-(\d+)-(\d+)[ T](\d+):(\d+):(\d+)/ or return 0;
+    my $epoch = eval { timegm($t[5], $t[4], $t[3], $t[2], $t[1] - 1, $t[0]) };
+    return 0 unless defined $epoch;
+    return (time() - $epoch) <= $within;
 }
 
 # --- reverse lookup -------------------------------------------------
@@ -491,7 +527,8 @@ net-lookup — resolve a regex name to the best IP for this caller, or
             an IP to its host name.
 
 Usage:
-  net-lookup [--all] [--verify] [--include-stale] [--verbose]
+  net-lookup [--all] [--verify [--ping-only] [--within SECONDS]]
+             [--include-stale] [--verbose]
              [--family v4|v6] [--listen HOST:PORT | --server NAME]
              <name-regex|IP>
 
@@ -500,7 +537,8 @@ Forward (name → IP):
   net-lookup 'nas3(|-.*)'              # nas3, nas3-up, nas3-down, nas3-dwn2
   net-lookup clevo=                    # shorthand for 'clevo.*'
   net-lookup --all 'wndr.*'            # every IP for every wndr-* host
-  net-lookup --verify gateway3=        # ping each candidate before picking
+  net-lookup --verify gateway3=        # keep only reachable (ping on-subnet,
+                                       #   else fleet-observed freshness)
   net-lookup --verbose nas3=           # IP<TAB>matched-name(s), one per line
 
 The pattern is a Perl regex; net-lookup wraps it as ^(?:...)\$ before
@@ -519,8 +557,16 @@ By default, paper-only addresses (last_observed IS NULL — known from
 dhcp.master config but never actually seen on the wire) are excluded.
 --include-stale brings them back into the pool.
 
---verify pings each candidate (1 packet, 1 s timeout) and keeps only
-those that respond. Without --all, it stops at the first responder.
+--verify keeps only candidates confirmed reachable. For a candidate on
+one of this host's own subnets it sends a live ping (1 packet, 1 s) —
+authoritative. For an off-subnet candidate, where this host often can't
+honestly reach it (behind NAT, or a slirp/VM ICMP path that lies both
+ways), it instead trusts the fleet's last observation: the address is
+kept only if the daemon saw it respond within --within seconds (default
+3600). So from a NAT'd box, --verify reflects what the network actually
+sees rather than the local host's broken pings. --ping-only forces a
+live ping for every candidate (the old behaviour); --within tunes the
+freshness window. Without --all, --verify stops at the first responder.
 
 Default prints one IP. --all prints every match, best-scored first.
 --verbose appends a TAB and the matching name(s) (comma-separated
