@@ -55,6 +55,7 @@ my $ping_only;
 my $within = 3600;
 my $include_stale;
 my $verbose;
+my $probe;
 my $help;
 GetOptions(
     'listen=s'      => \$listen,
@@ -66,6 +67,7 @@ GetOptions(
     'within=i'      => \$within,
     'include-stale' => \$include_stale,
     'verbose'       => \$verbose,
+    'probe'         => \$probe,
     'help|h'        => \$help,
 ) or usage(2);
 usage(0) if $help;
@@ -293,6 +295,90 @@ sub _fresh {
     return (time() - $epoch) <= $within;
 }
 
+# --probe: when the DB can't reverse-resolve an IP, ask the wire. Get its MAC
+# (live ARP, else the MAC the DB already has for the address), ask it its own
+# name over SSH, print whatever resolves, and OBSERVE kind=host back to the
+# daemon so the MAC/address/name correlate for next time. Exits 0 on any hit.
+sub _probe_ip {
+    my ($ip, $db_macs, $ifaces, $machines) = @_;
+    my $hit = 0;
+
+    # MAC via live ARP (only works on the target's own L2 segment), else the
+    # MAC the DB already associates with this address.
+    system("ping -c 1 -W 1 -q -n $ip >/dev/null 2>&1");
+    my $mac;
+    for my $line (`ip neigh show $ip 2>/dev/null`) {
+        if ($line =~ /\blladdr\s+([0-9a-f:]{17})/i) { $mac = lc $1; last }
+    }
+    $mac //= (@$db_macs ? lc $db_macs->[0] : undef);
+    print STDERR "probe: $ip mac="
+        . ($mac // 'unknown (no ARP entry on this segment)') . "\n";
+
+    if (defined $mac) {
+        my @n = _names_for_mac($mac, $ifaces, $machines);
+        if (@n) { print "$_\n" for @n; $hit = 1 }
+    }
+
+    # Ask the host its own name over SSH (key auth only, fail fast).
+    my $hn = _ssh_hostname($ip);
+    print STDERR "probe: ssh hostname="
+        . (defined $hn && length $hn ? $hn : '(unreachable / no key auth)') . "\n";
+    if (defined $hn && length $hn) { print "$hn\n"; $hit = 1 }
+
+    # Feed it back so net-mgr correlates the MAC/address (+name when we got one).
+    if (defined $mac) {
+        my $host = `hostname 2>/dev/null`; chomp $host; $host ||= 'net-lookup';
+        my %obs = (kind => 'host', mac => $mac, ip => $ip,
+                   source => "$host:probe");
+        if (defined $hn && length $hn) {
+            $obs{name} = $hn; $obs{name_source} = 'ssh';
+        }
+        my $cli = eval { NetMgr::Client->new(listen => $listen, timeout => 5) };
+        if ($cli) {
+            eval { $cli->hello(consumer => "net-lookup-probe.$$") };
+            my $r = eval { $cli->observe(%obs) };
+            eval { $cli->bye };
+            if ($r && $r =~ /^ERR/) {
+                print STDERR "probe: DB update rejected: $r\n";
+            } else {
+                print STDERR "probe: recorded $mac on $ip"
+                    . (defined $obs{name} ? " as '$obs{name}'" : '')
+                    . " to the daemon\n";
+            }
+        }
+    }
+
+    exit($hit ? 0 : 1);
+}
+
+sub _names_for_mac {
+    my ($mac, $ifaces, $machines) = @_;
+    my %mids;
+    for my $i (@$ifaces) {
+        $mids{ $i->{machine_id} } = 1
+            if defined $i->{mac} && lc $i->{mac} eq $mac
+            && defined $i->{machine_id} && length $i->{machine_id};
+    }
+    my (@names, %seen);
+    for my $m (@$machines) {
+        push @names, $m->{primary_name}
+            if defined $m->{id} && $mids{ $m->{id} }
+            && defined $m->{primary_name} && length $m->{primary_name}
+            && !$seen{ $m->{primary_name} }++;
+    }
+    return @names;
+}
+
+# Ask $ip its own hostname over SSH — key auth only, short timeout, and don't
+# touch known_hosts. Returns the trimmed name, or undef if SSH didn't answer.
+sub _ssh_hostname {
+    my ($ip) = @_;
+    my $out = `ssh -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $ip hostname 2>/dev/null`;
+    return undef unless defined $out;
+    $out =~ s/\s+//g;
+    return length $out ? $out : undef;
+}
+
 # --- reverse lookup -------------------------------------------------
 
 # Returns (family, canonical-string) for v4 or v6, or empty list if
@@ -399,58 +485,50 @@ sub do_reverse {
     }
     $cli->bye;
 
-    # MACs that own this address.
+    # MACs that own this address (per the DB).
     my %macs;
     for my $a (@$addresses) {
         next unless defined $a->{addr} && defined $a->{mac};
         my $bin = inet_pton($af, $a->{addr}) or next;
-        $macs{ $a->{mac} } = 1
-            if inet_ntop($af, $bin) eq $canon;
+        $macs{ $a->{mac} } = 1 if inet_ntop($af, $bin) eq $canon;
     }
-    exit 1 unless %macs;
 
-    # Machine ids those MACs belong to.
+    # Machine ids those MACs belong to, then the names of those machines
+    # (primary_name; with --all also hostnames/friendly/aliases).
     my %mids;
     for my $i (@$ifaces) {
         next unless defined $i->{mac} && defined $i->{machine_id}
                                       && length $i->{machine_id};
         $mids{ $i->{machine_id} } = 1 if $macs{ $i->{mac} };
     }
-    exit 1 unless %mids;
-
-    if (!$all) {
-        # Default: one canonical name. Prefer machines.primary_name;
-        # fall back to nothing else (machines.primary_name is the
-        # canonical-name field; if it's empty the host doesn't have
-        # one and the caller should use --all to see alternates).
-        for my $m (@$machines) {
-            next unless defined $m->{id} && $mids{ $m->{id} };
-            next unless defined $m->{primary_name} && length $m->{primary_name};
-            print "$m->{primary_name}\n";
-            exit 0;
-        }
-        exit 1;
-    }
-
-    # --all: every name we know for any matching machine, deduped,
-    # primary_names first, then hostnames/friendly/aliases.
     my @names;
     for my $m (@$machines) {
         next unless defined $m->{id} && $mids{ $m->{id} };
         push @names, $m->{primary_name}
             if defined $m->{primary_name} && length $m->{primary_name};
     }
-    for my $row (@$hostnames, @$friendly, @$aliases) {
-        my $mid = $row->{machine_id};
-        next unless defined $mid && $mids{$mid};
-        push @names, $row->{name}
-            if defined $row->{name} && length $row->{name};
+    if ($all) {
+        for my $row (@$hostnames, @$friendly, @$aliases) {
+            my $mid = $row->{machine_id};
+            next unless defined $mid && $mids{$mid};
+            push @names, $row->{name}
+                if defined $row->{name} && length $row->{name};
+        }
     }
     my %seen;
-    @names = grep { !$seen{$_}++ } @names;
-    exit 1 unless @names;
-    print "$_\n" for @names;
-    exit 0;
+    @names = grep { length && !$seen{$_}++ } @names;
+
+    if (@names) {
+        if ($all) { print "$_\n" for @names }
+        else      { print "$names[0]\n" }
+        exit 0;
+    }
+
+    # Nothing usable in the DB. With --probe, hit the wire: live ARP for the
+    # MAC (else the DB-known one), an SSH hostname query, then record what we
+    # learn back to the daemon so the orphan correlates next time.
+    _probe_ip($canon, [ keys %macs ], $ifaces, $machines) if $probe;
+    exit 1;
 }
 
 # --- helpers --------------------------------------------------------
@@ -576,11 +654,19 @@ Reverse (IP → name):
   net-lookup 192.168.15.104            # primary_name for that machine
   net-lookup --all 192.168.15.104      # every name we know for it
   net-lookup 2001:db8::1               # IPv6 works the same way
+  net-lookup --probe 192.168.223.93    # if the DB can't, ask the wire
 
 Family is inferred from the input. The address is canonicalised with
 inet_pton/inet_ntop so '::1' and '0:0:...:1' compare equal. Reverse
 ignores --include-stale and --verify (the user typed the IP directly,
 so we resolve regardless of liveness signal).
+
+--probe is a wire fallback for a reverse lookup the DB can't answer (an
+IP that's live but uncorrelated). It pings to learn the MAC (live ARP,
+else the MAC the DB already has for the address), asks the host its own
+name over SSH (key auth, 3 s), prints whatever resolves, and OBSERVEs
+kind=host (mac + ip + name) back to the daemon so the MAC/address/name
+correlate next time. MAC + SSH diagnostics go to stderr; names to stdout.
 
 MAC (MAC → IP[+name]):
   net-lookup 00:e0:4c:68:00:b4         # IP(s) bound to that MAC
