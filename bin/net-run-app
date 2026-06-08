@@ -54,6 +54,7 @@
 use strict;
 use warnings;
 use File::Basename qw(basename);
+use POSIX ();
 use File::Path     qw(make_path);
 
 # ---- per-link layout table -----------------------------------------
@@ -629,5 +630,25 @@ sub lookup_host {
         if ($line =~ /^(\d+\.\d+\.\d+\.\d+)\z/) { $ip = $1; last }
     }
     close $fh;
+    # Seed the host-key identity map against the alias we just resolved, so
+    # the machine is recognisable next time it floats to a different IP. Fully
+    # fire-and-forget — never delays or fails the launch.
+    _record_host_key_bg($host, $ip) if defined $ip;
     return $ip;
+}
+
+# Double-fork a detached `net-lookup --record-key` so it outlives our exec of
+# ssh/vnc and leaves no zombie (the grandchild is reparented to init).
+sub _record_host_key_bg {
+    my ($name, $ip) = @_;
+    my $pid = fork;
+    return unless defined $pid;
+    if ($pid) { waitpid($pid, 0); return }   # reap the short-lived middle child
+    my $g = fork;
+    POSIX::_exit(0) if !defined $g || $g;     # middle child exits immediately
+    open STDIN,  '<', '/dev/null';
+    open STDOUT, '>', '/dev/null';
+    open STDERR, '>', '/dev/null';
+    exec('net-lookup', @NM_LOOKUP_OPTS, '--record-key', '--keyname', $name, $ip);
+    POSIX::_exit(0);                          # exec failed
 }

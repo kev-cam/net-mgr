@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 22;
+our $SCHEMA_VERSION = 23;
 
 sub new {
     my ($class, %args) = @_;
@@ -598,7 +598,50 @@ CREATE TABLE IF NOT EXISTS chat_presence (
 SQL
         return;
     }
+    if ($v == 23) {
+        # host_keys: SSH host-key fingerprint -> machine. A host key is stable
+        # across IP and even MAC changes, so it identifies a machine on a
+        # floating IP. See sql/schema.sql for column docs.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS host_keys (
+    key_id     VARCHAR(80)  NOT NULL PRIMARY KEY,   -- "SHA256:..." fingerprint
+    key_type   VARCHAR(20)  NOT NULL DEFAULT '',    -- ed25519 / rsa / ecdsa
+    machine_id INT          NULL,                   -- owning machine (NULL = orphan)
+    first_seen DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_host_keys_machine (machine_id),
+    CONSTRAINT fk_host_keys_machine
+        FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
     croak "no migration for schema v$v";
+}
+
+# host_keys: SSH host-key fingerprint <-> machine identity. The fingerprint is
+# the stable key; machine_id is filled when we know whose it is (NULL until).
+sub upsert_host_key {
+    my ($self, %f) = @_;
+    my $key_id = $f{key_id} or croak "upsert_host_key: key_id required";
+    $self->{dbh}->do(
+        "INSERT INTO host_keys (key_id, key_type, machine_id)
+         VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           key_type   = VALUES(key_type),
+           machine_id = COALESCE(VALUES(machine_id), machine_id),
+           last_seen  = NOW()",
+        undef, $key_id, ($f{key_type} // ''), $f{machine_id});
+    return;
+}
+
+# Machine id this host key already belongs to, or undef if unseen/orphan.
+sub host_key_machine {
+    my ($self, $key_id) = @_;
+    return undef unless defined $key_id && length $key_id;
+    my ($mid) = $self->{dbh}->selectrow_array(
+        "SELECT machine_id FROM host_keys WHERE key_id = ?", undef, $key_id);
+    return $mid;
 }
 
 # ---- UPSERT helpers ----------------------------------------------------
@@ -1910,6 +1953,7 @@ sub query_table {
         zone_classes interface_zones wifi_zones
         audit_annotations wifi_scan_results wifi_radio_state
         chat_sessions chat_members chat_messages chat_presence
+        host_keys
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};

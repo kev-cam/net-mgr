@@ -568,3 +568,20 @@ CREATE TABLE IF NOT EXISTS chat_presence (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 INSERT IGNORE INTO schema_version (version) VALUES (22);
+
+-- SSH host keys. A host key (fingerprint) is stable across IP and even MAC
+-- changes, so it identifies a machine on a floating IP. Recorded on demand by
+-- `net-lookup --probe` and by net-ssh (which knows the target's alias). A
+-- known key resolves an otherwise-uncorrelated IP straight to its machine.
+CREATE TABLE IF NOT EXISTS host_keys (
+    key_id     VARCHAR(80)  NOT NULL PRIMARY KEY,   -- "SHA256:..." fingerprint
+    key_type   VARCHAR(20)  NOT NULL DEFAULT '',    -- ed25519 / rsa / ecdsa
+    machine_id INT          NULL,                   -- owning machine (NULL = orphan)
+    first_seen DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_host_keys_machine (machine_id),
+    CONSTRAINT fk_host_keys_machine
+        FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO schema_version (version) VALUES (23);

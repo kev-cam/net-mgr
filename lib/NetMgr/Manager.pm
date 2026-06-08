@@ -35,6 +35,7 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
     forwarding_rules zone_classes interface_zones wifi_zones
     audit_annotations wifi_scan_results wifi_radio_state
     chat_sessions chat_members chat_messages chat_presence
+    host_keys
 );
 
 # Tables whose contents are sensitive (credentials etc.); SUBSCRIBE
@@ -2215,6 +2216,7 @@ sub _handle_observe {
         elsif ($kind eq 'arp')         { @events = $self->_obs_arp($cli, $kv) }
         elsif ($kind eq 'lease')       { @events = $self->_obs_lease($cli, $kv) }
         elsif ($kind eq 'host')        { @events = $self->_obs_host($cli, $kv) }
+        elsif ($kind eq 'ssh_host_key'){ @events = $self->_obs_ssh_host_key($cli, $kv) }
         elsif ($kind eq 'port')        { @events = $self->_obs_port($cli, $kv) }
         elsif ($kind eq 'ping')        { @events = $self->_obs_ping($cli, $kv) }
         elsif ($kind eq 'link')        { @events = $self->_obs_link($cli, $kv) }
@@ -2461,6 +2463,71 @@ sub _obs_host {
                 $mac, $kv->{name}, $kv->{name_source} // 'config');
         }
     }
+    return @ev;
+}
+
+# Find or create a machine by primary_name; returns its id. Used when we know
+# the name but not (yet) a MAC to link — e.g. net-ssh recording a host key
+# against the alias it just connected to.
+sub _machine_id_for_name {
+    my ($self, $name) = @_;
+    return undef unless defined $name && length $name;
+    my ($id) = $self->{db}->dbh->selectrow_array(
+        "SELECT id FROM machines WHERE primary_name = ? LIMIT 1", undef, $name);
+    return $id if $id;
+    my $r = $self->_upsert('machines', 'upsert_machine',
+        primary_name => $name, online => 1);
+    return $r->{now}{id};
+}
+
+# kind=ssh_host_key key_id=SHA256:... [key_type=ed25519] [ip=IP] [mac=MAC]
+#                   [name=NAME] [name_source=...] [source=...]
+# Record an SSH host key against a machine. A host key is stable per machine,
+# so a fingerprint we've seen before identifies the host even on a new IP/MAC.
+# Machine resolution, strongest first: an explicit name (net-ssh knows the
+# alias) wins; else a previously-recorded machine for this fingerprint (the
+# floating-IP case); else the MAC's current machine. When mac+ip are present we
+# also refresh their liveness, like a host observation.
+sub _obs_ssh_host_key {
+    my ($self, $cli, $kv) = @_;
+    my $key_id = $kv->{key_id} or die "ssh_host_key: key_id required\n";
+    my $mac    = $kv->{mac} ? lc $kv->{mac} : undef;
+    my $ip     = $kv->{ip};
+    my @ev;
+
+    if ($mac && $ip) {
+        my $iface = $self->_upsert('interfaces', 'upsert_interface',
+            mac => $mac, kind => $kv->{iface_kind} // 'ethernet',
+            online => 1, live => 1);
+        push @ev, _events_from_iface_change($iface, $ip);
+        my $a = $self->_upsert('addresses', 'upsert_address',
+            mac => $mac, family => $kv->{family} // 'v4', addr => $ip, live => 1,
+            defined $kv->{source} ? (source => $kv->{source}) : ());
+        push @ev, _events_for_addr_op($a, $mac, $ip);
+    }
+
+    my $known = $self->{db}->host_key_machine($key_id);
+    my $mid;
+    if ($kv->{name}) {
+        $mid = $self->_machine_id_for_name($kv->{name});
+        $self->_associate_machine($mac, $kv->{name},
+            $kv->{name_source} // 'ssh-hostkey') if $mac;
+    } elsif ($known) {
+        # Seen this key before → same machine, wherever it is now.
+        $mid = $known;
+        if ($mac) {
+            my ($pname) = $self->{db}->dbh->selectrow_array(
+                "SELECT primary_name FROM machines WHERE id = ?", undef, $known);
+            $self->_associate_machine($mac, $pname, 'ssh-hostkey')
+                if defined $pname && length $pname;
+        }
+    } elsif ($mac) {
+        my $iface = $self->{db}->get_interface_by_mac($mac);
+        $mid = $iface->{machine_id} if $iface && $iface->{machine_id};
+    }
+
+    $self->{db}->upsert_host_key(
+        key_id => $key_id, key_type => $kv->{key_type}, machine_id => $mid);
     return @ev;
 }
 

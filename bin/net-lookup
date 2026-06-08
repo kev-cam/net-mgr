@@ -42,6 +42,7 @@ use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
 use Socket qw(inet_pton inet_ntop AF_INET AF_INET6);
 use Time::Local qw(timegm);
+use IPC::Open2 qw(open2);
 
 use NetMgr::Client;
 use NetMgr::Config;
@@ -56,6 +57,8 @@ my $within = 3600;
 my $include_stale;
 my $verbose;
 my $probe;
+my $record_key;
+my $keyname;
 my $help;
 GetOptions(
     'listen=s'      => \$listen,
@@ -68,6 +71,8 @@ GetOptions(
     'include-stale' => \$include_stale,
     'verbose'       => \$verbose,
     'probe'         => \$probe,
+    'record-key'    => \$record_key,
+    'keyname=s'     => \$keyname,
     'help|h'        => \$help,
 ) or usage(2);
 usage(0) if $help;
@@ -87,6 +92,14 @@ if (!defined $listen) {
                // '127.0.0.1:7531';
     }
 }
+# --record-key <ip>: keyscan the IP and record its SSH host key(s) to the
+# daemon (kind=ssh_host_key), optionally against --keyname NAME. net-ssh uses
+# this after it resolves an alias; also runnable standalone.
+if ($record_key) {
+    usage(2) unless @ARGV == 1;
+    exit(_record_host_keys($ARGV[0], $keyname, undef) ? 0 : 1);
+}
+
 usage(2) if @ARGV != 1;
 
 my $pattern = $ARGV[0];
@@ -348,6 +361,19 @@ sub _probe_ip {
         }
     }
 
+    # SSH host key — a stable identity that survives IP/MAC changes, read with
+    # no auth. Record it; if the daemon already knew this fingerprint, the IP
+    # now resolves to its machine even when SSH auth and the MAC told us nothing.
+    my $recorded = _record_host_keys($ip, (defined $hn && length $hn ? $hn : undef), $mac);
+    if ($recorded && !$hit) {
+        my $name = _resolve_ip_name($ip);
+        if (defined $name && length $name) {
+            print "$name\n";
+            print STDERR "probe: identified $ip as '$name' via its SSH host key\n";
+            $hit = 1;
+        }
+    }
+
     exit($hit ? 0 : 1);
 }
 
@@ -377,6 +403,116 @@ sub _ssh_hostname {
     return undef unless defined $out;
     $out =~ s/\s+//g;
     return length $out ? $out : undef;
+}
+
+# Normalise an ssh key-type token (ssh-ed25519, ecdsa-sha2-nistp256, ssh-rsa)
+# to a short family name.
+sub _normtype {
+    my ($t) = @_;
+    return 'ed25519' if $t =~ /ed25519/;
+    return 'ecdsa'   if $t =~ /ecdsa/;
+    return 'rsa'     if $t =~ /rsa/;
+    return 'dsa'     if $t =~ /ds[sa]/;
+    ($t //= '') =~ s/^ssh-//;
+    return $t;
+}
+
+# Fingerprint "type b64" to its SHA256 id via ssh-keygen -lf - (no shell).
+sub _fingerprint {
+    my ($type, $b64) = @_;
+    my ($out, $in);
+    my $pid = eval { open2($out, $in, 'ssh-keygen', '-lf', '-') } or return undef;
+    print {$in} "$type $b64\n";
+    close $in;
+    my $line = <$out>;
+    close $out;
+    waitpid($pid, 0);
+    return ($line && $line =~ /\b(SHA256:\S+)/) ? $1 : undef;
+}
+
+# ssh-keyscan $ip and fingerprint each key — no auth, the host key is public.
+# Returns ({ key_id => "SHA256:…", key_type => "ed25519" }, …). Forks rather
+# than shelling out so an arbitrary $ip can't be injected, and silences
+# ssh-keyscan's "# host SSH-2.0-…" banner (it goes to stderr).
+sub _host_keys {
+    my ($ip) = @_;
+    my @keys;
+    my $pid = open(my $ks, '-|');
+    return @keys unless defined $pid;
+    if ($pid == 0) {
+        open STDERR, '>', '/dev/null';
+        exec('ssh-keyscan', '-T', '3', $ip);
+        exit 127;
+    }
+    while (my $line = <$ks>) {
+        chomp $line;
+        next if $line =~ /^\s*#/ || $line !~ /\S/;
+        my (undef, $type, $b64) = split ' ', $line, 3;
+        next unless $type && $b64;
+        my $fp = _fingerprint($type, $b64) or next;
+        push @keys, { key_id => $fp, key_type => _normtype($type) };
+    }
+    close $ks;
+    return @keys;
+}
+
+# Keyscan $ip and OBSERVE each host key to the daemon (kind=ssh_host_key).
+# $name (optional) is the machine the keys belong to (net-ssh knows the alias);
+# $mac (optional) ties the address. Returns the number of keys recorded.
+sub _record_host_keys {
+    my ($ip, $name, $mac) = @_;
+    my @keys = _host_keys($ip);
+    unless (@keys) {
+        print STDERR "host-key: ssh-keyscan got nothing from $ip\n";
+        return 0;
+    }
+    my $cli = eval { NetMgr::Client->new(listen => $listen, timeout => 5) };
+    unless ($cli) { print STDERR "host-key: cannot reach daemon\n"; return 0 }
+    eval { $cli->hello(consumer => "net-lookup-hostkey.$$") };
+    my $n = 0;
+    for my $k (@keys) {
+        my %obs = (kind => 'ssh_host_key', key_id => $k->{key_id},
+                   key_type => $k->{key_type}, ip => $ip);
+        $obs{mac}  = $mac  if defined $mac && length $mac;
+        if (defined $name && length $name) {
+            $obs{name} = $name; $obs{name_source} = 'ssh-keyscan';
+        }
+        my $r = eval { $cli->observe(%obs) };
+        if ($r && $r =~ /^ERR/) {
+            print STDERR "host-key: $k->{key_id} rejected: $r\n";
+        } else {
+            print STDERR "host-key: recorded $k->{key_type} $k->{key_id}"
+                . (defined $name && length $name ? " for '$name'" : '') . " ($ip)\n";
+            $n++;
+        }
+    }
+    eval { $cli->bye };
+    return $n;
+}
+
+# Fresh reverse lookup of $ip → primary_name (or undef). Used after a host-key
+# OBSERVE to see whether the daemon just correlated the address.
+sub _resolve_ip_name {
+    my ($ip) = @_;
+    my $cli = eval { NetMgr::Client->new(listen => $listen, timeout => 5) } or return undef;
+    eval { $cli->hello(consumer => "net-lookup-reresolve.$$") };
+    my $addresses = eval { $cli->snapshot(1, 'addresses', where => "addr = '$ip'") } || [];
+    my $ifaces    = eval { $cli->snapshot(2, 'interfaces') } || [];
+    my $machines  = eval { $cli->snapshot(3, 'machines') } || [];
+    eval { $cli->bye };
+    my %macs = map { lc $_->{mac} => 1 } grep { $_->{mac} } @$addresses;
+    my %mids;
+    for my $i (@$ifaces) {
+        $mids{ $i->{machine_id} } = 1
+            if $i->{mac} && $macs{ lc $i->{mac} }
+            && defined $i->{machine_id} && length $i->{machine_id};
+    }
+    for my $m (@$machines) {
+        return $m->{primary_name}
+            if defined $m->{id} && $mids{ $m->{id} }
+            && defined $m->{primary_name} && length $m->{primary_name};
+    }
+    return undef;
 }
 
 # --- reverse lookup -------------------------------------------------
@@ -671,9 +807,16 @@ so we resolve regardless of liveness signal).
 --probe is a wire fallback for a reverse lookup the DB can't answer (an
 IP that's live but uncorrelated). It pings to learn the MAC (live ARP,
 else the MAC the DB already has for the address), asks the host its own
-name over SSH (key auth, 3 s), prints whatever resolves, and OBSERVEs
-kind=host (mac + ip + name) back to the daemon so the MAC/address/name
-correlate next time. MAC + SSH diagnostics go to stderr; names to stdout.
+name over SSH (key auth, 3 s), records the host's SSH host key (no auth)
+so a fingerprint already on file resolves the IP straight to its machine,
+prints whatever resolves, and OBSERVEs back to the daemon so it correlates
+next time. MAC / SSH / host-key diagnostics go to stderr; names to stdout.
+
+--record-key <ip> [--keyname NAME] keyscans the IP (no auth) and records
+its SSH host key(s) against NAME via OBSERVE kind=ssh_host_key. A host key
+is stable across IP and MAC changes, so this is the identity anchor for a
+machine on a floating IP. net-ssh runs this automatically against the
+alias it just resolved, seeding the map on normal use.
 
 MAC (MAC → IP[+name]):
   net-lookup 00:e0:4c:68:00:b4         # IP(s) bound to that MAC
