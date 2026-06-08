@@ -144,7 +144,7 @@ list:
 	@echo "  $(PERL5DIR)"
 	@echo
 	@echo "first-time DB bootstrap (auto-invoked from 'install' when root):"
-	@echo "  creates MySQL database 'netmgr' and writes /root/.my.cnf [net-mgr] section"
+	@echo "  creates MySQL database 'netmgr' and writes /etc/net-mgr/root.conf [net-mgr] section"
 	@echo "  (run 'make setup' standalone to do just this step)"
 	@echo
 	@echo "vars: PREFIX=$(PREFIX)  DESTDIR=$(DESTDIR)  SYSCONFDIR=$(SYSCONFDIR)"
@@ -289,7 +289,7 @@ install: .version
 	@echo "Files installed."
 	@if [ -z "$(DESTDIR)" ] && [ "$$(id -u)" = "0" ]; then \
 	  need_setup=0; \
-	  if [ ! -f /root/.my.cnf ] || ! grep -q '^\[net-mgr\]' /root/.my.cnf 2>/dev/null; then \
+	  if ! grep -q '^\[net-mgr\]' /etc/net-mgr/root.conf 2>/dev/null && ! grep -q '^\[net-mgr\]' /root/.my.cnf 2>/dev/null; then \
 	    need_setup=1; \
 	  fi; \
 	  if [ $$need_setup = 1 ]; then \
@@ -297,24 +297,24 @@ install: .version
 	      echo; echo "Running first-time DB setup..."; \
 	      if ! $(DESTDIR)$(SBINDIR)/net-mgr-setup; then \
 	        echo; \
-	        echo "*** net-mgr-setup did NOT complete. /root/.my.cnf was not written."; \
+	        echo "*** net-mgr-setup did NOT complete. /etc/net-mgr/root.conf was not written."; \
 	        echo "*** The daemon will fail to start until you re-run it:"; \
 	        echo "***   sudo $(SBINDIR)/net-mgr-setup"; \
-	      elif [ ! -f /root/.my.cnf ] || ! grep -q '^\[net-mgr\]' /root/.my.cnf 2>/dev/null; then \
+	      elif ! grep -q '^\[net-mgr\]' /etc/net-mgr/root.conf 2>/dev/null && ! grep -q '^\[net-mgr\]' /root/.my.cnf 2>/dev/null; then \
 	        echo; \
-	        echo "*** net-mgr-setup exited 0 but /root/.my.cnf still has no [net-mgr] section."; \
+	        echo "*** net-mgr-setup exited 0 but no [net-mgr] section in /etc/net-mgr/root.conf (or /root/.my.cnf)."; \
 	        echo "*** Re-run it before starting the daemon:"; \
 	        echo "***   sudo $(SBINDIR)/net-mgr-setup"; \
 	      fi; \
 	    else \
 	      echo; \
-	      echo "*** No TTY for interactive setup. /root/.my.cnf is missing or"; \
+	      echo "*** No TTY for interactive setup. /etc/net-mgr/root.conf is missing or"; \
 	      echo "*** has no [net-mgr] section, so the daemon will fail to start."; \
 	      echo "*** Run setup manually before starting the service:"; \
 	      echo "***   sudo $(SBINDIR)/net-mgr-setup"; \
 	    fi; \
 	  else \
-	    echo "(/root/.my.cnf already has [net-mgr] section — skipping setup)"; \
+	    echo "(credentials present in /etc/net-mgr/root.conf or /root/.my.cnf — skipping setup)"; \
 	  fi; \
 	  if command -v systemctl >/dev/null 2>&1; then \
 	    echo; \
@@ -387,7 +387,7 @@ install-on: .version
 # --- setup (interactive DB + creds bootstrap) ------------------------
 setup:
 	@if [ "$$(id -u)" != "0" ]; then \
-	  echo "setup must run as root (it writes /root/.my.cnf)"; exit 1; \
+	  echo "setup must run as root (it writes /etc/net-mgr/root.conf)"; exit 1; \
 	fi
 	$(DESTDIR)$(SBINDIR)/net-mgr-setup
 

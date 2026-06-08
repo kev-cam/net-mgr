@@ -21,11 +21,11 @@ is(NetMgr::Config->mysql_defaults_file({ mysql => { defaults => $path } }),
 # 2. Missing configured path, no readable legacy -> the configured path comes
 #    back (so the eventual "not readable" error names what was asked for).
 SKIP: {
-    skip "only valid when /root/.my.cnf is unreadable here", 1
-        if -r '/root/.my.cnf';
+    skip "only valid when neither canonical nor legacy is readable here", 1
+        if -r '/root/.my.cnf' || -r '/etc/net-mgr/root.conf';
     my $missing = "$path.nope";
     is(NetMgr::Config->mysql_defaults_file({ mysql => { defaults => $missing } }),
-       $missing, 'missing configured path with no legacy -> configured path');
+       $missing, 'missing configured path, no canonical/legacy -> configured path');
 }
 
 # 3. With no cfg, the built-in default is /etc/net-mgr/root.conf.

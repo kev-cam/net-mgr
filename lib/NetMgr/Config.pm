@@ -272,18 +272,26 @@ sub dead_keys {
 my %_mycnf_warned;
 sub mysql_defaults_file {
     my ($class, $cfg) = @_;
-    my $path = (ref $cfg eq 'HASH' && defined $cfg->{mysql}{defaults})
-             ? $cfg->{mysql}{defaults}
-             : '/etc/net-mgr/root.conf';
-    return $path if -r $path;
-    my $legacy = '/root/.my.cnf';
-    if ($path ne $legacy && -r $legacy) {
-        warn "net-mgr: '$path' not found; falling back to legacy '$legacy' "
-           . "(deprecated — move it to '/etc/net-mgr/root.conf')\n"
-            unless $_mycnf_warned{$legacy}++;
-        return $legacy;
+    my $configured = (ref $cfg eq 'HASH') ? $cfg->{mysql}{defaults} : undef;
+    my $canonical  = '/etc/net-mgr/root.conf';
+    my $legacy     = '/root/.my.cnf';
+    # Try the explicitly-configured path, then the canonical location, then the
+    # deprecated /root/.my.cnf. Trying the canonical path even when the config
+    # still pins the old one self-heals an existing install whose creds moved to
+    # the new file while [mysql] defaults wasn't updated.
+    my (@seen, $first);
+    for my $p ($configured, $canonical, $legacy) {
+        next unless defined $p && length $p;
+        next if grep { $_ eq $p } @seen;
+        push @seen, $p;
+        $first //= $p;
+        next unless -r $p;
+        warn "net-mgr: using legacy MySQL option file '$p' "
+           . "(deprecated — move it to '$canonical')\n"
+            if $p eq $legacy && !$_mycnf_warned{$legacy}++;
+        return $p;
     }
-    return $path;
+    return $first // $canonical;   # none readable: name what we looked for first
 }
 
 # Path to the per-user config (XDG: $XDG_CONFIG_HOME/net-mgr/config, else

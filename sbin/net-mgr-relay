@@ -73,9 +73,12 @@ if (@peers_cli) {
 # DB connection settings — each child opens its own connection.
 my $mycnf = NetMgr::Config->mysql_defaults_file($cfg);
 unless (-r $mycnf) {
-    $mycnf = "$ENV{HOME}/.my.cnf" if -r "$ENV{HOME}/.my.cnf";
+    # systemd services usually have no HOME; guard so it isn't a warning.
+    $mycnf = "$ENV{HOME}/.my.cnf"
+        if $ENV{HOME} && -r "$ENV{HOME}/.my.cnf";
 }
-die "no readable .my.cnf for [net-mgr]\n" unless -r $mycnf;
+die "no readable MySQL option file for [net-mgr] (tried $mycnf)\n"
+    unless -r $mycnf;
 
 unless ($foreground) {
     my $pid = fork; die "fork: $!" unless defined $pid;
