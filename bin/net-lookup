@@ -257,13 +257,24 @@ if (!@candidates) {
 # a host that's reachable now but stale in the DB). Freshness is checked first
 # so reachable hosts usually skip the ping. --ping-only forces a live ping for
 # every candidate. Stops at the first responder unless --all is set.
+my %ping_ms;          # ip -> live RTT (ms) when a verify ping got a reply
 if ($verify) {
     my @alive;
     for my $c (@candidates) {
         my $ip = $c->[2];
-        my $ok = $ping_only ? _ping_ok($ip)
-                            : (_fresh($ip) || _ping_ok($ip));
+        my ($ok, $rtt);
+        if ($ping_only) {
+            $rtt = _ping_time($ip);
+            $ok  = defined $rtt;
+        } else {
+            my $fresh = _fresh($ip);
+            # Ping to confirm reachability when stale, and always under
+            # --verbose so we can report the time even for fresh hosts.
+            $rtt = _ping_time($ip) if !$fresh || $verbose;
+            $ok  = $fresh || defined $rtt;
+        }
         next unless $ok;
+        $ping_ms{$ip} = $rtt if defined $rtt;
         push @alive, $c;
         last unless $all;
     }
@@ -277,17 +288,43 @@ for my $c (@to_print) {
         my %seen_name;
         my @names = grep { !$seen_name{$_}++ }
                     @{ $matched_names_by_mid{ $c->[3] } || [] };
-        printf "%s\t%s\n", $c->[2], join(',', @names);
+        my $line = sprintf "%s\t%s", $c->[2], join(',', @names);
+        # --verify --verbose: annotate with the live ping time, or "# fresh"
+        # when the address was kept on the fleet's observation, not a reply.
+        if ($verify) {
+            my $rtt = $ping_ms{ $c->[2] };
+            $line .= defined $rtt ? sprintf("\t# %s ms", $rtt) : "\t# fresh";
+        }
+        print "$line\n";
     } else {
         print "$c->[2]\n";
     }
 }
 exit 0;
 
-sub _ping_ok {
+# Live RTT to $ip in ms, or undef if no reply within ~1 s. Forks (no shell)
+# and silences stderr.
+sub _ping_time {
     my ($ip) = @_;
-    return system("ping -c 1 -W 1 -q -n $ip >/dev/null 2>&1") == 0;
+    my $pid = open(my $fh, '-|');
+    return undef unless defined $pid;
+    if ($pid == 0) {
+        open STDERR, '>', '/dev/null';
+        exec('ping', '-c', '1', '-W', '1', '-n', $ip);
+        exit 127;
+    }
+    my $rtt;
+    while (my $l = <$fh>) {
+        if ($l =~ /\btime[=<]([\d.]+)\s*ms/) { $rtt = $1 + 0; last }
+    }
+    close $fh;
+    # A 0.000 ms "reply" to a remote IP is a slirp/NAT local fake (the giveaway
+    # is time=0.000, icmp_seq stuck at 0, DUP!), not a real round trip — treat
+    # it as no reply so verify doesn't keep phantom hosts.
+    return ($rtt && $rtt > 0) ? $rtt : undef;
 }
+
+sub _ping_ok { return defined _ping_time($_[0]) }
 
 # True when the daemon last observed $ip responding within --within seconds.
 # last_observed is stored UTC ("YYYY-MM-DD HH:MM:SS[.ffffff]"); a missing or
@@ -778,6 +815,10 @@ answers a live 1 s ping (catches a host reachable now but stale in the
 DB). Freshness is checked first, so reachable hosts usually skip the
 ping. --ping-only forces a live ping for every candidate; --within tunes
 the freshness window. Without --all, --verify stops at the first responder.
+A 0.000 ms reply (a slirp/NAT local fake — DUP!, icmp_seq stuck at 0) is
+not treated as reachable. With --verbose, each verified line is annotated
+with the live ping time ("# 2.98 ms"), or "# fresh" when it was kept on
+the fleet's observation rather than a live reply.
 
 Default prints one IP. --all prints every match, best-scored first.
 --verbose appends a TAB and the matching name(s) (comma-separated
