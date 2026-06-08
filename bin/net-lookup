@@ -222,14 +222,16 @@ for my $a (@$addresses) {
 }
 
 my %seen;
-my @candidates;       # list of [score, rtt_for_tiebreak, ip, mid]
+my @candidates;       # list of [score, rtt_for_tiebreak, ip, mid, last_observed]
 for my $mid (keys %matched_mids) {
     for my $mac (@{ $macs_by_mid{$mid} || [] }) {
         for my $ip (@{ $addrs_by_mac{$mac} || [] }) {
             next if $seen{$ip}++;
             my $score = _score($ip, \@prefer_cidrs, \%kind_by_mac, \%meta_by_addr);
-            my $rtt = ($meta_by_addr{$ip} || {})->{min_rtt_ms} // 9999;
-            push @candidates, [ $score, $rtt, $ip, $mid ];
+            my $meta  = $meta_by_addr{$ip} || {};
+            my $rtt   = $meta->{min_rtt_ms} // 9999;
+            my $lo    = $meta->{last_observed} // '';
+            push @candidates, [ $score, $rtt, $ip, $mid, $lo ];
         }
     }
 }
@@ -238,10 +240,13 @@ if (!@candidates) {
     exit 1;
 }
 
-# Sort: score desc, RTT asc (lower is better — fastest path wins ties),
-# then IP asc as final deterministic tiebreak.
+# Sort: score desc, then most-recently-observed first (so a device that moved
+# DHCP lease resolves to its current address, not the stale one with the same
+# score), then RTT asc (fastest path), then IP asc as a deterministic tiebreak.
+# last_observed is ISO "YYYY-MM-DD HH:MM:SS" so string cmp orders it by time.
 @candidates = sort {
        $b->[0] <=> $a->[0]
+    || ($b->[4] // '') cmp ($a->[4] // '')
     || $a->[1] <=> $b->[1]
     || _ipkey($a->[2]) cmp _ipkey($b->[2])
 } @candidates;
