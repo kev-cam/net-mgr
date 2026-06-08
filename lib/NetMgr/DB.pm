@@ -1875,6 +1875,35 @@ sub set_chat_member {
     return { op => 'update', now => $self->get_chat_member($f{session}, $f{principal}) };
 }
 
+# All messages of a session, oldest first — for moving them to the archive.
+sub get_chat_messages {
+    my ($self, $session) = @_;
+    return $self->{dbh}->selectall_arrayref(
+        "SELECT id, session, ts, sender, sender_kind, body, in_reply_to
+           FROM chat_messages WHERE session = ? ORDER BY id",
+        { Slice => {} }, $session);
+}
+
+# Delete every message of a session (when moving them out to the archive).
+sub delete_chat_messages {
+    my ($self, $session) = @_;
+    $self->{dbh}->do("DELETE FROM chat_messages WHERE session = ?", undef, $session);
+}
+
+# Re-insert an archived message verbatim — preserving id and ts so reply
+# chains and ordering survive a close/resurrect round trip.
+sub restore_chat_message {
+    my ($self, %f) = @_;
+    croak "session + sender + body required"
+        unless defined $f{session} && defined $f{sender} && defined $f{body};
+    $self->{dbh}->do(
+        "INSERT INTO chat_messages
+            (id, session, ts, sender, sender_kind, body, in_reply_to)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        undef, $f{id}, $f{session}, $f{ts}, $f{sender},
+        ($f{sender_kind} // 'agent'), $f{body}, $f{in_reply_to});
+}
+
 # Append a message. Returns the persisted row (with id + ts) so the
 # daemon can emit it to subscribers.
 sub insert_chat_message {

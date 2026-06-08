@@ -21,6 +21,7 @@ use FindBin ();
 use POSIX ();
 use NetMgr::Protocol qw(parse_line format_ok format_err format_row format_eos format_ready);
 use NetMgr::Where    qw(parse eval_ast);
+use NetMgr::ChatArchive ();
 use NetMgr::Auth     ();
 use NetMgr::Mesh     ();
 use NetMgr::Election ();
@@ -2014,6 +2015,9 @@ sub _handle_chat_open {
             return $self->_send($cli,
                 format_err("CHAT_OPEN: not authorized to reopen '$name'"))
                 unless $self->_chat_may_admin($cli, $existing, $who);
+            # Resurrect archived messages back into the DB before reopening.
+            eval { $self->_chat_restore($name) };
+            $self->_log("chat resurrect $name failed: $@") if $@;
             my $rr = $self->{db}->reopen_chat_session($name,
                 (defined $kv->{mode}  ? (access_mode => $mode)        : ()),
                 (defined $kv->{topic} ? (topic       => $kv->{topic}) : ()));
@@ -2080,11 +2084,54 @@ sub _handle_chat_close {
         or return $self->_send($cli, format_err("CHAT_CLOSE: no such session '".($name//'')."'"));
     return $self->_send($cli, format_err("CHAT_CLOSE: not authorized"))
         unless $self->_chat_may_admin($cli, $s, $who);
+
+    # Move the messages out of the DB into the on-disk archive (kept until
+    # explicitly deleted). The chat_sessions row stays so owners can find and
+    # resurrect it. If archiving fails, abort the close — don't lose messages.
+    my $dir = eval { $self->_chat_archive($name, $s) };
+    if ($@) {
+        my $e = $@; $e =~ s/\s+\z//;
+        $self->_log("chat close $name: archive FAILED: $e");
+        return $self->_send($cli, format_err("CHAT_CLOSE: archive failed: $e"));
+    }
+
     my $r = $self->{db}->close_chat_session($name);
     $self->_emit_change(table => 'chat_sessions', op => 'update', row => $r->{now})
         if $r->{now};
-    $self->_log("chat close $name by ".($who//'?'));
-    $self->_send($cli, format_ok(name => $name, status => 'closed'));
+    $self->_log("chat close $name by ".($who//'?')." -> $dir");
+    $self->_send($cli, format_ok(name => $name, status => 'closed', archive => $dir));
+}
+
+sub _chat_archive_base {
+    my ($self) = @_;
+    return $self->{config}{chat}{archive_dir} // '/var/lib/net-mgr/chat';
+}
+
+# Serialize a session's messages (+ metadata + members) to its archive
+# directory, then delete the message rows from the DB. Returns the directory.
+sub _chat_archive {
+    my ($self, $name, $s) = @_;
+    my $base     = $self->_chat_archive_base;
+    my $members  = $self->{db}->dbh->selectall_arrayref(
+        "SELECT * FROM chat_members WHERE session = ?", { Slice => {} }, $name);
+    my $messages = $self->{db}->get_chat_messages($name);
+    my $dir = NetMgr::ChatArchive::write_archive($base, $s, $members, $messages);
+    $self->{db}->delete_chat_messages($name);
+    return $dir;
+}
+
+# Resurrect: pull archived messages back into the DB (only when the session has
+# none live, so a reopen can't duplicate them). Ids/ts are preserved.
+sub _chat_restore {
+    my ($self, $name) = @_;
+    my $base = $self->_chat_archive_base;
+    return unless NetMgr::ChatArchive::has_archive($base, $name);
+    my ($have) = $self->{db}->dbh->selectrow_array(
+        "SELECT COUNT(*) FROM chat_messages WHERE session = ?", undef, $name);
+    return if $have;
+    my $msgs = NetMgr::ChatArchive::read_messages($base, $name);
+    $self->{db}->restore_chat_message(%$_) for @$msgs;
+    $self->_log("chat resurrect $name: restored " . scalar(@$msgs) . " message(s)");
 }
 
 sub _handle_chat_join {

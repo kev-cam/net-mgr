@@ -90,6 +90,11 @@ my %DEFAULTS = (
     # entry. Usually set in the per-user file (~/.config/net-mgr/config) and
     # read via NetMgr::Config->servers; pick one with `--server NAME`.
     servers => {},
+    # net-chat: where a closed session's messages + uploaded files are archived
+    # (one <archive_dir>/<name>/ per chat). Lives on the daemon hosting the chat.
+    chat => {
+        archive_dir => '/var/lib/net-mgr/chat',
+    },
 );
 
 # Per-section, which keys should be coerced to integer seconds.
@@ -232,6 +237,7 @@ my %ACTIVE = (
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
     forward    => [qw(method allow_peers)],   # net-connect FORWARD backend
     servers    => '*',                        # client server list (see servers())
+    chat       => [qw(archive_dir)],          # net-chat archive location
 );
 
 # Returns a list of "[section] key" strings for entries in $path that

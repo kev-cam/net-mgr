@@ -214,9 +214,15 @@ sub cmd_set {
 sub cmd_close {
     my $name = need_name(shift @ARGV);
     my $cli = connect_client();
-    eval { $cli->chat_close(name => $name) };
+    my $r = eval { $cli->chat_close(name => $name) };
     die "net-chat: $@" if $@;
-    print "closed '$name'\n";
+    my $arch = (ref $r eq 'HASH') ? $r->{archive} : undef;
+    if (defined $arch) {
+        print "closed '$name' — messages archived to $arch\n";
+        print "  resurrect with: net-chat open $name\n";
+    } else {
+        print "closed '$name'\n";
+    }
 }
 
 sub cmd_join {
@@ -801,9 +807,9 @@ sub usage {
 usage: net-chat <command> [args]
 
   ls [--all]                       list chat sessions
-  open  <name> [--mode M] [--topic T]   create (M=open|list|request)
+  open  <name> [--mode M] [--topic T]   create, or resurrect an archived chat
   set   <name> [--mode M] [--topic T]   edit (owner)
-  close <name>                     close (owner)
+  close <name>                     close (owner): archive messages to disk
   join  <name>                     join a session
   leave <name>                     drop out of the roster
   who   <name>                     show who's in a session

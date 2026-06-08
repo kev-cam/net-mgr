@@ -49,6 +49,14 @@ db       = netmgr
 defaults = /etc/net-mgr/root.conf
 section  = net-mgr
 
+# net-chat archive. Closing a session (owner only) moves its messages out of
+# the DB into <archive_dir>/<name>/ (messages.jsonl + transcript.txt + a
+# files/ dir for uploads); the session row stays so it can be found and
+# resurrected by reopening it. The archive lives on the daemon hosting the
+# chat (chat isn't cluster-replicated) and persists until deleted.
+[chat]
+archive_dir = /var/lib/net-mgr/chat
+
 [scanner]
 # fping/ip-neigh sweep of known IPs (the periodic 'presence' trigger
 # in [scheduling] uses this).

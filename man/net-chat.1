@@ -120,7 +120,13 @@ The caller becomes the owner.
 Edit a session (owner only).
 .TP
 .B close \fINAME\fR
-Close a session (owner only); history is retained.
+Close a session (owner only). Its messages are moved out of the database into
+the on-disk archive (\fIarchive_dir\fR/\fINAME\fR/: \fBmessages.jsonl\fR,
+\fBtranscript.txt\fR, and a \fBfiles/\fR directory), kept until explicitly
+deleted. The session row remains so the chat can be found and resurrected by
+reopening it with
+.BR open .
+The archive lives on the daemon hosting the chat.
 .TP
 .B join \fINAME\fR
 Join a session. On a
