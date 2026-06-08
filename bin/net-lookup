@@ -246,19 +246,18 @@ if (!@candidates) {
     || _ipkey($a->[2]) cmp _ipkey($b->[2])
 } @candidates;
 
-# --verify: keep only IPs confirmed reachable. For a candidate on one of the
-# caller's own subnets a live 1 s ping is authoritative; for an off-subnet
-# candidate the caller often can't honestly reach it (NAT, slirp ICMP that
-# lies both ways), so we instead trust the fleet's last observation — keep it
-# only if the daemon saw it respond within --within seconds. --ping-only forces
-# a live ping for every candidate (the old behaviour). Stops at the first
-# responder unless --all is set.
+# --verify: keep only IPs confirmed reachable. An address counts as reachable
+# if the fleet observed it within --within seconds (cheap, and authoritative
+# even from a host that can't reach it) OR it answers a live 1 s ping (catches
+# a host that's reachable now but stale in the DB). Freshness is checked first
+# so reachable hosts usually skip the ping. --ping-only forces a live ping for
+# every candidate. Stops at the first responder unless --all is set.
 if ($verify) {
     my @alive;
     for my $c (@candidates) {
         my $ip = $c->[2];
-        my $ok = ($ping_only || _in_local_nets($ip)) ? _ping_ok($ip)
-                                                      : _fresh($ip);
+        my $ok = $ping_only ? _ping_ok($ip)
+                            : (_fresh($ip) || _ping_ok($ip));
         next unless $ok;
         push @alive, $c;
         last unless $all;
@@ -283,17 +282,6 @@ exit 0;
 sub _ping_ok {
     my ($ip) = @_;
     return system("ping -c 1 -W 1 -q -n $ip >/dev/null 2>&1") == 0;
-}
-
-# True when $ip falls in one of the caller's own /24s (from `ip addr` above) —
-# i.e. somewhere a live ping is actually meaningful.
-sub _in_local_nets {
-    my ($ip) = @_;
-    my $ipi = _ip2int($ip) // return 0;
-    for my $n (@local_nets) {
-        return 1 if ($ipi & $n->[1]) == $n->[0];
-    }
-    return 0;
 }
 
 # True when the daemon last observed $ip responding within --within seconds.
@@ -778,16 +766,13 @@ By default, paper-only addresses (last_observed IS NULL — known from
 dhcp.master config but never actually seen on the wire) are excluded.
 --include-stale brings them back into the pool.
 
---verify keeps only candidates confirmed reachable. For a candidate on
-one of this host's own subnets it sends a live ping (1 packet, 1 s) —
-authoritative. For an off-subnet candidate, where this host often can't
-honestly reach it (behind NAT, or a slirp/VM ICMP path that lies both
-ways), it instead trusts the fleet's last observation: the address is
-kept only if the daemon saw it respond within --within seconds (default
-3600). So from a NAT'd box, --verify reflects what the network actually
-sees rather than the local host's broken pings. --ping-only forces a
-live ping for every candidate (the old behaviour); --within tunes the
-freshness window. Without --all, --verify stops at the first responder.
+--verify keeps only candidates confirmed reachable: an address is kept
+if the fleet observed it within --within seconds (default 3600 — cheap,
+and authoritative even from a host that can't reach it itself) OR it
+answers a live 1 s ping (catches a host reachable now but stale in the
+DB). Freshness is checked first, so reachable hosts usually skip the
+ping. --ping-only forces a live ping for every candidate; --within tunes
+the freshness window. Without --all, --verify stops at the first responder.
 
 Default prints one IP. --all prints every match, best-scored first.
 --verbose appends a TAB and the matching name(s) (comma-separated
