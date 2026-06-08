@@ -432,12 +432,19 @@ sub do_mac {
     my ($iface) = grep { defined $_->{mac} && lc $_->{mac} eq $mac } @$ifaces;
     exit 1 unless $iface;
 
-    my @ips = map  { $_->{addr} }
-              grep { defined $_->{mac} && lc $_->{mac} eq $mac
-                  && defined $_->{addr} } @$addresses;
-    exit 1 unless @ips;
+    my @rows = grep { defined $_->{mac} && lc $_->{mac} eq $mac
+                   && defined $_->{addr} } @$addresses;
+    exit 1 unless @rows;
 
-    @ips = sort { _ipkey($a) cmp _ipkey($b) } @ips;
+    # Freshest first (most recently observed — a device that changed DHCP
+    # lease leaves an older address behind), then lowest IP as a stable
+    # tiebreak. last_observed is ISO "YYYY-MM-DD HH:MM:SS" so string cmp
+    # orders it chronologically.
+    @rows = sort {
+           ($b->{last_observed} // '') cmp ($a->{last_observed} // '')
+        || _ipkey($a->{addr}) cmp _ipkey($b->{addr})
+    } @rows;
+    my @ips = map { $_->{addr} } @rows;
     @ips = ($ips[0]) unless $all;
 
     if (!$verbose) {
