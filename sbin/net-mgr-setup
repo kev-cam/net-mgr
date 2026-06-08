@@ -112,18 +112,24 @@ unless (mysql_root_query("SELECT 1")) {
 }
 print "  ok\n";
 
-# Don't blow away someone else's databases (ZoneMinder, mediawiki, …).
-# Only the system schemas are allowed unless --allow-existing was passed.
-{
+# Guard against running on the wrong host: if we see other application
+# databases (ZoneMinder, mediawiki, …) on a machine that does NOT yet have a
+# net-mgr database, refuse without explicit consent. net-mgr-setup only ever
+# creates/uses '$DBNAME' and never touches other schemas, so once that
+# database exists this is plainly the right host — skip the check, which is
+# what makes reinstalling on a box that also runs ZoneMinder/etc. just work.
+unless ($allow_existing || db_exists($DBNAME)) {
     my %sys = map { $_ => 1 } qw(information_schema mysql performance_schema sys);
     my @all = mysql_root_query("SHOW DATABASES");
     my @user_dbs = grep { !$sys{$_} && $_ ne $DBNAME } @all;
-    if (@user_dbs && !$allow_existing) {
+    if (@user_dbs) {
         die "Refusing to proceed: existing user database(s) detected:\n"
           . "  @user_dbs\n\n"
-          . "net-mgr-setup will not run on a machine with other application data\n"
-          . "without explicit consent — re-run with --allow-existing if you have\n"
-          . "a recent mysqldump backup of the listed databases and want to proceed.\n";
+          . "net-mgr-setup will not run on a fresh machine that already holds other\n"
+          . "application data without explicit consent. (This check is skipped once\n"
+          . "the '$DBNAME' database exists, so reinstalling net-mgr on such a host is\n"
+          . "fine.) Re-run with --allow-existing if you have a recent mysqldump backup\n"
+          . "of the listed databases and want to proceed anyway.\n";
     }
 }
 
