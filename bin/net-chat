@@ -430,9 +430,9 @@ sub cmd_member {
 
 # ---- GUI (Perl/Tk) ---------------------------------------------------
 # net-chat --gui [session]: a desktop chat window — pick a session (or
-# "+ new chat" to create one), watch it live, type to post, Upload a file
-# or browse Files to Save As, and get approve/reject pop-ups for join
-# requests on sessions you own. Bar widgets
+# "+ new chat" to create one), watch it live, type to post, send a file
+# with the up-arrow button, and right-click an "uploaded …" line to Save
+# As. Owners also get approve/reject pop-ups for join requests. Bar widgets
 # use ASCII (the default UI font lacks many glyphs; the message pane is
 # Courier and renders Unicode fine).
 # Multi-line messages fold to their first line (a " [+]"
@@ -559,6 +559,7 @@ sub cmd_gui {
     my @order;         # message ordinals, top -> bottom
     my %otext;         # ord -> decoded full text (for Search)
     my %folded;        # ord -> bool
+    my %file_of_ord;   # ord -> uploaded filename (for the right-click Save As)
     my $last_hit;      # ord the last Search hit landed in
     my $last_q = '';   # query that produced $last_hit
 
@@ -602,18 +603,26 @@ sub cmd_gui {
         my $rest = substr($t, $cut);
         my $who  = $kv->{sender} // '?'; utf8::decode($who);
         my $ut   = $user_tag->($who);        # per-sender background tint
+        # A completed upload is a system message "<who> uploaded <file> (size)";
+        # tag it 'file' and remember the name so right-click can offer Save As.
+        my @base = ('msg', $ut, "i$ord");
+        if (($kv->{sender_kind} // '') eq 'system'
+            && ($kv->{body} // '') =~ /\buploaded\s+(\S+)\s+\(/) {
+            $file_of_ord{$ord} = $1;
+            push @base, 'file';
+        }
         $txt->configure(-state => 'normal');
         if (length $rest) {                  # long / multi-line -> foldable
             $txt->insert($where,
-                $head,  ['msg', $ut, "i$ord"],
-                ' [+]', ['msg', $ut, "i$ord", "k$ord"],
-                $rest,  ['msg', $ut, "i$ord", "b$ord"],
-                "\n",   ['msg', $ut, "i$ord"]);
+                $head,  [@base],
+                ' [+]', [@base, "k$ord"],
+                $rest,  [@base, "b$ord"],
+                "\n",   [@base]);
             $txt->tagConfigure("b$ord", -elide => $fold ? 1 : 0);
             $txt->tagConfigure("k$ord", -elide => $fold ? 0 : 1);
             $folded{$ord} = $fold ? 1 : 0;
         } else {                             # single line -> nothing to fold
-            $txt->insert($where, $head."\n", ['msg', $ut, "i$ord"]);
+            $txt->insert($where, $head."\n", [@base]);
         }
         $txt->configure(-state => 'disabled');
         if ($where eq '1.0') { unshift @order, $ord } else { push @order, $ord }
@@ -629,7 +638,7 @@ sub cmd_gui {
         $txt->delete('1.0', 'end');
         $txt->configure(-state => 'disabled');
         $min_shown = undef;
-        %shown = (); @order = (); %otext = (); %folded = ();
+        %shown = (); @order = (); %otext = (); %folded = (); %file_of_ord = ();
         $last_hit = undef; $last_q = '';
     };
 
@@ -647,6 +656,46 @@ sub cmd_gui {
         sub { $set_fold->($ord_at->($txt->index('current')), 1) });
     $txt->tagBind('msg', '<Enter>', sub { $txt->configure(-cursor => 'hand2') });
     $txt->tagBind('msg', '<Leave>', sub { $txt->configure(-cursor => 'xterm') });
+
+    # Uploaded files (system "… uploaded <file> …" lines) are tagged 'file' and
+    # underlined; right-click one for a Save As menu that downloads it (chunked
+    # CHAT_GET, like `net-chat download`).
+    $txt->tagConfigure('file', -underline => 1);
+    my $download_file = sub {
+        my ($name) = @_;
+        return unless defined $name && length $name && defined $cur;
+        my $dest = $mw->getSaveFile(-title => "Save '$name' as",
+                                    -initialfile => $name);
+        return unless defined $dest && length $dest;
+        open my $fh, '>', $dest or return $set_status->("write $dest: $!");
+        binmode $fh;
+        require MIME::Base64;
+        $set_status->("downloading $name ..."); $mw->update;
+        my $offset = 0;
+        while (1) {
+            my $gr = eval { $ctrl->chat_get(session => $cur, file => $name,
+                                            offset => $offset) };
+            if ($@) { close $fh; return $set_status->("download failed: $@") }
+            my $chunk = defined $gr->{data}
+                ? MIME::Base64::decode_base64($gr->{data}) : '';
+            print {$fh} $chunk;
+            $offset += length $chunk;
+            last if $gr->{eof} || length($chunk) == 0;
+        }
+        close $fh;
+        $set_status->("saved $name -> $dest ($offset bytes)");
+    };
+    my $rc_file;
+    my $filemenu = $mw->Menu(-tearoff => 0);
+    $filemenu->add('command', -label => 'Save As...',
+                   -command => sub { $download_file->($rc_file) });
+    $txt->tagBind('file', '<Button-3>', sub {
+        my $ord = $ord_at->($txt->index('current'));
+        return unless defined $ord && defined $file_of_ord{$ord};
+        $rc_file = $file_of_ord{$ord};
+        $filemenu->entryconfigure(0, -label => "Save '$rc_file' As...");
+        $filemenu->post($txt->pointerxy);
+    });
 
     # -- search row: scan all loaded messages, reveal + highlight the match ----
     my $srch = $mw->Frame;
@@ -877,62 +926,13 @@ sub cmd_gui {
         $set_status->("uploaded $name (" . ($r->{size} // $offset) . " bytes)");
     };
 
-    # Files: list the current chat's uploads; pick one and "Save As" to
-    # download it elsewhere (chunked CHAT_GET, like `net-chat download`).
-    my $files_dialog = sub {
-        unless (defined $cur) { $set_status->('pick a chat first'); return }
-        my $r = eval { $ctrl->chat_ls(session => $cur) };
-        if ($@) { $set_status->("files failed: $@"); return }
-        require MIME::Base64; require JSON::PP;
-        my $files = $r->{files}
-            ? JSON::PP->new->decode(MIME::Base64::decode_base64($r->{files})) : [];
-        my $pop = $mw->Toplevel; $pop->title("files in $cur");
-        unless (@$files) {
-            $pop->Label(-text => "(no files in '$cur')", -padx => 20, -pady => 16)->pack;
-            $pop->Button(-text => 'Close', -command => sub { $pop->destroy })->pack(-pady => 6);
-            return;
-        }
-        my $lb = $pop->Scrolled('Listbox', -scrollbars => 'oe', -width => 42,
-                                -height => 10, -selectmode => 'browse', -font => 'ncmono')
-                     ->pack(-fill => 'both', -expand => 1, -padx => 6, -pady => 6);
-        $lb->insert('end', sprintf("%-30s %9d", $_->{name}, $_->{size})) for @$files;
-        $lb->selectionSet(0);
-        my $download = sub {
-            my @sel = $lb->curselection; return unless @sel;
-            my $name = $files->[$sel[0]]{name};
-            my $dest = $mw->getSaveFile(-title => "Save '$name' as",
-                                        -initialfile => $name);
-            return unless defined $dest && length $dest;
-            open my $fh, '>', $dest or return $set_status->("write $dest: $!");
-            binmode $fh;
-            require MIME::Base64;
-            $set_status->("downloading $name ..."); $mw->update;
-            my $offset = 0;
-            while (1) {
-                my $gr = eval { $ctrl->chat_get(session => $cur, file => $name,
-                                                offset => $offset) };
-                if ($@) { close $fh; return $set_status->("download failed: $@") }
-                my $chunk = defined $gr->{data}
-                    ? MIME::Base64::decode_base64($gr->{data}) : '';
-                print {$fh} $chunk;
-                $offset += length $chunk;
-                last if $gr->{eof} || length($chunk) == 0;
-            }
-            close $fh;
-            $set_status->("saved $name -> $dest ($offset bytes)");
-        };
-        my $bf = $pop->Frame->pack(-pady => 4);
-        $bf->Button(-text => 'Save As...', -command => $download)
-           ->pack(-side => 'left', -padx => 6);
-        $bf->Button(-text => 'Close', -command => sub { $pop->destroy })
-           ->pack(-side => 'left', -padx => 6);
-        $lb->bind('<Double-1>', $download);
-    };
-
     $entry->bind('<Return>', $send);
-    $bot->Button(-text => 'Send',   -command => $send)->pack(-side => 'right');
-    $bot->Button(-text => 'Upload', -command => $upload)->pack(-side => 'right');
-    $bot->Button(-text => 'Files',  -command => $files_dialog)->pack(-side => 'right');
+    $bot->Button(-text => 'Send', -command => $send)->pack(-side => 'right');
+    # Upload glyph (an up-arrow). Rendered in the Courier 'ncmono' font, which
+    # has Unicode coverage on this system — the default bar font does not.
+    # Downloads are reached by right-clicking the upload message in the pane.
+    $bot->Button(-text => "\x{2191}", -font => 'ncmono', -command => $upload)
+        ->pack(-side => 'right');
 
     # live reader: drain all complete lines without blocking the event loop
     $mw->fileevent($stream->{sock}, 'readable', sub {
