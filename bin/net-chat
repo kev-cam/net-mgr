@@ -430,8 +430,9 @@ sub cmd_member {
 
 # ---- GUI (Perl/Tk) ---------------------------------------------------
 # net-chat --gui [session]: a desktop chat window — pick a session (or
-# "+ new chat" to create one), watch it live, type to post, and get
-# approve/reject pop-ups for join requests on sessions you own. Bar widgets
+# "+ new chat" to create one), watch it live, type to post, Upload a file
+# or browse Files to Save As, and get approve/reject pop-ups for join
+# requests on sessions you own. Bar widgets
 # use ASCII (the default UI font lacks many glyphs; the message pane is
 # Courier and renders Unicode fine).
 # Multi-line messages fold to their first line (a " [+]"
@@ -847,8 +848,91 @@ sub cmd_gui {
         $set_status->("post failed: $@") if $@;
         $entry->delete(0, 'end');
     };
+
+    # Upload: pick a file and stream it to the current chat in 48 KB chunks
+    # (the same CHAT_PUT loop as `net-chat upload`); the daemon posts a system
+    # message on completion, which arrives live in the pane.
+    my $upload = sub {
+        unless (defined $cur) { $set_status->('pick a chat first'); return }
+        my $path = $mw->getOpenFile(-title => "Upload to $cur");
+        return unless defined $path && length $path;   # cancelled
+        open my $fh, '<', $path or return $set_status->("open $path: $!");
+        binmode $fh;
+        require File::Basename; require MIME::Base64;
+        my $name = File::Basename::basename($path);
+        $set_status->("uploading $name ..."); $mw->update;
+        my ($offset, $r) = (0, undef);
+        while (1) {
+            my $n   = read($fh, my $buf, 48 * 1024);
+            $buf    = '' unless defined $n;
+            my $eof = (!$n || eof($fh)) ? 1 : 0;
+            $r = eval { $ctrl->chat_put(session => $cur, file => $name,
+                offset => $offset, ($eof ? (eof => 1) : ()),
+                data => MIME::Base64::encode_base64($buf, '')) };
+            if ($@) { close $fh; return $set_status->("upload failed: $@") }
+            $offset += length $buf;
+            last if $eof;
+        }
+        close $fh;
+        $set_status->("uploaded $name (" . ($r->{size} // $offset) . " bytes)");
+    };
+
+    # Files: list the current chat's uploads; pick one and "Save As" to
+    # download it elsewhere (chunked CHAT_GET, like `net-chat download`).
+    my $files_dialog = sub {
+        unless (defined $cur) { $set_status->('pick a chat first'); return }
+        my $r = eval { $ctrl->chat_ls(session => $cur) };
+        if ($@) { $set_status->("files failed: $@"); return }
+        require MIME::Base64; require JSON::PP;
+        my $files = $r->{files}
+            ? JSON::PP->new->decode(MIME::Base64::decode_base64($r->{files})) : [];
+        my $pop = $mw->Toplevel; $pop->title("files in $cur");
+        unless (@$files) {
+            $pop->Label(-text => "(no files in '$cur')", -padx => 20, -pady => 16)->pack;
+            $pop->Button(-text => 'Close', -command => sub { $pop->destroy })->pack(-pady => 6);
+            return;
+        }
+        my $lb = $pop->Scrolled('Listbox', -scrollbars => 'oe', -width => 42,
+                                -height => 10, -selectmode => 'browse', -font => 'ncmono')
+                     ->pack(-fill => 'both', -expand => 1, -padx => 6, -pady => 6);
+        $lb->insert('end', sprintf("%-30s %9d", $_->{name}, $_->{size})) for @$files;
+        $lb->selectionSet(0);
+        my $download = sub {
+            my @sel = $lb->curselection; return unless @sel;
+            my $name = $files->[$sel[0]]{name};
+            my $dest = $mw->getSaveFile(-title => "Save '$name' as",
+                                        -initialfile => $name);
+            return unless defined $dest && length $dest;
+            open my $fh, '>', $dest or return $set_status->("write $dest: $!");
+            binmode $fh;
+            require MIME::Base64;
+            $set_status->("downloading $name ..."); $mw->update;
+            my $offset = 0;
+            while (1) {
+                my $gr = eval { $ctrl->chat_get(session => $cur, file => $name,
+                                                offset => $offset) };
+                if ($@) { close $fh; return $set_status->("download failed: $@") }
+                my $chunk = defined $gr->{data}
+                    ? MIME::Base64::decode_base64($gr->{data}) : '';
+                print {$fh} $chunk;
+                $offset += length $chunk;
+                last if $gr->{eof} || length($chunk) == 0;
+            }
+            close $fh;
+            $set_status->("saved $name -> $dest ($offset bytes)");
+        };
+        my $bf = $pop->Frame->pack(-pady => 4);
+        $bf->Button(-text => 'Save As...', -command => $download)
+           ->pack(-side => 'left', -padx => 6);
+        $bf->Button(-text => 'Close', -command => sub { $pop->destroy })
+           ->pack(-side => 'left', -padx => 6);
+        $lb->bind('<Double-1>', $download);
+    };
+
     $entry->bind('<Return>', $send);
-    $bot->Button(-text => 'Send', -command => $send)->pack(-side => 'right');
+    $bot->Button(-text => 'Send',   -command => $send)->pack(-side => 'right');
+    $bot->Button(-text => 'Upload', -command => $upload)->pack(-side => 'right');
+    $bot->Button(-text => 'Files',  -command => $files_dialog)->pack(-side => 'right');
 
     # live reader: drain all complete lines without blocking the event loop
     $mw->fileevent($stream->{sock}, 'readable', sub {
