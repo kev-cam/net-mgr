@@ -59,6 +59,9 @@ package NetMgr::Protocol;
 #   CHAT_DENY    session=N principal=ID          -- owner: revoke
 #   CHAT_APPROVE session=N principal=ID          -- owner: OK a request
 #   CHAT_REJECT  session=N principal=ID          -- owner: deny a request
+#   CHAT_PUT session=N file=F offset=O [eof=1] data=base64  -- upload a chunk
+#   CHAT_GET session=N file=F [offset=O]         -- download (base64 chunk)
+#   CHAT_LS  session=N                            -- list uploaded files
 #   (messages are posted with OBSERVE kind=chat_msg session=N body="...")
 #   BYE
 #
@@ -129,6 +132,10 @@ sub parse_line {
     elsif ($verb eq 'CHAT_DENY')      { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'CHAT_APPROVE')   { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'CHAT_REJECT')    { $cmd->{kv} = _parse_kv_only(\@toks) }
+    # net-chat file transfer (data= is base64).
+    elsif ($verb eq 'CHAT_PUT')       { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'CHAT_GET')       { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'CHAT_LS')        { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'BYE')       { croak "BYE takes no args" if @toks }
     elsif ($verb eq 'STATUS')    { croak "STATUS takes no args" if @toks }
     elsif ($verb eq 'UNSUB') {
