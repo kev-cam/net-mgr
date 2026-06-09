@@ -15,7 +15,10 @@ use JSON::PP ();
 use File::Path qw(make_path);
 use File::Spec;
 
-my $JSON = JSON::PP->new->utf8->canonical;
+# No ->utf8: encode/decode work on character strings, and the file handles
+# (all opened :encoding(UTF-8)) do the bytes<->chars. (utf8 + an encoding layer
+# would double-encode.)
+my $JSON = JSON::PP->new->canonical;
 
 # A chat name is validated [A-Za-z0-9][A-Za-z0-9._-]* by the protocol, so it is
 # a single safe path segment; re-check here so a bad name can never escape.

@@ -2130,7 +2130,8 @@ sub _chat_restore {
         "SELECT COUNT(*) FROM chat_messages WHERE session = ?", undef, $name);
     return if $have;
     my $msgs = NetMgr::ChatArchive::read_messages($base, $name);
-    $self->{db}->restore_chat_message(%$_) for @$msgs;
+    # session isn't stored per-message (it's the archive dir); supply it here.
+    $self->{db}->restore_chat_message(%$_, session => $name) for @$msgs;
     $self->_log("chat resurrect $name: restored " . scalar(@$msgs) . " message(s)");
 }
 
