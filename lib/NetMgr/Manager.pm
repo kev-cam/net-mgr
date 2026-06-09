@@ -574,6 +574,7 @@ sub _handle_line {
     elsif ($verb eq 'CHAT_PUT')       { $self->_handle_chat_put($cli, $cmd) }
     elsif ($verb eq 'CHAT_GET')       { $self->_handle_chat_get($cli, $cmd) }
     elsif ($verb eq 'CHAT_LS')        { $self->_handle_chat_ls($cli, $cmd) }
+    elsif ($verb eq 'CHAT_DELETE')    { $self->_handle_chat_delete($cli, $cmd) }
     else {
         $self->_send($cli, format_err("verb $verb not handled"));
     }
@@ -2115,12 +2116,39 @@ sub _chat_archive_base {
 sub _chat_archive {
     my ($self, $name, $s) = @_;
     my $base     = $self->_chat_archive_base;
+    my $messages = $self->{db}->get_chat_messages($name);
+    # Guard: never overwrite a non-empty archive with an empty one (e.g. a
+    # chat closed again with 0 live messages). Keep the existing archive.
+    if (!@$messages && NetMgr::ChatArchive::has_archive($base, $name)) {
+        $self->_log("chat close $name: 0 live messages, keeping existing archive");
+        return NetMgr::ChatArchive::dir($base, $name);
+    }
     my $members  = $self->{db}->dbh->selectall_arrayref(
         "SELECT * FROM chat_members WHERE session = ?", { Slice => {} }, $name);
-    my $messages = $self->{db}->get_chat_messages($name);
     my $dir = NetMgr::ChatArchive::write_archive($base, $s, $members, $messages);
     $self->{db}->delete_chat_messages($name);
     return $dir;
+}
+
+# CHAT_DELETE name=N — owner-only, destructive: remove the chat's whole archive
+# directory and its DB rows (members/messages/presence cascade off the session).
+sub _handle_chat_delete {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my ($who) = $self->_chat_identity($cli, $kv);
+    my $name = $kv->{name};
+    my $s = $self->{db}->get_chat_session($name)
+        or return $self->_send($cli,
+            format_err("CHAT_DELETE: no such session '" . ($name // '') . "'"));
+    return $self->_send($cli, format_err("CHAT_DELETE: not authorized"))
+        unless $self->_chat_may_admin($cli, $s, $who);
+
+    eval { NetMgr::ChatArchive::delete_archive($self->_chat_archive_base, $name) };
+    $self->_log("chat delete $name: archive rm failed: $@") if $@;
+    $self->{db}->delete_chat_session($name);
+    $self->_emit_change(table => 'chat_sessions', op => 'delete', row => $s);
+    $self->_log("chat delete $name by " . ($who // '?'));
+    $self->_send($cli, format_ok(name => $name, deleted => 1));
 }
 
 # Resurrect: pull archived messages back into the DB (only when the session has

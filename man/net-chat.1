@@ -180,6 +180,15 @@ or its own name).
 .B files \fINAME\fR
 List the uploaded files (name and size).
 .TP
+.B delete \fINAME\fR \fR[\fB\-\-force\fR]
+Owner only, and destructive: permanently remove the chat \(em its database
+rows
+.RB ( close
+only archives) and its entire archive directory, messages and uploaded files.
+Prompts for confirmation unless
+.B \-\-force
+is given. This is the only command that deletes data.
+.TP
 .B approve\fR|\fBreject \fINAME\fR \fIPRINCIPAL\fR
 Act on a join request (owner).
 .TP

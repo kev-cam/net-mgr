@@ -1837,6 +1837,15 @@ sub reopen_chat_session {
     return { op => 'reopen', now => $self->get_chat_session($name) };
 }
 
+# Delete a session and (via FK ON DELETE CASCADE) its members, messages, and
+# presence. Returns the row that was deleted, or undef if it didn't exist.
+sub delete_chat_session {
+    my ($self, $name) = @_;
+    my $was = $self->get_chat_session($name) or return undef;
+    $self->{dbh}->do("DELETE FROM chat_sessions WHERE name = ?", undef, $name);
+    return $was;
+}
+
 sub touch_chat_activity {
     my ($self, $name) = @_;
     $self->{dbh}->do(

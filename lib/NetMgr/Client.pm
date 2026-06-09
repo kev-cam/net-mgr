@@ -409,6 +409,13 @@ sub chat_put { my ($self, %a) = @_; return $self->_chat_cmd('CHAT_PUT', %a) }
 sub chat_get { my ($self, %a) = @_; return $self->_chat_cmd('CHAT_GET', %a) }
 sub chat_ls  { my ($self, %a) = @_; return $self->_chat_cmd('CHAT_LS',  %a) }
 
+# Owner-only, destructive: delete a chat and its whole archive.
+sub chat_delete {
+    my ($self, %a) = @_;
+    croak "chat_delete needs name" unless defined $a{name};
+    return $self->_chat_cmd('CHAT_DELETE', name => $a{name});
+}
+
 sub chat_join {
     my ($self, %a) = @_;
     croak "chat_join needs session" unless defined $a{session};

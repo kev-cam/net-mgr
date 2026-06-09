@@ -123,6 +123,16 @@ sub list_files {
     return \@files;
 }
 
+# Remove a chat's whole archive directory (messages + files). Validates the
+# name (so it can only ever remove <base>/<safe-name>) and no-ops if absent.
+sub delete_archive {
+    my ($base, $name) = @_;
+    my $d = dir($base, $name);          # croaks on a bad name
+    return 0 unless -d $d;
+    File::Path::remove_tree($d);
+    return 1;
+}
+
 sub _spew {
     my ($path, $data) = @_;
     open my $fh, '>:encoding(UTF-8)', $path or croak "write $path: $!";

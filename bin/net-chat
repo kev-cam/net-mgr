@@ -131,6 +131,7 @@ my %DISPATCH = (
     tail     => \&cmd_follow,    # alias
     requests => \&cmd_requests,
     members  => \&cmd_members,
+    delete   => \&cmd_delete,
     upload   => \&cmd_upload,
     download => \&cmd_download,
     files    => \&cmd_files,
@@ -337,6 +338,22 @@ sub cmd_members {
         printf "%-24s %-8s %s\n",
             $m->{principal}, $m->{role} // '?', $m->{state} // '?';
     }
+}
+
+sub cmd_delete {
+    my $name = need_name(shift @ARGV);
+    my $force = grep { $_ eq '--force' || $_ eq '-f' } @ARGV;
+    unless ($force) {
+        local $| = 1;
+        print STDERR "Delete chat '$name' and its ENTIRE archive "
+                   . "(messages + uploaded files)? This cannot be undone. [y/N] ";
+        my $ans = <STDIN>;
+        unless (defined $ans && $ans =~ /^\s*y/i) { print "aborted\n"; return }
+    }
+    my $cli = connect_client();
+    eval { $cli->chat_delete(name => $name) };
+    die "net-chat: $@" if $@;
+    print "deleted '$name' (archive removed)\n";
 }
 
 sub cmd_upload {
@@ -882,6 +899,7 @@ usage: net-chat <command> [args]
   follow <name>                    join + stream live (Ctrl-C)
   requests <name>                  list pending join requests
   members  <name>                  list the membership list
+  delete   <name> [--force]        owner: delete chat + archive (destructive)
   upload   <name> <file> [as]      upload a file (posts a system message)
   download <name> <file> [to]      download a file
   files    <name>                  list uploaded files
