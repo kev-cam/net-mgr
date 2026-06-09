@@ -429,9 +429,12 @@ sub cmd_member {
 }
 
 # ---- GUI (Perl/Tk) ---------------------------------------------------
-# net-chat --gui [session]: a desktop chat window — pick a session, watch
-# it live, type to post, and get approve/reject pop-ups for join requests
-# on sessions you own. Multi-line messages fold to their first line (a " [+]"
+# net-chat --gui [session]: a desktop chat window — pick a session (or
+# "+ new chat" to create one), watch it live, type to post, and get
+# approve/reject pop-ups for join requests on sessions you own. Bar widgets
+# use ASCII (the default UI font lacks many glyphs; the message pane is
+# Courier and renders Unicode fine).
+# Multi-line messages fold to their first line (a " [+]"
 # marker; left-click to open, right-click to close) and older/seeded lines
 # start folded; the search box reveals and highlights matches across the whole
 # loaded log; each sender gets a light background tint. Uses two connections:
@@ -468,7 +471,7 @@ sub cmd_gui {
     my %created_by;          # session -> created_by (for request ownership)
     my $cur;                 # session currently followed
     my %seen_req;            # "$session/$principal" -> 1 (dedupe pop-ups)
-    my $statusvar = 'connecting…';
+    my $statusvar = 'connecting...';
 
     # -- top: server + session picker + refresh --------------------------
     my $top = $mw->Frame->pack(-fill => 'x', -padx => 4, -pady => 3);
@@ -502,9 +505,12 @@ sub cmd_gui {
             })->pack(-side => 'left');
     }
 
+    my $NEWCHAT = '+ new chat';   # sentinel entry in the chat picker
+    my $new_chat;                 # assigned below (it uses $refresh/$follow)
     $top->Label(-text => 'chat:')->pack(-side => 'left');
     my $sessvar = $session // 'select';      # placeholder until a chat is picked
-    my $om = $top->Optionmenu(-variable => \$sessvar, -options => ['select'])
+    my $om = $top->Optionmenu(-variable => \$sessvar,
+                              -options => ['select', $NEWCHAT])
                  ->pack(-side => 'left');
     my $topiclbl = $top->Label(-text => '', -anchor => 'w')
                        ->pack(-side => 'left', -fill => 'x', -expand => 1);
@@ -674,15 +680,15 @@ sub cmd_gui {
                 $txt->see($hit);
             } else { $txt->see($r[0]) }
             return $set_status->("match ".($j+1)."/$n for '$q'"
-                               . " — Enter=next, Shift-Enter=prev");
+                               . " - Enter=next, Shift-Enter=prev");
         }
         $set_status->("no match for '$q'");
     };
     $se->bind('<Return>',       sub { $find->( 1) });
     $se->bind('<Shift-Return>', sub { $find->(-1) });
-    $srch->Button(-text => '›', -width => 2, -command => sub { $find->( 1) })
+    $srch->Button(-text => '>', -width => 2, -command => sub { $find->( 1) })
          ->pack(-side => 'right');
-    $srch->Button(-text => '‹', -width => 2, -command => sub { $find->(-1) })
+    $srch->Button(-text => '<', -width => 2, -command => sub { $find->(-1) })
          ->pack(-side => 'right');
 
     my $req_popup = sub {
@@ -725,12 +731,13 @@ sub cmd_gui {
     my $follow = sub {
         my ($name) = @_;
         return unless defined $name && length $name;
-        return if $name eq 'select' || $name eq '(no open chats)';
+        return if $name eq 'select' || $name eq '(no open chats)'
+               || $name eq $NEWCHAT;
         return if defined $cur && $cur eq $name;
         $stream->send_line('UNSUB sub=1') if defined $cur;
         $clear->();
         $cur = $name;
-        $mw->title("net-chat — $name");
+        $mw->title("net-chat - $name");
         $topiclbl->configure(-text => ($created_by{$name} ? "owner: $created_by{$name}" : ''));
         eval { $ctrl->chat_join(session => $name) };   # roster + post rights
         # Stream new messages only; past messages are pulled in on demand with
@@ -739,7 +746,7 @@ sub cmd_gui {
         $stream->send_line("SUBSCRIBE sub=1 mode=stream"
                          . " FROM chat_messages WHERE session = '$name'");
         $seed_recent->(10);                 # last 10 lines for context
-        $set_status->("following $name — History for older messages");
+        $set_status->("following $name - History for older messages");
         $entry->focus;
     };
 
@@ -755,9 +762,10 @@ sub cmd_gui {
         # still exists.
         my $keep = $sessvar;
         $om->configure(-command => undef);
-        $om->configure(-options => [ 'select', @names ]);
+        $om->configure(-options => [ 'select', @names, $NEWCHAT ]);
         $sessvar = (defined $keep && grep { $_ eq $keep } @names) ? $keep : 'select';
-        $om->configure(-command => sub { $follow->($sessvar) });
+        $om->configure(-command => sub {
+            $sessvar eq $NEWCHAT ? $new_chat->() : $follow->($sessvar) });
         $set_status->(scalar(@names) . ' open chat(s)');
     };
     # History: each click pulls in the single next-older message (the newest one
@@ -774,7 +782,52 @@ sub cmd_gui {
         $set_status->("history: + 1 older line (id $msg->{id})");
     };
 
-    $om->configure(-command => sub { $follow->($sessvar) });
+    # New-chat dialog: prompt for name/topic/mode, create it via the control
+    # connection, then refresh the picker and follow the new chat.
+    $new_chat = sub {
+        my $pop = $mw->Toplevel; $pop->title('new chat');
+        my $row = sub {
+            my ($label) = @_;
+            my $f = $pop->Frame->pack(-fill => 'x', -padx => 8, -pady => 3);
+            $f->Label(-text => $label, -width => 6, -anchor => 'e')
+              ->pack(-side => 'left');
+            return $f;
+        };
+        my $namevar  = '';
+        my $ne = $row->('name:')->Entry(-textvariable => \$namevar, -width => 26)
+                     ->pack(-side => 'left', -fill => 'x', -expand => 1);
+        my $topicvar = '';
+        $row->('topic:')->Entry(-textvariable => \$topicvar, -width => 26)
+            ->pack(-side => 'left', -fill => 'x', -expand => 1);
+        my $modevar  = 'open';
+        $row->('mode:')->Optionmenu(-variable => \$modevar,
+                                    -options => ['open', 'list', 'request'])
+            ->pack(-side => 'left');
+        my $create = sub {
+            (my $name = $namevar) =~ s/^\s+|\s+$//g;
+            unless ($name =~ /\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z/) {
+                $set_status->("bad chat name (use A-Z a-z 0-9 . _ -)"); return;
+            }
+            my $ok = eval { $ctrl->chat_open(name => $name, mode => $modevar,
+                (length $topicvar ? (topic => $topicvar) : ())); 1 };
+            unless ($ok) { $set_status->("create '$name' failed: $@"); return }
+            $pop->destroy;
+            $refresh->();
+            $sessvar = $name;
+            $follow->($name);
+        };
+        my $bf = $pop->Frame->pack(-pady => 8);
+        $bf->Button(-text => 'Create', -command => $create)
+           ->pack(-side => 'left', -padx => 6);
+        $bf->Button(-text => 'Cancel',
+            -command => sub { $pop->destroy; $sessvar = $cur // 'select' })
+           ->pack(-side => 'left', -padx => 6);
+        $ne->bind('<Return>', $create);
+        $ne->focus;
+    };
+
+    $om->configure(-command => sub {
+        $sessvar eq $NEWCHAT ? $new_chat->() : $follow->($sessvar) });
     $top->Button(-text => 'Refresh', -command => $refresh)->pack(-side => 'right');
     $top->Button(-text => 'History', -command => $load_history)->pack(-side => 'right');
     # font size controls
