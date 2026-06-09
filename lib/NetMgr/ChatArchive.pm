@@ -88,6 +88,41 @@ sub read_messages {
     return \@msgs;
 }
 
+# A filename within a chat's files/ dir: one safe segment, no path parts.
+sub safe_filename {
+    my ($name) = @_;
+    return (defined $name && $name =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
+            && $name ne '..') ? $name : undef;
+}
+
+# Absolute path to an uploaded file, creating the files/ dir. Dies on a bad
+# filename so nothing can be written outside the chat's directory.
+sub file_path {
+    my ($base, $session, $filename) = @_;
+    my $fn = safe_filename($filename)
+        or croak "bad file name '" . ($filename // '') . "'";
+    my $d = files_dir($base, $session);
+    make_path($d) unless -d $d;
+    return File::Spec->catfile($d, $fn);
+}
+
+# List uploaded files as ({ name, size, mtime }, …), name-sorted.
+sub list_files {
+    my ($base, $session) = @_;
+    my $d = files_dir($base, $session);
+    return [] unless -d $d;
+    opendir my $dh, $d or return [];
+    my @files;
+    for my $f (sort grep { !/^\./ } readdir $dh) {
+        my $p = File::Spec->catfile($d, $f);
+        next unless -f $p;
+        my @st = stat $p;
+        push @files, { name => $f, size => $st[7], mtime => $st[9] };
+    }
+    closedir $dh;
+    return \@files;
+}
+
 sub _spew {
     my ($path, $data) = @_;
     open my $fh, '>:encoding(UTF-8)', $path or croak "write $path: $!";

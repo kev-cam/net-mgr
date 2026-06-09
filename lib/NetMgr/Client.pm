@@ -404,6 +404,11 @@ sub chat_close {
     return $self->_chat_cmd('CHAT_CLOSE', name => $a{name});
 }
 
+# File transfer (phase 2). Each returns the OK kv (or croaks on ERR).
+sub chat_put { my ($self, %a) = @_; return $self->_chat_cmd('CHAT_PUT', %a) }
+sub chat_get { my ($self, %a) = @_; return $self->_chat_cmd('CHAT_GET', %a) }
+sub chat_ls  { my ($self, %a) = @_; return $self->_chat_cmd('CHAT_LS',  %a) }
+
 sub chat_join {
     my ($self, %a) = @_;
     croak "chat_join needs session" unless defined $a{session};

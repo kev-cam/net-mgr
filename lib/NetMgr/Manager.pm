@@ -571,6 +571,9 @@ sub _handle_line {
     elsif ($verb eq 'CHAT_DENY')      { $self->_handle_chat_member_op($cli, $cmd, 'deny') }
     elsif ($verb eq 'CHAT_APPROVE')   { $self->_handle_chat_member_op($cli, $cmd, 'approve') }
     elsif ($verb eq 'CHAT_REJECT')    { $self->_handle_chat_member_op($cli, $cmd, 'reject') }
+    elsif ($verb eq 'CHAT_PUT')       { $self->_handle_chat_put($cli, $cmd) }
+    elsif ($verb eq 'CHAT_GET')       { $self->_handle_chat_get($cli, $cmd) }
+    elsif ($verb eq 'CHAT_LS')        { $self->_handle_chat_ls($cli, $cmd) }
     else {
         $self->_send($cli, format_err("verb $verb not handled"));
     }
@@ -2133,6 +2136,133 @@ sub _chat_restore {
     # session isn't stored per-message (it's the archive dir); supply it here.
     $self->{db}->restore_chat_message(%$_, session => $name) for @$msgs;
     $self->_log("chat resurrect $name: restored " . scalar(@$msgs) . " message(s)");
+}
+
+# May $who post to / upload to / read files of session $s? Same rule as
+# posting: open sessions are public, otherwise members only; loopback bypass.
+sub _chat_may_post {
+    my ($self, $cli, $s, $who) = @_;
+    return 1 if _peer_is_loopback($cli);
+    return 0 unless defined $who;
+    return 1 if $s->{access_mode} eq 'open';
+    my $m = $self->{db}->get_chat_member($s->{name}, $who);
+    return $m && $m->{state} eq 'member';
+}
+
+sub _human_size {
+    my ($n) = @_;
+    return "$n B" if $n < 1024;
+    my @u = ('KB', 'MB', 'GB', 'TB');
+    my ($v, $i) = ($n, -1);
+    do { $v /= 1024; $i++ } while ($v >= 1024 && $i < $#u);
+    return sprintf("%.1f %s", $v, $u[$i]);
+}
+
+# Resolve session + authorize for a file op; returns ($session_row, $who) or
+# sends an ERR and returns () on failure.
+sub _chat_file_auth {
+    my ($self, $cli, $verb, $kv) = @_;
+    my ($who) = $self->_chat_identity($cli, $kv);
+    my $name = $kv->{session};
+    unless (defined $name && length $name) {
+        $self->_send($cli, format_err("$verb: missing session=")); return;
+    }
+    my $s = $self->{db}->get_chat_session($name);
+    unless ($s) {
+        $self->_send($cli, format_err("$verb: no such session '$name'")); return;
+    }
+    unless ($self->_chat_may_post($cli, $s, $who)) {
+        $self->_send($cli, format_err("$verb: not authorized")); return;
+    }
+    return ($s, $who);
+}
+
+# CHAT_PUT session=N file=F offset=O [eof=1] data=base64 — write a file chunk
+# into the chat's files/ dir. On eof, post a system message announcing it.
+sub _handle_chat_put {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my ($s, $who) = $self->_chat_file_auth($cli, 'CHAT_PUT', $kv) or return;
+    my $name = $s->{name};
+    return $self->_send($cli, format_err("CHAT_PUT: session '$name' is closed"))
+        if $s->{status} eq 'closed';
+    my $file = $kv->{file};
+    return $self->_send($cli, format_err("CHAT_PUT: missing file="))
+        unless defined $file && length $file;
+
+    my $path = eval { NetMgr::ChatArchive::file_path($self->_chat_archive_base, $name, $file) };
+    return $self->_send($cli, format_err("CHAT_PUT: $@")) if $@;
+
+    my $offset = $kv->{offset} // 0;
+    require MIME::Base64;
+    my $data = defined $kv->{data} ? MIME::Base64::decode_base64($kv->{data}) : '';
+
+    my $mode = ($offset == 0) ? '>' : '+<';
+    open my $fh, $mode, $path
+        or return $self->_send($cli, format_err("CHAT_PUT: open $path: $!"));
+    binmode $fh;
+    seek($fh, $offset, 0) if $offset;
+    print {$fh} $data;
+    truncate($fh, $offset + length($data)) if $kv->{eof};   # drop any stale tail
+    close $fh;
+
+    unless ($kv->{eof}) {
+        return $self->_send($cli, format_ok(session => $name, file => $file,
+            offset => $offset + length($data)));
+    }
+
+    my $size = -s $path;
+    my $msg = $self->{db}->insert_chat_message(
+        session => $name, sender => 'system', sender_kind => 'system',
+        body => ($who // 'someone') . " uploaded $file (" . _human_size($size) . ")");
+    $self->{db}->touch_chat_activity($name);
+    $self->_emit_change(table => 'chat_messages', op => 'insert', row => $msg);
+    $self->_log("chat put $name/$file by " . ($who // '?') . " ($size bytes)");
+    $self->_send($cli, format_ok(session => $name, file => $file, size => $size));
+}
+
+# CHAT_GET session=N file=F [offset=O] — return a base64 chunk; the reply
+# carries size/offset/eof so the client can loop.
+sub _handle_chat_get {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my ($s, $who) = $self->_chat_file_auth($cli, 'CHAT_GET', $kv) or return;
+    my $name = $s->{name};
+    my $file = $kv->{file};
+    return $self->_send($cli, format_err("CHAT_GET: missing file="))
+        unless defined $file && length $file;
+    my $path = eval { NetMgr::ChatArchive::file_path($self->_chat_archive_base, $name, $file) };
+    return $self->_send($cli, format_err("CHAT_GET: $@")) if $@;
+    return $self->_send($cli, format_err("CHAT_GET: no such file '$file'")) unless -f $path;
+
+    my $offset = $kv->{offset} // 0;
+    my $total  = -s $path;
+    open my $fh, '<', $path
+        or return $self->_send($cli, format_err("CHAT_GET: open $path: $!"));
+    binmode $fh;
+    seek($fh, $offset, 0);
+    my $got = read($fh, my $buf, 48 * 1024);
+    close $fh;
+    $buf = '' unless defined $got;
+    my $eof = ($offset + length($buf) >= $total) ? 1 : 0;
+    require MIME::Base64;
+    $self->_send($cli, format_ok(session => $name, file => $file, size => $total,
+        offset => $offset, eof => $eof,
+        data => MIME::Base64::encode_base64($buf, '')));
+}
+
+# CHAT_LS session=N — list uploaded files (base64 JSON: [{name,size,mtime},…]).
+sub _handle_chat_ls {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my ($s) = $self->_chat_file_auth($cli, 'CHAT_LS', $kv) or return;
+    my $name = $s->{name};
+    my $files = NetMgr::ChatArchive::list_files($self->_chat_archive_base, $name);
+    require MIME::Base64;
+    require JSON::PP;
+    my $json = JSON::PP->new->canonical->encode($files);
+    $self->_send($cli, format_ok(session => $name, count => scalar(@$files),
+        files => MIME::Base64::encode_base64($json, '')));
 }
 
 sub _handle_chat_join {

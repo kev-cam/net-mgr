@@ -131,6 +131,9 @@ my %DISPATCH = (
     tail     => \&cmd_follow,    # alias
     requests => \&cmd_requests,
     members  => \&cmd_members,
+    upload   => \&cmd_upload,
+    download => \&cmd_download,
+    files    => \&cmd_files,
     approve  => sub { cmd_member('approve', @_) },
     reject   => sub { cmd_member('reject',  @_) },
     allow    => sub { cmd_member('allow',   @_) },
@@ -334,6 +337,67 @@ sub cmd_members {
         printf "%-24s %-8s %s\n",
             $m->{principal}, $m->{role} // '?', $m->{state} // '?';
     }
+}
+
+sub cmd_upload {
+    my $session = need_name(shift @ARGV);
+    my $path = shift @ARGV or die "net-chat: upload needs a file path\n";
+    my $name = shift @ARGV;          # optional stored name (default: basename)
+    require File::Basename;
+    $name //= File::Basename::basename($path);
+    open my $fh, '<', $path or die "net-chat: open $path: $!\n";
+    binmode $fh;
+    require MIME::Base64;
+    my $cli = connect_client();
+    my ($offset, $r) = (0, undef);
+    while (1) {
+        my $n   = read($fh, my $buf, 48 * 1024);
+        $buf    = '' unless defined $n;
+        my $eof = (!$n || eof($fh)) ? 1 : 0;
+        $r = eval { $cli->chat_put(session => $session, file => $name,
+            offset => $offset, ($eof ? (eof => 1) : ()),
+            data => MIME::Base64::encode_base64($buf, '')) };
+        die "net-chat: $@" if $@;
+        $offset += length $buf;
+        last if $eof;
+    }
+    close $fh;
+    print "uploaded '$name' (", ($r->{size} // $offset), " bytes) to '$session'\n";
+}
+
+sub cmd_download {
+    my $session = need_name(shift @ARGV);
+    my $name = shift @ARGV or die "net-chat: download needs a file name\n";
+    my $out  = shift @ARGV // $name;   # optional local destination
+    require MIME::Base64;
+    my $cli = connect_client(want_auth => 0);
+    open my $fh, '>', $out or die "net-chat: write $out: $!\n";
+    binmode $fh;
+    my $offset = 0;
+    while (1) {
+        my $r = eval { $cli->chat_get(session => $session, file => $name,
+                                      offset => $offset) };
+        die "net-chat: $@" if $@;
+        my $chunk = defined $r->{data} ? MIME::Base64::decode_base64($r->{data}) : '';
+        print {$fh} $chunk;
+        $offset += length $chunk;
+        last if $r->{eof} || length($chunk) == 0;
+    }
+    close $fh;
+    print "downloaded '$name' from '$session' -> $out ($offset bytes)\n";
+}
+
+sub cmd_files {
+    my $session = need_name(shift @ARGV);
+    my $cli = connect_client(want_auth => 0);
+    my $r = eval { $cli->chat_ls(session => $session) };
+    die "net-chat: $@" if $@;
+    require MIME::Base64; require JSON::PP;
+    my $files = $r->{files}
+        ? JSON::PP->new->decode(MIME::Base64::decode_base64($r->{files})) : [];
+    unless (@$files) { print "no files in '$session'\n"; return }
+    printf "%-32s %10s\n", 'NAME', 'BYTES';
+    printf "%-32s %10d\n", $_->{name}, $_->{size} for @$files;
 }
 
 sub cmd_member {
@@ -818,6 +882,9 @@ usage: net-chat <command> [args]
   follow <name>                    join + stream live (Ctrl-C)
   requests <name>                  list pending join requests
   members  <name>                  list the membership list
+  upload   <name> <file> [as]      upload a file (posts a system message)
+  download <name> <file> [to]      download a file
+  files    <name>                  list uploaded files
   approve|reject <name> <who>      act on a join request (owner)
   allow|deny     <name> <who>      edit the allow-list (owner)
 

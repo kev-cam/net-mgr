@@ -160,6 +160,26 @@ List pending join requests (owner).
 .B members \fINAME\fR
 List the membership list.
 .TP
+.B upload \fINAME\fR \fIFILE\fR \fR[\fISTORED\fR]
+Upload
+.I FILE
+into the chat's
+.B files/
+directory (stored under its basename, or
+.I STORED
+if given), chunked through the daemon. Posts a
+.B system
+message announcing the upload, so it shows inline and notifies watchers.
+Same authorization as posting.
+.TP
+.B download \fINAME\fR \fIFILE\fR \fR[\fIDEST\fR]
+Download an uploaded file (to
+.I DEST
+or its own name).
+.TP
+.B files \fINAME\fR
+List the uploaded files (name and size).
+.TP
 .B approve\fR|\fBreject \fINAME\fR \fIPRINCIPAL\fR
 Act on a join request (owner).
 .TP
