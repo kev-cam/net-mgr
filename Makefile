@@ -49,7 +49,7 @@ LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \
 
 INSTALL ?= install
 
-.PHONY: list install install-on setup deps uninstall test check clean help .version
+.PHONY: list install install-on deploy setup deps uninstall test check clean help .version
 
 # --- dependency check (Debian/Ubuntu apt names) ----------------------
 # Required deps must be present; optional deps print a hint but don't
@@ -149,9 +149,11 @@ list:
 	@echo
 	@echo "vars: PREFIX=$(PREFIX)  DESTDIR=$(DESTDIR)  SYSCONFDIR=$(SYSCONFDIR)"
 	@echo
-	@echo "remote install: make install-on TARGET=host [KEEP=1] [SUDO=sudo]"
+	@echo "remote install: make install-on TARGET=host [SUDO=sudo] [SSHOPTS=..] [MAKEARGS='FORCE=1'] [KEEP=1]"
 	@echo "  rsyncs this tree to /tmp/$$USER/net-mgr on the target,"
 	@echo "  runs 'make install' there, then removes the tmp dir."
+	@echo "fleet deploy:   make deploy   (installs on every host in [deploy] of $(DEPLOY_CONF))"
+	@echo "  configure once: [deploy] hosts = nas3, bigsony  (sudo/ssh_opts/make_args optional)"
 	@echo
 	@echo "--- dependency check ---"
 	@$(MAKE) -s deps || true
@@ -355,6 +357,8 @@ install: .version
 REMOTE_TMP ?= /tmp/$(USER)/net-mgr
 SUDO       ?=
 SSHOPTS    ?=
+# Config file `make deploy` reads its [deploy] hosts from.
+DEPLOY_CONF ?= $(if $(NET_MGR_CONF),$(NET_MGR_CONF),/etc/net-mgr/config)
 MAKEARGS   ?=
 
 install-on: .version
@@ -383,6 +387,34 @@ install-on: .version
 	  ssh $(SSHOPTS) $(TARGET) "rm -rf $(REMOTE_TMP)"; \
 	fi
 	@echo "==> $(TARGET): install-on done"
+
+# --- deploy to the whole fleet from [deploy] in the config -----------
+#   make deploy                         # uses [deploy] hosts in $(DEPLOY_CONF)
+#   make deploy DEPLOY_CONF=./my.conf   # a different config file
+# Reads hosts/sudo/ssh_opts/make_args from the [deploy] section and runs
+# install-on for each host. Edit the config once; deploy with one command.
+deploy: .version
+	@command -v perl >/dev/null 2>&1 || { echo "perl required for 'make deploy'"; exit 1; }
+	@cfg='$(DEPLOY_CONF)'; \
+	[ -f "$$cfg" ] || { echo "config '$$cfg' not found (set DEPLOY_CONF=)"; exit 2; }; \
+	get() { perl -Ilib -MNetMgr::Config -e \
+	  'my $$c=NetMgr::Config->load($$ARGV[0]); my $$v=$$c->{deploy}{$$ARGV[1]}//q(); $$v=~s/^\s+|\s+$$//g; print $$v' \
+	  "$$cfg" "$$1"; }; \
+	hosts=`get hosts | tr ',' ' '`; \
+	if [ -z "$$hosts" ]; then \
+	  echo "No [deploy] hosts in $$cfg. Add e.g.:"; \
+	  echo "  [deploy]"; echo "  hosts = nas3, bigsony"; echo "  sudo  = sudo   # optional"; \
+	  exit 2; \
+	fi; \
+	sudo_v=`get sudo`; sshopts_v=`get ssh_opts`; makeargs_v=`get make_args`; \
+	echo "==> deploy to: $$hosts  (sudo='$$sudo_v' ssh='$$sshopts_v' args='$$makeargs_v')"; \
+	for h in $$hosts; do \
+	  echo; echo "===== $$h ====="; \
+	  $(MAKE) --no-print-directory install-on TARGET="$$h" \
+	      SUDO="$$sudo_v" SSHOPTS="$$sshopts_v" MAKEARGS="$$makeargs_v" \
+	    || { echo "deploy: $$h FAILED — stopping"; exit 1; }; \
+	done; \
+	echo; echo "==> deploy complete ($$hosts)"
 
 # --- setup (interactive DB + creds bootstrap) ------------------------
 setup:
