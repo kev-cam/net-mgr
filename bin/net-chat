@@ -467,6 +467,10 @@ sub cmd_gui {
     my $fontsize = 10;
     $mw->fontCreate('ncui',   -size => $fontsize);
     $mw->fontCreate('ncmono', -family => 'Courier', -size => $fontsize);
+    # Bold mono, a couple of points up — for the upload-arrow button so the
+    # glyph reads as a chunky icon rather than a thin stroke.
+    $mw->fontCreate('ncmonob', -family => 'Courier', -size => $fontsize + 2,
+                    -weight => 'bold');
     $mw->optionAdd('*font' => 'ncui', 81);
 
     my %created_by;          # session -> created_by (for request ownership)
@@ -530,8 +534,9 @@ sub cmd_gui {
 
     my $set_status = sub { $statusvar = $_[0] };
     my $set_font = sub {
-        $mw->fontConfigure('ncui',   -size => $fontsize);
-        $mw->fontConfigure('ncmono', -size => $fontsize);
+        $mw->fontConfigure('ncui',    -size => $fontsize);
+        $mw->fontConfigure('ncmono',  -size => $fontsize);
+        $mw->fontConfigure('ncmonob', -size => $fontsize + 2);
     };
     my $min_shown;     # smallest message id on screen — the History cursor
     my %shown;         # ids already displayed — dedup live/seed/history overlap
@@ -931,7 +936,7 @@ sub cmd_gui {
     # Upload glyph (an up-arrow). Rendered in the Courier 'ncmono' font, which
     # has Unicode coverage on this system — the default bar font does not.
     # Downloads are reached by right-clicking the upload message in the pane.
-    $bot->Button(-text => "\x{2191}", -font => 'ncmono', -command => $upload)
+    $bot->Button(-text => "\x{2191}", -font => 'ncmonob', -command => $upload)
         ->pack(-side => 'right');
 
     # live reader: drain all complete lines without blocking the event loop
