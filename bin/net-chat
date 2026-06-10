@@ -388,7 +388,7 @@ sub cmd_download {
     my $name = shift @ARGV or die "net-chat: download needs a file name\n";
     my $out  = shift @ARGV // $name;   # optional local destination
     require MIME::Base64;
-    my $cli = connect_client(want_auth => 0);
+    my $cli = connect_client();   # file reads are ACL-gated; auth on remote
     open my $fh, '>', $out or die "net-chat: write $out: $!\n";
     binmode $fh;
     my $offset = 0;
@@ -407,7 +407,7 @@ sub cmd_download {
 
 sub cmd_files {
     my $session = need_name(shift @ARGV);
-    my $cli = connect_client(want_auth => 0);
+    my $cli = connect_client();   # file listing is ACL-gated; auth on remote
     my $r = eval { $cli->chat_ls(session => $session) };
     die "net-chat: $@" if $@;
     require MIME::Base64; require JSON::PP;
