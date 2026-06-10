@@ -138,6 +138,7 @@ sub parse_line {
     elsif ($verb eq 'CHAT_PUT')       { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'CHAT_GET')       { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'CHAT_LS')        { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'CHAT_RM')        { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'CHAT_DELETE')    { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'BYE')       { croak "BYE takes no args" if @toks }
     elsif ($verb eq 'STATUS')    { croak "STATUS takes no args" if @toks }

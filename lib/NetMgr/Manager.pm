@@ -574,6 +574,7 @@ sub _handle_line {
     elsif ($verb eq 'CHAT_PUT')       { $self->_handle_chat_put($cli, $cmd) }
     elsif ($verb eq 'CHAT_GET')       { $self->_handle_chat_get($cli, $cmd) }
     elsif ($verb eq 'CHAT_LS')        { $self->_handle_chat_ls($cli, $cmd) }
+    elsif ($verb eq 'CHAT_RM')        { $self->_handle_chat_rm($cli, $cmd) }
     elsif ($verb eq 'CHAT_DELETE')    { $self->_handle_chat_delete($cli, $cmd) }
     else {
         $self->_send($cli, format_err("verb $verb not handled"));
@@ -2291,6 +2292,32 @@ sub _handle_chat_ls {
     my $json = JSON::PP->new->canonical->encode($files);
     $self->_send($cli, format_ok(session => $name, count => scalar(@$files),
         files => MIME::Base64::encode_base64($json, '')));
+}
+
+# CHAT_RM session=N file=F — delete one uploaded file (posting ACL, like
+# upload). Posts a system message announcing the removal.
+sub _handle_chat_rm {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my ($s, $who) = $self->_chat_file_auth($cli, 'CHAT_RM', $kv) or return;
+    my $name = $s->{name};
+    my $file = $kv->{file};
+    return $self->_send($cli, format_err("CHAT_RM: missing file="))
+        unless defined $file && length $file;
+
+    my $removed = eval {
+        NetMgr::ChatArchive::delete_file($self->_chat_archive_base, $name, $file) };
+    return $self->_send($cli, format_err("CHAT_RM: $@")) if $@;
+    return $self->_send($cli, format_err("CHAT_RM: no such file '$file'"))
+        unless $removed;
+
+    my $msg = $self->{db}->insert_chat_message(
+        session => $name, sender => 'system', sender_kind => 'system',
+        body => ($who // 'someone') . " deleted $file");
+    $self->{db}->touch_chat_activity($name);
+    $self->_emit_change(table => 'chat_messages', op => 'insert', row => $msg);
+    $self->_log("chat rm $name/$file by " . ($who // '?'));
+    $self->_send($cli, format_ok(session => $name, file => $file, deleted => 1));
 }
 
 sub _handle_chat_join {

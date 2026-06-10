@@ -123,6 +123,18 @@ sub list_files {
     return \@files;
 }
 
+# Remove one uploaded file. Validates the name (so it can only ever unlink
+# <base>/<session>/files/<safe-name>). Returns 1 if removed, 0 if absent.
+sub delete_file {
+    my ($base, $session, $filename) = @_;
+    my $fn = safe_filename($filename)
+        or croak "bad file name '" . ($filename // '') . "'";
+    my $p = File::Spec->catfile(files_dir($base, $session), $fn);
+    return 0 unless -f $p;
+    unlink $p or croak "unlink $p: $!";
+    return 1;
+}
+
 # Remove a chat's whole archive directory (messages + files). Validates the
 # name (so it can only ever remove <base>/<safe-name>) and no-ops if absent.
 sub delete_archive {

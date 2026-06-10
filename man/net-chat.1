@@ -180,6 +180,14 @@ or its own name).
 .B files \fINAME\fR
 List the uploaded files (name and size).
 .TP
+.B rm \fINAME\fR \fIFILE\fR
+Delete one uploaded file from the chat. Posts a
+.B system
+message announcing the removal. Any chat member who may post may delete a
+file; the operation is irreversible. (To remove a whole chat, see
+.B delete
+below.)
+.TP
 .B delete \fINAME\fR \fR[\fB\-\-force\fR]
 Owner only, and destructive: permanently remove the chat \(em its database
 rows

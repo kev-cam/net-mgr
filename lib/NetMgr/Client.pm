@@ -408,6 +408,7 @@ sub chat_close {
 sub chat_put { my ($self, %a) = @_; return $self->_chat_cmd('CHAT_PUT', %a) }
 sub chat_get { my ($self, %a) = @_; return $self->_chat_cmd('CHAT_GET', %a) }
 sub chat_ls  { my ($self, %a) = @_; return $self->_chat_cmd('CHAT_LS',  %a) }
+sub chat_rm  { my ($self, %a) = @_; return $self->_chat_cmd('CHAT_RM',  %a) }
 
 # Owner-only, destructive: delete a chat and its whole archive.
 sub chat_delete {
