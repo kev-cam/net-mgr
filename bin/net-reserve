@@ -162,6 +162,27 @@ sub cidr_parts {
 }
 sub subnet_of { my $i = ip2int($_[0]); defined $i ? int2ip($i & 0xFFFFFF00) . "/24" : undef }
 
+# Normalise a user-typed subnet ("192.168.20", "192.168.20.5/24", ...) to a
+# canonical "network/len" CIDR, or undef if it doesn't parse. Bare input
+# without a /len defaults to /24.
+sub normalize_cidr {
+    my ($s) = @_;
+    return undef unless defined $s;
+    $s =~ s/^\s+|\s+$//g;
+    return undef unless length $s;
+    my ($net, $len) = split m{/}, $s;
+    $len = 24 unless defined $len && length $len;
+    return undef unless $len =~ /^\d+$/ && $len >= 0 && $len <= 32;
+    # Pad a short dotted form: "192.168.20" -> "192.168.20.0".
+    my @o = split /\./, ($net // '');
+    return undef unless @o >= 1 && @o <= 4;
+    push @o, 0 while @o < 4;
+    $net = join '.', @o;
+    my ($network) = cidr_parts("$net/$len");
+    return undef unless defined $network;
+    return int2ip($network) . "/$len";
+}
+
 # ---- gather the world from the daemon --------------------------------
 #
 # Returns a model: { ranges=>[..], resv=>{ip=>row}, leased=>{ip=>row},
@@ -397,11 +418,16 @@ sub cmd_del_range {
 
 sub cmd_gui {
     my ($want_subnet) = @_;
-    eval { require Tk; Tk->import; require Tk::DialogBox; require Tk::Optionmenu; 1 }
+    eval { require Tk; Tk->import; require Tk::DialogBox; require Tk::BrowseEntry; 1 }
         or die "net-reserve: Perl/Tk not available: $@";
 
     my $cli = connect_client();   # auth on remote so reserve/release work
-    my %S = (subnet => $want_subnet, model => gather($cli), cur => undef);
+    my %S = (subnet => undef, model => gather($cli), cur => undef, pinned => {});
+    # An explicit `--gui SUBNET` opens straight to it, even with no data yet.
+    if (defined $want_subnet) {
+        my $n = normalize_cidr($want_subnet);
+        if ($n) { $S{subnet} = $n; $S{pinned}{$n} = 1; }
+    }
     $S{subnet} //= $S{model}{subnets}[0];
 
     my $mw = Tk::MainWindow->new(-title => "net-reserve — $listen");
@@ -415,13 +441,39 @@ sub cmd_gui {
     $top->Label(-text => 'Subnet:')->pack(-side => 'left');
     # Forward-declared so the widget callbacks below close over them; the
     # coderefs are assigned further down but only ever *called* at event time.
-    my ($subnet_om, $status, $canvas, $resv_text, $redraw, $refresh_subnets);
+    my ($subnet_be, $status, $canvas, $resv_text, $redraw, $refresh_subnets);
 
-    $subnet_om = $top->Optionmenu(
-        -options => [ @{ $S{model}{subnets} } ],
-        -variable => \$S{subnet},
-        -command  => sub { $redraw->() },
+    # The picker offers the union of discovered subnets, any pinned
+    # (manually-entered) ones, and the current selection — so you can jump
+    # to a subnet that has no rows yet and start allocating in it.
+    my $all_subnets = sub {
+        my %u;
+        $u{$_} = 1 for @{ $S{model}{subnets} };
+        $u{$_} = 1 for keys %{ $S{pinned} };
+        $u{ $S{subnet} } = 1 if defined $S{subnet} && length $S{subnet};
+        return [ sort { (ip2int((split m{/}, $a)[0]) // 0)
+                    <=> (ip2int((split m{/}, $b)[0]) // 0) } keys %u ];
+    };
+    # Jump to (and pin) a typed/selected subnet; silently ignores junk.
+    my $set_subnet = sub {
+        my $n = normalize_cidr($S{subnet});
+        return unless defined $n;
+        $S{subnet} = $n;
+        $S{pinned}{$n} = 1;
+        $refresh_subnets->();
+        $redraw->();
+    };
+
+    $subnet_be = $top->BrowseEntry(
+        -variable  => \$S{subnet},
+        -choices   => $all_subnets->(),
+        -width     => 18,
+        -browsecmd => sub { $redraw->() },        # picked from the dropdown
     )->pack(-side => 'left');
+    # Typing a CIDR + Enter (or Go) jumps to it, adding it to the list if new.
+    $subnet_be->Subwidget('entry')->bind('<Return>', sub { $set_subnet->() });
+    $top->Button(-text => 'Go', -command => sub { $set_subnet->() })
+        ->pack(-side => 'left', -padx => 2);
     $top->Button(-text => 'Reload',
         -command => sub { $S{model} = gather($cli); $refresh_subnets->(); $redraw->() }
     )->pack(-side => 'left', -padx => 4);
@@ -449,7 +501,9 @@ sub cmd_gui {
         ->pack(-side => 'bottom', -fill => 'x');
 
     $refresh_subnets = sub {
-        $subnet_om->configure(-options => [ @{ $S{model}{subnets} } ]);
+        my $list = $all_subnets->();
+        $subnet_be->delete(0, 'end');
+        $subnet_be->insert('end', $_) for @$list;
     };
 
     $redraw = sub {
