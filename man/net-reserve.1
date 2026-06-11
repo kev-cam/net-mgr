@@ -1,0 +1,188 @@
+.TH NET-RESERVE 1 "2026-06-11" "net-mgr" "User Commands"
+.SH NAME
+net-reserve \- manage permanent DHCP reservations and dynamic ranges
+.SH SYNOPSIS
+.B net-reserve list
+.RI [ SUBNET ]
+.br
+.B net-reserve free
+.RI [ SUBNET ]
+.RB [ \-n
+.IR N ]
+.br
+.B net-reserve ranges
+.br
+.B net-reserve reserve
+.I IP MAC
+.RB [ \-\-name
+.IR N ]
+.RB [ \-\-group
+.IR G ]
+.RB [ \-\-notes
+.IR T ]
+.br
+.B net-reserve release
+.I IP
+.br
+.B net-reserve move
+.I OLD_IP NEW_IP
+.br
+.B net-reserve add-range
+.I CIDR START END
+.RB [ \-\-zone
+.IR Z ]
+.br
+.B net-reserve del-range
+.I CIDR START
+.br
+.B net-reserve \-\-gui
+.RI [ SUBNET ]
+.SH DESCRIPTION
+.B net-reserve
+manages permanent (MAC \(-> fixed IP) DHCP reservations and the
+dynamic\-pool ranges they must avoid, storing both in the net\-mgr
+database \(em the
+.B dhcp_reservations
+and
+.B dhcp_ranges
+tables (schema v24). This replaces hand\-edited
+.RB ` host " { " "hardware ethernet" " ..; " "fixed-address" " ..; } '"
+blocks in
+.IR /etc/net-mgr/dhcp.master :
+both tables are cluster\-replicated, so a reservation made on one host
+relays to every peer, and
+.BR net-gen-dnsmasq (1)
+can generate the dnsmasq config straight from the DB.
+.PP
+Like
+.BR net-show (1)
+and
+.BR net-chat (1),
+net\-reserve talks to the daemon over the socket (snapshot +
+.BR OBSERVE )
+rather than the database directly, so it runs from any host without DB
+credentials. A non\-loopback daemon is authenticated automatically with
+your SSH key.
+.SH STATES
+The
+.B list
+map and the GUI colour each address by state:
+.TP
+.B free
+Allocatable static \(em not in any dynamic range, not reserved, not in
+use. Glyph
+.BR . ,
+green.
+.TP
+.B reserved
+A permanent reservation. Glyph
+.BR R ,
+red.
+.TP
+.B pool-free
+Inside a dynamic DHCP range, currently idle. Glyph
+.BR \- ,
+blue.
+.TP
+.B pool-used
+Inside a dynamic range and currently leased/observed. Glyph
+.BR = ,
+yellow.
+.TP
+.B used-static
+In use but neither reserved nor inside a pool \(em an unmanaged static
+(or squatter). Glyph
+.BR ! ,
+magenta.
+.PP
+A
+.I free static
+\(em the kind you allocate a permanent address from \(em is exactly the
+.B free
+state.
+.SH COMMANDS
+.TP
+.B list \fR[\fISUBNET\fR]
+Print a colour\-coded address map plus the reservations (grouped) for
+each known subnet, or just
+.IR SUBNET .
+.TP
+.B free \fR[\fISUBNET\fR] \fR[\fB\-n\fI N\fR]
+List the next
+.I N
+(default 10) free static IPs per subnet.
+.TP
+.B ranges
+List the dynamic DHCP pools.
+.TP
+.B reserve \fIIP MAC\fR
+Create or update a reservation. With
+.BR \-\-group ,
+file it under a group label;
+.B \-\-name
+sets the dnsmasq host name. Warns (does not block) if
+.I IP
+falls inside a dynamic range.
+.TP
+.B release \fIIP\fR
+Remove the reservation on
+.IR IP .
+.TP
+.B move \fIOLD_IP NEW_IP\fR
+Reallocate an existing reservation to a different address, carrying its
+MAC, name and group. Atomic \(em the device never holds two reservations
+mid\-move. Aliased as
+.BR reallocate .
+In the GUI, use the
+.B Move
+button on a reserved cell (it suggests the next free static).
+.TP
+.B add-range \fICIDR START END\fR
+Define a dynamic pool, e.g.
+.RB ` "add-range 192.168.15.0/24 192.168.15.100 192.168.15.200" '.
+.TP
+.B del-range \fICIDR START\fR
+Remove a dynamic pool by its start address.
+.TP
+.B \-\-gui \fR[\fISUBNET\fR]
+Open the Perl/Tk map: a clickable grid of the subnet's address space,
+coloured by state, with a grouped reservation list. Click a free cell to
+reserve it (the MAC is pre\-filled when the address is currently leased);
+click a reserved cell to release it. Refreshes live.
+.SH OPTIONS
+.TP
+.BI \-\-listen " HOST:PORT"
+Daemon address (overrides
+.B \-\-server
+and config).
+.TP
+.BI \-\-server " NAME"
+A server from the
+.B [servers]
+section of
+.IR ~/.config/net-mgr/config .
+.TP
+.BR \-\-auth ", " \-\-no\-auth
+Force or suppress the SSH\-key handshake. A non\-loopback daemon is
+AUTH'd by default.
+.TP
+.BI \-\-key-id " ID\fR, \fB\-\-key-file " PATH
+Identity for AUTH.
+.SH EXAMPLES
+Pin a newly\-added IP camera (currently on an auto lease) to a free
+static address, grouped:
+.PP
+.RS
+.nf
+net-reserve free 192.168.15.0/24
+net-reserve reserve 192.168.15.40 aa:bb:cc:dd:ee:01 \\
+    --name frontcam --group cameras
+.fi
+.RE
+.SH SEE ALSO
+.BR net-gen-dnsmasq (1),
+.BR net-import-dhcp (1),
+.BR net-show (1),
+.BR net-mgr (7)
+.SH AUTHOR
+Part of the net\-mgr suite.

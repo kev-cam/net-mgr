@@ -36,7 +36,7 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
     forwarding_rules zone_classes interface_zones wifi_zones
     audit_annotations wifi_scan_results wifi_radio_state
     chat_sessions chat_members chat_messages chat_presence
-    host_keys
+    host_keys dhcp_ranges dhcp_reservations
 );
 
 # Tables whose contents are sensitive (credentials etc.); SUBSCRIBE
@@ -2436,6 +2436,121 @@ sub _obs_chat_msg {
     return ();   # not a network event; no events-table row
 }
 
+# ---- DB-native DHCP plan: reservations + ranges ----------------------
+#
+# Writes require an authorized identity (a verified key or a loopback
+# peer) — same trust model as the chat admin ops. The upserts go through
+# _upsert so the change streams to the net-reserve GUI and the cluster
+# relay carries it to peers. Deletes snapshot-then-emit like the other
+# *_delete observers.
+
+# Mirror INET_ATON for the /24 a reservation falls in, when the caller
+# didn't pass subnet_cidr explicitly.
+sub _dhcp_subnet_of {
+    my ($ip) = @_;
+    return undef unless defined $ip && $ip =~ /\A(\d+\.\d+\.\d+)\.\d+\z/;
+    return "$1.0/24";
+}
+
+# OBSERVE kind=dhcp_reservation ip=.. mac=.. [name=..] [subnet_cidr=..]
+#   [grp=..] [notes=..] [as=NAME]
+sub _obs_dhcp_reservation {
+    my ($self, $cli, $kv) = @_;
+    my ($who) = $self->_chat_identity($cli, $kv);
+    die "dhcp_reservation: not authorized\n" unless defined $who;
+    my $ip  = $kv->{ip};
+    my $mac = $kv->{mac};
+    die "dhcp_reservation: ip required\n"  unless defined $ip  && length $ip;
+    die "dhcp_reservation: mac required\n" unless defined $mac && length $mac;
+    die "dhcp_reservation: bad ip '$ip'\n"
+        unless $ip =~ /\A\d+\.\d+\.\d+\.\d+\z/;
+    die "dhcp_reservation: bad mac '$mac'\n"
+        unless $mac =~ /\A[0-9a-fA-F:]{17}\z/;
+    $self->_upsert('dhcp_reservations', 'upsert_dhcp_reservation',
+        ip          => $ip,
+        mac         => $mac,
+        name        => $kv->{name},
+        subnet_cidr => ($kv->{subnet_cidr} // _dhcp_subnet_of($ip)),
+        grp         => $kv->{grp},
+        notes       => $kv->{notes},
+        updated_by  => $who,
+    );
+    $self->_log("dhcp reservation $ip -> $mac by $who");
+    return ();
+}
+
+# OBSERVE kind=dhcp_reservation_delete ip=..
+sub _obs_dhcp_reservation_delete {
+    my ($self, $cli, $kv) = @_;
+    my ($who) = $self->_chat_identity($cli, $kv);
+    die "dhcp_reservation_delete: not authorized\n" unless defined $who;
+    my $ip = $kv->{ip};
+    die "dhcp_reservation_delete: ip required\n" unless defined $ip && length $ip;
+    my $row = $self->{db}->delete_dhcp_reservation($ip);
+    $self->_emit_change(table => 'dhcp_reservations', op => 'delete', row => $row)
+        if $row;
+    $self->_log("dhcp reservation delete $ip by $who") if $row;
+    return ();
+}
+
+# OBSERVE kind=dhcp_reservation_move ip=OLD new_ip=NEW — reallocate an
+# existing reservation to a different address, atomically, keeping its
+# mac/name/group. Emits a delete of the old row + insert of the new.
+sub _obs_dhcp_reservation_move {
+    my ($self, $cli, $kv) = @_;
+    my ($who) = $self->_chat_identity($cli, $kv);
+    die "dhcp_reservation_move: not authorized\n" unless defined $who;
+    my $old = $kv->{ip} // $kv->{old_ip};
+    my $new = $kv->{new_ip};
+    die "dhcp_reservation_move: ip (old) required\n" unless defined $old && length $old;
+    die "dhcp_reservation_move: new_ip required\n"   unless defined $new && length $new;
+    die "dhcp_reservation_move: bad new_ip '$new'\n"
+        unless $new =~ /\A\d+\.\d+\.\d+\.\d+\z/;
+    my $res = $self->{db}->move_dhcp_reservation($old, $new,
+        subnet_cidr => _dhcp_subnet_of($new), updated_by => $who);
+    die "dhcp_reservation_move: no reservation at '$old'\n" unless $res;
+    die "dhcp_reservation_move: '$new' is already reserved\n" if $res->{error};
+    $self->_emit_change(table => 'dhcp_reservations', op => 'delete', row => $res->{old})
+        if $res->{old};
+    $self->_emit_change(table => 'dhcp_reservations', op => 'insert', row => $res->{new})
+        if $res->{new};
+    $self->_log("dhcp reservation move $old -> $new by $who");
+    return ();
+}
+
+# OBSERVE kind=dhcp_range subnet_cidr=.. start_ip=.. end_ip=.. [zone=..] [notes=..]
+sub _obs_dhcp_range {
+    my ($self, $cli, $kv) = @_;
+    my ($who) = $self->_chat_identity($cli, $kv);
+    die "dhcp_range: not authorized\n" unless defined $who;
+    my $cidr  = $kv->{subnet_cidr};
+    my $start = $kv->{start_ip};
+    my $end   = $kv->{end_ip};
+    die "dhcp_range: subnet_cidr required\n" unless defined $cidr  && length $cidr;
+    die "dhcp_range: start_ip required\n"    unless defined $start && length $start;
+    die "dhcp_range: end_ip required\n"      unless defined $end   && length $end;
+    $self->_upsert('dhcp_ranges', 'upsert_dhcp_range',
+        subnet_cidr => $cidr, start_ip => $start, end_ip => $end,
+        zone => $kv->{zone}, notes => $kv->{notes});
+    $self->_log("dhcp range $cidr $start-$end by $who");
+    return ();
+}
+
+# OBSERVE kind=dhcp_range_delete subnet_cidr=.. start_ip=..
+sub _obs_dhcp_range_delete {
+    my ($self, $cli, $kv) = @_;
+    my ($who) = $self->_chat_identity($cli, $kv);
+    die "dhcp_range_delete: not authorized\n" unless defined $who;
+    my ($cidr, $start) = ($kv->{subnet_cidr}, $kv->{start_ip});
+    die "dhcp_range_delete: subnet_cidr + start_ip required\n"
+        unless defined $cidr && defined $start;
+    my $row = $self->{db}->delete_dhcp_range($cidr, $start);
+    $self->_emit_change(table => 'dhcp_ranges', op => 'delete', row => $row)
+        if $row;
+    $self->_log("dhcp range delete $cidr $start by $who") if $row;
+    return ();
+}
+
 # ---- OBSERVE dispatch ------------------------------------------------
 
 sub _handle_observe {
@@ -2466,6 +2581,15 @@ sub _handle_observe {
         elsif ($kind eq 'event')       { @events = $self->_obs_event($cli, $kv) }
         elsif ($kind eq 'forward')     { @events = $self->_obs_forward($cli, $kv) }
         elsif ($kind eq 'chat_msg')    { @events = $self->_obs_chat_msg($cli, $kv) }
+        elsif ($kind eq 'dhcp_reservation')
+                                       { @events = $self->_obs_dhcp_reservation($cli, $kv) }
+        elsif ($kind eq 'dhcp_reservation_delete')
+                                       { @events = $self->_obs_dhcp_reservation_delete($cli, $kv) }
+        elsif ($kind eq 'dhcp_reservation_move')
+                                       { @events = $self->_obs_dhcp_reservation_move($cli, $kv) }
+        elsif ($kind eq 'dhcp_range')  { @events = $self->_obs_dhcp_range($cli, $kv) }
+        elsif ($kind eq 'dhcp_range_delete')
+                                       { @events = $self->_obs_dhcp_range_delete($cli, $kv) }
         else {
             die "unknown observation kind '$kind'\n";
         }

@@ -27,6 +27,7 @@ use NetMgr::Protocol qw(parse_line);
 my @REPLICATED = qw(
     machines hostnames interfaces addresses ports
     aps associations dhcp_leases aliases
+    dhcp_ranges dhcp_reservations
 );
 
 sub run {
@@ -258,6 +259,38 @@ sub _apply_aliases {
         notes              => $row->{notes},
     );
     _stamp($db, 'aliases', $repl_from, 'name = ?', $row->{name});
+}
+
+# DB-native DHCP plan. No machine-id remap — these are keyed by IP/subnet,
+# not machine, so they replicate verbatim.
+sub _apply_dhcp_ranges {
+    my ($db, $row, $idmap, $repl_from) = @_;
+    return unless $row->{subnet_cidr} && $row->{start_ip} && $row->{end_ip};
+    $db->upsert_dhcp_range(
+        subnet_cidr => $row->{subnet_cidr},
+        start_ip    => $row->{start_ip},
+        end_ip      => $row->{end_ip},
+        zone        => $row->{zone},
+        notes       => $row->{notes},
+    );
+    _stamp($db, 'dhcp_ranges', $repl_from,
+           'subnet_cidr = ? AND start_ip = ?',
+           $row->{subnet_cidr}, $row->{start_ip});
+}
+
+sub _apply_dhcp_reservations {
+    my ($db, $row, $idmap, $repl_from) = @_;
+    return unless $row->{ip} && $row->{mac};
+    $db->upsert_dhcp_reservation(
+        ip          => $row->{ip},
+        mac         => $row->{mac},
+        name        => $row->{name},
+        subnet_cidr => $row->{subnet_cidr},
+        grp         => $row->{grp},
+        notes       => $row->{notes},
+        updated_by  => $row->{updated_by},
+    );
+    _stamp($db, 'dhcp_reservations', $repl_from, 'ip = ?', $row->{ip});
 }
 
 1;

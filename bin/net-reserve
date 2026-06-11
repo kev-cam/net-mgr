@@ -1,0 +1,629 @@
+#!/usr/bin/perl
+# net-reserve — manage permanent DHCP reservations and dynamic-pool ranges
+# straight from the net-mgr DB (schema v24: dhcp_reservations + dhcp_ranges),
+# replacing hand-edited host { fixed-address } blocks in dhcp.master. Both
+# tables are cluster-replicated, so a reservation made here relays to every
+# peer and net-gen-dnsmasq can generate from the DB.
+#
+# Talks to the daemon over the socket (snapshot + OBSERVE), so it runs from any
+# host without DB credentials — like net-show / net-chat. A non-loopback daemon
+# is AUTH'd automatically with your SSH key.
+#
+# Usage:
+#   net-reserve list [SUBNET]        colour-coded address map (free/reserved/pool)
+#   net-reserve free [SUBNET] [-n N] list the next free static IPs
+#   net-reserve ranges               list the dynamic DHCP pools
+#   net-reserve reserve IP MAC [--name N] [--group G] [--notes '..']
+#   net-reserve release IP           remove a reservation
+#   net-reserve add-range CIDR START END [--zone Z]
+#   net-reserve del-range CIDR START
+#   net-reserve --gui [SUBNET]       Perl/Tk map: click a free cell to reserve
+#
+#   --listen HOST:PORT   daemon address (overrides --server and config)
+#   --server NAME        a server from [servers] in ~/.config/net-mgr/config
+#   --auth / --no-auth   force / suppress the SSH-key handshake
+#   --key-id ID / --key-file PATH   identity for AUTH
+#
+# A "free static" IP is one that is NOT inside any dynamic range, NOT already
+# reserved, and (for `free`) not currently observed in use — i.e. exactly the
+# pool you allocate permanent addresses from.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling pass_through);
+use NetMgr::Client;
+use NetMgr::Config;
+
+# Render tables. Defined up here (not lower in the file) because the dispatch
+# runs before any later statement would — a `my` initialised below the
+# $handler->() call is still empty when the handlers fire.
+my %COLOR = (   # ANSI background per state
+    reserved     => "\e[41m", # red     — permanent reservation
+    'pool-used'  => "\e[43m", # yellow  — dynamic pool, in use
+    'pool-free'  => "\e[44m", # blue    — dynamic pool, idle
+    'used-static'=> "\e[45m", # magenta — in use, NOT reserved (squatter)
+    free         => "\e[42m", # green   — allocatable static
+);
+my $RESET = "\e[0m";
+# Distinct one-char glyphs for the no-colour (piped) map.
+my %GLYPH = (
+    reserved => 'R', 'pool-used' => '=', 'pool-free' => '-',
+    'used-static' => '!', free => '.',
+);
+
+my ($listen, $server, $force_auth, $no_auth, $key_id, $key_file);
+my ($gui, $describe, $opt_name, $opt_group, $opt_notes, $opt_zone, $limit);
+GetOptions(
+    'listen=s'   => \$listen,
+    'server=s'   => \$server,
+    'auth'       => \$force_auth,
+    'no-auth'    => \$no_auth,
+    'key-id=s'   => \$key_id,
+    'key-file=s' => \$key_file,
+    'gui'        => \$gui,
+    'describe'   => \$describe,
+    'name=s'     => \$opt_name,
+    'group=s'    => \$opt_group,
+    'notes=s'    => \$opt_notes,
+    'zone=s'     => \$opt_zone,
+    'n=i'        => \$limit,
+) or die "bad options\n";
+
+if ($describe) {
+    print "name: net-reserve\n";
+    print "description: manage DHCP reservations + dynamic ranges in the net-mgr DB\n";
+    exit 0;
+}
+
+my $cmd = shift @ARGV;
+
+# Server resolution mirrors net-chat: --listen wins, then --server (config
+# [servers]), then $NET_MGR_LISTEN, then the configured default, then loopback.
+if (!defined $listen) {
+    if (defined $server) {
+        $listen = NetMgr::Config->resolve_server($server)
+            or die "net-reserve: unknown server '$server'\n";
+    } else {
+        $listen = $ENV{NET_MGR_LISTEN}
+               // NetMgr::Config->resolve_server(undef)
+               // '127.0.0.1:7531';
+    }
+}
+
+if ($gui) { cmd_gui(shift @ARGV); exit 0; }
+usage() unless defined $cmd;
+
+my %DISPATCH = (
+    list      => \&cmd_list,
+    map       => \&cmd_list,    # alias
+    free      => \&cmd_free,
+    ranges    => \&cmd_ranges,
+    reserve   => \&cmd_reserve,
+    release   => \&cmd_release,
+    move       => \&cmd_move,
+    reallocate => \&cmd_move,   # alias
+    'add-range' => \&cmd_add_range,
+    'del-range' => \&cmd_del_range,
+    gui       => sub { cmd_gui(shift @ARGV) },
+);
+my $handler = $DISPATCH{$cmd} or usage("unknown command '$cmd'");
+$handler->();
+exit 0;
+
+# ---- connection ------------------------------------------------------
+
+sub connect_client {
+    my %opt = @_;
+    my $cli = eval { NetMgr::Client->new(listen => $listen, timeout => 10) }
+        or die "net-reserve: cannot reach daemon at $listen: $@";
+    my ($host) = NetMgr::Client::split_hostport($listen); $host //= '';
+    my $is_loopback = $host =~ /^(?:127\.\d+\.\d+\.\d+|::1|localhost)$/;
+    my $do_auth = $force_auth || (!$is_loopback && !$no_auth);
+    $do_auth = $opt{want_auth} if exists $opt{want_auth};
+    $do_auth = 0 if $no_auth;
+    if ($do_auth) {
+        eval {
+            $cli->auth(
+                (defined $key_id   ? (key_id   => $key_id)   : ()),
+                (defined $key_file ? (key_file => $key_file) : ()),
+            );
+        };
+        die "net-reserve: AUTH failed: $@" if $@;
+    }
+    $cli->hello(consumer => "net-reserve.$$");
+    return $cli;
+}
+
+# ---- IP / subnet math ------------------------------------------------
+
+sub ip2int {
+    my @o = split /\./, ($_[0] // '');
+    return undef unless @o == 4 && !grep { $_ !~ /^\d+$/ || $_ > 255 } @o;
+    return ($o[0] << 24) + ($o[1] << 16) + ($o[2] << 8) + $o[3];
+}
+sub int2ip { my $n = $_[0]; join '.', ($n >> 24) & 255, ($n >> 16) & 255,
+                                       ($n >> 8) & 255, $n & 255 }
+
+# Parse "A.B.C.D/len" → (network_int, len, first_host_int, last_host_int).
+sub cidr_parts {
+    my ($cidr) = @_;
+    my ($net, $len) = split m{/}, $cidr;
+    $len = 24 unless defined $len && length $len;
+    my $ni = ip2int($net);
+    return unless defined $ni;
+    my $mask = $len == 0 ? 0 : (0xFFFFFFFF << (32 - $len)) & 0xFFFFFFFF;
+    my $network = $ni & $mask;
+    my $bcast   = $network | (~$mask & 0xFFFFFFFF);
+    my $first   = $len >= 31 ? $network : $network + 1;     # skip .0
+    my $last    = $len >= 31 ? $bcast   : $bcast - 1;       # skip .255
+    return ($network, $len, $first, $last);
+}
+sub subnet_of { my $i = ip2int($_[0]); defined $i ? int2ip($i & 0xFFFFFF00) . "/24" : undef }
+
+# ---- gather the world from the daemon --------------------------------
+#
+# Returns a model: { ranges=>[..], resv=>{ip=>row}, leased=>{ip=>row},
+#                    observed=>{ip=>row}, subnets=>[cidr,..] }
+sub gather {
+    my ($cli) = @_;
+    my $ranges = eval { $cli->snapshot(1, 'dhcp_ranges') }        || [];
+    my $resv   = eval { $cli->snapshot(2, 'dhcp_reservations') }  || [];
+    my $leases = eval { $cli->snapshot(3, 'dhcp_leases') }        || [];
+    my $addrs  = eval { $cli->snapshot(4, 'addresses',
+                          where => "family = 'inet'") }           || [];
+
+    my %resv     = map { $_->{ip}  => $_ } @$resv;
+    my %leased   = map { $_->{ip}  => $_ } grep { $_->{ip}  } @$leases;
+    my %observed = map { $_->{addr} => $_ } grep { $_->{addr} } @$addrs;
+
+    my %subnets;
+    $subnets{ $_->{subnet_cidr} } = 1 for @$ranges;
+    for my $ip (keys %resv, keys %leased, keys %observed) {
+        my $s = subnet_of($ip) or next;
+        $subnets{$s} = 1;
+    }
+    my @subnets = sort {
+        (ip2int((split m{/}, $a)[0]) // 0) <=> (ip2int((split m{/}, $b)[0]) // 0)
+    } keys %subnets;
+
+    return {
+        ranges => $ranges, resv => \%resv, leased => \%leased,
+        observed => \%observed, subnets => \@subnets,
+    };
+}
+
+# Is $ip_int inside any dynamic range of $cidr?
+sub in_pool {
+    my ($model, $ip_int) = @_;
+    for my $r (@{ $model->{ranges} }) {
+        my $lo = ip2int($r->{start_ip}); my $hi = ip2int($r->{end_ip});
+        next unless defined $lo && defined $hi;
+        return 1 if $ip_int >= $lo && $ip_int <= $hi;
+    }
+    return 0;
+}
+
+# Classify one host address → state keyword.
+sub classify {
+    my ($model, $ip) = @_;
+    my $i = ip2int($ip);
+    return 'reserved'  if $model->{resv}{$ip};
+    if (in_pool($model, $i)) {
+        return 'pool-used' if $model->{leased}{$ip} || $model->{observed}{$ip};
+        return 'pool-free';
+    }
+    return 'used-static' if $model->{leased}{$ip} || $model->{observed}{$ip};
+    return 'free';
+}
+
+# ---- CLI: colour + rendering ----------------------------------------
+
+sub use_color { -t STDOUT }
+
+sub state_label {
+    my %L = (reserved=>'reserved', 'pool-used'=>'dhcp (in use)',
+             'pool-free'=>'dhcp (free)', 'used-static'=>'in use, unreserved',
+             free=>'free static');
+    return $L{$_[0]} // $_[0];
+}
+
+sub cmd_list {
+    my $cli = connect_client(want_auth => 0);
+    my $model = gather($cli);
+    my $only = shift @ARGV;
+    my @subnets = $only ? (grep { $_ eq $only || index($_, "$only/") == 0
+                                  || (split m{/}, $_)[0] eq $only }
+                                @{ $model->{subnets} })
+                        : @{ $model->{subnets} };
+    @subnets = @{ $model->{subnets} } if $only && !@subnets && $only =~ m{/};
+    unless (@subnets) {
+        print "no subnets known to the daemon yet "
+            . "(seed ranges with `net-reserve add-range` or net-import-dhcp)\n";
+        return;
+    }
+    my $c = use_color();
+    for my $cidr (@subnets) {
+        my ($net, $len, $first, $last) = cidr_parts($cidr);
+        next unless defined $net;
+        printf "\n%s  (%s)\n", $cidr, pool_summary($model, $cidr);
+        # 16-wide grid of last octet for /24; generic otherwise.
+        my $col = 0;
+        for (my $i = $first; $i <= $last; $i++) {
+            my $ip = int2ip($i);
+            my $st = classify($model, $ip);
+            my $oct = $i & 0xFF;
+            if ($c) {
+                printf "%s%3d%s ", $COLOR{$st}, $oct, $RESET;
+            } else {
+                printf "%3d%s ", $oct, ($GLYPH{$st} // '?');
+            }
+            if (++$col % 16 == 0) { print "\n" }
+        }
+        print "\n" if $col % 16;
+        # Reservations in this subnet, grouped.
+        my @mine = sort { ip2int($a->{ip}) <=> ip2int($b->{ip}) }
+                   grep { ($_->{subnet_cidr} // subnet_of($_->{ip}) // '') eq $cidr }
+                   values %{ $model->{resv} };
+        if (@mine) {
+            print "  reservations:\n";
+            my %by_grp;
+            push @{ $by_grp{ $_->{grp} // '(ungrouped)' } }, $_ for @mine;
+            for my $g (sort keys %by_grp) {
+                print "    [$g]\n";
+                for my $r (@{ $by_grp{$g} }) {
+                    printf "      %-15s %-17s %s\n",
+                        $r->{ip}, $r->{mac}, ($r->{name} // '');
+                }
+            }
+        }
+    }
+    if ($c) {
+        print "\nlegend: ";
+        print "$COLOR{$_}$RESET ", state_label($_), "  " for
+            qw(free reserved pool-free pool-used used-static);
+        print "\n";
+    }
+}
+
+sub pool_summary {
+    my ($model, $cidr) = @_;
+    my @r = grep { $_->{subnet_cidr} eq $cidr } @{ $model->{ranges} };
+    return "no dynamic range defined" unless @r;
+    return join ", ", map { "$_->{start_ip}-$_->{end_ip}" } @r;
+}
+
+sub cmd_free {
+    my $cli = connect_client(want_auth => 0);
+    my $model = gather($cli);
+    my $only = shift @ARGV;
+    my $want = $limit || 10;
+    my @subnets = $only ? (grep { (split m{/}, $_)[0] eq $only || $_ eq $only }
+                                @{ $model->{subnets} })
+                        : @{ $model->{subnets} };
+    @subnets = ($only) if $only && !@subnets && $only =~ m{/};
+    for my $cidr (@subnets) {
+        my ($net, $len, $first, $last) = cidr_parts($cidr);
+        next unless defined $net;
+        my @free;
+        for (my $i = $first; $i <= $last && @free < $want; $i++) {
+            push @free, int2ip($i) if classify($model, int2ip($i)) eq 'free';
+        }
+        printf "%s: %s\n", $cidr, (@free ? join(' ', @free) : '(none free)');
+    }
+}
+
+sub cmd_ranges {
+    my $cli = connect_client(want_auth => 0);
+    my $rows = eval { $cli->snapshot(1, 'dhcp_ranges') } || [];
+    unless (@$rows) { print "no dynamic ranges defined\n"; return }
+    printf "%-20s %-15s %-15s %s\n", 'SUBNET', 'START', 'END', 'ZONE';
+    for my $r (sort { $a->{subnet_cidr} cmp $b->{subnet_cidr} } @$rows) {
+        printf "%-20s %-15s %-15s %s\n",
+            $r->{subnet_cidr}, $r->{start_ip}, $r->{end_ip}, ($r->{zone} // '');
+    }
+}
+
+sub cmd_reserve {
+    my $ip  = shift @ARGV or usage("reserve needs IP MAC");
+    my $mac = shift @ARGV or usage("reserve needs IP MAC");
+    die "net-reserve: bad IP '$ip'\n"  unless defined ip2int($ip);
+    die "net-reserve: bad MAC '$mac'\n" unless $mac =~ /^[0-9a-fA-F:]{17}$/;
+    my $cli = connect_client();
+    # Warn (don't block) if the chosen IP sits inside a dynamic pool.
+    my $model = gather($cli);
+    my $st = classify($model, $ip);
+    warn "net-reserve: note: $ip is inside a DHCP dynamic range — "
+       . "it may also be auto-leased; consider a free static instead\n"
+        if $st =~ /^pool/;
+    my $r = $cli->observe(
+        kind => 'dhcp_reservation', ip => $ip, mac => lc $mac,
+        (defined $opt_name  ? (name  => $opt_name)  : ()),
+        subnet_cidr => subnet_of($ip),
+        (defined $opt_group ? (grp   => $opt_group) : ()),
+        (defined $opt_notes ? (notes => $opt_notes) : ()),
+    );
+    die "net-reserve: $r\n" if !defined $r || $r =~ /^ERR/;
+    print "reserved $ip -> $mac",
+          (defined $opt_name ? " ($opt_name)" : ''),
+          (defined $opt_group ? " [$opt_group]" : ''), "\n";
+}
+
+sub cmd_release {
+    my $ip = shift @ARGV or usage("release needs IP");
+    my $cli = connect_client();
+    my $r = $cli->observe(kind => 'dhcp_reservation_delete', ip => $ip);
+    die "net-reserve: $r\n" if !defined $r || $r =~ /^ERR/;
+    print "released $ip\n";
+}
+
+sub cmd_move {
+    my $old = shift @ARGV or usage("move needs OLD_IP NEW_IP");
+    my $new = shift @ARGV or usage("move needs OLD_IP NEW_IP");
+    die "net-reserve: bad IP\n" unless defined ip2int($old) && defined ip2int($new);
+    my $cli = connect_client();
+    my $model = gather($cli);
+    warn "net-reserve: note: $new is inside a DHCP dynamic range\n"
+        if classify($model, $new) =~ /^pool/;
+    my $r = $cli->observe(kind => 'dhcp_reservation_move', ip => $old, new_ip => $new);
+    die "net-reserve: $r\n" if !defined $r || $r =~ /^ERR/;
+    print "moved $old -> $new\n";
+}
+
+sub cmd_add_range {
+    my $cidr  = shift @ARGV or usage("add-range needs CIDR START END");
+    my $start = shift @ARGV or usage("add-range needs CIDR START END");
+    my $end   = shift @ARGV or usage("add-range needs CIDR START END");
+    my $cli = connect_client();
+    my $r = $cli->observe(kind => 'dhcp_range', subnet_cidr => $cidr,
+        start_ip => $start, end_ip => $end,
+        (defined $opt_zone ? (zone => $opt_zone) : ()));
+    die "net-reserve: $r\n" if !defined $r || $r =~ /^ERR/;
+    print "added range $cidr $start-$end\n";
+}
+
+sub cmd_del_range {
+    my $cidr  = shift @ARGV or usage("del-range needs CIDR START");
+    my $start = shift @ARGV or usage("del-range needs CIDR START");
+    my $cli = connect_client();
+    my $r = $cli->observe(kind => 'dhcp_range_delete',
+        subnet_cidr => $cidr, start_ip => $start);
+    die "net-reserve: $r\n" if !defined $r || $r =~ /^ERR/;
+    print "deleted range $cidr $start\n";
+}
+
+# ---- Perl/Tk GUI -----------------------------------------------------
+
+sub cmd_gui {
+    my ($want_subnet) = @_;
+    eval { require Tk; Tk->import; require Tk::DialogBox; require Tk::Optionmenu; 1 }
+        or die "net-reserve: Perl/Tk not available: $@";
+
+    my $cli = connect_client();   # auth on remote so reserve/release work
+    my %S = (subnet => $want_subnet, model => gather($cli), cur => undef);
+    $S{subnet} //= $S{model}{subnets}[0];
+
+    my $mw = Tk::MainWindow->new(-title => "net-reserve — $listen");
+    $S{anchor} = $mw;             # dialogs parent off the main window
+    my $fs = 10;
+    $mw->fontCreate('nrui',   -size => $fs);
+    $mw->fontCreate('nrmono', -family => 'Courier', -size => $fs);
+    $mw->optionAdd('*font' => 'nrui', 81);
+
+    my $top = $mw->Frame->pack(-side => 'top', -fill => 'x', -pady => 2);
+    $top->Label(-text => 'Subnet:')->pack(-side => 'left');
+    # Forward-declared so the widget callbacks below close over them; the
+    # coderefs are assigned further down but only ever *called* at event time.
+    my ($subnet_om, $status, $canvas, $resv_text, $redraw, $refresh_subnets);
+
+    $subnet_om = $top->Optionmenu(
+        -options => [ @{ $S{model}{subnets} } ],
+        -variable => \$S{subnet},
+        -command  => sub { $redraw->() },
+    )->pack(-side => 'left');
+    $top->Button(-text => 'Reload',
+        -command => sub { $S{model} = gather($cli); $refresh_subnets->(); $redraw->() }
+    )->pack(-side => 'left', -padx => 4);
+
+    # legend
+    my %CELL = (
+        reserved => '#d33', 'pool-used' => '#dd3', 'pool-free' => '#36c',
+        'used-static' => '#c3c', free => '#3a3',
+    );
+    my $leg = $top->Frame->pack(-side => 'right');
+    for my $st (qw(free reserved pool-free pool-used used-static)) {
+        $leg->Label(-text => '  ', -background => $CELL{$st})->pack(-side => 'left');
+        $leg->Label(-text => state_label($st) . ' ')->pack(-side => 'left');
+    }
+
+    my $body = $mw->Frame->pack(-side => 'top', -fill => 'both', -expand => 1);
+    $canvas = $body->Canvas(-width => 16*34, -height => 16*22, -background => '#fff')
+        ->pack(-side => 'left', -fill => 'both', -expand => 1, -padx => 4, -pady => 4);
+    my $side = $body->Frame->pack(-side => 'right', -fill => 'y');
+    $side->Label(-text => 'Reservations')->pack(-side => 'top', -anchor => 'w');
+    $resv_text = $side->Scrolled('ROText', -width => 38, -height => 24,
+        -font => 'nrmono', -scrollbars => 'oe')->pack(-side => 'top', -fill => 'y', -expand => 1);
+
+    $status = $mw->Label(-anchor => 'w', -relief => 'sunken')
+        ->pack(-side => 'bottom', -fill => 'x');
+
+    $refresh_subnets = sub {
+        $subnet_om->configure(-options => [ @{ $S{model}{subnets} } ]);
+    };
+
+    $redraw = sub {
+        my $cidr = $S{subnet};
+        $canvas->delete('all');
+        $resv_text->delete('1.0', 'end');
+        unless (defined $cidr) { $status->configure(-text => ' no subnets'); return }
+        my ($net, $len, $first, $last) = cidr_parts($cidr);
+        unless (defined $net) { $status->configure(-text => " bad subnet $cidr"); return }
+        my $model = $S{model};
+        my ($cw, $ch, $pad) = (34, 22, 2);
+        my $col = 0; my $rown = 0;
+        for (my $i = $first; $i <= $last; $i++) {
+            my $ip = int2ip($i);
+            my $st = classify($model, $ip);
+            my $x = ($col % 16) * $cw + $pad;
+            my $y = $rown * $ch + $pad;
+            my $r = $canvas->createRectangle($x, $y, $x+$cw-2, $y+$ch-2,
+                -fill => $CELL{$st}, -outline => '#999');
+            my $t = $canvas->createText($x+($cw-2)/2, $y+($ch-2)/2,
+                -text => ($i & 0xFF), -font => 'nrmono');
+            for my $item ($r, $t) {
+                $canvas->bind($item, '<Button-1>',
+                    [ sub { cell_click($cli, \%S, $ip, $redraw, $status) } ]);
+            }
+            if (++$col % 16 == 0) { $rown++ }
+        }
+        # side list, grouped
+        my @mine = sort { ip2int($a->{ip}) <=> ip2int($b->{ip}) }
+                   grep { ($_->{subnet_cidr} // subnet_of($_->{ip}) // '') eq $cidr }
+                   values %{ $model->{resv} };
+        my %by_grp; push @{ $by_grp{ $_->{grp} // '(ungrouped)' } }, $_ for @mine;
+        for my $g (sort keys %by_grp) {
+            $resv_text->insert('end', "[$g]\n");
+            for my $rr (@{ $by_grp{$g} }) {
+                $resv_text->insert('end',
+                    sprintf("  %-15s %s\n", $rr->{ip}, ($rr->{name} // $rr->{mac})));
+            }
+        }
+        $status->configure(-text => sprintf(" %s — %s", $cidr, pool_summary($model, $cidr)));
+    };
+
+    $refresh_subnets->();
+    $redraw->();
+    # periodic refresh
+    my $tick; $tick = sub {
+        $S{model} = gather($cli); $refresh_subnets->(); $redraw->();
+        $mw->after(5000, $tick);
+    };
+    $mw->after(5000, $tick);
+    Tk::MainLoop();
+}
+
+# Click handler: free → reserve dialog; reserved → release/edit dialog.
+sub cell_click {
+    my ($cli, $S, $ip, $redraw, $status) = @_;
+    my $model = $S->{model};
+    my $st = classify($model, $ip);
+    if ($st eq 'reserved') {
+        my $r = $model->{resv}{$ip};
+        release_dialog($cli, $S, $ip, $r, $redraw, $status);
+    } else {
+        # prefill MAC if the address is currently leased/observed
+        my $mac = '';
+        $mac = $model->{leased}{$ip}{mac}   if $model->{leased}{$ip};
+        $mac = $model->{observed}{$ip}{mac} if !$mac && $model->{observed}{$ip};
+        reserve_dialog($cli, $S, $ip, $mac, $redraw, $status);
+    }
+}
+
+sub reserve_dialog {
+    my ($cli, $S, $ip, $mac, $redraw, $status) = @_;
+    my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Reserve $ip",
+        -buttons => ['Reserve', 'Cancel']);
+    my %v = (ip => $ip, mac => $mac, name => '', group => '');
+    # known groups for convenience
+    my %groups; $groups{ $_->{grp} } = 1 for grep { $_->{grp} } values %{ $S->{model}{resv} };
+    for my $f (['IP', 'ip', 0], ['MAC', 'mac', 1], ['Name', 'name', 1], ['Group', 'group', 1]) {
+        my ($lbl, $key, $edit) = @$f;
+        my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
+        $row->Label(-text => "$lbl:", -width => 7, -anchor => 'w')->pack(-side => 'left');
+        my $e = $row->Entry(-textvariable => \$v{$key}, -width => 24);
+        $e->configure(-state => 'readonly') unless $edit;
+        $e->pack(-side => 'left', -fill => 'x', -expand => 1);
+    }
+    if (keys %groups) {
+        my $row = $dlg->add('Frame')->pack(-fill => 'x');
+        $row->Label(-text => '', -width => 7)->pack(-side => 'left');
+        for my $g (sort keys %groups) {
+            $row->Button(-text => $g, -command => sub { $v{group} = $g })
+                ->pack(-side => 'left');
+        }
+    }
+    my $ans = $dlg->Show // 'Cancel';
+    return unless $ans eq 'Reserve';
+    unless ($v{mac} =~ /^[0-9a-fA-F:]{17}$/) {
+        $status->configure(-text => " bad MAC '$v{mac}' — not reserved"); return;
+    }
+    my $r = $cli->observe(kind => 'dhcp_reservation', ip => $v{ip}, mac => lc $v{mac},
+        ($v{name}  ne '' ? (name => $v{name})  : ()),
+        subnet_cidr => subnet_of($v{ip}),
+        ($v{group} ne '' ? (grp  => $v{group}) : ()));
+    if (!defined $r || $r =~ /^ERR/) { $status->configure(-text => " $r"); return }
+    $S->{model} = gather($cli); $redraw->();
+    $status->configure(-text => " reserved $v{ip} -> $v{mac}");
+}
+
+sub release_dialog {
+    my ($cli, $S, $ip, $r, $redraw, $status) = @_;
+    my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Reservation $ip",
+        -buttons => ['Move', 'Release', 'Cancel']);
+    $dlg->add('Label', -text =>
+        sprintf("%s\nMAC:  %s\nName: %s\nGroup: %s",
+            $ip, $r->{mac}, ($r->{name} // ''), ($r->{grp} // '')),
+        -justify => 'left')->pack(-padx => 8, -pady => 6);
+    my $ans = $dlg->Show // 'Cancel';
+    if ($ans eq 'Release') {
+        my $resp = $cli->observe(kind => 'dhcp_reservation_delete', ip => $ip);
+        if (!defined $resp || $resp =~ /^ERR/) { $status->configure(-text => " $resp"); return }
+        $S->{model} = gather($cli); $redraw->();
+        $status->configure(-text => " released $ip");
+    } elsif ($ans eq 'Move') {
+        move_dialog($cli, $S, $ip, $r, $redraw, $status);
+    }
+}
+
+# Reallocate an existing reservation to a different IP (default: the next
+# free static in the same subnet).
+sub move_dialog {
+    my ($cli, $S, $ip, $r, $redraw, $status) = @_;
+    my $suggest = next_free($S->{model}, subnet_of($ip)) // '';
+    my $newip = $suggest;
+    my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Move $ip",
+        -buttons => ['Move', 'Cancel']);
+    my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 4, -padx => 6);
+    $row->Label(-text => "$ip ($r->{mac}) -> ")->pack(-side => 'left');
+    $row->Entry(-textvariable => \$newip, -width => 16)->pack(-side => 'left');
+    my $ans = $dlg->Show // 'Cancel';
+    return unless $ans eq 'Move';
+    unless (defined ip2int($newip)) { $status->configure(-text => " bad IP '$newip'"); return }
+    my $resp = $cli->observe(kind => 'dhcp_reservation_move', ip => $ip, new_ip => $newip);
+    if (!defined $resp || $resp =~ /^ERR/) { $status->configure(-text => " $resp"); return }
+    $S->{model} = gather($cli); $redraw->();
+    $status->configure(-text => " moved $ip -> $newip");
+}
+
+# Lowest free static IP in $cidr, or undef.
+sub next_free {
+    my ($model, $cidr) = @_;
+    my ($net, $len, $first, $last) = cidr_parts($cidr);
+    return undef unless defined $net;
+    for (my $i = $first; $i <= $last; $i++) {
+        return int2ip($i) if classify($model, int2ip($i)) eq 'free';
+    }
+    return undef;
+}
+
+sub usage {
+    my ($msg) = @_;
+    print STDERR "net-reserve: $msg\n\n" if $msg;
+    print STDERR <<'USAGE';
+usage:
+  net-reserve list [SUBNET]              colour-coded address map
+  net-reserve free [SUBNET] [-n N]       next free static IPs
+  net-reserve ranges                     dynamic DHCP pools
+  net-reserve reserve IP MAC [--name N] [--group G] [--notes '..']
+  net-reserve release IP
+  net-reserve move OLD_IP NEW_IP         reallocate a reservation
+  net-reserve add-range CIDR START END [--zone Z]
+  net-reserve del-range CIDR START
+  net-reserve --gui [SUBNET]             Perl/Tk map (click a cell to reserve)
+
+  --listen H:P / --server NAME           daemon address
+  --auth / --no-auth / --key-id / --key-file
+USAGE
+    exit($msg ? 2 : 0);
+}

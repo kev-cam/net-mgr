@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 23;
+our $SCHEMA_VERSION = 24;
 
 sub new {
     my ($class, %args) = @_;
@@ -612,6 +612,44 @@ CREATE TABLE IF NOT EXISTS host_keys (
     KEY idx_host_keys_machine (machine_id),
     CONSTRAINT fk_host_keys_machine
         FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
+    if ($v == 24) {
+        # DB-native DHCP plan: dynamic-pool ranges + static reservations,
+        # both cluster-replicated. See sql/schema.sql for column docs.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS dhcp_ranges (
+    subnet_cidr  VARCHAR(45)  NOT NULL,
+    start_ip     VARCHAR(45)  NOT NULL,
+    end_ip       VARCHAR(45)  NOT NULL,
+    zone         VARCHAR(64)  NULL,
+    notes        TEXT         NULL,
+    updated_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                              ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from VARCHAR(64) NULL,
+    PRIMARY KEY (subnet_cidr, start_ip),
+    KEY idx_dhcp_ranges_subnet (subnet_cidr),
+    KEY idx_dhcp_ranges_replicated (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS dhcp_reservations (
+    ip           VARCHAR(45)  NOT NULL PRIMARY KEY,
+    mac          CHAR(17)     NOT NULL,
+    name         VARCHAR(255) NULL,
+    subnet_cidr  VARCHAR(45)  NULL,
+    grp          VARCHAR(64)  NULL,
+    notes        TEXT         NULL,
+    updated_by   VARCHAR(128) NULL,
+    updated_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                              ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from VARCHAR(64) NULL,
+    KEY idx_resv_mac    (mac),
+    KEY idx_resv_subnet (subnet_cidr),
+    KEY idx_resv_grp    (grp),
+    KEY idx_resv_replicated (replicated_from)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
         return;
@@ -1981,6 +2019,134 @@ sub clear_chat_presence {
     $self->{dbh}->do("DELETE FROM chat_presence");
 }
 
+# ---- DB-native DHCP plan: ranges + reservations (schema v24) ---------
+#
+# These return the {op, now} shape so the daemon's _upsert/_emit_change
+# pipeline streams changes to subscribers (the net-reserve GUI) and the
+# cluster relay carries them to peers.
+
+# All dynamic-pool ranges, optionally for one subnet. Oldest-stable order.
+sub get_dhcp_ranges {
+    my ($self, $subnet) = @_;
+    return $self->{dbh}->selectall_arrayref(
+        "SELECT * FROM dhcp_ranges"
+        . ($subnet ? " WHERE subnet_cidr = ?" : "")
+        . " ORDER BY subnet_cidr, INET_ATON(start_ip)",
+        { Slice => {} }, ($subnet ? ($subnet) : ()));
+}
+
+# Upsert one dynamic range. Keyed by (subnet_cidr, start_ip).
+sub upsert_dhcp_range {
+    my ($self, %f) = @_;
+    croak "subnet_cidr + start_ip + end_ip required"
+        unless defined $f{subnet_cidr} && defined $f{start_ip}
+            && defined $f{end_ip};
+    my $was = $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM dhcp_ranges WHERE subnet_cidr = ? AND start_ip = ?",
+        undef, $f{subnet_cidr}, $f{start_ip});
+    $self->{dbh}->do(
+        "INSERT INTO dhcp_ranges (subnet_cidr, start_ip, end_ip, zone, notes)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            end_ip = VALUES(end_ip),
+            zone   = VALUES(zone),
+            notes  = VALUES(notes)",
+        undef, $f{subnet_cidr}, $f{start_ip}, $f{end_ip},
+        $f{zone}, $f{notes});
+    my $now = $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM dhcp_ranges WHERE subnet_cidr = ? AND start_ip = ?",
+        undef, $f{subnet_cidr}, $f{start_ip});
+    return { op => ($was ? 'update' : 'insert'), now => $now };
+}
+
+# Remove one dynamic range. Returns the deleted row (for a delete emit) or undef.
+sub delete_dhcp_range {
+    my ($self, $subnet, $start) = @_;
+    my $row = $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM dhcp_ranges WHERE subnet_cidr = ? AND start_ip = ?",
+        undef, $subnet, $start) or return undef;
+    $self->{dbh}->do(
+        "DELETE FROM dhcp_ranges WHERE subnet_cidr = ? AND start_ip = ?",
+        undef, $subnet, $start);
+    return $row;
+}
+
+# All reservations, optionally for one subnet.
+sub get_dhcp_reservations {
+    my ($self, $subnet) = @_;
+    return $self->{dbh}->selectall_arrayref(
+        "SELECT * FROM dhcp_reservations"
+        . ($subnet ? " WHERE subnet_cidr = ?" : "")
+        . " ORDER BY INET_ATON(ip)",
+        { Slice => {} }, ($subnet ? ($subnet) : ()));
+}
+
+sub get_dhcp_reservation {
+    my ($self, $ip) = @_;
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM dhcp_reservations WHERE ip = ?", undef, $ip);
+}
+
+# Upsert one reservation, keyed by IP (one device per address). mac is
+# stored lowercased to match interfaces/addresses.
+sub upsert_dhcp_reservation {
+    my ($self, %f) = @_;
+    croak "ip + mac required" unless defined $f{ip} && defined $f{mac};
+    my $mac = lc $f{mac};
+    my $was = $self->get_dhcp_reservation($f{ip});
+    $self->{dbh}->do(
+        "INSERT INTO dhcp_reservations
+            (ip, mac, name, subnet_cidr, grp, notes, updated_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            mac         = VALUES(mac),
+            name        = VALUES(name),
+            subnet_cidr = VALUES(subnet_cidr),
+            grp         = VALUES(grp),
+            notes       = VALUES(notes),
+            updated_by  = VALUES(updated_by)",
+        undef, $f{ip}, $mac, $f{name}, $f{subnet_cidr},
+        $f{grp}, $f{notes}, $f{updated_by});
+    return { op => ($was ? 'update' : 'insert'),
+             now => $self->get_dhcp_reservation($f{ip}) };
+}
+
+# Remove a reservation by IP. Returns the deleted row or undef.
+sub delete_dhcp_reservation {
+    my ($self, $ip) = @_;
+    my $row = $self->get_dhcp_reservation($ip) or return undef;
+    $self->{dbh}->do("DELETE FROM dhcp_reservations WHERE ip = ?", undef, $ip);
+    return $row;
+}
+
+# Move a reservation from $old to $new IP, carrying its mac/name/grp/notes.
+# Atomic (the device never has two reservations mid-flight). Returns:
+#   undef                          — nothing reserved at $old
+#   { error => 'occupied', ... }   — $new already holds a different reservation
+#   { old => $oldrow, new => $newrow } — moved
+# %opts: subnet_cidr (for the new /24), updated_by.
+sub move_dhcp_reservation {
+    my ($self, $old, $new, %opts) = @_;
+    return undef if $old eq $new;     # no-op handled by caller as success
+    my $row = $self->get_dhcp_reservation($old) or return undef;
+    my $at_new = $self->get_dhcp_reservation($new);
+    return { error => 'occupied', new => $at_new } if $at_new;
+    $self->{dbh}->begin_work;
+    eval {
+        $self->{dbh}->do(
+            "INSERT INTO dhcp_reservations
+                (ip, mac, name, subnet_cidr, grp, notes, updated_by)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            undef, $new, $row->{mac}, $row->{name},
+            ($opts{subnet_cidr} // $row->{subnet_cidr}),
+            $row->{grp}, $row->{notes}, ($opts{updated_by} // $row->{updated_by}));
+        $self->{dbh}->do("DELETE FROM dhcp_reservations WHERE ip = ?", undef, $old);
+        $self->{dbh}->commit;
+        1;
+    } or do { my $e = $@; eval { $self->{dbh}->rollback }; croak "move failed: $e"; };
+    return { old => $row, new => $self->get_dhcp_reservation($new) };
+}
+
 sub query_table {
     my ($self, $table, %opts) = @_;
     my %allowed = map { $_ => 1 } qw(
@@ -1991,7 +2157,7 @@ sub query_table {
         zone_classes interface_zones wifi_zones
         audit_annotations wifi_scan_results wifi_radio_state
         chat_sessions chat_members chat_messages chat_presence
-        host_keys
+        host_keys dhcp_ranges dhcp_reservations
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};

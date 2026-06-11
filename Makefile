@@ -23,7 +23,7 @@ CGIDIR     ?= /usr/lib/cgi-bin
 APACHE_CONF_DIR ?= $(SYSCONFDIR)/apache2/conf-available
 DESTDIR    ?=
 
-BINS  = net-alias net-chat net-poll-ap net-audit net-audit-aps net-cluster net-cluster-gui net-config-gui net-connect net-diag net-discover net-find-lost net-find-peers net-find-rogue-dhcp net-fw net-gen-apache-conf net-gen-dnsmasq net-import-dhcp net-import-ssh-forwards net-fix net-isp net-link-stats net-lookup net-name net-peer net-ping net-kill-rogue-dhcp net-roam net-router net-run-app net-scan net-report net-set net-show net-tp-scan net-uplink-probe net-var net-watch net-wifi-survey net-zones
+BINS  = net-alias net-chat net-poll-ap net-audit net-audit-aps net-cluster net-cluster-gui net-config-gui net-connect net-diag net-discover net-find-lost net-find-peers net-find-rogue-dhcp net-fw net-gen-apache-conf net-gen-dnsmasq net-import-dhcp net-import-ssh-forwards net-fix net-isp net-link-stats net-lookup net-name net-peer net-ping net-kill-rogue-dhcp net-reserve net-roam net-router net-run-app net-scan net-report net-set net-show net-tp-scan net-uplink-probe net-var net-watch net-wifi-survey net-zones
 
 # Symlinks installed pointing at net-run-app — each link picks its
 # behavior from basename($0) so adding a new wrapper is a one-line
@@ -36,7 +36,7 @@ RECOVERYS = net-recover-tlsg2424
 UNITS = net-mgr.service net-dns.service net-mgr-relay.service
 MAN1S = net-alias.1 net-chat.1 net-connect.1 net-diag.1 net-discover.1 net-fix.1 \
         net-gen-dnsmasq.1 net-import-dhcp.1 net-name.1 net-ping.1 \
-        net-poll-ap.1 net-report.1 net-roam.1 net-router.1 net-scan.1 \
+        net-poll-ap.1 net-report.1 net-reserve.1 net-roam.1 net-router.1 net-scan.1 \
         net-show.1 net-tp-scan.1 net-var.1 net-watch.1
 MAN7S = net-mgr.7
 LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \

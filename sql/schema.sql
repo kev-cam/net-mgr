@@ -584,4 +584,48 @@ CREATE TABLE IF NOT EXISTS host_keys (
         FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-INSERT IGNORE INTO schema_version (version) VALUES (23);
+-- DB-native DHCP plan (schema v24) — moves the dynamic-pool bounds and the
+-- static reservations out of the hand-edited /etc/net-mgr/dhcp.master and into
+-- the (cluster-replicated) DB, so net-reserve(1) can manage them from any host
+-- and net-gen-dnsmasq can generate straight from the DB. Seeded once from the
+-- existing dhcp.master by net-import-dhcp.
+
+-- dhcp_ranges: the address ranges the DHCP server hands out automatically.
+-- These are exactly the IPs net-reserve must NOT offer as a static. One row
+-- per `range A B;` directive; a subnet may have several.
+CREATE TABLE IF NOT EXISTS dhcp_ranges (
+    subnet_cidr  VARCHAR(45)  NOT NULL,        -- e.g. 192.168.15.0/24
+    start_ip     VARCHAR(45)  NOT NULL,        -- first auto-assigned address
+    end_ip       VARCHAR(45)  NOT NULL,        -- last auto-assigned address
+    zone         VARCHAR(64)  NULL,            -- subnet `# zone=` annotation
+    notes        TEXT         NULL,
+    updated_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                              ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from VARCHAR(64) NULL,          -- cluster master, NULL = local
+    PRIMARY KEY (subnet_cidr, start_ip),
+    KEY idx_dhcp_ranges_subnet (subnet_cidr),
+    KEY idx_dhcp_ranges_replicated (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- dhcp_reservations: permanent (MAC -> fixed IP) assignments — the DB-native
+-- replacement for `host { hardware ethernet ..; fixed-address ..; }` blocks.
+-- One reservation per IP (uniq); a device (mac) may hold more than one across
+-- subnets. `grp` is the user's group label (was a dhcp.master comment).
+CREATE TABLE IF NOT EXISTS dhcp_reservations (
+    ip           VARCHAR(45)  NOT NULL PRIMARY KEY,
+    mac          CHAR(17)     NOT NULL,
+    name         VARCHAR(255) NULL,            -- dnsmasq host name / label
+    subnet_cidr  VARCHAR(45)  NULL,            -- owning subnet (for grouping)
+    grp          VARCHAR(64)  NULL,            -- user group, e.g. 'cameras'
+    notes        TEXT         NULL,
+    updated_by   VARCHAR(128) NULL,            -- who last set it
+    updated_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                              ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from VARCHAR(64) NULL,
+    KEY idx_resv_mac    (mac),
+    KEY idx_resv_subnet (subnet_cidr),
+    KEY idx_resv_grp    (grp),
+    KEY idx_resv_replicated (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO schema_version (version) VALUES (24);
