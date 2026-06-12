@@ -211,7 +211,7 @@ sub gather {
     my $resv   = eval { $cli->snapshot(2, 'dhcp_reservations') }  || [];
     my $leases = eval { $cli->snapshot(3, 'dhcp_leases') }        || [];
     my $addrs  = eval { $cli->snapshot(4, 'addresses',
-                          where => "family = 'inet'") }           || [];
+                          where => "family = 'v4'") }             || [];
 
     my %resv     = map { $_->{ip}  => $_ } @$resv;
     my %leased   = map { $_->{ip}  => $_ } grep { $_->{ip}  } @$leases;
