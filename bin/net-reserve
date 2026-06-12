@@ -183,6 +183,24 @@ sub normalize_cidr {
     return int2ip($network) . "/$len";
 }
 
+# Subnets this machine is directly attached to (from `ip -o -4 addr`), as
+# canonical CIDRs — used to seed the GUI subnet picker so your own LANs show
+# up even before the DB has any rows for them. Loopback/link-local skipped.
+sub local_subnets {
+    my (@out, %seen);
+    open my $fh, '-|', 'ip', '-o', '-4', 'addr', 'show'
+        or return [];
+    while (<$fh>) {
+        next unless /\binet\s+(\d+\.\d+\.\d+\.\d+)\/(\d+)/;
+        my ($ip, $len) = ($1, $2);
+        next if $ip =~ /^127\./ || $ip =~ /^169\.254\./;
+        my $c = normalize_cidr("$ip/$len") or next;
+        push @out, $c unless $seen{$c}++;
+    }
+    close $fh;
+    return \@out;
+}
+
 # ---- gather the world from the daemon --------------------------------
 #
 # Returns a model: { ranges=>[..], resv=>{ip=>row}, leased=>{ip=>row},
@@ -423,12 +441,15 @@ sub cmd_gui {
 
     my $cli = connect_client();   # auth on remote so reserve/release work
     my %S = (subnet => undef, model => gather($cli), cur => undef, pinned => {});
+    # Seed the picker with this machine's own attached subnets, so your LANs
+    # are pickable even before the DB has ranges/leases for them.
+    $S{pinned}{$_} = 1 for @{ local_subnets() };
     # An explicit `--gui SUBNET` opens straight to it, even with no data yet.
     if (defined $want_subnet) {
         my $n = normalize_cidr($want_subnet);
         if ($n) { $S{subnet} = $n; $S{pinned}{$n} = 1; }
     }
-    $S{subnet} //= $S{model}{subnets}[0];
+    $S{subnet} //= $S{model}{subnets}[0] // (sort keys %{ $S{pinned} })[0];
 
     my $mw = Tk::MainWindow->new(-title => "net-reserve — $listen");
     $S{anchor} = $mw;             # dialogs parent off the main window
@@ -514,22 +535,50 @@ sub cmd_gui {
         my ($net, $len, $first, $last) = cidr_parts($cidr);
         unless (defined $net) { $status->configure(-text => " bad subnet $cidr"); return }
         my $model = $S{model};
-        my ($cw, $ch, $pad) = (34, 22, 2);
-        my $col = 0; my $rown = 0;
-        for (my $i = $first; $i <= $last; $i++) {
+        # Fixed-size cells. For a /24 (or smaller) the whole subnet fits in one
+        # 256-block, so position every cell by its last octet — column = low
+        # nibble, row = high nibble — giving a regular 16-wide grid you can read
+        # by address. Larger subnets fall back to sequential fixed boxes.
+        my ($cw, $ch, $pad) = (30, 22, 1);
+        my ($hx, $hy) = (24, 16);        # left + top header gutters
+        my $octet_mode = $len >= 24;
+        my $draw_cell = sub {
+            my ($i, $x, $y) = @_;
             my $ip = int2ip($i);
             my $st = classify($model, $ip);
-            my $x = ($col % 16) * $cw + $pad;
-            my $y = $rown * $ch + $pad;
-            my $r = $canvas->createRectangle($x, $y, $x+$cw-2, $y+$ch-2,
+            my $r = $canvas->createRectangle($x, $y, $x + $cw - 2, $y + $ch - 2,
                 -fill => $CELL{$st}, -outline => '#999');
-            my $t = $canvas->createText($x+($cw-2)/2, $y+($ch-2)/2,
+            my $t = $canvas->createText($x + ($cw - 2) / 2, $y + ($ch - 2) / 2,
                 -text => ($i & 0xFF), -font => 'nrmono');
             for my $item ($r, $t) {
                 $canvas->bind($item, '<Button-1>',
                     [ sub { cell_click($cli, \%S, $ip, $redraw, $status) } ]);
             }
-            if (++$col % 16 == 0) { $rown++ }
+        };
+        if ($octet_mode) {
+            # column headers (low nibble, hex) ...
+            for my $c (0 .. 15) {
+                $canvas->createText($hx + $c * $cw + ($cw - 2) / 2, $hy / 2,
+                    -text => sprintf('%X', $c), -font => 'nrmono', -fill => '#888');
+            }
+            my %rows;  $rows{ ($_ & 0xFF) >> 4 } = 1 for ($first .. $last);
+            # ... row labels (base octet of each used row)
+            for my $rr (sort { $a <=> $b } keys %rows) {
+                $canvas->createText($hx - 3, $hy + $rr * $ch + ($ch - 2) / 2,
+                    -text => $rr * 16, -font => 'nrmono', -fill => '#888',
+                    -anchor => 'e');
+            }
+            for my $i ($first .. $last) {
+                my $oct = $i & 0xFF;
+                $draw_cell->($i, $hx + ($oct & 0x0F) * $cw + $pad,
+                                 $hy + ($oct >> 4)   * $ch + $pad);
+            }
+        } else {
+            my $col = 0; my $rown = 0;
+            for my $i ($first .. $last) {
+                $draw_cell->($i, ($col % 16) * $cw + $pad, $rown * $ch + $pad);
+                $rown++ if ++$col % 16 == 0;
+            }
         }
         # side list, grouped
         my @mine = sort { ip2int($a->{ip}) <=> ip2int($b->{ip}) }
