@@ -140,6 +140,9 @@ sub parse_line {
     elsif ($verb eq 'CHAT_LS')        { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'CHAT_RM')        { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'CHAT_DELETE')    { $cmd->{kv} = _parse_kv_only(\@toks) }
+    # net-mgr-relay's loopback proxy: pull one subnet's rows from the
+    # elected master into the local DB right now (lazy sync otherwise).
+    elsif ($verb eq 'REFRESH')        { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'BYE')       { croak "BYE takes no args" if @toks }
     elsif ($verb eq 'STATUS')    { croak "STATUS takes no args" if @toks }
     elsif ($verb eq 'UNSUB') {

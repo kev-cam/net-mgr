@@ -293,4 +293,85 @@ sub _apply_dhcp_reservations {
     _stamp($db, 'dhcp_reservations', $repl_from, 'ip = ?', $row->{ip});
 }
 
+# ---- scoped one-shot refresh (the relay's REFRESH proxy) -------------
+#
+# Pull ONE subnet's rows from a peer (normally the elected master) into
+# the local DB, right now — the synchronous complement to the lazy
+# subscribe-stream. Lets an app that needs current data (net-reserve)
+# force just the subnet it is looking at, instead of a full resync.
+#
+# Scoped tables: addresses / dhcp_leases / dhcp_reservations by IP
+# prefix, dhcp_ranges by subnet_cidr prefix. addresses.mac carries an
+# FK to interfaces and a subnet-scoped pull can't ride the usual
+# interfaces-first dependency order, so a bare interface row is ensured
+# per MAC before its address lands. The v24 DHCP-plan tables may not
+# exist on an older master — their ERR is treated as "no rows".
+#
+# Returns the number of rows applied. Dies on connect/protocol errors.
+sub refresh_subnet {
+    my (%a) = @_;
+    my $db     = $a{db}     or croak "refresh_subnet: db required";
+    my $peer   = $a{peer}   or croak "refresh_subnet: peer required";
+    my $subnet = $a{subnet} or croak "refresh_subnet: subnet required";
+    my $repl_from = $a{replicated_from};
+
+    my $prefix = _subnet_like_prefix($subnet)
+        or croak "refresh_subnet: unsupported subnet '$subnet' "
+               . "(need a.b.c.d/len with len >= 8)";
+
+    my $cli = NetMgr::Client->new(listen => $peer,
+                                  timeout => $a{timeout} // 10);
+    $cli->hello(consumer => "relay-refresh.$$");
+
+    my ($rows, %seen_mac, $sub) = (0);
+    for my $r (@{ $cli->snapshot(++$sub, 'addresses',
+                                 where => "addr LIKE '$prefix'") }) {
+        next unless $r->{mac} && $r->{addr} && $r->{family};
+        $db->upsert_interface(mac => $r->{mac})
+            unless $seen_mac{ lc $r->{mac} }++;
+        _apply_addresses($db, $r, {}, $repl_from);
+        $rows++;
+    }
+    for my $r (@{ $cli->snapshot(++$sub, 'dhcp_leases',
+                                 where => "ip LIKE '$prefix'") }) {
+        next unless $r->{mac} && $r->{ip};
+        $db->upsert_interface(mac => $r->{mac})
+            unless $seen_mac{ lc $r->{mac} }++;
+        _apply_dhcp_leases($db, $r, {}, $repl_from);
+        $rows++;
+    }
+    my $resv = eval { $cli->snapshot(++$sub, 'dhcp_reservations',
+                                     where => "ip LIKE '$prefix'") } || [];
+    for my $r (@$resv) {
+        next unless $r->{ip} && $r->{mac};
+        _apply_dhcp_reservations($db, $r, {}, $repl_from);
+        $rows++;
+    }
+    my $ranges = eval { $cli->snapshot(++$sub, 'dhcp_ranges',
+                                       where => "subnet_cidr LIKE '$prefix'") } || [];
+    for my $r (@$ranges) {
+        next unless $r->{subnet_cidr} && $r->{start_ip} && $r->{end_ip};
+        _apply_dhcp_ranges($db, $r, {}, $repl_from);
+        $rows++;
+    }
+    eval { $cli->bye };
+    return $rows;
+}
+
+# "a.b.c.d/len" → SQL LIKE prefix on the containing octet boundary.
+# A non-octet-aligned length rounds DOWN to the wider boundary — the
+# pull over-fetches a superset, which is harmless for upserts. The
+# same prefix also matches dhcp_ranges.subnet_cidr ("a.b.c.0/24").
+sub _subnet_like_prefix {
+    my ($s) = @_;
+    return undef unless defined $s
+        && $s =~ m{\A(\d+)\.(\d+)\.(\d+)\.(\d+)/(\d+)\z};
+    my ($a, $b, $c, $d, $len) = ($1, $2, $3, $4, $5);
+    return undef if grep { $_ > 255 } $a, $b, $c, $d;
+    return "$a.$b.$c.%" if $len >= 24;
+    return "$a.$b.%"    if $len >= 16;
+    return "$a.%"       if $len >= 8;
+    return undef;       # wider than /8: too broad for a "scoped" pull
+}
+
 1;

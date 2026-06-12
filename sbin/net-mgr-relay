@@ -35,11 +35,15 @@ use Getopt::Long qw(:config no_ignore_case bundling);
 use POSIX qw(:sys_wait_h);
 use Time::HiRes qw(sleep);
 
+use IO::Socket::IP;
+use IO::Select;
+
 use NetMgr::Config;
 use NetMgr::DB;
 use NetMgr::Relay;
 use NetMgr::Manager;       # for _load_cluster_state
 use NetMgr::Client;
+use NetMgr::Protocol qw(parse_line format_ok format_err);
 
 my $conf_path  = $ENV{NET_MGR_CONF} // '/etc/net-mgr/config';
 my $foreground = 0;
@@ -121,6 +125,25 @@ if ($fixed_peer) {
 # The relay still runs its legacy run_election() as a fallback so a
 # very old daemon (pre-Slice C) still gets a CLUSTER_ROLE push. The
 # daemon's own election will override almost immediately when present.
+# Loopback proxy socket: apps that need *current* data for one subnet
+# (net-reserve) send `REFRESH subnet=a.b.c.0/24` here; we answer from
+# ourselves when this host is the master, else scope-pull the subnet
+# from the elected master into the local DB. The lazy subscribe-stream
+# stays the normal path; this is the on-demand complement.
+my $proxy_addr = $cfg->{cluster}{proxy_listen} // '127.0.0.1:7532';
+my $proxy_sock;
+if (lc($proxy_addr) ne 'none') {
+    my ($ph, $pp) = NetMgr::Client::split_hostport($proxy_addr);
+    $proxy_sock = IO::Socket::IP->new(
+        LocalHost => $ph, LocalPort => $pp // 7532,
+        Listen => 5, ReuseAddr => 1, Type => Socket::SOCK_STREAM(),
+    ) or print STDERR "[net-mgr-relay] proxy listen $proxy_addr: $! "
+                    . "(REFRESH disabled)\n";
+    print STDERR "[net-mgr-relay] REFRESH proxy on $proxy_addr\n"
+        if $proxy_sock;
+}
+my $proxy_sel = $proxy_sock ? IO::Select->new($proxy_sock) : undef;
+
 my $tick = $cluster->{election_interval} || 10;
 while (1) {
     my $watched = watch_local_status();
@@ -138,7 +161,102 @@ while (1) {
             . " will re-evaluate on next tick\n";
         %child = ();
     }
-    sleep $tick;
+    proxy_wait($tick);
+}
+
+# Sleep the inter-election tick, but wake up for proxy requests.
+sub proxy_wait {
+    my ($secs) = @_;
+    return sleep($secs) unless $proxy_sel;
+    my $end = Time::HiRes::time() + $secs;
+    while ((my $left = $end - Time::HiRes::time()) > 0) {
+        my @ready = $proxy_sel->can_read($left) or last;   # timed out
+        for my $l (@ready) {
+            my $conn = $l->accept or next;
+            eval { handle_proxy($conn) };
+            print STDERR "[net-mgr-relay] proxy request failed: $@" if $@;
+            close $conn;
+        }
+    }
+}
+
+# One request per connection: read a line, act, reply, done. Short
+# alarm so a stuck client can't wedge the election loop.
+sub handle_proxy {
+    my ($conn) = @_;
+    my $line;
+    eval {
+        local $SIG{ALRM} = sub { die "proxy read timeout\n" };
+        alarm 5;
+        $line = <$conn>;
+        alarm 0;
+    };
+    die $@ if $@;
+    return unless defined $line;
+    $line =~ s/[\r\n]+$//;
+    my $cmd = eval { parse_line($line) };
+    if (!$cmd || $@) {
+        my $e = $@ || 'unparsable'; chomp $e;
+        $e =~ s/\s+at \S+ line \d+\.?\s*$//;   # strip croak's location
+        print {$conn} format_err("bad request: $e"), "\n";
+        return;
+    }
+    if ($cmd->{verb} ne 'REFRESH') {
+        print {$conn} format_err("unsupported verb '$cmd->{verb}'"), "\n";
+        return;
+    }
+    my $subnet = $cmd->{kv}{subnet};
+    unless (defined $subnet && length $subnet) {
+        print {$conn} format_err("REFRESH: missing subnet="), "\n";
+        return;
+    }
+
+    my $w = watch_local_status();
+    unless ($w) {
+        print {$conn} format_err("REFRESH: local daemon unreachable"), "\n";
+        return;
+    }
+    my $role = $w->{role} // '';
+    if ($role eq 'master' || $role eq 'auto') {
+        # We ARE the source of truth — nothing to pull.
+        print {$conn} format_ok(role => 'master', rows => 0), "\n";
+        return;
+    }
+    unless ($role eq 'follower' && length $w->{master}) {
+        print {$conn} format_err("REFRESH: no master (role=$role)"), "\n";
+        return;
+    }
+    my $addr = $w->{master_addr};
+    if (!length($addr // '')) {
+        my $ip = resolve_ip($w->{master});
+        $addr = $ip ? NetMgr::Client::join_hostport($ip, 7531) : undef;
+    }
+    unless ($addr) {
+        print {$conn} format_err("REFRESH: can't resolve master "
+                                . "'$w->{master}'"), "\n";
+        return;
+    }
+
+    my $db = NetMgr::DB->new(
+        defaults_file => $mycnf,
+        section       => $cfg->{mysql}{section} // 'net-mgr',
+        db            => $cfg->{mysql}{db}      // 'netmgr',
+    );
+    $db->connect;
+    my $rows = eval {
+        NetMgr::Relay::refresh_subnet(
+            db => $db, peer => $addr, subnet => $subnet,
+            replicated_from => $w->{master}, timeout => 10);
+    };
+    if ($@) {
+        my $e = $@; chomp $e;
+        print {$conn} format_err("REFRESH: $e"), "\n";
+        return;
+    }
+    print {$conn} format_ok(role => 'follower', master => $w->{master},
+                            subnet => $subnet, rows => $rows), "\n";
+    print STDERR "[net-mgr-relay] REFRESH $subnet from $w->{master}: "
+               . "$rows rows\n";
 }
 
 # Returns a hashref of the local daemon's cluster_role / cluster_master /
@@ -423,10 +541,10 @@ sub _kill_child {
 
 # Log + dedupe consecutive identical status lines so the daemon log
 # doesn't get spammed with the same "isolated" line every minute.
-my $last_status_msg = '';
-sub _log_status {
+my $last_status_msg;     # NB: file-bottom `my ... = ''` would never run —
+sub _log_status {        # the main while(1) above never falls through here.
     my ($msg) = @_;
-    return if $msg eq $last_status_msg;
+    return if $msg eq ($last_status_msg // '');
     $last_status_msg = $msg;
     my @t = localtime;
     printf STDERR "%04d-%02d-%02d %02d:%02d:%02d [net-mgr-relay] %s\n",
