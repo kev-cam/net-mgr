@@ -35,22 +35,21 @@ use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling pass_through);
 use NetMgr::Client;
 use NetMgr::Config;
+use NetMgr::Protocol qw(parse_line format_kv);
 
 # Render tables. Defined up here (not lower in the file) because the dispatch
 # runs before any later statement would — a `my` initialised below the
 # $handler->() call is still empty when the handlers fire.
 my %COLOR = (   # ANSI background per state
-    reserved     => "\e[41m", # red     — permanent reservation
-    'pool-used'  => "\e[43m", # yellow  — dynamic pool, in use
-    'pool-free'  => "\e[44m", # blue    — dynamic pool, idle
-    'used-static'=> "\e[45m", # magenta — in use, NOT reserved (squatter)
-    free         => "\e[42m", # green   — allocatable static
+    reserved => "\e[41m",        # red    — permanent reservation
+    assigned => "\e[44m",        # blue   — inside a DHCP dynamic range
+    'in-use' => "\e[48;5;208m",  # orange — actually occupied (lease/observed)
+    free     => "\e[42m",        # green  — allocatable static
 );
 my $RESET = "\e[0m";
 # Distinct one-char glyphs for the no-colour (piped) map.
 my %GLYPH = (
-    reserved => 'R', 'pool-used' => '=', 'pool-free' => '-',
-    'used-static' => '!', free => '.',
+    reserved => 'R', assigned => '-', 'in-use' => '!', free => '.',
 );
 
 my ($listen, $server, $force_auth, $no_auth, $key_id, $key_file);
@@ -201,6 +200,34 @@ sub local_subnets {
     return \@out;
 }
 
+# Ask the local net-mgr-relay's REFRESH proxy to pull this subnet's rows
+# from the elected master into the local DB before we read it — current
+# view on demand, while the relay's subscribe-stream stays the lazy
+# default. Best-effort: silently a no-op when the target daemon isn't
+# local, the proxy isn't running, or this host is itself the master.
+# Returns a human-readable note (for the GUI status bar) or undef.
+sub maybe_refresh {
+    my ($subnet) = @_;
+    return undef unless defined $subnet && length $subnet;
+    my ($host) = NetMgr::Client::split_hostport($listen); $host //= '';
+    return undef
+        unless $host =~ /^(?:127\.\d+\.\d+\.\d+|::1|localhost)$/;
+    my $cfg = eval {
+        NetMgr::Config->load($ENV{NET_MGR_CONF} // '/etc/net-mgr/config') };
+    my $addr = ($cfg && $cfg->{cluster}{proxy_listen}) // '127.0.0.1:7532';
+    return undef if lc($addr) eq 'none';
+    my $reply = eval {
+        my $px = NetMgr::Client->new(listen => $addr, timeout => 8);
+        $px->send_recv("REFRESH " . format_kv(subnet => $subnet));
+    };
+    return undef unless defined $reply && $reply =~ /^OK\b/;
+    my $kv = eval { parse_line($reply)->{kv} } || {};
+    return 'already current (this host is the master)'
+        if ($kv->{role} // '') eq 'master';
+    return sprintf('refreshed %s from %s (%s rows)',
+                   $subnet, $kv->{master} // 'master', $kv->{rows} // '?');
+}
+
 # ---- gather the world from the daemon --------------------------------
 #
 # Returns a model: { ranges=>[..], resv=>{ip=>row}, leased=>{ip=>row},
@@ -244,16 +271,17 @@ sub in_pool {
     return 0;
 }
 
-# Classify one host address → state keyword.
+# Classify one host address → state keyword. An address inside a DHCP
+# dynamic range is 'assigned' (managed by DHCP) regardless of whether a
+# host currently holds it — you don't allocate statics from there anyway.
+# 'in-use' is reserved for an address occupied *outside* any pool and not
+# reserved: a real, unmanaged occupant worth noticing.
 sub classify {
     my ($model, $ip) = @_;
     my $i = ip2int($ip);
-    return 'reserved'  if $model->{resv}{$ip};
-    if (in_pool($model, $i)) {
-        return 'pool-used' if $model->{leased}{$ip} || $model->{observed}{$ip};
-        return 'pool-free';
-    }
-    return 'used-static' if $model->{leased}{$ip} || $model->{observed}{$ip};
+    return 'reserved' if $model->{resv}{$ip};
+    return 'assigned' if in_pool($model, $i);
+    return 'in-use'   if $model->{leased}{$ip} || $model->{observed}{$ip};
     return 'free';
 }
 
@@ -262,16 +290,16 @@ sub classify {
 sub use_color { -t STDOUT }
 
 sub state_label {
-    my %L = (reserved=>'reserved', 'pool-used'=>'dhcp (in use)',
-             'pool-free'=>'dhcp (free)', 'used-static'=>'in use, unreserved',
-             free=>'free static');
+    my %L = (reserved => 'reserved', assigned => 'DHCP assigned',
+             'in-use' => 'in use', free => 'free static');
     return $L{$_[0]} // $_[0];
 }
 
 sub cmd_list {
     my $cli = connect_client(want_auth => 0);
-    my $model = gather($cli);
     my $only = shift @ARGV;
+    maybe_refresh(normalize_cidr($only)) if defined $only;
+    my $model = gather($cli);
     my @subnets = $only ? (grep { $_ eq $only || index($_, "$only/") == 0
                                   || (split m{/}, $_)[0] eq $only }
                                 @{ $model->{subnets} })
@@ -321,7 +349,7 @@ sub cmd_list {
     if ($c) {
         print "\nlegend: ";
         print "$COLOR{$_}$RESET ", state_label($_), "  " for
-            qw(free reserved pool-free pool-used used-static);
+            qw(free assigned in-use reserved);
         print "\n";
     }
 }
@@ -335,8 +363,9 @@ sub pool_summary {
 
 sub cmd_free {
     my $cli = connect_client(want_auth => 0);
-    my $model = gather($cli);
     my $only = shift @ARGV;
+    maybe_refresh(normalize_cidr($only)) if defined $only;
+    my $model = gather($cli);
     my $want = $limit || 10;
     my @subnets = $only ? (grep { (split m{/}, $_)[0] eq $only || $_ eq $only }
                                 @{ $model->{subnets} })
@@ -370,12 +399,14 @@ sub cmd_reserve {
     die "net-reserve: bad IP '$ip'\n"  unless defined ip2int($ip);
     die "net-reserve: bad MAC '$mac'\n" unless $mac =~ /^[0-9a-fA-F:]{17}$/;
     my $cli = connect_client();
-    # Warn (don't block) if the chosen IP sits inside a dynamic pool.
+    # Pull this subnet's current view first, then warn (don't block) if
+    # the chosen IP sits inside a dynamic pool.
+    maybe_refresh(subnet_of($ip));
     my $model = gather($cli);
     my $st = classify($model, $ip);
     warn "net-reserve: note: $ip is inside a DHCP dynamic range — "
        . "it may also be auto-leased; consider a free static instead\n"
-        if $st =~ /^pool/;
+        if $st eq 'assigned';
     my $r = $cli->observe(
         kind => 'dhcp_reservation', ip => $ip, mac => lc $mac,
         (defined $opt_name  ? (name  => $opt_name)  : ()),
@@ -402,9 +433,10 @@ sub cmd_move {
     my $new = shift @ARGV or usage("move needs OLD_IP NEW_IP");
     die "net-reserve: bad IP\n" unless defined ip2int($old) && defined ip2int($new);
     my $cli = connect_client();
+    maybe_refresh(subnet_of($new));
     my $model = gather($cli);
     warn "net-reserve: note: $new is inside a DHCP dynamic range\n"
-        if classify($model, $new) =~ /^pool/;
+        if classify($model, $new) eq 'assigned';
     my $r = $cli->observe(kind => 'dhcp_reservation_move', ip => $old, new_ip => $new);
     die "net-reserve: $r\n" if !defined $r || $r =~ /^ERR/;
     print "moved $old -> $new\n";
@@ -462,7 +494,8 @@ sub cmd_gui {
     $top->Label(-text => 'Subnet:')->pack(-side => 'left');
     # Forward-declared so the widget callbacks below close over them; the
     # coderefs are assigned further down but only ever *called* at event time.
-    my ($subnet_be, $status, $canvas, $resv_text, $redraw, $refresh_subnets);
+    my ($subnet_be, $status, $canvas, $resv_text, $redraw, $refresh_subnets,
+        $sync_now);
 
     # The picker offers the union of discovered subnets, any pinned
     # (manually-entered) ones, and the current selection — so you can jump
@@ -475,37 +508,45 @@ sub cmd_gui {
         return [ sort { (ip2int((split m{/}, $a)[0]) // 0)
                     <=> (ip2int((split m{/}, $b)[0]) // 0) } keys %u ];
     };
+    # Explicit user actions (open / jump / Reload) want CURRENT data:
+    # nudge the relay's REFRESH proxy to pull this subnet from the master
+    # into the local DB, then re-read. The periodic tick stays lazy.
+    $sync_now = sub {
+        my $note = maybe_refresh($S{subnet});
+        $S{model} = gather($cli);
+        $refresh_subnets->();
+        $redraw->();
+        $status->configure(-text => " $note") if $note;
+    };
     # Jump to (and pin) a typed/selected subnet; silently ignores junk.
     my $set_subnet = sub {
         my $n = normalize_cidr($S{subnet});
         return unless defined $n;
         $S{subnet} = $n;
         $S{pinned}{$n} = 1;
-        $refresh_subnets->();
-        $redraw->();
+        $sync_now->();
     };
 
     $subnet_be = $top->BrowseEntry(
         -variable  => \$S{subnet},
         -choices   => $all_subnets->(),
         -width     => 18,
-        -browsecmd => sub { $redraw->() },        # picked from the dropdown
+        -browsecmd => sub { $sync_now->() },      # picked from the dropdown
     )->pack(-side => 'left');
     # Typing a CIDR + Enter (or Go) jumps to it, adding it to the list if new.
     $subnet_be->Subwidget('entry')->bind('<Return>', sub { $set_subnet->() });
     $top->Button(-text => 'Go', -command => sub { $set_subnet->() })
         ->pack(-side => 'left', -padx => 2);
-    $top->Button(-text => 'Reload',
-        -command => sub { $S{model} = gather($cli); $refresh_subnets->(); $redraw->() }
-    )->pack(-side => 'left', -padx => 4);
+    $top->Button(-text => 'Reload', -command => sub { $sync_now->() })
+        ->pack(-side => 'left', -padx => 4);
 
     # legend
     my %CELL = (
-        reserved => '#d33', 'pool-used' => '#dd3', 'pool-free' => '#36c',
-        'used-static' => '#c3c', free => '#3a3',
+        reserved => '#d33', assigned => '#36c', 'in-use' => '#e8821e',
+        free => '#3a3',
     );
     my $leg = $top->Frame->pack(-side => 'right');
-    for my $st (qw(free reserved pool-free pool-used used-static)) {
+    for my $st (qw(free assigned in-use reserved)) {
         $leg->Label(-text => '  ', -background => $CELL{$st})->pack(-side => 'left');
         $leg->Label(-text => state_label($st) . ' ')->pack(-side => 'left');
     }
@@ -595,9 +636,8 @@ sub cmd_gui {
         $status->configure(-text => sprintf(" %s — %s", $cidr, pool_summary($model, $cidr)));
     };
 
-    $refresh_subnets->();
-    $redraw->();
-    # periodic refresh
+    $sync_now->();      # open with a forced pull of the initial subnet
+    # periodic refresh: lazy (local DB only) — explicit actions force-sync
     my $tick; $tick = sub {
         $S{model} = gather($cli); $refresh_subnets->(); $redraw->();
         $mw->after(5000, $tick);
