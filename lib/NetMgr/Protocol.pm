@@ -273,6 +273,12 @@ sub _read_quoted {
             }
             return ($val, $i+1);
         }
+        if ($c eq '\\' && $i+1 < $n) {       # decode \n \r \\ (symmetric with _quote_if_needed)
+            my $d = substr($s, $i+1, 1);
+            if    ($d eq 'n')  { $val .= "\n"; $i += 2; next }
+            elsif ($d eq 'r')  { $val .= "\r"; $i += 2; next }
+            elsif ($d eq '\\') { $val .= "\\"; $i += 2; next }
+        }
         $val .= $c; $i++;
     }
     croak "unterminated quoted string";
@@ -294,8 +300,11 @@ sub format_kv {
 sub _quote_if_needed {
     my ($v) = @_;
     return '""' if !length $v;
-    if ($v =~ /[\s"=()]/) {
+    if ($v =~ /[\s"=()\\]/) {
         my $q = $v;
+        $q =~ s/\\/\\\\/g;   # escape backslash first
+        $q =~ s/\r/\\r/g;       # CR -> \r (a literal CR/LF would split the line-based wire frame)
+        $q =~ s/\n/\\n/g;       # LF -> \n
         $q =~ s/"/""/g;
         return qq("$q");
     }
