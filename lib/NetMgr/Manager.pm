@@ -575,6 +575,7 @@ sub _handle_line {
     elsif ($verb eq 'CHAT_GET')       { $self->_handle_chat_get($cli, $cmd) }
     elsif ($verb eq 'CHAT_LS')        { $self->_handle_chat_ls($cli, $cmd) }
     elsif ($verb eq 'CHAT_RM')        { $self->_handle_chat_rm($cli, $cmd) }
+    elsif ($verb eq 'CHAT_KEYS')      { $self->_handle_chat_keys($cli, $cmd) }
     elsif ($verb eq 'CHAT_DELETE')    { $self->_handle_chat_delete($cli, $cmd) }
     else {
         $self->_send($cli, format_err("verb $verb not handled"));
@@ -2323,8 +2324,8 @@ sub _handle_chat_rm {
 sub _handle_chat_join {
     my ($self, $cli, $cmd) = @_;
     my $kv = $cmd->{kv} || {};
-    my ($who) = $self->_chat_identity($cli, $kv);
-    return $self->_send($cli, format_err("CHAT_JOIN: not authorized"))
+    my ($who, $kind) = $self->_chat_identity($cli, $kv);
+    return $self->_send($cli, format_err("CHAT_JOIN: not authorized (no identity)"))
         unless defined $who;
     my $name = $kv->{session} // $kv->{name};
     my $s = $self->{db}->get_chat_session($name)
@@ -2332,25 +2333,28 @@ sub _handle_chat_join {
     return $self->_send($cli, format_err("CHAT_JOIN: session '$name' is closed"))
         if $s->{status} eq 'closed';
 
-    my $mode = $s->{access_mode};
-    my $existing = $self->{db}->get_chat_member($name, $who);
-    my $is_member = $existing && $existing->{state} eq 'member';
+    my $mode      = $s->{access_mode};
+    my $existing  = $self->{db}->get_chat_member($name, $who);
+    my $is_member  = $existing && $existing->{state} eq 'member';
+    my $is_invited = $existing && $existing->{state} eq 'invited';
+    my $is_admin   = $self->_chat_may_admin($cli, $s, $who);
+    # A key on the chat's persistent authorized-key list joins automatically,
+    # even if its live member row is gone (e.g. roster cleared, or it was an
+    # owner pre-load via CHAT_ALLOW <key_id>).
+    my $key_ok = (($kind // '') eq 'agent'
+                  && $self->{db}->get_chat_authorized_key($name, $who)) ? 1 : 0;
 
-    if ($mode eq 'request' && !$is_member && !$self->_chat_may_admin($cli, $s, $who)) {
-        # Not yet allowed — record/refresh the join request and notify
-        # owners (anyone subscribed WHERE state="requested" sees it).
+    unless ($is_member || $is_invited || $is_admin || $key_ok || $mode eq 'open') {
+        # Not authorized yet. Rather than a flat reject, record a join request
+        # and notify owners (anyone subscribed WHERE state="requested" gets the
+        # approval pop-up). Approving saves the key (see _handle_chat_member_op),
+        # so the next join is automatic. Applies to both 'list' and 'request'.
         my $m = $self->{db}->set_chat_member(
             session => $name, principal => $who, state => 'requested', added_by => $who);
         $self->_emit_change(table => 'chat_members', op => 'update', row => $m->{now})
             if $m->{now};
         $self->_log("chat join-request $name by $who");
         return $self->_send($cli, format_ok(session => $name, state => 'requested'));
-    }
-    if ($mode eq 'list' && !$is_member
-        && !($existing && $existing->{state} eq 'invited')
-        && !$self->_chat_may_admin($cli, $s, $who)) {
-        return $self->_send($cli,
-            format_err("CHAT_JOIN: '$name' is allow-list only; ask an owner to CHAT_ALLOW you"));
     }
 
     # Allowed: ensure a member row (idempotent) and add live presence.
@@ -2398,8 +2402,46 @@ sub _handle_chat_member_op {
         session => $name, principal => $principal, state => $state, added_by => $who);
     $self->_emit_change(table => 'chat_members', op => 'update', row => $m->{now})
         if $m->{now};
+
+    # Persist (or revoke) the SSH key on the chat's durable authorized-key list
+    # when the principal is a key fingerprint. Humans on loopback ('as' names)
+    # have no key, so they're tracked by membership only.
+    my ($ktype, $label) = $self->{db}->host_key_identity($principal);
+    if ($ktype ne '' || $principal =~ /^SHA256:/) {
+        if ($state eq 'member') {
+            my $k = $self->{db}->add_chat_authorized_key(
+                session => $name, key_id => $principal,
+                key_type => $ktype, label => $label, added_by => $who);
+            $self->_emit_change(table => 'chat_authorized_keys', op => 'update', row => $k)
+                if $k;
+        } else {
+            my $had = $self->{db}->get_chat_authorized_key($name, $principal);
+            $self->{db}->remove_chat_authorized_key($name, $principal);
+            $self->_emit_change(table => 'chat_authorized_keys', op => 'delete', row => $had)
+                if $had;
+        }
+    }
     $self->_log("chat $op $name principal=$principal by ".($who//'?'));
     $self->_send($cli, format_ok(session => $name, principal => $principal, state => $state));
+}
+
+# CHAT_KEYS session=N — list a chat's authorized SSH keys (owner only). Returns
+# OK count=N keys=<base64 JSON [{key_id,key_type,label,added_by,added_at},…]>.
+sub _handle_chat_keys {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my ($who) = $self->_chat_identity($cli, $kv);
+    my $name = $kv->{session} // $kv->{name};
+    my $s = $self->{db}->get_chat_session($name)
+        or return $self->_send($cli, format_err("CHAT_KEYS: no such session '".($name//'')."'"));
+    return $self->_send($cli, format_err("CHAT_KEYS: not authorized"))
+        unless $self->_chat_may_admin($cli, $s, $who);
+    my $keys = $self->{db}->list_chat_authorized_keys($name);
+    require MIME::Base64;
+    require JSON::PP;
+    my $json = JSON::PP->new->canonical->encode($keys);
+    $self->_send($cli, format_ok(session => $name, count => scalar(@$keys),
+        keys => MIME::Base64::encode_base64($json, '')));
 }
 
 # OBSERVE kind=chat_msg session=N body="..." [in_reply_to=ID] [as=NAME]

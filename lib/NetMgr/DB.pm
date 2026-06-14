@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 24;
+our $SCHEMA_VERSION = 25;
 
 sub new {
     my ($class, %args) = @_;
@@ -654,6 +654,27 @@ CREATE TABLE IF NOT EXISTS dhcp_reservations (
 SQL
         return;
     }
+    if ($v == 25) {
+        # net-chat: persistent per-chat authorized SSH keys. When an owner
+        # approves a join request the requester's key is recorded here, so the
+        # authorization survives independent of live membership and can be
+        # inspected / exported / pre-loaded. See sql/schema.sql for column docs.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS chat_authorized_keys (
+    session    VARCHAR(64)  NOT NULL,
+    key_id     VARCHAR(80)  NOT NULL,            -- "SHA256:..." fingerprint
+    key_type   VARCHAR(20)  NOT NULL DEFAULT '', -- ed25519 / rsa / ecdsa
+    label      VARCHAR(128) NOT NULL DEFAULT '', -- friendly name (machine) at approval
+    added_by   VARCHAR(128) NULL,                -- principal who authorized it
+    added_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (session, key_id),
+    KEY idx_cak_key (key_id),
+    CONSTRAINT fk_cak_session
+        FOREIGN KEY (session) REFERENCES chat_sessions(name) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
     croak "no migration for schema v$v";
 }
 
@@ -680,6 +701,21 @@ sub host_key_machine {
     my ($mid) = $self->{dbh}->selectrow_array(
         "SELECT machine_id FROM host_keys WHERE key_id = ?", undef, $key_id);
     return $mid;
+}
+
+# Friendly identification for an SSH key_id from host_keys + machines:
+# returns (key_type, machine_name), each '' when unknown. Used to label a
+# chat's authorized keys with something more human than a raw fingerprint.
+sub host_key_identity {
+    my ($self, $key_id) = @_;
+    return ('', '') unless defined $key_id && length $key_id;
+    my $row = $self->{dbh}->selectrow_hashref(
+        "SELECT hk.key_type AS key_type, m.primary_name AS name
+           FROM host_keys hk
+           LEFT JOIN machines m ON m.id = hk.machine_id
+          WHERE hk.key_id = ?", undef, $key_id);
+    return ('', '') unless $row;
+    return ($row->{key_type} // '', $row->{name} // '');
 }
 
 # ---- UPSERT helpers ----------------------------------------------------
@@ -1920,6 +1956,49 @@ sub set_chat_member {
             joined_at    = COALESCE(VALUES(joined_at),    joined_at)",
         undef, $f{session}, $f{principal}, $role, $state, $f{added_by});
     return { op => 'update', now => $self->get_chat_member($f{session}, $f{principal}) };
+}
+
+# ---- per-chat authorized SSH keys (schema v25) ------------------------
+
+sub get_chat_authorized_key {
+    my ($self, $session, $key_id) = @_;
+    return undef unless defined $session && defined $key_id;
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM chat_authorized_keys WHERE session = ? AND key_id = ?",
+        undef, $session, $key_id);
+}
+
+# Authorize (or refresh the metadata of) an SSH key for a chat. Idempotent.
+sub add_chat_authorized_key {
+    my ($self, %f) = @_;
+    croak "session + key_id required"
+        unless defined $f{session} && defined $f{key_id};
+    $self->{dbh}->do(
+        "INSERT INTO chat_authorized_keys
+            (session, key_id, key_type, label, added_by)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            key_type = VALUES(key_type),
+            label    = VALUES(label),
+            added_by = VALUES(added_by)",
+        undef, $f{session}, $f{key_id}, ($f{key_type} // ''),
+        ($f{label} // ''), $f{added_by});
+    return $self->get_chat_authorized_key($f{session}, $f{key_id});
+}
+
+sub remove_chat_authorized_key {
+    my ($self, $session, $key_id) = @_;
+    $self->{dbh}->do(
+        "DELETE FROM chat_authorized_keys WHERE session = ? AND key_id = ?",
+        undef, $session, $key_id);
+}
+
+sub list_chat_authorized_keys {
+    my ($self, $session) = @_;
+    return $self->{dbh}->selectall_arrayref(
+        "SELECT session, key_id, key_type, label, added_by, added_at
+           FROM chat_authorized_keys WHERE session = ? ORDER BY label, key_id",
+        { Slice => {} }, $session) || [];
 }
 
 # All messages of a session, oldest first — for moving them to the archive.

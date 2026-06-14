@@ -136,6 +136,7 @@ my %DISPATCH = (
     download => \&cmd_download,
     files    => \&cmd_files,
     rm       => \&cmd_rm,
+    keys     => \&cmd_keys,
     approve  => sub { cmd_member('approve', @_) },
     reject   => sub { cmd_member('reject',  @_) },
     allow    => sub { cmd_member('allow',   @_) },
@@ -425,6 +426,24 @@ sub cmd_rm {
     eval { $cli->chat_rm(session => $session, file => $name) };
     die "net-chat: $@" if $@;
     print "deleted '$name' from '$session'\n";
+}
+
+# keys <chat>: list the chat's authorized SSH keys (owner only). Pre-load a key
+# with `allow <chat> <key_id>`; revoke with `deny <chat> <key_id>`.
+sub cmd_keys {
+    my $session = need_name(shift @ARGV);
+    my $cli = connect_client();             # owner-only -> wants identity
+    my $r = eval { $cli->chat_keys(session => $session) };
+    die "net-chat: $@" if $@;
+    require MIME::Base64; require JSON::PP;
+    my $keys = $r->{keys}
+        ? JSON::PP->new->decode(MIME::Base64::decode_base64($r->{keys})) : [];
+    unless (@$keys) { print "no authorized keys for '$session'\n"; return }
+    printf "%-18s %-9s %s\n", 'LABEL', 'TYPE', 'KEY_ID';
+    for my $k (@$keys) {
+        printf "%-18s %-9s %s\n",
+            ($k->{label} // ''), ($k->{key_type} // ''), $k->{key_id};
+    }
 }
 
 sub cmd_member {
@@ -772,6 +791,22 @@ sub cmd_gui {
     $srch->Button(-text => '<', -width => 2, -command => sub { $find->(-1) })
          ->pack(-side => 'right');
 
+    # Friendly display for a requester: an SSH key fingerprint becomes the
+    # owning machine name (host_keys + machines) when known, else a shortened
+    # fingerprint. Loopback 'as' names pass through unchanged.
+    my $who_label = sub {
+        my ($p) = @_;
+        return $p unless defined $p && $p =~ /^SHA256:[\w+\/=]+$/;
+        my $short = substr($p, 0, 18) . '...';
+        my $hk = eval { $ctrl->snapshot(7, 'host_keys', where => "key_id = '$p'") } || [];
+        if (@$hk && defined $hk->[0]{machine_id}) {
+            my $mr = eval { $ctrl->snapshot(7, 'machines',
+                                            where => "id = $hk->[0]{machine_id}") } || [];
+            return "$mr->[0]{primary_name} ($short)"
+                if @$mr && length($mr->[0]{primary_name} // '');
+        }
+        return $short;
+    };
     my $req_popup = sub {
         my ($kv) = @_;
         my $sess = $kv->{session}   // return;
@@ -780,7 +815,7 @@ sub cmd_gui {
         return if $seen_req{"$sess/$who"}++;         # once per request
         return unless $is_loopback || (($created_by{$sess} // '') eq $me);
         my $pop = $mw->Toplevel; $pop->title('join request');
-        $pop->Label(-text => "'$who' requests to join '$sess'",
+        $pop->Label(-text => "'" . $who_label->($who) . "' requests to join '$sess'",
                     -padx => 14, -pady => 12)->pack;
         my $act = sub {
             my ($op) = @_;
@@ -1084,8 +1119,9 @@ usage: net-chat <command> [args]
   download <name> <file> [to]      download a file
   files    <name>                  list uploaded files
   rm       <name> <file>           delete an uploaded file
+  keys     <name>                  list the chat's authorized SSH keys (owner)
   approve|reject <name> <who>      act on a join request (owner)
-  allow|deny     <name> <who>      edit the allow-list (owner)
+  allow|deny     <name> <who>      edit the allow-list / keys (owner)
 
   --gui [name]                     Tk window: pick/watch a chat, type to
                                    post, approve/reject join requests via

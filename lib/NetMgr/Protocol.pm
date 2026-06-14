@@ -62,6 +62,8 @@ package NetMgr::Protocol;
 #   CHAT_PUT session=N file=F offset=O [eof=1] data=base64  -- upload a chunk
 #   CHAT_GET session=N file=F [offset=O]         -- download (base64 chunk)
 #   CHAT_LS  session=N                            -- list uploaded files
+#   CHAT_KEYS session=N                           -- owner: list the chat's
+#                                                    authorized SSH keys
 #   CHAT_DELETE name=N                            -- owner: delete a chat +
 #                                                    its whole archive (destructive)
 #   (messages are posted with OBSERVE kind=chat_msg session=N body="...")
@@ -139,6 +141,7 @@ sub parse_line {
     elsif ($verb eq 'CHAT_GET')       { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'CHAT_LS')        { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'CHAT_RM')        { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'CHAT_KEYS')      { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'CHAT_DELETE')    { $cmd->{kv} = _parse_kv_only(\@toks) }
     # net-mgr-relay's loopback proxy: pull one subnet's rows from the
     # elected master into the local DB right now (lazy sync otherwise).

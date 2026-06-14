@@ -38,6 +38,24 @@ into a pending state and an owner
 .B approve\fRs
 them.
 .RE
+.PP
+For both
+.B list
+and
+.B request
+sessions, a client that is not yet authorized does not get a flat
+rejection: its
+.B join
+is recorded as a pending request that an owner can
+.B approve
+(the
+.B \-\-gui
+raises a pop-up). Approving a key-authenticated client saves its SSH
+key on the chat's authorized-key list (see
+.BR keys ),
+so subsequent joins from that key are automatic;
+.B deny / reject
+revokes it.
 .SH CONNECTION AND IDENTITY
 A loopback daemon
 .RB ( 127.0.0.1:7531 )
@@ -129,9 +147,13 @@ reopening it with
 The archive lives on the daemon hosting the chat.
 .TP
 .B join \fINAME\fR
-Join a session. On a
+Join a session. If you are not yet authorized (a
 .B request
-session this records a join request instead.
+or
+.B list
+session you are not on), this records a pending join request for an owner to
+.B approve
+rather than failing.
 .TP
 .B leave \fINAME\fR
 Drop out of the live roster.
@@ -197,11 +219,26 @@ Prompts for confirmation unless
 .B \-\-force
 is given. This is the only command that deletes data.
 .TP
+.B keys \fINAME\fR
+List the chat's authorized SSH keys (owner): label, type, and fingerprint.
+A key lands here when an owner approves a key-authenticated join request, or
+is pre-loaded with
+.BR allow .
+.TP
 .B approve\fR|\fBreject \fINAME\fR \fIPRINCIPAL\fR
-Act on a join request (owner).
+Act on a join request (owner). When
+.I PRINCIPAL
+is an SSH key fingerprint,
+.B approve
+also saves it to the chat's authorized keys and
+.B reject
+revokes it.
 .TP
 .B allow\fR|\fBdeny \fINAME\fR \fIPRINCIPAL\fR
-Add to / revoke from the allow-list (owner).
+Add to / revoke from the allow-list (owner). Passing an SSH key fingerprint as
+.I PRINCIPAL
+pre-authorizes (or revokes) that key directly \(em see
+.BR keys .
 .SH EXAMPLES
 .PP
 Open a session and follow it:

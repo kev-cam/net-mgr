@@ -629,3 +629,24 @@ CREATE TABLE IF NOT EXISTS dhcp_reservations (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 INSERT IGNORE INTO schema_version (version) VALUES (24);
+
+-- Per-chat authorized SSH keys (schema v25). When a chat owner approves a join
+-- request, the requester's SSH key is recorded here so the authorization is
+-- durable (independent of the live chat_members roster) and can be inspected,
+-- exported, or pre-loaded. A key on this list joins its chat without prompting;
+-- denying/rejecting removes it. label is a friendly name (the machine that owns
+-- the key, resolved from host_keys at approval time).
+CREATE TABLE IF NOT EXISTS chat_authorized_keys (
+    session    VARCHAR(64)  NOT NULL,
+    key_id     VARCHAR(80)  NOT NULL,            -- "SHA256:..." fingerprint
+    key_type   VARCHAR(20)  NOT NULL DEFAULT '', -- ed25519 / rsa / ecdsa
+    label      VARCHAR(128) NOT NULL DEFAULT '', -- friendly name (machine)
+    added_by   VARCHAR(128) NULL,                -- principal who authorized it
+    added_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (session, key_id),
+    KEY idx_cak_key (key_id),
+    CONSTRAINT fk_cak_session
+        FOREIGN KEY (session) REFERENCES chat_sessions(name) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO schema_version (version) VALUES (25);
