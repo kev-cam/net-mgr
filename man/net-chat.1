@@ -98,14 +98,27 @@ Manager address. Overrides
 .B \-\-server
 and the config.
 .TP
-\fB\-\-server\fR \fINAME\fR
+\fB\-\-server\fR \fINAME\fR|\fIHOST:PORT\fR
 Connect to the server named
 .I NAME
 in the
 .B [servers]
-config section. The
+config section, or to a literal
+.IR HOST [: PORT ]
+\(em in the latter form it is an alias for
+.BR \-\-listen .
+The
 .B \-\-gui
-shows a drop-down to switch between configured servers.
+shows a drop-down to switch servers, populated from the configured
+.B [servers]
+.I and
+the peers the current daemon knows about (its
+.B peers
+table), plus a
+.B set default
+button that writes the active server as
+.B default
+in the per-user config.
 .TP
 \fB\-\-as\fR \fINAME\fR
 Display name for posts on a loopback daemon. Ignored once AUTH'd.

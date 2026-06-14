@@ -358,4 +358,57 @@ sub resolve_server {
     return $default;                                          # default (maybe undef)
 }
 
+# Persist the preferred server as `default = <sel>` in the [servers] section of
+# the per-user config (~/.config/net-mgr/config). $sel is a server name from
+# [servers] or a literal host[:port]. Creates the file/dir/section as needed and
+# preserves everything else. Returns the written path; dies on failure.
+sub save_default {
+    my ($class, $sel) = @_;
+    die "save_default: nothing to save\n" unless defined $sel && length $sel;
+    my $path = $class->user_path
+        or die "save_default: no user config path (set HOME or XDG_CONFIG_HOME)\n";
+
+    my @lines;
+    if (-e $path) {
+        open my $fh, '<', $path or die "save_default: read $path: $!\n";
+        @lines = <$fh>;
+        close $fh;
+    }
+
+    my @out;
+    my ($in_servers, $done) = (0, 0);
+    for my $line (@lines) {
+        if ($line =~ /^\s*\[([^\]]+)\]\s*$/) {
+            # leaving a section: drop our default line in before we go
+            push @out, "default = $sel\n" if $in_servers && !$done and $done = 1;
+            $in_servers = (lc $1 eq 'servers') ? 1 : 0;
+            push @out, $line;
+            next;
+        }
+        if ($in_servers && $line =~ /^\s*default\s*=/) {
+            push @out, "default = $sel\n" unless $done;   # replace existing
+            $done = 1;
+            next;                                          # drop the old line
+        }
+        push @out, $line;
+    }
+    push @out, "default = $sel\n" if $in_servers && !$done and $done = 1;
+    unless ($done) {                                       # no [servers] at all
+        push @out, "\n" if @out && $out[-1] !~ /^\s*$/;
+        push @out, "[servers]\n", "default = $sel\n";
+    }
+
+    (my $dir = $path) =~ s{/[^/]+$}{};
+    if (length $dir && !-d $dir) {
+        require File::Path;
+        File::Path::make_path($dir);
+    }
+    my $tmp = "$path.tmp.$$";
+    open my $wh, '>', $tmp or die "save_default: write $tmp: $!\n";
+    print {$wh} @out;
+    close $wh or die "save_default: close $tmp: $!\n";
+    rename $tmp, $path or die "save_default: rename $tmp -> $path: $!\n";
+    return $path;
+}
+
 1;
