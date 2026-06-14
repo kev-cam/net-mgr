@@ -847,7 +847,19 @@ sub cmd_gui {
         $sessvar = (defined $keep && grep { $_ eq $keep } @names) ? $keep : 'select';
         $om->configure(-command => sub {
             $sessvar eq $NEWCHAT ? $new_chat->() : $follow->($sessvar) });
-        $set_status->(scalar(@names) . ' open chat(s)');
+        # Reload the open conversation too: re-arm the live stream (in case it
+        # dropped) and re-seed recent lines. Without this Refresh only touched
+        # the session menu, so sitting in a chat it looked like it did nothing.
+        if (defined $cur) {
+            $stream->send_line('UNSUB sub=1');
+            $clear->();
+            $stream->send_line("SUBSCRIBE sub=1 mode=stream"
+                             . " FROM chat_messages WHERE session = '$cur'");
+            $seed_recent->(10);
+            $set_status->("refreshed $cur - " . scalar(@names) . ' open chat(s)');
+        } else {
+            $set_status->(scalar(@names) . ' open chat(s)');
+        }
     };
     # History: each click pulls in the single next-older message (the newest one
     # below what's already shown) and prepends it at the top.
