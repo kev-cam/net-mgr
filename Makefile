@@ -153,7 +153,8 @@ list:
 	@echo "  rsyncs this tree to /tmp/$$USER/net-mgr on the target,"
 	@echo "  runs 'make install' there, then removes the tmp dir."
 	@echo "fleet deploy:   make deploy   (installs on every host in [deploy] of $(DEPLOY_CONF))"
-	@echo "  configure once: [deploy] hosts = nas3, bigsony  (sudo/ssh_opts/make_args optional)"
+	@echo "  configure once: [deploy] hosts = nas3, bigsony, workhorse(FORCE=1,CYGWIN=1)"
+	@echo "    per-host make args go in (..) and override the default make_args; sudo/ssh_opts optional"
 	@echo
 	@echo "--- dependency check ---"
 	@$(MAKE) -s deps || true
@@ -400,21 +401,28 @@ deploy: .version
 	get() { perl -Ilib -MNetMgr::Config -e \
 	  'my $$c=NetMgr::Config->load($$ARGV[0]); my $$v=$$c->{deploy}{$$ARGV[1]}//q(); $$v=~s/^\s+|\s+$$//g; print $$v' \
 	  "$$cfg" "$$1"; }; \
-	hosts=`get hosts | tr ',' ' '`; \
-	if [ -z "$$hosts" ]; then \
+	entries=`perl -Ilib -MNetMgr::Config -e \
+	  'my $$c=NetMgr::Config->load($$ARGV[0]); my $$h=$$c->{deploy}{hosts}//q(); while($$h=~/([^,()]+(?:\([^)]*\))?)/g){ my $$e=$$1; $$e=~s/\s+//g; print "$$e\n" if length $$e }' \
+	  "$$cfg"`; \
+	if [ -z "$$entries" ]; then \
 	  echo "No [deploy] hosts in $$cfg. Add e.g.:"; \
-	  echo "  [deploy]"; echo "  hosts = nas3, bigsony"; echo "  sudo  = sudo   # optional"; \
+	  echo "  [deploy]"; echo "  hosts = nas3, bigsony, workhorse(FORCE=1,CYGWIN=1)"; echo "  sudo  = sudo   # optional"; \
 	  exit 2; \
 	fi; \
 	sudo_v=`get sudo`; sshopts_v=`get ssh_opts`; makeargs_v=`get make_args`; \
-	echo "==> deploy to: $$hosts  (sudo='$$sudo_v' ssh='$$sshopts_v' args='$$makeargs_v')"; \
-	for h in $$hosts; do \
-	  echo; echo "===== $$h ====="; \
+	echo "==> deploy (sudo='$$sudo_v' ssh='$$sshopts_v' default make_args='$$makeargs_v'; per-host (..) overrides)"; \
+	for entry in $$entries; do \
+	  h="$${entry%%(*}"; \
+	  case "$$entry" in \
+	    *\(*\)) a="$${entry#*(}"; a="$${a%)}"; margs=`echo "$$a" | tr ',' ' '`;; \
+	    *)      margs="$$makeargs_v";; \
+	  esac; \
+	  echo; echo "===== $$h (make_args='$$margs') ====="; \
 	  $(MAKE) --no-print-directory install-on TARGET="$$h" \
-	      SUDO="$$sudo_v" SSHOPTS="$$sshopts_v" MAKEARGS="$$makeargs_v" \
+	      SUDO="$$sudo_v" SSHOPTS="$$sshopts_v" MAKEARGS="$$margs" \
 	    || { echo "deploy: $$h FAILED — stopping"; exit 1; }; \
 	done; \
-	echo; echo "==> deploy complete ($$hosts)"
+	echo; echo "==> deploy complete"
 
 # --- setup (interactive DB + creds bootstrap) ------------------------
 setup:

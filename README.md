@@ -67,10 +67,10 @@ of them with one command:
 ```ini
 # /etc/net-mgr/config
 [deploy]
-hosts     = nas3, bigsony, clevo
+hosts     = nas3, bigsony, clevo, workhorse(FORCE=1,CYGWIN=1)
 sudo      = sudo                       # optional: run remote installs as root
 ssh_opts  = -p 2222 -i ~/.ssh/firewall # optional: applied to every host
-make_args = FORCE=1                    # optional: passed to remote make install
+make_args = FORCE=1                    # optional: default remote make args
 ```
 
 ```sh
@@ -79,8 +79,10 @@ make deploy DEPLOY_CONF=./my.conf
 ```
 
 The `[deploy]` section is build-host tooling only — the daemon never reads it.
-The `sudo`/`ssh_opts`/`make_args` knobs apply to every host; for per-host
-differences, run `install-on` directly.
+`sudo`/`ssh_opts` apply to every host. For per-host make args, append them to
+the host in parentheses (comma-separated) — `workhorse(FORCE=1,CYGWIN=1)` above.
+A host's own args **override** the default `make_args`; hosts without
+parentheses fall back to it.
 
 ## Uninstall
 

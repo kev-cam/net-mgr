@@ -59,13 +59,16 @@ archive_dir = /var/lib/net-mgr/chat
 
 # Fleet deploy. `make deploy` reads this and runs the remote install
 # (rsync + remote `make install`, i.e. install-on) on each host. Only the
-# build host needs this section; the daemon never reads it. The knobs apply
-# to every host. See README.md "Deploying to the fleet".
+# build host needs this section; the daemon never reads it. sudo/ssh_opts
+# apply to every host. See README.md "Deploying to the fleet".
 [deploy]
-# hosts     = nas3, bigsony, clevo
+# hosts is comma-separated. A host may carry its own make args in parentheses
+# (comma-separated); those OVERRIDE the default make_args below for that host,
+# while bare hosts fall back to it. e.g. workhorse needs FORCE=1 and CYGWIN=1:
+# hosts     = nas3, bigsony, clevo, workhorse(FORCE=1,CYGWIN=1)
 # sudo      = sudo                       # run the remote install as root
 # ssh_opts  = -p 2222 -i ~/.ssh/firewall
-# make_args = FORCE=1                    # passed to the remote `make install`
+# make_args = FORCE=1                    # default for hosts without their own (..)
 
 [scanner]
 # fping/ip-neigh sweep of known IPs (the periodic 'presence' trigger
