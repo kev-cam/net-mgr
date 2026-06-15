@@ -114,9 +114,12 @@ shows a drop-down to switch servers, populated from the configured
 .I and
 the peers the current daemon knows about (its
 .B peers
-table), plus a
+table). Peers are shown by machine name (resolved through the daemon) rather
+than bare IP, and servers already in your SSH
+.I known_hosts
+are listed first. A
 .B set default
-button that writes the active server as
+button writes the active server as
 .B default
 in the per-user config.
 .TP

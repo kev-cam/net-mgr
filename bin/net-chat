@@ -31,7 +31,8 @@
 #                         or a literal host[:port] — an alias for --listen. With
 #                         neither flag, the configured default server is used,
 #                         else loopback. The --gui shows a server menu (config
-#                         servers + the daemon's known peers) and a "set default"
+#                         servers + the daemon's known peers, shown by name with
+#                         SSH known_hosts entries first) and a "set default"
 #                         button that saves the active server to the config.
 #   --as NAME             Display name for posts on a loopback daemon
 #                         (default $NET_CHAT_AS or $USER). Ignored once
@@ -460,6 +461,67 @@ sub cmd_member {
     print "$op: $principal on '$name'\n";
 }
 
+# True if SSH has a known_hosts entry for any of the given host tokens. Uses
+# `ssh-keygen -F`, which matches hashed (HashKnownHosts) entries too — plain
+# parsing can't read those back, and hashing is the default on many systems.
+# Memoized per token; tolerant of a missing ssh-keygen (then nothing floats).
+{
+    my %memo;
+    my $have_keygen;
+    sub _ssh_knows {
+        unless (defined $have_keygen) {
+            $have_keygen = 0;
+            for my $d (split /:/, ($ENV{PATH} // '')) {
+                -x "$d/ssh-keygen" and $have_keygen = 1, last;
+            }
+        }
+        return 0 unless $have_keygen;
+        for my $t (@_) {
+            next unless defined $t && length $t;
+            $memo{lc $t} //= do {
+                my $pid = open(my $kh, '-|');
+                my $hit = 0;
+                if (defined $pid && !$pid) {          # child
+                    open STDERR, '>', '/dev/null';
+                    exec('ssh-keygen', '-F', $t);
+                    exit 127;
+                } elsif ($pid) {                      # parent: drain + reap
+                    local $/; my $out = <$kh>; close $kh;   # close sets $?
+                    $hit = ($? == 0 && defined $out && $out =~ /\S/) ? 1 : 0;
+                }
+                $hit;
+            };
+            return 1 if $memo{lc $t};
+        }
+        return 0;
+    }
+}
+
+# Map IP address -> machine primary_name via the daemon's
+# addresses -> interfaces -> machines tables (net-lookup's reverse path), so
+# the server picker can show names instead of bare peer IPs.
+sub _daemon_ip_names {
+    my ($cli) = @_;
+    my %ip2name;
+    my $machines = eval { $cli->snapshot(11, 'machines') }   || [];
+    my $ifaces   = eval { $cli->snapshot(12, 'interfaces') } || [];
+    my $addrs    = eval { $cli->snapshot(13, 'addresses') }  || [];
+    my %name_of_mid = map { ($_->{id} => $_->{primary_name}) }
+                      grep { $_->{primary_name} } @$machines;
+    my %mid_of_mac;
+    for my $i (@$ifaces) {
+        $mid_of_mac{lc $i->{mac}} = $i->{machine_id}
+            if $i->{mac} && $i->{machine_id};
+    }
+    for my $a (@$addrs) {
+        next unless defined $a->{addr} && defined $a->{mac};
+        my $mid = $mid_of_mac{lc $a->{mac}} or next;
+        my $nm  = $name_of_mid{$mid} or next;
+        $ip2name{$a->{addr}} //= $nm;
+    }
+    return %ip2name;
+}
+
 # ---- GUI (Perl/Tk) ---------------------------------------------------
 # net-chat --gui [session]: a desktop chat window — pick a session (or
 # "+ new chat" to create one), watch it live, type to post, send a file
@@ -522,25 +584,57 @@ sub cmd_gui {
     # to the per-user config. See ~/.config/net-mgr/config [servers].
     my ($srvmap) = NetMgr::Config->servers;
     my %addr2name = reverse %$srvmap;              # host:port -> config name
-    my @opts = sort keys %$srvmap;                 # configured names first
-    my %have = map { ($srvmap->{$_} => 1) } keys %$srvmap;
+    my $host_of = sub { (NetMgr::Client::split_hostport($_[0]))[0] // $_[0] };
+
+    # Candidate servers: configured [servers], the active one, then the peers
+    # the daemon knows about. Each is (addr, optional config name).
+    my @raw = ( (map { [ $srvmap->{$_}, $_ ] } sort keys %$srvmap),
+                [ $listen, undef ] );
     {
         my $peers = eval { $ctrl->snapshot(6, 'peers') } || [];
-        for my $p (sort { ($a->{host}//'') cmp ($b->{host}//'') } @$peers) {
-            next unless defined $p->{host} && length $p->{host};
-            my $addr = $p->{host} . ':' . ($p->{port} // 7531);
-            next if $have{$addr}++ || defined $addr2name{$addr};
-            push @opts, $addr;                     # unnamed peer addrs, as-is
-        }
+        push @raw, [ $_->{host} . ':' . ($_->{port} // 7531), undef ]
+            for grep { defined $_->{host} && length $_->{host} } @$peers;
     }
-    my $cursrv = $addr2name{$listen} // $listen;   # show the active one by name
-    push @opts, $cursrv unless grep { $_ eq $cursrv } @opts;
+    # Resolve bare-IP hosts to machine names (only worth the table snapshots if
+    # some host is actually an IP); float known_hosts entries to the top.
+    my $need_names = grep { local $_ = $host_of->($_->[0]);
+                            /^\d+\.\d+\.\d+\.\d+$/ || /:/ } @raw;
+    my %ip2name = $need_names ? _daemon_ip_names($ctrl) : ();
+
+    my %cand;   # addr -> { name, kh }
+    for my $r (@raw) {
+        my ($addr, $cfgname) = @$r;
+        next unless defined $addr && length $addr;
+        my $host = $host_of->($addr);
+        my $name = $cfgname // $ip2name{$host} // $host;
+        # familiar = the host, the resolved name, or the config name is in
+        # the user's SSH known_hosts.
+        my $kh   = _ssh_knows($host, $name, ($cfgname // ())) ? 1 : 0;
+        $cand{$addr} //= { name => $name, kh => $kh };   # first (config) wins
+    }
+    # Labels, disambiguating shared names by appending the host.
+    my %n_addrs;
+    push @{ $n_addrs{ $cand{$_}{name} } }, $_ for keys %cand;
+    my %label2addr;
+    for my $addr (keys %cand) {
+        my $name  = $cand{$addr}{name};
+        my $label = (@{ $n_addrs{$name} } > 1)
+                    ? "$name (" . $host_of->($addr) . ")" : $name;
+        $label2addr{$label} = $addr;
+        $cand{$addr}{label} = $label;
+    }
+    # known_hosts first, then by name (case-insensitive).
+    my @opts = sort {
+        $cand{$label2addr{$b}}{kh} <=> $cand{$label2addr{$a}}{kh}
+            || lc($a) cmp lc($b)
+    } keys %label2addr;
+
     if (@opts > 1) {
-        my $srvvar = $cursrv;
+        my $srvvar = $cand{$listen}{label} // $listen;
         $top->Label(-text => 'server:')->pack(-side => 'left');
         $top->Optionmenu(-variable => \$srvvar, -options => \@opts,
             -command => sub {
-                my $addr = $srvmap->{$srvvar} // $srvvar;
+                my $addr = $label2addr{$srvvar} // $srvvar;
                 return if $addr eq $listen;
                 eval { $ctrl->chat_leave(session => $cur) } if defined $cur;
                 eval { $ctrl->bye }; eval { $stream->bye };
@@ -553,7 +647,8 @@ sub cmd_gui {
                 push @argv, $cur                      if defined $cur;
                 exec $^X, $0, @argv;
             })->pack(-side => 'left');
-        # Persist the active server as the user-config default.
+        # Persist the active server as the user-config default (a config name
+        # when the address has one, else the literal address).
         $top->Button(-text => 'set default', -command => sub {
             my $sel = $addr2name{$listen} // $listen;
             my $ok  = eval { NetMgr::Config->save_default($sel); 1 };
@@ -1159,8 +1254,9 @@ usage: net-chat <command> [args]
 
   Address precedence: --listen, then --server, then $NET_MGR_LISTEN, then
   the configured default server, then 127.0.0.1:7531.
-  --gui server menu: configured [servers] + the daemon's known peers, with a
-  "set default" button that saves the active server to the user config.
+  --gui server menu: configured [servers] + the daemon's known peers (shown by
+  name, known_hosts entries first), with a "set default" button that saves the
+  active server to the user config.
 USAGE
     exit($msg ? 2 : 0);
 }
