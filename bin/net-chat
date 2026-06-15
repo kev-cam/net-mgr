@@ -529,6 +529,9 @@ sub _daemon_ip_names {
 # As or Delete it. Owners also get approve/reject pop-ups for join requests. Bar widgets
 # use ASCII (the default UI font lacks many glyphs; the message pane is
 # Courier and renders Unicode fine).
+# The "terminal" button launches your terminal emulator on a tmux session bound
+# to the current chat; its input is the keyboard plus any chat message starting
+# "@<local user>" (injected via tmux send-keys). See _ssh_knows/$term_feed.
 # Multi-line messages fold to their first line (a " [+]"
 # marker; left-click to open, right-click to close) and older/seeded lines
 # start folded; the search box reveals and highlights matches across the whole
@@ -1072,10 +1075,75 @@ sub cmd_gui {
         $ne->focus;
     };
 
+    # -- chat-driven terminal --------------------------------------------
+    # "terminal" launches your terminal emulator running a tmux session bound to
+    # the current chat. Its input is then BOTH the keyboard (native, in the
+    # terminal) AND any chat message that starts with "@<local user>": the
+    # prefix is stripped and the rest is injected with `tmux send-keys`. Only
+    # live messages from others in this chat are fed; output is not echoed back.
+    my $localuser = $ENV{USER} // (getpwuid($<))[0] // 'user';
+    my $term_cfg;                       # optional [chat] terminal override
+    for my $p ($ENV{NET_MGR_CONF} // '/etc/net-mgr/config', NetMgr::Config->user_path) {
+        next unless defined $p && -r $p;
+        my $c = eval { NetMgr::Config->load($p) } or next;
+        $term_cfg = $c->{chat}{terminal} if $c->{chat} && defined $c->{chat}{terminal};
+    }
+    my $term_prog = $term_cfg || $ENV{TERMINAL};
+    unless ($term_prog) {
+        CAND: for my $c (qw(x-terminal-emulator xterm gnome-terminal konsole
+                            alacritty foot kitty)) {
+            for my $d (split /:/, ($ENV{PATH} // '')) {
+                -x "$d/$c" and $term_prog = $c, last CAND;
+            }
+        }
+    }
+    my ($term_session, $term_chat);
+    my $tmux_send = sub {               # one literal line + Enter (no shell)
+        my ($text) = @_;
+        return unless defined $term_session;
+        system('tmux', 'send-keys', '-t', $term_session, '-l', '--', $text);
+        system('tmux', 'send-keys', '-t', $term_session, 'Enter');
+    };
+    my $term_feed = sub {               # inject a live chat message if it's for us
+        my ($kv) = @_;
+        return unless defined $term_session && defined $term_chat;
+        return unless ($kv->{session} // '') eq $term_chat;
+        return if ($kv->{sender} // '') eq $me;          # skip our own posts
+        my $body = $kv->{body};
+        return unless defined $body
+                   && $body =~ s/^\s*\@\Q$localuser\E\b[\s:,]*//i && length $body;
+        $tmux_send->($body);
+        $set_status->("terminal <= \@$localuser: $body");
+    };
+    my $launch_term = sub {
+        return $set_status->('terminal: no terminal emulator found '
+                           . '(set [chat] terminal or $TERMINAL)') unless $term_prog;
+        return $set_status->('terminal: pick a chat first') unless defined $cur;
+        (my $name = "nc-$cur") =~ s/[^A-Za-z0-9_-]/_/g;   # tmux-safe session name
+        # Pre-create the session so injection works the instant it's bound.
+        system("tmux has-session -t $name 2>/dev/null") == 0
+            or system('tmux', 'new-session', '-d', '-s', $name);
+        my @cmd  = ('tmux', 'new-session', '-A', '-s', $name);
+        my @argv = ($term_prog =~ /(?:gnome-terminal|konsole)$/)
+                 ? ($term_prog, '--', @cmd) : ($term_prog, '-e', @cmd);
+        my $pid = fork();
+        return $set_status->("terminal: fork failed: $!") unless defined $pid;
+        if ($pid == 0) {                              # detach via double-fork
+            my $p2 = fork();
+            CORE::exit(0) if $p2;
+            { exec { $argv[0] } @argv }
+            CORE::exit(127);
+        }
+        waitpid($pid, 0);
+        ($term_session, $term_chat) = ($name, $cur);
+        $set_status->("terminal '$name' up - '\@$localuser ...' in '$cur' runs in it");
+    };
+
     $om->configure(-command => sub {
         $sessvar eq $NEWCHAT ? $new_chat->() : $follow->($sessvar) });
     $top->Button(-text => 'Refresh', -command => $refresh)->pack(-side => 'right');
     $top->Button(-text => 'History', -command => $load_history)->pack(-side => 'right');
+    $top->Button(-text => 'terminal', -command => $launch_term)->pack(-side => 'right');
     # font size controls
     $top->Button(-text => 'A+', -width => 2,
                  -command => sub { $fontsize++ if $fontsize < 32; $set_font->() })
@@ -1138,7 +1206,8 @@ sub cmd_gui {
             my $c = parse_line($line) or next;
             if ($c->{verb} eq 'ROW') {
                 my $t = $c->{kv}{table} // '';
-                if    ($t eq 'chat_messages') { $append->($c->{kv}) }
+                if    ($t eq 'chat_messages') { $append->($c->{kv});
+                                                $term_feed->($c->{kv}) }
                 elsif ($t eq 'chat_members'
                     && (($c->{kv}{state} // '') eq 'requested')) {
                     $req_popup->($c->{kv});
@@ -1243,7 +1312,9 @@ usage: net-chat <command> [args]
 
   --gui [name]                     Tk window: pick/watch a chat, type to
                                    post, approve/reject join requests via
-                                   pop-ups (Perl/Tk required)
+                                   pop-ups (Perl/Tk required). The "terminal"
+                                   button opens a tmux terminal fed by the
+                                   keyboard + chat msgs starting "@<user>".
 
   --listen HOST:PORT   daemon address (overrides --server and config)
   --server NAME|HOST:PORT

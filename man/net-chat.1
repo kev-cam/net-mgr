@@ -255,6 +255,39 @@ Add to / revoke from the allow-list (owner). Passing an SSH key fingerprint as
 .I PRINCIPAL
 pre-authorizes (or revokes) that key directly \(em see
 .BR keys .
+.SH GUI TERMINAL
+The
+.B \-\-gui
+has a
+.B terminal
+button that launches your terminal emulator running a
+.BR tmux (1)
+session bound to the current chat (named \fBnc-\fR\fICHAT\fR). Its input is
+.IR both :
+the keyboard, as usual, AND any chat message that begins with
+.RB \(lq @ \fIuser\fR\(rq,
+where
+.I user
+is your local Unix user \(em the prefix is stripped and the rest is sent to the
+terminal with
+.BR "tmux send-keys" .
+Only live messages from
+.I other
+participants in the bound chat are fed (never your own posts or replayed
+history), and terminal output is
+.I not
+posted back to the chat. The emulator is
+.B [chat] terminal
+in the config, else
+.BR $TERMINAL ,
+else the first of
+.BR x\-terminal\-emulator ", " xterm ", " gnome\-terminal .
+Requires
+.BR tmux .
+.PP
+.B Caution:
+while this is running, anyone able to post to the chat can run commands as you
+in that terminal. Launch it only in chats you trust.
 .SH EXAMPLES
 .PP
 Open a session and follow it:

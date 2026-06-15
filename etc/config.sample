@@ -56,6 +56,11 @@ section  = net-mgr
 # chat (chat isn't cluster-replicated) and persists until deleted.
 [chat]
 archive_dir = /var/lib/net-mgr/chat
+# terminal: the emulator the net-chat --gui "terminal" button launches (running
+# a tmux session bound to the chat). Its input is the keyboard AND any chat
+# message starting "@<your unix user>" (injected via `tmux send-keys`). Defaults
+# to $TERMINAL, else x-terminal-emulator / xterm / gnome-terminal. Needs tmux.
+# terminal = xterm
 
 # Fleet deploy. `make deploy` reads this and runs the remote install
 # (rsync + remote `make install`, i.e. install-on) on each host. Only the
