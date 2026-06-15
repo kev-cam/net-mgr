@@ -17,7 +17,8 @@
 #   net-reserve release IP           remove a reservation
 #   net-reserve add-range CIDR START END [--zone Z]
 #   net-reserve del-range CIDR START
-#   net-reserve --gui [SUBNET]       Perl/Tk map: click a free cell to reserve
+#   net-reserve --gui [SUBNET]       Perl/Tk map: click a cell to reserve (pick
+#                                    the target address from a menu), move, release
 #
 #   --listen HOST:PORT   daemon address (overrides --server and config)
 #   --server NAME        a server from [servers] in ~/.config/net-mgr/config
@@ -670,13 +671,24 @@ sub reserve_dialog {
     my %v = (ip => $ip, mac => $mac, name => '', group => '');
     # known groups for convenience
     my %groups; $groups{ $_->{grp} } = 1 for grep { $_->{grp} } values %{ $S->{model}{resv} };
-    for my $f (['IP', 'ip', 0], ['MAC', 'mac', 1], ['Name', 'name', 1], ['Group', 'group', 1]) {
-        my ($lbl, $key, $edit) = @$f;
+    # Target address: a selection menu of the free static IPs in this subnet, so
+    # a machine seen at one address (e.g. a DHCP .67) can be given a permanent
+    # one (e.g. .228). Defaults to the clicked cell (reserve-in-place) and stays
+    # editable, so any address can be typed too.
+    my @ipchoices = ($ip, free_ips($S->{model}, subnet_of($ip)));
+    my %seen_ip; @ipchoices = grep { !$seen_ip{$_}++ } @ipchoices;
+    {
+        my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
+        $row->Label(-text => 'IP:', -width => 7, -anchor => 'w')->pack(-side => 'left');
+        $row->BrowseEntry(-variable => \$v{ip}, -choices => \@ipchoices, -width => 22)
+            ->pack(-side => 'left', -fill => 'x', -expand => 1);
+    }
+    for my $f (['MAC', 'mac'], ['Name', 'name'], ['Group', 'group']) {
+        my ($lbl, $key) = @$f;
         my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
         $row->Label(-text => "$lbl:", -width => 7, -anchor => 'w')->pack(-side => 'left');
-        my $e = $row->Entry(-textvariable => \$v{$key}, -width => 24);
-        $e->configure(-state => 'readonly') unless $edit;
-        $e->pack(-side => 'left', -fill => 'x', -expand => 1);
+        $row->Entry(-textvariable => \$v{$key}, -width => 24)
+            ->pack(-side => 'left', -fill => 'x', -expand => 1);
     }
     if (keys %groups) {
         my $row = $dlg->add('Frame')->pack(-fill => 'x');
@@ -750,6 +762,19 @@ sub next_free {
     return undef;
 }
 
+# All free static IPs in $cidr, ascending — the reserve dialog's address menu.
+sub free_ips {
+    my ($model, $cidr) = @_;
+    my ($net, $len, $first, $last) = cidr_parts($cidr);
+    return () unless defined $net;
+    my @free;
+    for (my $i = $first; $i <= $last; $i++) {
+        my $ip = int2ip($i);
+        push @free, $ip if classify($model, $ip) eq 'free';
+    }
+    return @free;
+}
+
 sub usage {
     my ($msg) = @_;
     print STDERR "net-reserve: $msg\n\n" if $msg;
@@ -763,7 +788,8 @@ usage:
   net-reserve move OLD_IP NEW_IP         reallocate a reservation
   net-reserve add-range CIDR START END [--zone Z]
   net-reserve del-range CIDR START
-  net-reserve --gui [SUBNET]             Perl/Tk map (click a cell to reserve)
+  net-reserve --gui [SUBNET]             Perl/Tk map (click a cell; reserve at a
+                                         chosen address, move, or release)
 
   --listen H:P / --server NAME           daemon address
   --auth / --no-auth / --key-id / --key-file

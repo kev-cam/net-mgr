@@ -146,9 +146,16 @@ Remove a dynamic pool by its start address.
 .TP
 .B \-\-gui \fR[\fISUBNET\fR]
 Open the Perl/Tk map: a clickable grid of the subnet's address space,
-coloured by state, with a grouped reservation list. Click a free cell to
-reserve it (the MAC is pre\-filled when the address is currently leased);
-click a reserved cell to release it. Refreshes live.
+coloured by state, with a grouped reservation list. Click any non\-reserved
+cell to reserve it (the MAC is pre\-filled when the address is currently
+leased or in use); the reserve dialog's
+.B IP
+field is a menu of the subnet's free static addresses, so a machine seen at
+one address (e.g. a DHCP\-assigned
+.IR .67 )
+can be given a permanent one (e.g.
+.IR .228 ).
+Click a reserved cell to move or release it. Refreshes live.
 .SH OPTIONS
 .TP
 .BI \-\-listen " HOST:PORT"
