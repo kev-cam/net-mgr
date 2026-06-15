@@ -84,6 +84,30 @@ the host in parentheses (comma-separated) — `workhorse(FORCE=1,CYGWIN=1)` abov
 A host's own args **override** the default `make_args`; hosts without
 parentheses fall back to it.
 
+## Running in an Xpra pod
+
+For an isolated, throwaway GUI environment, net-mgr ships a layer for the
+`xpra-pod` toolset — a `+net-mgr` image variant built on the generic
+`xpra-pod:<flavor>` base (which bakes xpra + sshd + a terminal), adding the
+net-mgr client tools, Perl/Tk, and tmux. Apps launched in the pod show through
+Xpra as ordinary windows.
+
+```sh
+make pod-image                       # build xpra-pod:<flavor>+net-mgr (host flavor)
+make pod-image POD_FLAVOR=ubuntu-noble
+```
+
+This builds the base first if it's missing (via `xpra-pod-build`). Then spin up
+a pod whose app is the net-chat GUI:
+
+```sh
+xpra-pod run nc --flavor <flavor>+net-mgr -c 'net-chat --gui --server <srv>'
+```
+
+See `pod/Containerfile`. It's a **client** image (talks to a remote daemon), so
+it omits the daemon's DB stack — the pod just needs network reach to the
+daemon's address. Requires `podman` and the `xpra-pod` toolset.
+
 ## Uninstall
 
 ```sh

@@ -49,7 +49,7 @@ LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Config.pm NetMgr/DB.pm \
 
 INSTALL ?= install
 
-.PHONY: list install install-on deploy setup deps uninstall test check clean help .version
+.PHONY: list install install-on deploy pod-image setup deps uninstall test check clean help .version
 
 # --- dependency check (Debian/Ubuntu apt names) ----------------------
 # Required deps must be present; optional deps print a hint but don't
@@ -423,6 +423,29 @@ deploy: .version
 	    || { echo "deploy: $$h FAILED — stopping"; exit 1; }; \
 	done; \
 	echo; echo "==> deploy complete"
+
+# --- xpra-pod net-mgr image -----------------------------------------
+#   make pod-image                       # build for the host's flavor
+#   make pod-image POD_FLAVOR=ubuntu-noble
+# Builds xpra-pod:<flavor>+net-mgr: the generic xpra-pod base (built first if
+# absent) plus the net-mgr client tools, Perl/Tk, and tmux (see pod/Containerfile).
+# Run a pod whose app shows through Xpra with:
+#   xpra-pod run nc --flavor <flavor>+net-mgr -c 'net-chat --gui --server <srv>'
+pod-image:
+	@command -v podman >/dev/null 2>&1 || { echo "podman required for pod-image"; exit 1; }
+	@command -v xpra-pod-build >/dev/null 2>&1 \
+	  || { echo "xpra-pod-build not found (install the xpra-pod toolset)"; exit 1; }
+	@flavor='$(POD_FLAVOR)'; \
+	[ -n "$$flavor" ] \
+	  || flavor=`xpra-pod-build --help 2>&1 | sed -n 's/^Detected flavor on this host: //p'`; \
+	[ -n "$$flavor" ] \
+	  || { echo "couldn't detect flavor; pass POD_FLAVOR= (xpra-pod-build --list)"; exit 2; }; \
+	podman image exists "xpra-pod:$$flavor" || xpra-pod-build --flavor "$$flavor"; \
+	echo "==> building xpra-pod:$$flavor+net-mgr"; \
+	podman build -t "xpra-pod:$$flavor+net-mgr" --build-arg FLAVOR="$$flavor" \
+	    -f pod/Containerfile . || exit 1; \
+	echo; echo "==> built xpra-pod:$$flavor+net-mgr. Launch (app shows via Xpra):"; \
+	echo "    xpra-pod run nc --flavor $$flavor+net-mgr -c 'net-chat --gui --server <srv>'"
 
 # --- setup (interactive DB + creds bootstrap) ------------------------
 setup:

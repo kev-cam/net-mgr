@@ -1,0 +1,55 @@
+# net-mgr layer for an xpra-pod image.
+#
+# Builds  xpra-pod:<flavor>+net-mgr  FROM the generic xpra-pod:<flavor> base
+# (which already bakes xpra + sshd + xterm + your user), adding the net-mgr
+# *client* tools (net-chat and friends), Perl/Tk for the --gui, and tmux so the
+# chat-driven terminal works. Apps launched in the pod show through Xpra as
+# ordinary windows.
+#
+# Build with `make pod-image` (which ensures the base first). Then:
+#   xpra-pod run nc --flavor <flavor>+net-mgr -c 'net-chat --gui --server <srv>'
+#
+# Note: a CLIENT image — it talks to a remote net-mgr daemon, so it does NOT
+# install the daemon's DB stack (DBD::mysql). The pod must be able to reach the
+# daemon's address from inside its network.
+
+ARG FLAVOR=ubuntu-jammy
+FROM xpra-pod:${FLAVOR}
+
+USER root
+
+# Runtime deps: perl-Tk (--gui), tmux (chat-driven terminal), ssh client
+# (AUTH handshake + host-key scan). Spans the apt/dnf/pacman flavor families.
+RUN set -eu; \
+    if command -v apt-get >/dev/null 2>&1; then \
+        export DEBIAN_FRONTEND=noninteractive; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends perl-tk tmux openssh-client; \
+        apt-get clean; rm -rf /var/lib/apt/lists/*; \
+    elif command -v dnf >/dev/null 2>&1; then \
+        dnf -y install perl-Tk tmux openssh-clients; dnf clean all; \
+    elif command -v pacman >/dev/null 2>&1; then \
+        pacman -Sy --noconfirm perl-tk tmux openssh; pacman -Scc --noconfirm; \
+    else echo "net-mgr pod: no known package manager" >&2; exit 1; fi
+
+# The net-mgr tree, run in place: net-* scripts locate their libs via FindBin
+# (use lib "$FindBin::Bin/../lib"), so no install/`use lib` rewrite is needed.
+COPY bin      /opt/net-mgr/bin
+COPY lib      /opt/net-mgr/lib
+COPY man      /opt/net-mgr/man
+COPY sql      /opt/net-mgr/sql
+COPY etc      /opt/net-mgr/etc
+COPY Makefile /opt/net-mgr/Makefile
+
+# Put the tools on PATH via thin wrappers. A symlink would set $FindBin::Bin to
+# /usr/local/bin and break the ../lib lookup; a wrapper execs the real path so
+# FindBin resolves to /opt/net-mgr/bin.
+RUN set -eu; \
+    for t in /opt/net-mgr/bin/net-*; do \
+        [ -f "$t" ] || continue; \
+        n=$(basename "$t"); \
+        printf '#!/bin/sh\nexec /opt/net-mgr/bin/%s "$@"\n' "$n" > /usr/local/bin/"$n"; \
+        chmod 0755 /usr/local/bin/"$n"; \
+    done
+
+# Inherit the base image's sshd CMD; xpra-pod starts the app per session.
