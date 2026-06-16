@@ -51,7 +51,7 @@ sub new {
     # `as` is a loopback-only self-declared identity stamped onto chat
     # control verbs / posts (the daemon ignores it once AUTH'd).
     return bless { sock => $sock, buf => '', listen => join_hostport($host, $port),
-                   as => $args{as} }, $class;
+                   as => $args{as}, timeout => $timeout }, $class;
 }
 
 sub send_line {
@@ -78,11 +78,13 @@ sub recv_line {
     return $1;
 }
 
-# Send a line and return the next reply line.
+# Send a line and return the next reply line. Bounded by the connection's
+# timeout so a peer that accepts but never replies (e.g. a wedged proxy) can't
+# hang us forever — returns undef on timeout instead.
 sub send_recv {
     my ($self, $line) = @_;
     $self->send_line($line);
-    return $self->recv_line;
+    return $self->recv_line($self->{timeout});
 }
 
 # Convenience: send HELLO, expect OK.
