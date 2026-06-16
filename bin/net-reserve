@@ -92,7 +92,9 @@ if (!defined $listen) {
     }
 }
 
-if ($gui) { cmd_gui(shift @ARGV); exit 0; }
+# With the --gui flag, the subnet is the leftover positional, already shifted
+# into $cmd above (not still on @ARGV).
+if ($gui) { cmd_gui($cmd); exit 0; }
 usage() unless defined $cmd;
 
 my %DISPATCH = (
