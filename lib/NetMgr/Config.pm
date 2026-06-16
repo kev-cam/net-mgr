@@ -358,44 +358,46 @@ sub resolve_server {
     return $default;                                          # default (maybe undef)
 }
 
-# Persist the preferred server as `default = <sel>` in the [servers] section of
-# the per-user config (~/.config/net-mgr/config). $sel is a server name from
-# [servers] or a literal host[:port]. Creates the file/dir/section as needed and
-# preserves everything else. Returns the written path; dies on failure.
-sub save_default {
-    my ($class, $sel) = @_;
-    die "save_default: nothing to save\n" unless defined $sel && length $sel;
+# Persist `$key = $value` in [$section] of the per-user config
+# (~/.config/net-mgr/config), creating the file/dir/section as needed and
+# preserving everything else (an existing $key in that section is replaced).
+# Returns the written path; dies on failure.
+sub save_user_value {
+    my ($class, $section, $key, $value) = @_;
+    die "save_user_value: section + key required\n"
+        unless defined $section && length $section && defined $key && length $key;
+    $value = '' unless defined $value;
     my $path = $class->user_path
-        or die "save_default: no user config path (set HOME or XDG_CONFIG_HOME)\n";
+        or die "save_user_value: no user config path (set HOME or XDG_CONFIG_HOME)\n";
 
     my @lines;
     if (-e $path) {
-        open my $fh, '<', $path or die "save_default: read $path: $!\n";
+        open my $fh, '<', $path or die "save_user_value: read $path: $!\n";
         @lines = <$fh>;
         close $fh;
     }
 
+    my $sec = lc $section;
     my @out;
-    my ($in_servers, $done) = (0, 0);
+    my ($in_sec, $done) = (0, 0);
     for my $line (@lines) {
         if ($line =~ /^\s*\[([^\]]+)\]\s*$/) {
-            # leaving a section: drop our default line in before we go
-            push @out, "default = $sel\n" if $in_servers && !$done and $done = 1;
-            $in_servers = (lc $1 eq 'servers') ? 1 : 0;
+            push @out, "$key = $value\n" if $in_sec && !$done and $done = 1;
+            $in_sec = (lc $1 eq $sec) ? 1 : 0;
             push @out, $line;
             next;
         }
-        if ($in_servers && $line =~ /^\s*default\s*=/) {
-            push @out, "default = $sel\n" unless $done;   # replace existing
+        if ($in_sec && $line =~ /^\s*\Q$key\E\s*=/) {
+            push @out, "$key = $value\n" unless $done;   # replace existing
             $done = 1;
-            next;                                          # drop the old line
+            next;
         }
         push @out, $line;
     }
-    push @out, "default = $sel\n" if $in_servers && !$done and $done = 1;
-    unless ($done) {                                       # no [servers] at all
+    push @out, "$key = $value\n" if $in_sec && !$done and $done = 1;
+    unless ($done) {                                      # section absent
         push @out, "\n" if @out && $out[-1] !~ /^\s*$/;
-        push @out, "[servers]\n", "default = $sel\n";
+        push @out, "[$section]\n", "$key = $value\n";
     }
 
     (my $dir = $path) =~ s{/[^/]+$}{};
@@ -404,11 +406,19 @@ sub save_default {
         File::Path::make_path($dir);
     }
     my $tmp = "$path.tmp.$$";
-    open my $wh, '>', $tmp or die "save_default: write $tmp: $!\n";
+    open my $wh, '>', $tmp or die "save_user_value: write $tmp: $!\n";
     print {$wh} @out;
-    close $wh or die "save_default: close $tmp: $!\n";
-    rename $tmp, $path or die "save_default: rename $tmp -> $path: $!\n";
+    close $wh or die "save_user_value: close $tmp: $!\n";
+    rename $tmp, $path or die "save_user_value: rename $tmp -> $path: $!\n";
     return $path;
+}
+
+# Persist the preferred server as `default = <sel>` in [servers]. $sel is a
+# server name from [servers] or a literal host[:port].
+sub save_default {
+    my ($class, $sel) = @_;
+    die "save_default: nothing to save\n" unless defined $sel && length $sel;
+    return $class->save_user_value('servers', 'default', $sel);
 }
 
 1;

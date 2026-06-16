@@ -177,7 +177,26 @@ can be given a free permanent one (e.g.
 A
 .B show DHCP pool / assigned
 toggle hides the blue (pool) rows so the list is just static candidates.
+The occupant shown for a leased/observed address is the machine name net\-mgr
+knows for its MAC (the same name
+.BR net-lookup (1)
+gives), falling back to the MAC.
 Click a reserved cell to move or release it. Refreshes live.
+.PP
+The subnet picker shows discovered subnets, your local LANs, and a persistent
+.B show
+list, minus a persistent
+.B ignore
+list \(em handy when many unused subnets (link\-local, transient) clutter it.
+The
+.B +
+and
+.B \-
+buttons beside the picker add the current subnet to the show or ignore list;
+both are saved under
+.B [net-reserve]
+.RB ( show " / " ignore ", comma-separated CIDRs)"
+in the per\-user config.
 .SH OPTIONS
 .TP
 .BI \-\-listen " HOST:PORT"

@@ -19,7 +19,9 @@
 #   net-reserve add-range CIDR START END [--zone Z]
 #   net-reserve del-range CIDR START
 #   net-reserve --gui [SUBNET]       Perl/Tk map: click a cell to reserve (pick
-#                                    the target address from a menu), move, release
+#                                    the target address from a menu), move, release;
+#                                    +/- keep or ignore subnets in the picker
+#                                    ([net-reserve] show/ignore in the user config)
 #
 #   --listen HOST:PORT   daemon address (overrides --server and config)
 #   --server NAME        a server from [servers] in ~/.config/net-mgr/config
@@ -205,6 +207,30 @@ sub local_subnets {
     return \@out;
 }
 
+# Persistent subnet show/ignore lists for the GUI picker, kept in the per-user
+# config's [net-reserve] section (show = / ignore =, comma-separated CIDRs).
+# Read merges the system + user config; writes go to the user file.
+sub _read_cidr_list {
+    my ($key) = @_;
+    my %set;
+    for my $p ($ENV{NET_MGR_CONF} // '/etc/net-mgr/config', NetMgr::Config->user_path) {
+        next unless defined $p && -r $p;
+        my $cfg = eval { NetMgr::Config->load($p) } or next;
+        my $v = $cfg->{'net-reserve'}{$key} // next;
+        for my $c (split /[,\s]+/, $v) {
+            my $n = normalize_cidr($c) or next;
+            $set{$n} = 1;
+        }
+    }
+    return \%set;
+}
+sub _write_cidr_list {
+    my ($key, $set) = @_;
+    my @c = sort { (ip2int((split m{/}, $a)[0]) // 0)
+               <=> (ip2int((split m{/}, $b)[0]) // 0) } keys %$set;
+    eval { NetMgr::Config->save_user_value('net-reserve', $key, join(', ', @c)); 1 };
+}
+
 # Ask the local net-mgr-relay's REFRESH proxy to pull this subnet's rows
 # from the elected master into the local DB before we read it — current
 # view on demand, while the relay's subscribe-stream stays the lazy
@@ -236,7 +262,7 @@ sub maybe_refresh {
 # ---- gather the world from the daemon --------------------------------
 #
 # Returns a model: { ranges=>[..], resv=>{ip=>row}, leased=>{ip=>row},
-#                    observed=>{ip=>row}, subnets=>[cidr,..] }
+#                    observed=>{ip=>row}, mac_name=>{mac=>name}, subnets=>[cidr,..] }
 sub gather {
     my ($cli) = @_;
     my $ranges = eval { $cli->snapshot(1, 'dhcp_ranges') }        || [];
@@ -244,10 +270,23 @@ sub gather {
     my $leases = eval { $cli->snapshot(3, 'dhcp_leases') }        || [];
     my $addrs  = eval { $cli->snapshot(4, 'addresses',
                           where => "family = 'v4'") }             || [];
+    # MAC -> machine name, so observed/leased addresses can show who's there
+    # (the same name net-lookup gives), not just a bare MAC.
+    my $ifaces   = eval { $cli->snapshot(5, 'interfaces') } || [];
+    my $machines = eval { $cli->snapshot(6, 'machines') }   || [];
 
     my %resv     = map { $_->{ip}  => $_ } @$resv;
     my %leased   = map { $_->{ip}  => $_ } grep { $_->{ip}  } @$leases;
     my %observed = map { $_->{addr} => $_ } grep { $_->{addr} } @$addrs;
+
+    my %name_of_mid = map { ($_->{id} => $_->{primary_name}) }
+                      grep { defined $_->{primary_name} && length $_->{primary_name} } @$machines;
+    my %mac_name;
+    for my $i (@$ifaces) {
+        next unless $i->{mac} && $i->{machine_id};
+        my $n = $name_of_mid{ $i->{machine_id} } or next;
+        $mac_name{ lc $i->{mac} } = $n;
+    }
 
     my %subnets;
     $subnets{ $_->{subnet_cidr} } = 1 for @$ranges;
@@ -261,7 +300,7 @@ sub gather {
 
     return {
         ranges => $ranges, resv => \%resv, leased => \%leased,
-        observed => \%observed, subnets => \@subnets,
+        observed => \%observed, mac_name => \%mac_name, subnets => \@subnets,
     };
 }
 
@@ -514,7 +553,8 @@ sub cmd_gui {
         or die "net-reserve: Perl/Tk not available: $@";
 
     my $cli = connect_client();   # auth on remote so reserve/release work
-    my %S = (subnet => undef, model => gather($cli), cur => undef, pinned => {});
+    my %S = (subnet => undef, model => gather($cli), cur => undef, pinned => {},
+             show => _read_cidr_list('show'), ignore => _read_cidr_list('ignore'));
     # Seed the picker with this machine's own attached subnets, so your LANs
     # are pickable even before the DB has ranges/leases for them.
     $S{pinned}{$_} = 1 for @{ local_subnets() };
@@ -540,13 +580,17 @@ sub cmd_gui {
         $sync_now);
 
     # The picker offers the union of discovered subnets, any pinned
-    # (manually-entered) ones, and the current selection — so you can jump
-    # to a subnet that has no rows yet and start allocating in it.
+    # (manually-entered) ones, the persistent "show" list, and the current
+    # selection — minus the persistent "ignore" list (the current subnet is
+    # kept visible regardless, so you can un-ignore it). See [net-reserve] in
+    # the per-user config; the + / - buttons edit it.
     my $all_subnets = sub {
         my %u;
         $u{$_} = 1 for @{ $S{model}{subnets} };
         $u{$_} = 1 for keys %{ $S{pinned} };
+        $u{$_} = 1 for keys %{ $S{show} };
         $u{ $S{subnet} } = 1 if defined $S{subnet} && length $S{subnet};
+        delete $u{$_} for grep { $_ ne ($S{subnet} // '') } keys %{ $S{ignore} };
         return [ sort { (ip2int((split m{/}, $a)[0]) // 0)
                     <=> (ip2int((split m{/}, $b)[0]) // 0) } keys %u ];
     };
@@ -567,6 +611,23 @@ sub cmd_gui {
         $S{subnet} = $n;
         $S{pinned}{$n} = 1;
         $sync_now->();
+    };
+    # + : remember the current subnet (always show it); - : ignore it (drop it
+    # from the picker). Both persist to [net-reserve] in the per-user config.
+    my $show_subnet = sub {
+        my $n = $S{subnet} or return;
+        $S{show}{$n} = 1; delete $S{ignore}{$n};
+        _write_cidr_list('show', $S{show}); _write_cidr_list('ignore', $S{ignore});
+        $refresh_subnets->();
+        $status->configure(-text => " keep $n in the list");
+    };
+    my $hide_subnet = sub {
+        my $n = $S{subnet} or return;
+        my @vis = grep { $_ ne $n } @{ $all_subnets->() };   # before we change subnet
+        $S{ignore}{$n} = 1; delete $S{show}{$n};
+        _write_cidr_list('ignore', $S{ignore}); _write_cidr_list('show', $S{show});
+        if (@vis) { $S{subnet} = $vis[0]; $sync_now->() } else { $refresh_subnets->() }
+        $status->configure(-text => " ignore $n");
     };
     # Backfill host names on every reservation that lacks one (all subnets):
     # re-observe each so the daemon names it from the MAC's machine.
@@ -597,6 +658,11 @@ sub cmd_gui {
         -width     => 18,
         -browsecmd => sub { $sync_now->() },      # picked from the dropdown
     )->pack(-side => 'left');
+    # +/- remember (always show) or ignore (hide) the current subnet, persisted.
+    $top->Button(-text => '+', -width => 2, -command => sub { $show_subnet->() })
+        ->pack(-side => 'left');
+    $top->Button(-text => '-', -width => 2, -command => sub { $hide_subnet->() })
+        ->pack(-side => 'left', -padx => 2);
     # Typing a CIDR + Enter (or Go) jumps to it, adding it to the list if new.
     $subnet_be->Subwidget('entry')->bind('<Return>', sub { $set_subnet->() });
     $top->Button(-text => 'Go', -command => sub { $set_subnet->() })
@@ -873,22 +939,20 @@ sub menu_color {
     return '#cc0000';
 }
 
-# Who currently holds $ip (for the reserve menu): the reservation's MAC/name/
-# group, else a lease's MAC/host, else an observed MAC. '' when free/unknown.
+# Who currently holds $ip: the reservation's name/MAC/group, else the machine
+# name for a lease/observed address's MAC (the name net-lookup would give),
+# falling back to the MAC. '' when free/unknown.
 sub occupant {
     my ($model, $ip) = @_;
     if (my $r = $model->{resv}{$ip}) {
         return join ' ', grep { defined && length }
-            $r->{mac}, $r->{name}, ($r->{grp} ? "[$r->{grp}]" : ());
+            $r->{name}, $r->{mac}, ($r->{grp} ? "[$r->{grp}]" : ());
     }
-    if (my $l = $model->{leased}{$ip}) {
-        return join ' ', grep { defined && length }
-            $l->{mac}, ($l->{hostname} // $l->{name});
-    }
-    if (my $o = $model->{observed}{$ip}) {
-        return $o->{mac} // '';
-    }
-    return '';
+    my $rec = $model->{leased}{$ip} || $model->{observed}{$ip} or return '';
+    my $mac  = $rec->{mac};
+    my $name = (defined $mac && length $mac) ? $model->{mac_name}{ lc $mac } : undef;
+    $name //= $rec->{hostname} // $rec->{name};        # lease-supplied name, if any
+    return join ' ', grep { defined && length } ($name, $mac);
 }
 
 sub usage {
