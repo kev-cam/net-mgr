@@ -699,7 +699,9 @@ sub reserve_dialog {
     {
         my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
         $row->Label(-text => 'IP:', -width => 7, -anchor => 'w')->pack(-side => 'left');
-        $be = $row->BrowseEntry(-variable => \$v{ip}, -width => 30,
+        $be = $row->BrowseEntry(-variable => \$v{ip}, -width => 60,
+            -listheight => 32,         # show 32 rows in the drop-down
+            -autolistwidth => 1,       # size the drop-down to the occupant text
             # the listbox rows carry "IP state occupant"; keep just the IP
             -browsecmd => sub { ($v{ip}) = ($_[-1] // '') =~ /(\d+\.\d+\.\d+\.\d+)/ });
         $be->pack(-side => 'left', -fill => 'x', -expand => 1);
@@ -719,7 +721,7 @@ sub reserve_dialog {
         my ($lbl, $key) = @$f;
         my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
         $row->Label(-text => "$lbl:", -width => 7, -anchor => 'w')->pack(-side => 'left');
-        $row->Entry(-textvariable => \$v{$key}, -width => 24)
+        $row->Entry(-textvariable => \$v{$key}, -width => 48)
             ->pack(-side => 'left', -fill => 'x', -expand => 1);
     }
     if (keys %groups) {
