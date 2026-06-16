@@ -65,9 +65,18 @@ if (@peers_cli) {
     $fixed_peer = (split /,/, $peers_cli[0])[0];
     print STDERR "[net-mgr-relay] fixed-peer mode: $fixed_peer\n";
 } elsif (!@{ $cluster->{members} }) {
-    print STDERR "[net-mgr-relay] no roster ([cluster] members empty) and no "
-               . "--peer; nothing to do. Exiting.\n";
-    exit 0;
+    # No roster and no --peer means nothing to *replicate*. But the REFRESH
+    # proxy is still useful on a sole/master node (it just answers "I'm the
+    # master"), so keep running to serve it — only bail out entirely when the
+    # proxy is disabled too. (Exiting here is what left net-reserve's REFRESH
+    # hanging against a sole-member daemon: no proxy was listening.)
+    if (lc($cfg->{cluster}{proxy_listen} // '') eq 'none') {
+        print STDERR "[net-mgr-relay] no roster/--peer and proxy disabled; "
+                   . "nothing to do. Exiting.\n";
+        exit 0;
+    }
+    print STDERR "[net-mgr-relay] no roster/--peer; proxy-only mode "
+               . "(serving REFRESH, no replication).\n";
 } else {
     print STDERR "[net-mgr-relay] cluster mode: self=$cluster->{self_name} "
                . "roster=" . join(',', @{ $cluster->{members} }) . " "
