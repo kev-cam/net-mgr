@@ -27,6 +27,9 @@ net-reserve \- manage permanent DHCP reservations and dynamic ranges
 .B net-reserve move
 .I OLD_IP NEW_IP
 .br
+.B net-reserve autoname
+.RI [ SUBNET ]
+.br
 .B net-reserve add-range
 .I CIDR START END
 .RB [ \-\-zone
@@ -136,6 +139,16 @@ mid\-move. Aliased as
 In the GUI, use the
 .B Move
 button on a reserved cell (it suggests the next free static).
+.TP
+.B autoname \fR[\fISUBNET\fR]
+Fill in a host name for every reservation that lacks one (optionally limited to
+.IR SUBNET ),
+taking the name from the machine each reservation's MAC is correlated to in the
+net\-mgr DB. New reservations are auto\-named the same way when you don't supply
+a name. In the GUI, the
+.B Name unnamed
+button does this for all subnets. Reservations whose MAC isn't correlated to a
+known machine are left unnamed.
 .TP
 .B add-range \fICIDR START END\fR
 Define a dynamic pool, e.g.

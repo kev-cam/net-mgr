@@ -2508,10 +2508,14 @@ sub _obs_dhcp_reservation {
         unless $ip =~ /\A\d+\.\d+\.\d+\.\d+\z/;
     die "dhcp_reservation: bad mac '$mac'\n"
         unless $mac =~ /\A[0-9a-fA-F:]{17}\z/;
+    # Auto-name from the MAC's correlated machine when the caller gives no name,
+    # so reservations don't sit nameless in dnsmasq/DNS.
+    my $name = $kv->{name};
+    $name = $self->{db}->name_for_mac($mac) if !defined $name || $name eq '';
     $self->_upsert('dhcp_reservations', 'upsert_dhcp_reservation',
         ip          => $ip,
         mac         => $mac,
-        name        => $kv->{name},
+        name        => $name,
         subnet_cidr => ($kv->{subnet_cidr} // _dhcp_subnet_of($ip)),
         grp         => $kv->{grp},
         notes       => $kv->{notes},

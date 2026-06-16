@@ -2166,6 +2166,19 @@ sub get_dhcp_reservation {
         "SELECT * FROM dhcp_reservations WHERE ip = ?", undef, $ip);
 }
 
+# Best host name for a MAC: the primary_name of the machine it's correlated to,
+# or undef when the MAC is unknown / uncorrelated. Used to auto-name reservations.
+sub name_for_mac {
+    my ($self, $mac) = @_;
+    return undef unless defined $mac && length $mac;
+    my ($name) = $self->{dbh}->selectrow_array(
+        "SELECT m.primary_name
+           FROM interfaces i JOIN machines m ON m.id = i.machine_id
+          WHERE i.mac = ? AND m.primary_name IS NOT NULL AND m.primary_name <> ''
+          LIMIT 1", undef, lc $mac);
+    return $name;
+}
+
 # Upsert one reservation, keyed by IP (one device per address). mac is
 # stored lowercased to match interfaces/addresses.
 sub upsert_dhcp_reservation {

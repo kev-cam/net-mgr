@@ -15,6 +15,7 @@
 #   net-reserve ranges               list the dynamic DHCP pools
 #   net-reserve reserve IP MAC [--name N] [--group G] [--notes '..']
 #   net-reserve release IP           remove a reservation
+#   net-reserve autoname [SUBNET]    fill missing reservation host names
 #   net-reserve add-range CIDR START END [--zone Z]
 #   net-reserve del-range CIDR START
 #   net-reserve --gui [SUBNET]       Perl/Tk map: click a cell to reserve (pick
@@ -106,6 +107,7 @@ my %DISPATCH = (
     release   => \&cmd_release,
     move       => \&cmd_move,
     reallocate => \&cmd_move,   # alias
+    autoname   => \&cmd_autoname,
     'add-range' => \&cmd_add_range,
     'del-range' => \&cmd_del_range,
     gui       => sub { cmd_gui(shift @ARGV) },
@@ -445,6 +447,42 @@ sub cmd_move {
     print "moved $old -> $new\n";
 }
 
+# Backfill host names on reservations that lack one: re-observe each nameless
+# reservation (preserving its fields) so the daemon fills the name from the
+# MAC's correlated machine. Optional SUBNET limits the scope.
+sub cmd_autoname {
+    my $subnet = shift @ARGV;
+    my $want   = defined $subnet ? normalize_cidr($subnet) : undef;
+    die "net-reserve: bad subnet '$subnet'\n" if defined $subnet && !defined $want;
+    my $cli = connect_client();
+    my $model = gather($cli);
+    my @resv = grep { !defined $_->{name} || $_->{name} eq '' }
+               values %{ $model->{resv} };
+    @resv = grep { (subnet_of($_->{ip}) // '') eq $want } @resv if defined $want;
+    unless (@resv) { print "no reservations missing a name\n"; return }
+    for my $r (sort { ip2int($a->{ip}) <=> ip2int($b->{ip}) } @resv) {
+        my $resp = $cli->observe(kind => 'dhcp_reservation',
+            ip => $r->{ip}, mac => $r->{mac},
+            subnet_cidr => ($r->{subnet_cidr} // subnet_of($r->{ip})),
+            (defined $r->{grp}   && length $r->{grp}   ? (grp   => $r->{grp})   : ()),
+            (defined $r->{notes} && length $r->{notes} ? (notes => $r->{notes}) : ()));
+        warn "net-reserve: $r->{ip}: $resp\n" if !defined $resp || $resp =~ /^ERR/;
+    }
+    my $after = gather($cli);
+    my ($named, @unknown) = (0);
+    for my $r (sort { ip2int($a->{ip}) <=> ip2int($b->{ip}) } @resv) {
+        my $now = $after->{resv}{ $r->{ip} };
+        if ($now && defined $now->{name} && $now->{name} ne '') {
+            $named++;
+            printf "  %-15s %s -> %s\n", $r->{ip}, $r->{mac}, $now->{name};
+        } else {
+            push @unknown, $r->{ip};
+        }
+    }
+    print "named $named of ", scalar(@resv), " reservation(s)\n";
+    print "still unnamed (MAC not correlated to a machine): @unknown\n" if @unknown;
+}
+
 sub cmd_add_range {
     my $cidr  = shift @ARGV or usage("add-range needs CIDR START END");
     my $start = shift @ARGV or usage("add-range needs CIDR START END");
@@ -529,6 +567,28 @@ sub cmd_gui {
         $S{pinned}{$n} = 1;
         $sync_now->();
     };
+    # Backfill host names on every reservation that lacks one (all subnets):
+    # re-observe each so the daemon names it from the MAC's machine.
+    my $autoname = sub {
+        my @resv = grep { !defined $_->{name} || $_->{name} eq '' }
+                   values %{ $S{model}{resv} };
+        unless (@resv) {
+            $status->configure(-text => ' no reservations missing a name'); return;
+        }
+        $status->configure(-text => ' naming ' . scalar(@resv) . ' reservation(s)...');
+        $S{anchor}->update;
+        for my $r (@resv) {
+            $cli->observe(kind => 'dhcp_reservation', ip => $r->{ip}, mac => $r->{mac},
+                subnet_cidr => ($r->{subnet_cidr} // subnet_of($r->{ip})),
+                (defined $r->{grp}   && length $r->{grp}   ? (grp   => $r->{grp})   : ()),
+                (defined $r->{notes} && length $r->{notes} ? (notes => $r->{notes}) : ()));
+        }
+        $S{model} = gather($cli); $redraw->();
+        my @still = grep { !defined $_->{name} || $_->{name} eq '' }
+                    values %{ $S{model}{resv} };
+        $status->configure(-text => sprintf(' named %d of %d (%d still unknown)',
+            scalar(@resv) - scalar(@still), scalar(@resv), scalar(@still)));
+    };
 
     $subnet_be = $top->BrowseEntry(
         -variable  => \$S{subnet},
@@ -542,6 +602,8 @@ sub cmd_gui {
         ->pack(-side => 'left', -padx => 2);
     $top->Button(-text => 'Reload', -command => sub { $sync_now->() })
         ->pack(-side => 'left', -padx => 4);
+    $top->Button(-text => 'Name unnamed', -command => sub { $autoname->() })
+        ->pack(-side => 'left', -padx => 2);
 
     # legend
     my %CELL = (
@@ -839,6 +901,8 @@ usage:
   net-reserve reserve IP MAC [--name N] [--group G] [--notes '..']
   net-reserve release IP
   net-reserve move OLD_IP NEW_IP         reallocate a reservation
+  net-reserve autoname [SUBNET]          fill missing reservation host names
+                                         from each MAC's machine
   net-reserve add-range CIDR START END [--zone Z]
   net-reserve del-range CIDR START
   net-reserve --gui [SUBNET]             Perl/Tk map (click a cell; reserve at a
