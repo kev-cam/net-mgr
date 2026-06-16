@@ -671,38 +671,48 @@ sub reserve_dialog {
     my %v = (ip => $ip, mac => $mac, name => '', group => '');
     # known groups for convenience
     my %groups; $groups{ $_->{grp} } = 1 for grep { $_->{grp} } values %{ $S->{model}{resv} };
-    # Target address: a menu of EVERY address in the subnet — green for free,
-    # red for taken, with the current occupant (MAC/name) beside each — so a
-    # machine seen at one address (e.g. a DHCP .67) can be given a free permanent
-    # one (e.g. .228). Defaults to the clicked cell; editable, so any address can
-    # be typed too.
-    my @labels; my @colors;
-    {
+    # Target address: a menu of the subnet's addresses with the occupant
+    # (MAC/name) beside each, colour-coded — green free, blue for the auto-DHCP
+    # dynamic ranges, red otherwise-taken. The "DHCP pool / assigned" toggle
+    # hides the blue rows so the list is just static candidates. Editable, so any
+    # address can be typed; defaults to the clicked cell.
+    my $show_pool = 1;
+    my ($be, $lb);
+    my $rebuild = sub {
+        my (@labels, @colors);
         my ($net, $len, $first, $last) = cidr_parts(subnet_of($ip));
         for (my $i = $first; defined $first && $i <= $last; $i++) {
-            my $a   = int2ip($i);
-            my $st  = classify($S->{model}, $a);
-            my $occ = occupant($S->{model}, $a);
-            push @labels, (sprintf("%-15s %-7s %s", $a, $st, $occ) =~ s/\s+$//r);
-            push @colors, ($st eq 'free' ? '#0a0' : '#c00');
+            my $a  = int2ip($i);
+            my $st = classify($S->{model}, $a);
+            next if !$show_pool && $st eq 'assigned';       # hide the pool
+            push @labels,
+                (sprintf("%-15s %-7s %s", $a, $st, occupant($S->{model}, $a)) =~ s/\s+$//r);
+            push @colors, menu_color($st);
         }
-    }
+        return unless $be;
+        $be->delete(0, 'end');                              # delete/insert leave
+        $be->insert('end', @labels) if @labels;             #   the IP value alone
+        eval { $lb->itemconfigure($_, -foreground => $colors[$_]) } for 0 .. $#colors;
+    };
     {
         my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
         $row->Label(-text => 'IP:', -width => 7, -anchor => 'w')->pack(-side => 'left');
-        my $be = $row->BrowseEntry(-variable => \$v{ip}, -choices => \@labels,
-            -width => 30,
+        $be = $row->BrowseEntry(-variable => \$v{ip}, -width => 30,
             # the listbox rows carry "IP state occupant"; keep just the IP
             -browsecmd => sub { ($v{ip}) = ($_[-1] // '') =~ /(\d+\.\d+\.\d+\.\d+)/ });
         $be->pack(-side => 'left', -fill => 'x', -expand => 1);
-        my $lb = eval { $be->Subwidget('slistbox')->Subwidget('listbox') };
-        if ($lb) {
-            eval { $lb->configure(-font => 'Courier 10') };   # align the columns
-            eval { $lb->itemconfigure($_, -foreground => $colors[$_]) }
-                for 0 .. $#colors;
-        }
-        $v{ip} = $ip;                  # editable default = the clicked cell
+        $lb = eval { $be->Subwidget('slistbox')->Subwidget('listbox') };
+        eval { $lb->configure(-font => 'Courier 10 bold') } if $lb;  # bold = contrast
     }
+    {
+        my $row = $dlg->add('Frame')->pack(-fill => 'x');
+        $row->Label(-text => '', -width => 7)->pack(-side => 'left');
+        $row->Checkbutton(-text => 'show DHCP pool / assigned',
+            -variable => \$show_pool, -command => sub { $rebuild->() })
+            ->pack(-side => 'left');
+    }
+    $rebuild->();
+    $v{ip} = $ip;                      # editable default = the clicked cell
     for my $f (['MAC', 'mac'], ['Name', 'name'], ['Group', 'group']) {
         my ($lbl, $key) = @$f;
         my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
@@ -784,6 +794,15 @@ sub next_free {
         return int2ip($i) if classify($model, int2ip($i)) eq 'free';
     }
     return undef;
+}
+
+# High-contrast colour for a state in the reserve menu: green free, blue for the
+# auto-DHCP dynamic range ('assigned'), red for otherwise-taken (in-use/reserved).
+sub menu_color {
+    my ($st) = @_;
+    return '#008000' if $st eq 'free';
+    return '#0000cc' if $st eq 'assigned';
+    return '#cc0000';
 }
 
 # Who currently holds $ip (for the reserve menu): the reservation's MAC/name/

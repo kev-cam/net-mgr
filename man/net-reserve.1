@@ -153,12 +153,17 @@ leased or in use); the reserve dialog's
 field is a menu of every address in the subnet \(em
 .B green
 for free,
+.B blue
+for the auto\-DHCP dynamic ranges, and
 .B red
-for taken, with the current occupant (MAC/name) beside each \(em so a machine
-seen at one address (e.g. a DHCP\-assigned
+for otherwise\-taken \(em with the current occupant (MAC/name) beside each, so a
+machine seen at one address (e.g. a DHCP\-assigned
 .IR .67 )
 can be given a free permanent one (e.g.
 .IR .228 ).
+A
+.B show DHCP pool / assigned
+toggle hides the blue (pool) rows so the list is just static candidates.
 Click a reserved cell to move or release it. Refreshes live.
 .SH OPTIONS
 .TP
