@@ -509,7 +509,8 @@ sub cmd_del_range {
 
 sub cmd_gui {
     my ($want_subnet) = @_;
-    eval { require Tk; Tk->import; require Tk::DialogBox; require Tk::BrowseEntry; 1 }
+    eval { require Tk; Tk->import; require Tk::DialogBox; require Tk::BrowseEntry;
+           require Tk::ROText; 1 }   # explicit: silences Scrolled's "Assuming require" note
         or die "net-reserve: Perl/Tk not available: $@";
 
     my $cli = connect_client();   # auth on remote so reserve/release work
