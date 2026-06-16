@@ -57,7 +57,7 @@ my %GLYPH = (
 );
 
 my ($listen, $server, $force_auth, $no_auth, $key_id, $key_file);
-my ($gui, $describe, $opt_name, $opt_group, $opt_notes, $opt_zone, $limit);
+my ($gui, $describe, $opt_name, $opt_group, $opt_notes, $opt_zone, $limit, $opt_force);
 GetOptions(
     'listen=s'   => \$listen,
     'server=s'   => \$server,
@@ -67,6 +67,7 @@ GetOptions(
     'key-file=s' => \$key_file,
     'gui'        => \$gui,
     'describe'   => \$describe,
+    'force'      => \$opt_force,
     'name=s'     => \$opt_name,
     'group=s'    => \$opt_group,
     'notes=s'    => \$opt_notes,
@@ -287,6 +288,13 @@ sub gather {
         my $n = $name_of_mid{ $i->{machine_id} } or next;
         $mac_name{ lc $i->{mac} } = $n;
     }
+    # MAC -> where it currently is (lease/observed) and where it's reserved, so
+    # the UI can flag a device that's been given a new address but hasn't moved
+    # there yet.
+    my (%mac_cur_ip, %mac_resv_ip);
+    for my $ip (sort keys %leased)   { my $m=$leased{$ip}{mac};   $mac_cur_ip{lc $m} //= $ip if $m }
+    for my $ip (sort keys %observed) { my $m=$observed{$ip}{mac}; $mac_cur_ip{lc $m} //= $ip if $m }
+    for my $ip (keys %resv)          { my $m=$resv{$ip}{mac};     $mac_resv_ip{lc $m} //= $ip if $m }
 
     my %subnets;
     $subnets{ $_->{subnet_cidr} } = 1 for @$ranges;
@@ -300,7 +308,9 @@ sub gather {
 
     return {
         ranges => $ranges, resv => \%resv, leased => \%leased,
-        observed => \%observed, mac_name => \%mac_name, subnets => \@subnets,
+        observed => \%observed, mac_name => \%mac_name,
+        mac_cur_ip => \%mac_cur_ip, mac_resv_ip => \%mac_resv_ip,
+        subnets => \@subnets,
     };
 }
 
@@ -457,7 +467,10 @@ sub cmd_reserve {
         subnet_cidr => subnet_of($ip),
         (defined $opt_group ? (grp   => $opt_group) : ()),
         (defined $opt_notes ? (notes => $opt_notes) : ()),
+        ($opt_force ? (force => 1) : ()),
     );
+    # The daemon refuses a 2nd reservation for a MAC already reserved elsewhere;
+    # `net-reserve move OLD NEW` relocates it, or --force adds it anyway.
     die "net-reserve: $r\n" if !defined $r || $r =~ /^ERR/;
     print "reserved $ip -> $mac",
           (defined $opt_name ? " ($opt_name)" : ''),
@@ -871,10 +884,34 @@ sub reserve_dialog {
     unless ($v{mac} =~ /^[0-9a-fA-F:]{17}$/) {
         $status->configure(-text => " bad MAC '$v{mac}' — not reserved"); return;
     }
+    # One reservation per MAC. If this device is already reserved elsewhere,
+    # offer to move it rather than create a second (duplicate) reservation.
+    my $force = 0;
+    my ($dup) = grep { lc($_->{mac}) eq lc($v{mac}) && $_->{ip} ne $v{ip} }
+                values %{ $S->{model}{resv} };
+    if ($dup) {
+        my $ans = lc(($S->{anchor} // $status)->messageBox(
+            -type => 'yesnocancel', -icon => 'warning', -title => 'Already reserved',
+            -message => "$v{mac} is already reserved at $dup->{ip}"
+                . (defined $dup->{name} && length $dup->{name} ? " ($dup->{name})" : '')
+                . ".\n\nYes: move that reservation to $v{ip}\n"
+                . "No: keep both (add a second reservation)\nCancel: do nothing"));
+        return if $ans eq 'cancel';
+        if ($ans eq 'yes') {
+            my $resp = $cli->observe(kind => 'dhcp_reservation_move',
+                ip => $dup->{ip}, new_ip => $v{ip});
+            if (!defined $resp || $resp =~ /^ERR/) { $status->configure(-text => " $resp"); return }
+            $S->{model} = gather($cli); $redraw->();
+            $status->configure(-text => " moved $dup->{ip} -> $v{ip}");
+            return;
+        }
+        $force = 1;          # 'No' — caller insists on a second reservation
+    }
     my $r = $cli->observe(kind => 'dhcp_reservation', ip => $v{ip}, mac => lc $v{mac},
         ($v{name}  ne '' ? (name => $v{name})  : ()),
         subnet_cidr => subnet_of($v{ip}),
-        ($v{group} ne '' ? (grp  => $v{group}) : ()));
+        ($v{group} ne '' ? (grp  => $v{group}) : ()),
+        ($force ? (force => 1) : ()));
     if (!defined $r || $r =~ /^ERR/) { $status->configure(-text => " $r"); return }
     $S->{model} = gather($cli); $redraw->();
     $status->configure(-text => " reserved $v{ip} -> $v{mac}");
@@ -945,14 +982,22 @@ sub menu_color {
 sub occupant {
     my ($model, $ip) = @_;
     if (my $r = $model->{resv}{$ip}) {
-        return join ' ', grep { defined && length }
+        my $s = join ' ', grep { defined && length }
             $r->{name}, $r->{mac}, ($r->{grp} ? "[$r->{grp}]" : ());
+        # reserved here, but the device is currently seen at another address?
+        my $cur = $r->{mac} ? $model->{mac_cur_ip}{ lc $r->{mac} } : undef;
+        $s .= " (now at $cur)" if $cur && $cur ne $ip;
+        return $s;
     }
     my $rec = $model->{leased}{$ip} || $model->{observed}{$ip} or return '';
     my $mac  = $rec->{mac};
     my $name = (defined $mac && length $mac) ? $model->{mac_name}{ lc $mac } : undef;
     $name //= $rec->{hostname} // $rec->{name};        # lease-supplied name, if any
-    return join ' ', grep { defined && length } ($name, $mac);
+    my $s = join ' ', grep { defined && length } ($name, $mac);
+    # here now, but reserved for a different address (assigned, not yet moved)?
+    my $rip = (defined $mac && length $mac) ? $model->{mac_resv_ip}{ lc $mac } : undef;
+    $s .= " -> reserved $rip" if $rip && $rip ne $ip;
+    return $s;
 }
 
 sub usage {

@@ -2508,6 +2508,17 @@ sub _obs_dhcp_reservation {
         unless $ip =~ /\A\d+\.\d+\.\d+\.\d+\z/;
     die "dhcp_reservation: bad mac '$mac'\n"
         unless $mac =~ /\A[0-9a-fA-F:]{17}\z/;
+    # One reservation per MAC: refuse a NEW reservation for a device already
+    # reserved at another address (it should be moved/released, not duplicated).
+    # Updating the reservation already at this IP is fine, as is an explicit
+    # force=1 (multi-homed edge cases).
+    unless ($self->{db}->get_dhcp_reservation($ip) || $kv->{force}) {
+        my $other = $self->{db}->dhcp_reservation_for_mac($mac);
+        die "dhcp_reservation: $mac is already reserved at $other->{ip}"
+          . (defined $other->{name} && length $other->{name} ? " ($other->{name})" : '')
+          . " - move or release it first (or force=1)\n"
+            if $other;
+    }
     # Auto-name from the MAC's correlated machine when the caller gives no name,
     # so reservations don't sit nameless in dnsmasq/DNS.
     my $name = $kv->{name};

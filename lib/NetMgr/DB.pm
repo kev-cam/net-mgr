@@ -2166,6 +2166,16 @@ sub get_dhcp_reservation {
         "SELECT * FROM dhcp_reservations WHERE ip = ?", undef, $ip);
 }
 
+# The reservation currently held by $mac (lowest IP if somehow several), or
+# undef. Used to enforce one reservation per MAC.
+sub dhcp_reservation_for_mac {
+    my ($self, $mac) = @_;
+    return undef unless defined $mac && length $mac;
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM dhcp_reservations WHERE mac = ? ORDER BY INET_ATON(ip) LIMIT 1",
+        undef, lc $mac);
+}
+
 # Best host name for a MAC: the primary_name of the machine it's correlated to,
 # or undef when the MAC is unknown / uncorrelated. Used to auto-name reservations.
 sub name_for_mac {

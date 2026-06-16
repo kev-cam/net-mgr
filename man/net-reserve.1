@@ -125,7 +125,15 @@ file it under a group label;
 .B \-\-name
 sets the dnsmasq host name. Warns (does not block) if
 .I IP
-falls inside a dynamic range.
+falls inside a dynamic range. A MAC may hold only
+.I one
+reservation: reserving a second address for a MAC already reserved elsewhere is
+refused \(em
+.B move
+it (below) or pass
+.B \-\-force
+to keep both. In the GUI this is offered as a move when you reserve a fresh
+address for an already\-reserved device.
 .TP
 .B release \fIIP\fR
 Remove the reservation on
@@ -180,7 +188,12 @@ toggle hides the blue (pool) rows so the list is just static candidates.
 The occupant shown for a leased/observed address is the machine name net\-mgr
 knows for its MAC (the same name
 .BR net-lookup (1)
-gives), falling back to the MAC.
+gives), falling back to the MAC. A device reserved at one address but still
+seen at another is flagged \(em
+.RB \(lq "(now at \fIIP\fR)" \(rq
+on the reserved cell and
+.RB \(lq "-> reserved \fIIP\fR" \(rq
+on its current one \(em so you can tell it hasn't moved yet.
 Click a reserved cell to move or release it. Refreshes live.
 .PP
 The subnet picker shows discovered subnets, your local LANs, and a persistent
@@ -198,6 +211,12 @@ both are saved under
 .RB ( show " / " ignore ", comma-separated CIDRs)"
 in the per\-user config.
 .SH OPTIONS
+.TP
+.B \-\-force
+With
+.BR reserve ,
+allow a second reservation for a MAC that is already reserved at another
+address (normally refused).
 .TP
 .BI \-\-listen " HOST:PORT"
 Daemon address (overrides
