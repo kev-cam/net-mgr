@@ -671,17 +671,37 @@ sub reserve_dialog {
     my %v = (ip => $ip, mac => $mac, name => '', group => '');
     # known groups for convenience
     my %groups; $groups{ $_->{grp} } = 1 for grep { $_->{grp} } values %{ $S->{model}{resv} };
-    # Target address: a selection menu of the free static IPs in this subnet, so
-    # a machine seen at one address (e.g. a DHCP .67) can be given a permanent
-    # one (e.g. .228). Defaults to the clicked cell (reserve-in-place) and stays
-    # editable, so any address can be typed too.
-    my @ipchoices = ($ip, free_ips($S->{model}, subnet_of($ip)));
-    my %seen_ip; @ipchoices = grep { !$seen_ip{$_}++ } @ipchoices;
+    # Target address: a menu of EVERY address in the subnet — green for free,
+    # red for taken, with the current occupant (MAC/name) beside each — so a
+    # machine seen at one address (e.g. a DHCP .67) can be given a free permanent
+    # one (e.g. .228). Defaults to the clicked cell; editable, so any address can
+    # be typed too.
+    my @labels; my @colors;
+    {
+        my ($net, $len, $first, $last) = cidr_parts(subnet_of($ip));
+        for (my $i = $first; defined $first && $i <= $last; $i++) {
+            my $a   = int2ip($i);
+            my $st  = classify($S->{model}, $a);
+            my $occ = occupant($S->{model}, $a);
+            push @labels, (sprintf("%-15s %-7s %s", $a, $st, $occ) =~ s/\s+$//r);
+            push @colors, ($st eq 'free' ? '#0a0' : '#c00');
+        }
+    }
     {
         my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
         $row->Label(-text => 'IP:', -width => 7, -anchor => 'w')->pack(-side => 'left');
-        $row->BrowseEntry(-variable => \$v{ip}, -choices => \@ipchoices, -width => 22)
-            ->pack(-side => 'left', -fill => 'x', -expand => 1);
+        my $be = $row->BrowseEntry(-variable => \$v{ip}, -choices => \@labels,
+            -width => 30,
+            # the listbox rows carry "IP state occupant"; keep just the IP
+            -browsecmd => sub { ($v{ip}) = ($_[-1] // '') =~ /(\d+\.\d+\.\d+\.\d+)/ });
+        $be->pack(-side => 'left', -fill => 'x', -expand => 1);
+        my $lb = eval { $be->Subwidget('slistbox')->Subwidget('listbox') };
+        if ($lb) {
+            eval { $lb->configure(-font => 'Courier 10') };   # align the columns
+            eval { $lb->itemconfigure($_, -foreground => $colors[$_]) }
+                for 0 .. $#colors;
+        }
+        $v{ip} = $ip;                  # editable default = the clicked cell
     }
     for my $f (['MAC', 'mac'], ['Name', 'name'], ['Group', 'group']) {
         my ($lbl, $key) = @$f;
@@ -700,6 +720,10 @@ sub reserve_dialog {
     }
     my $ans = $dlg->Show // 'Cancel';
     return unless $ans eq 'Reserve';
+    ($v{ip}) = $v{ip} =~ /(\d+\.\d+\.\d+\.\d+)/ ? ($1) : ($v{ip});  # tolerate a label
+    unless (defined ip2int($v{ip})) {
+        $status->configure(-text => " bad IP '$v{ip}' — not reserved"); return;
+    }
     unless ($v{mac} =~ /^[0-9a-fA-F:]{17}$/) {
         $status->configure(-text => " bad MAC '$v{mac}' — not reserved"); return;
     }
@@ -762,17 +786,22 @@ sub next_free {
     return undef;
 }
 
-# All free static IPs in $cidr, ascending — the reserve dialog's address menu.
-sub free_ips {
-    my ($model, $cidr) = @_;
-    my ($net, $len, $first, $last) = cidr_parts($cidr);
-    return () unless defined $net;
-    my @free;
-    for (my $i = $first; $i <= $last; $i++) {
-        my $ip = int2ip($i);
-        push @free, $ip if classify($model, $ip) eq 'free';
+# Who currently holds $ip (for the reserve menu): the reservation's MAC/name/
+# group, else a lease's MAC/host, else an observed MAC. '' when free/unknown.
+sub occupant {
+    my ($model, $ip) = @_;
+    if (my $r = $model->{resv}{$ip}) {
+        return join ' ', grep { defined && length }
+            $r->{mac}, $r->{name}, ($r->{grp} ? "[$r->{grp}]" : ());
     }
-    return @free;
+    if (my $l = $model->{leased}{$ip}) {
+        return join ' ', grep { defined && length }
+            $l->{mac}, ($l->{hostname} // $l->{name});
+    }
+    if (my $o = $model->{observed}{$ip}) {
+        return $o->{mac} // '';
+    }
+    return '';
 }
 
 sub usage {

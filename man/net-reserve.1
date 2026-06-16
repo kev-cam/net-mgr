@@ -150,10 +150,14 @@ coloured by state, with a grouped reservation list. Click any non\-reserved
 cell to reserve it (the MAC is pre\-filled when the address is currently
 leased or in use); the reserve dialog's
 .B IP
-field is a menu of the subnet's free static addresses, so a machine seen at
-one address (e.g. a DHCP\-assigned
+field is a menu of every address in the subnet \(em
+.B green
+for free,
+.B red
+for taken, with the current occupant (MAC/name) beside each \(em so a machine
+seen at one address (e.g. a DHCP\-assigned
 .IR .67 )
-can be given a permanent one (e.g.
+can be given a free permanent one (e.g.
 .IR .228 ).
 Click a reserved cell to move or release it. Refreshes live.
 .SH OPTIONS
