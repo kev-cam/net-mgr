@@ -20,8 +20,9 @@
 #   net-reserve del-range CIDR START
 #   net-reserve --gui [SUBNET]       Perl/Tk map: click a cell to reserve (pick
 #                                    the target address from a menu), move, release;
-#                                    +/- keep or ignore subnets in the picker
-#                                    ([net-reserve] show/ignore in the user config)
+#                                    +/- keep or ignore subnets in the picker;
+#                                    reopens on the last subnet you viewed
+#                                    ([net-reserve] show/ignore/last in user config)
 #
 #   --listen HOST:PORT   daemon address (overrides --server and config)
 #   --server NAME        a server from [servers] in ~/.config/net-mgr/config
@@ -210,8 +211,9 @@ sub local_subnets {
 }
 
 # Persistent subnet show/ignore lists for the GUI picker, kept in the per-user
-# config's [net-reserve] section (show = / ignore =, comma-separated CIDRs).
-# Read merges the system + user config; writes go to the user file.
+# config's [net-reserve] section (show = / ignore =, comma-separated CIDRs;
+# also last = CIDR, the subnet the GUI reopens on). Read merges the system +
+# user config; writes go to the user file.
 sub _read_cidr_list {
     my ($key) = @_;
     my %set;
@@ -231,6 +233,24 @@ sub _write_cidr_list {
     my @c = sort { (ip2int((split m{/}, $a)[0]) // 0)
                <=> (ip2int((split m{/}, $b)[0]) // 0) } keys %$set;
     eval { NetMgr::Config->save_user_value('net-reserve', $key, join(', ', @c)); 1 };
+}
+
+# The GUI reopens on the last subnet you viewed. Persisted as a single CIDR in
+# the same [net-reserve] section as show/ignore (key `last`); user file wins.
+sub _read_last_subnet {
+    for my $p (NetMgr::Config->user_path, $ENV{NET_MGR_CONF} // '/etc/net-mgr/config') {
+        next unless defined $p && -r $p;
+        my $cfg = eval { NetMgr::Config->load($p) } or next;
+        my $v = $cfg->{'net-reserve'}{last} // next;
+        my $n = normalize_cidr($v) or next;
+        return $n;
+    }
+    return undef;
+}
+sub _write_last_subnet {
+    my ($cidr) = @_;
+    my $n = normalize_cidr($cidr // '') or return;
+    eval { NetMgr::Config->save_user_value('net-reserve', 'last', $n); 1 };
 }
 
 # Ask the local net-mgr-relay's REFRESH proxy to pull this subnet's rows
@@ -594,6 +614,12 @@ sub cmd_gui {
         my $n = normalize_cidr($want_subnet);
         if ($n) { $S{subnet} = $n; $S{pinned}{$n} = 1; }
     }
+    # No explicit --gui SUBNET → reopen on the last subnet you viewed (pin it so
+    # it's pickable even if undiscovered), then fall back to a discovered subnet.
+    if (!defined $S{subnet}) {
+        my $last = _read_last_subnet();
+        if (defined $last) { $S{subnet} = $last; $S{pinned}{$last} = 1; }
+    }
     $S{subnet} //= $S{model}{subnets}[0] // (sort keys %{ $S{pinned} })[0];
 
     my $mw = Tk::MainWindow->new(-title => "net-reserve — $listen");
@@ -634,6 +660,7 @@ sub cmd_gui {
         $refresh_subnets->();
         $redraw->();
         $status->configure(-text => " $note") if $note;
+        _write_last_subnet($S{subnet});   # remember it; --gui reopens here next time
     };
     # Jump to (and pin) a typed/selected subnet; silently ignores junk.
     my $set_subnet = sub {
