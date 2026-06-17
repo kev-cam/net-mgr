@@ -78,25 +78,26 @@ use. Glyph
 green.
 .TP
 .B reserved
-A permanent reservation. Glyph
+A permanent reservation whose device is not currently seen. Glyph
 .BR R ,
 red.
 .TP
-.B pool-free
-Inside a dynamic DHCP range, currently idle. Glyph
+.B active
+A reservation whose device is currently in use at that address \(em the
+reservation is in effect. Glyph
+.BR * ,
+purple.
+.TP
+.B assigned
+Inside a dynamic DHCP range (handed out automatically). Glyph
 .BR \- ,
 blue.
 .TP
-.B pool-used
-Inside a dynamic range and currently leased/observed. Glyph
-.BR = ,
-yellow.
-.TP
-.B used-static
-In use but neither reserved nor inside a pool \(em an unmanaged static
-(or squatter). Glyph
+.B in-use
+Occupied (leased/observed) but neither reserved nor inside a pool \(em an
+unmanaged static (or squatter). Glyph
 .BR ! ,
-magenta.
+orange.
 .PP
 A
 .I free static

@@ -1,6 +1,8 @@
 #!/usr/bin/perl
 # net-import-dhcp — read /etc/net-mgr/dhcp.master (and dhcp.extra) and push
-# each host reservation into net-mgr as a `kind=host` observation.
+# each host block into net-mgr both as a `kind=host` observation (seeds the
+# discovery tables) and as a `kind=dhcp_reservation` (the permanent MAC->IP
+# assignment, so net-reserve shows it reserved + named rather than just in-use).
 #
 # Usage:
 #   net-import-dhcp                          # both files (master + extra)
@@ -46,6 +48,7 @@ unless ($print_only) {
 }
 
 my $imported = 0;
+my $reserved = 0;
 my $skipped  = 0;
 for my $file (@files) {
     my $bname = basename($file);   # 'dhcp.master' or 'dhcp.extra'
@@ -81,10 +84,25 @@ for my $file (@files) {
                 $imported++;
             }
         }
+
+        # A `host { fixed-address }` block IS a permanent reservation, so also
+        # record it in dhcp_reservations — otherwise net-reserve only ever sees
+        # the address as "in use", never reserved/named.
+        next unless defined $h->{ip} && length $h->{ip}
+                 && defined $h->{mac} && length $h->{mac};
+        my %rkv = (kind => 'dhcp_reservation',
+                   ip => $h->{ip}, mac => $h->{mac}, name => $h->{name});
+        if ($print_only) {
+            print "OBSERVE ", format_kv(%rkv), "\n";
+        } else {
+            my $rr = $cli->observe(%rkv);
+            if ($rr && $rr =~ /^ERR/) { warn "reservation rejected for $h->{name}: $rr\n" }
+            else { $reserved++ }
+        }
     }
 }
 
 if ($cli) {
     $cli->bye;
-    print STDERR "imported=$imported skipped=$skipped\n";
+    print STDERR "imported=$imported reservations=$reserved skipped=$skipped\n";
 }

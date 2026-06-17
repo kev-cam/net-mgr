@@ -17,9 +17,13 @@ blocks out of
 .I /etc/net-mgr/dhcp.master
 and (if present)
 .IR /etc/net-mgr/dhcp.extra ,
-and pushes each reservation as a
+and pushes each one in two ways: a
 .B kind=host
-observation into the manager. The address source is tagged
+observation (seeds the discovery tables) and a
+.B kind=dhcp_reservation
+(the permanent MAC\(->IP assignment in the
+.B dhcp_reservations
+table). The address source is tagged
 .IB <hostname> : <basename>
 (e.g.
 .BR kc-qernel:dhcp.master )
@@ -27,7 +31,10 @@ so subsequent AP-lease observations don't downgrade these authoritative
 entries.
 .PP
 This is the seeding path \(em it tells net-mgr about devices that have a
-reservation but haven't yet appeared on the network.
+reservation but haven't yet appeared on the network, and makes each
+reservation show in
+.BR net-reserve (1)
+as reserved/named rather than merely \(lqin use\(rq.
 .SH OPTIONS
 .TP
 \fB\-\-file\fR \fIPATH\fR

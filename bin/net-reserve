@@ -45,15 +45,16 @@ use NetMgr::Protocol qw(parse_line format_kv);
 # runs before any later statement would — a `my` initialised below the
 # $handler->() call is still empty when the handlers fire.
 my %COLOR = (   # ANSI background per state
-    reserved => "\e[41m",        # red    — permanent reservation
+    reserved => "\e[41m",        # red    — permanent reservation, not seen now
+    active   => "\e[45m",        # purple — reserved AND currently in use
     assigned => "\e[44m",        # blue   — inside a DHCP dynamic range
-    'in-use' => "\e[48;5;208m",  # orange — actually occupied (lease/observed)
+    'in-use' => "\e[48;5;208m",  # orange — occupied (lease/observed), unreserved
     free     => "\e[42m",        # green  — allocatable static
 );
 my $RESET = "\e[0m";
 # Distinct one-char glyphs for the no-colour (piped) map.
 my %GLYPH = (
-    reserved => 'R', assigned => '-', 'in-use' => '!', free => '.',
+    reserved => 'R', active => '*', assigned => '-', 'in-use' => '!', free => '.',
 );
 
 my ($listen, $server, $force_auth, $no_auth, $key_id, $key_file);
@@ -344,7 +345,12 @@ sub in_pool {
 sub classify {
     my ($model, $ip) = @_;
     my $i = ip2int($ip);
-    return 'reserved' if $model->{resv}{$ip};
+    if ($model->{resv}{$ip}) {
+        # reserved AND currently occupied -> 'active' (the reservation is in
+        # effect); reserved but not seen -> 'reserved' (pending/vacant).
+        return ($model->{leased}{$ip} || $model->{observed}{$ip})
+               ? 'active' : 'reserved';
+    }
     return 'assigned' if in_pool($model, $i);
     return 'in-use'   if $model->{leased}{$ip} || $model->{observed}{$ip};
     return 'free';
@@ -355,8 +361,9 @@ sub classify {
 sub use_color { -t STDOUT }
 
 sub state_label {
-    my %L = (reserved => 'reserved', assigned => 'DHCP assigned',
-             'in-use' => 'in use', free => 'free static');
+    my %L = (reserved => 'reserved', active => 'reserved + in use',
+             assigned => 'DHCP assigned', 'in-use' => 'in use',
+             free => 'free static');
     return $L{$_[0]} // $_[0];
 }
 
@@ -414,7 +421,7 @@ sub cmd_list {
     if ($c) {
         print "\nlegend: ";
         print "$COLOR{$_}$RESET ", state_label($_), "  " for
-            qw(free assigned in-use reserved);
+            qw(free assigned in-use reserved active);
         print "\n";
     }
 }
@@ -698,11 +705,11 @@ sub cmd_gui {
 
     # legend
     my %CELL = (
-        reserved => '#d33', assigned => '#36c', 'in-use' => '#e8821e',
-        free => '#3a3',
+        reserved => '#d33', active => '#90c', assigned => '#36c',
+        'in-use' => '#e8821e', free => '#3a3',
     );
     my $leg = $top->Frame->pack(-side => 'right');
-    for my $st (qw(free assigned in-use reserved)) {
+    for my $st (qw(free assigned in-use reserved active)) {
         $leg->Label(-text => '  ', -background => $CELL{$st})->pack(-side => 'left');
         $leg->Label(-text => state_label($st) . ' ')->pack(-side => 'left');
     }
@@ -807,7 +814,7 @@ sub cell_click {
     my ($cli, $S, $ip, $redraw, $status) = @_;
     my $model = $S->{model};
     my $st = classify($model, $ip);
-    if ($st eq 'reserved') {
+    if ($st eq 'reserved' || $st eq 'active') {   # both are reservations
         my $r = $model->{resv}{$ip};
         release_dialog($cli, $S, $ip, $r, $redraw, $status);
     } else {
@@ -983,8 +990,9 @@ sub next_free {
 sub menu_color {
     my ($st) = @_;
     return '#008000' if $st eq 'free';
-    return '#0000cc' if $st eq 'assigned';
-    return '#cc0000';
+    return '#0000cc' if $st eq 'assigned';   # DHCP pool
+    return '#9000c0' if $st eq 'active';      # reserved + in use
+    return '#cc0000';                          # reserved / in-use (taken)
 }
 
 # Who currently holds $ip: the reservation's name/MAC/group, else the machine
