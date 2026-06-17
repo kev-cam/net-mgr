@@ -2853,7 +2853,13 @@ sub _obs_host {
         # dhcp.master / dhcp.extra are paper records — they don't
         # prove the device is currently reachable.
         my $src = $kv->{source} // '';
-        my $is_live = $src !~ /:dhcp\.(master|extra)$/;
+        # Liveness: an explicit live=0/1 wins — net-reserve --push pushes
+        # reservations as paper records (known MAC<->name<->IP, but no proof
+        # the device is up right now). Otherwise fall back to the source
+        # heuristic: file imports (dhcp.master/extra) are paper, anything
+        # else is a live sighting.
+        my $is_live = defined $kv->{live} ? ($kv->{live} ? 1 : 0)
+                    : ($src !~ /:dhcp\.(master|extra)$/);
         my %iface_args = (
             mac    => $mac,
             kind   => $kv->{iface_kind} // 'ethernet',

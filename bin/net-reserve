@@ -18,6 +18,9 @@
 #   net-reserve autoname [SUBNET]    fill missing reservation host names
 #   net-reserve add-range CIDR START END [--zone Z]
 #   net-reserve del-range CIDR START
+#   net-reserve --push [SUBNET]      push named reservations into net-lookup as
+#                                    never-seen hosts (kind=host, last_observed
+#                                    NULL); --dry-run previews the observations
 #   net-reserve --gui [SUBNET]       Perl/Tk map: click a cell to reserve (pick
 #                                    the target address from a menu), move, release;
 #                                    +/- keep or ignore subnets in the picker;
@@ -41,6 +44,7 @@ use Getopt::Long qw(:config no_ignore_case bundling pass_through);
 use NetMgr::Client;
 use NetMgr::Config;
 use NetMgr::Protocol qw(parse_line format_kv);
+use Sys::Hostname qw(hostname);
 
 # Render tables. Defined up here (not lower in the file) because the dispatch
 # runs before any later statement would — a `my` initialised below the
@@ -60,6 +64,7 @@ my %GLYPH = (
 
 my ($listen, $server, $force_auth, $no_auth, $key_id, $key_file);
 my ($gui, $describe, $opt_name, $opt_group, $opt_notes, $opt_zone, $limit, $opt_force);
+my ($opt_push, $opt_dry);
 GetOptions(
     'listen=s'   => \$listen,
     'server=s'   => \$server,
@@ -68,6 +73,8 @@ GetOptions(
     'key-id=s'   => \$key_id,
     'key-file=s' => \$key_file,
     'gui'        => \$gui,
+    'push'       => \$opt_push,
+    'dry-run'    => \$opt_dry,
     'describe'   => \$describe,
     'force'      => \$opt_force,
     'name=s'     => \$opt_name,
@@ -101,6 +108,9 @@ if (!defined $listen) {
 # With the --gui flag, the subnet is the leftover positional, already shifted
 # into $cmd above (not still on @ARGV).
 if ($gui) { cmd_gui($cmd); exit 0; }
+# --push: surface DB reservations as names net-lookup resolves (never-seen).
+# Like --gui, the optional SUBNET is the leftover positional now in $cmd.
+if ($opt_push) { cmd_push($cmd); exit 0; }
 usage() unless defined $cmd;
 
 my %DISPATCH = (
@@ -571,6 +581,66 @@ sub cmd_autoname {
     }
     print "named $named of ", scalar(@resv), " reservation(s)\n";
     print "still unnamed (MAC not correlated to a machine): @unknown\n" if @unknown;
+}
+
+# --push: surface reservations as names net-lookup can resolve. Each named
+# reservation is pushed to the daemon as a kind=host observation with live=0 —
+# a paper record (last_observed stays NULL, "never seen"), just like a
+# dhcp.master import but sourced from the DB reservations instead of a file.
+# net-lookup's MAC path (do_mac) resolves the name regardless of liveness, so
+# the name shows up (e.g. on the soil dashboard) without falsely marking the
+# device online. Optional SUBNET limits scope; --dry-run prints the
+# observations instead of sending them.
+sub cmd_push {
+    my ($subnet) = @_;
+    my $want = defined $subnet ? normalize_cidr($subnet) : undef;
+    die "net-reserve: bad subnet '$subnet'\n" if defined $subnet && !defined $want;
+
+    my $my_host = (split /\./, hostname())[0] || 'localhost';
+    my $src     = "$my_host:net-reserve";
+    my $cli     = connect_client();
+    my $model   = gather($cli);
+
+    my @resv = grep { defined $_->{name} && length $_->{name}
+                   && defined $_->{mac}  && length $_->{mac}
+                   && defined $_->{ip}   && length $_->{ip} }
+               values %{ $model->{resv} };
+    @resv = grep { (subnet_of($_->{ip}) // '') eq $want } @resv if defined $want;
+    @resv = sort { ip2int($a->{ip}) <=> ip2int($b->{ip}) } @resv;
+
+    unless (@resv) {
+        print "no named reservations to push", (defined $want ? " in $want" : ''), "\n";
+        return;
+    }
+
+    my ($pushed, $failed) = (0, 0);
+    for my $r (@resv) {
+        my %kv = (
+            kind        => 'host',
+            mac         => lc $r->{mac},
+            ip          => $r->{ip},
+            family      => 'v4',
+            name        => $r->{name},
+            name_source => 'dhcp_reservation',
+            source      => $src,
+            live        => 0,   # paper record: never-seen, like a dhcp.master import
+        );
+        if ($opt_dry) {
+            print "OBSERVE ", format_kv(%kv), "\n";
+            next;
+        }
+        my $resp = $cli->observe(%kv);
+        if (!defined $resp || $resp =~ /^ERR/) {
+            warn "net-reserve: push $r->{ip} ($r->{name}): ", ($resp // 'no response'), "\n";
+            $failed++;
+        } else {
+            printf "  pushed %-15s %s -> %s\n", $r->{ip}, lc $r->{mac}, $r->{name};
+            $pushed++;
+        }
+    }
+    return if $opt_dry;
+    print "pushed $pushed name(s) into net-lookup as never-seen hosts",
+          ($failed ? " ($failed failed)" : ''), "\n";
 }
 
 sub cmd_add_range {
@@ -1086,6 +1156,8 @@ usage:
                                          from each MAC's machine
   net-reserve add-range CIDR START END [--zone Z]
   net-reserve del-range CIDR START
+  net-reserve --push [SUBNET]            push named reservations into net-lookup
+                                         as never-seen hosts (--dry-run previews)
   net-reserve --gui [SUBNET]             Perl/Tk map (click a cell; reserve at a
                                          chosen address, move, or release)
 
