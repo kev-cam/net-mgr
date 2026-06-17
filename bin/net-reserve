@@ -13,7 +13,9 @@
 #   net-reserve list [SUBNET]        colour-coded address map (free/reserved/pool)
 #   net-reserve free [SUBNET] [-n N] list the next free static IPs
 #   net-reserve ranges               list the dynamic DHCP pools
-#   net-reserve reserve IP MAC [--name N] [--group G] [--notes '..']
+#   net-reserve reserve IP MAC [--name N] [--group G] [--notes '..'] [--push]
+#                                    --push also surfaces just this one as a
+#                                    never-seen net-lookup name (needs --name)
 #   net-reserve release IP           remove a reservation
 #   net-reserve autoname [SUBNET]    fill missing reservation host names
 #   net-reserve add-range CIDR START END [--zone Z]
@@ -107,12 +109,6 @@ if (!defined $listen) {
 
 # With the --gui flag, the subnet is the leftover positional, already shifted
 # into $cmd above (not still on @ARGV).
-if ($gui) { cmd_gui($cmd); exit 0; }
-# --push: surface DB reservations as names net-lookup resolves (never-seen).
-# Like --gui, the optional SUBNET is the leftover positional now in $cmd.
-if ($opt_push) { cmd_push($cmd); exit 0; }
-usage() unless defined $cmd;
-
 my %DISPATCH = (
     list      => \&cmd_list,
     map       => \&cmd_list,    # alias
@@ -127,6 +123,15 @@ my %DISPATCH = (
     'del-range' => \&cmd_del_range,
     gui       => sub { cmd_gui(shift @ARGV) },
 );
+
+if ($gui) { cmd_gui($cmd); exit 0; }
+# --push standalone: `net-reserve --push [SUBNET]` pushes every named
+# reservation (the leftover positional is in $cmd, like --gui). When --push
+# rides a subcommand instead (e.g. `reserve IP MAC --name N --push`), it's a
+# per-command modifier handled by that subcommand — so only run the standalone
+# push when $cmd isn't a known subcommand.
+if ($opt_push && (!defined $cmd || !exists $DISPATCH{$cmd})) { cmd_push($cmd); exit 0; }
+usage() unless defined $cmd;
 my $handler = $DISPATCH{$cmd} or usage("unknown command '$cmd'");
 $handler->();
 exit 0;
@@ -523,6 +528,18 @@ sub cmd_reserve {
     print "reserved $ip -> $mac",
           (defined $opt_name ? " ($opt_name)" : ''),
           (defined $opt_group ? " [$opt_group]" : ''), "\n";
+    # --push: also surface just this one reservation as a never-seen net-lookup
+    # name (so its tile/name resolves right away), without pushing the rest.
+    if ($opt_push) {
+        if (defined $opt_name && length $opt_name) {
+            my $ok = _push_host($cli, ip => $ip, mac => lc $mac, name => $opt_name);
+            print "pushed $ip -> $opt_name into net-lookup (never-seen)\n"
+                if $ok && !$opt_dry;
+        } else {
+            warn "net-reserve: --push needs a --name to resolve; "
+               . "reservation made, nothing pushed\n";
+        }
+    }
 }
 
 sub cmd_release {
@@ -583,6 +600,33 @@ sub cmd_autoname {
     print "still unnamed (MAC not correlated to a machine): @unknown\n" if @unknown;
 }
 
+# Push ONE reservation into net-lookup as a never-seen kind=host entry: the
+# daemon promotes the name to a machine and records interface+address with
+# last_observed NULL (paper record). Honors --dry-run. Returns 1 ok, 0 fail.
+sub _push_host {
+    my ($cli, %r) = @_;
+    my $my_host = (split /\./, hostname())[0] || 'localhost';
+    my %kv = (
+        kind        => 'host',
+        mac         => lc $r{mac},
+        ip          => $r{ip},
+        family      => 'v4',
+        (defined $r{name} && length $r{name} ? (name => $r{name}) : ()),
+        name_source => 'dhcp_reservation',
+        source      => "$my_host:net-reserve",
+        live        => 0,   # paper record: never-seen, like a dhcp.master import
+    );
+    if ($opt_dry) { print "OBSERVE ", format_kv(%kv), "\n"; return 1; }
+    my $resp = $cli->observe(%kv);
+    if (!defined $resp || $resp =~ /^ERR/) {
+        warn "net-reserve: push $r{ip}"
+           . (defined $r{name} ? " ($r{name})" : '') . ": "
+           . ($resp // 'no response') . "\n";
+        return 0;
+    }
+    return 1;
+}
+
 # --push: surface reservations as names net-lookup can resolve. Each named
 # reservation is pushed to the daemon as a kind=host observation with live=0 —
 # a paper record (last_observed stays NULL, "never seen"), just like a
@@ -596,8 +640,6 @@ sub cmd_push {
     my $want = defined $subnet ? normalize_cidr($subnet) : undef;
     die "net-reserve: bad subnet '$subnet'\n" if defined $subnet && !defined $want;
 
-    my $my_host = (split /\./, hostname())[0] || 'localhost';
-    my $src     = "$my_host:net-reserve";
     my $cli     = connect_client();
     my $model   = gather($cli);
 
@@ -615,27 +657,12 @@ sub cmd_push {
 
     my ($pushed, $failed) = (0, 0);
     for my $r (@resv) {
-        my %kv = (
-            kind        => 'host',
-            mac         => lc $r->{mac},
-            ip          => $r->{ip},
-            family      => 'v4',
-            name        => $r->{name},
-            name_source => 'dhcp_reservation',
-            source      => $src,
-            live        => 0,   # paper record: never-seen, like a dhcp.master import
-        );
-        if ($opt_dry) {
-            print "OBSERVE ", format_kv(%kv), "\n";
-            next;
-        }
-        my $resp = $cli->observe(%kv);
-        if (!defined $resp || $resp =~ /^ERR/) {
-            warn "net-reserve: push $r->{ip} ($r->{name}): ", ($resp // 'no response'), "\n";
-            $failed++;
-        } else {
-            printf "  pushed %-15s %s -> %s\n", $r->{ip}, lc $r->{mac}, $r->{name};
+        if (_push_host($cli, ip => $r->{ip}, mac => $r->{mac}, name => $r->{name})) {
+            printf "  pushed %-15s %s -> %s\n", $r->{ip}, lc $r->{mac}, $r->{name}
+                unless $opt_dry;
             $pushed++;
+        } else {
+            $failed++;
         }
     }
     return if $opt_dry;
@@ -1149,7 +1176,9 @@ usage:
   net-reserve list [SUBNET]              colour-coded address map
   net-reserve free [SUBNET] [-n N]       next free static IPs
   net-reserve ranges                     dynamic DHCP pools
-  net-reserve reserve IP MAC [--name N] [--group G] [--notes '..']
+  net-reserve reserve IP MAC [--name N] [--group G] [--notes '..'] [--push]
+                                         (--push: also push just this one as a
+                                         never-seen net-lookup name; needs --name)
   net-reserve release IP
   net-reserve move OLD_IP NEW_IP         reallocate a reservation
   net-reserve autoname [SUBNET]          fill missing reservation host names
