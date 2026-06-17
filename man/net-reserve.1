@@ -90,8 +90,8 @@ purple.
 .TP
 .B assigned
 Inside a dynamic DHCP range (handed out automatically). Glyph
-.BR \- ,
-blue.
+.BR \- ;
+left uncolored in the map, since these are managed by DHCP, not allocated here.
 .TP
 .B in-use
 Occupied (leased/observed) but neither reserved nor inside a pool \(em an
@@ -104,6 +104,11 @@ A
 \(em the kind you allocate a permanent address from \(em is exactly the
 .B free
 state.
+.PP
+Clicking a cell opens its reserve / release dialog, which shows the address's
+.B last seen
+time (its last live sighting \(em DHCP/ARP/nmap/ping; \(lqnever\(rq for a
+paper-only reservation that hasn't appeared on the network).
 .SH COMMANDS
 .TP
 .B list \fR[\fISUBNET\fR]

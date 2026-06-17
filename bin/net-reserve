@@ -705,12 +705,14 @@ sub cmd_gui {
 
     # legend
     my %CELL = (
-        reserved => '#d33', active => '#90c', assigned => '#36c',
+        reserved => '#d33', active => '#90c',
+        assigned => '#fff',          # DHCP dynamic range — left uncolored (auto)
         'in-use' => '#e8821e', free => '#3a3',
     );
     my $leg = $top->Frame->pack(-side => 'right');
-    for my $st (qw(free assigned in-use reserved active)) {
-        $leg->Label(-text => '  ', -background => $CELL{$st})->pack(-side => 'left');
+    for my $st (qw(free in-use reserved active assigned)) {
+        $leg->Label(-text => '  ', -background => $CELL{$st},
+                    -relief => 'solid', -borderwidth => 1)->pack(-side => 'left');
         $leg->Label(-text => state_label($st) . ' ')->pack(-side => 'left');
     }
 
@@ -878,6 +880,11 @@ sub reserve_dialog {
     }
     $rebuild->();
     $v{ip} = $ip;                      # editable default = the clicked cell
+    if (my $seen = last_seen_str($S->{model}, $ip)) {   # context for the clicked cell
+        my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
+        $row->Label(-text => 'seen:', -width => 7, -anchor => 'w')->pack(-side => 'left');
+        $row->Label(-text => "$ip last seen $seen", -anchor => 'w')->pack(-side => 'left');
+    }
     for my $f (['MAC', 'mac'], ['Name', 'name'], ['Group', 'group']) {
         my ($lbl, $key) = @$f;
         my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
@@ -939,9 +946,11 @@ sub release_dialog {
     my ($cli, $S, $ip, $r, $redraw, $status) = @_;
     my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Reservation $ip",
         -buttons => ['Move', 'Release', 'Cancel']);
+    my $seen = last_seen_str($S->{model}, $ip);
     $dlg->add('Label', -text =>
-        sprintf("%s\nMAC:  %s\nName: %s\nGroup: %s",
-            $ip, $r->{mac}, ($r->{name} // ''), ($r->{grp} // '')),
+        sprintf("%s\nMAC:  %s\nName: %s\nGroup: %s\nLast seen: %s",
+            $ip, $r->{mac}, ($r->{name} // ''), ($r->{grp} // ''),
+            (length $seen ? $seen : 'never')),
         -justify => 'left')->pack(-padx => 8, -pady => 6);
     my $ans = $dlg->Show // 'Cancel';
     if ($ans eq 'Release') {
@@ -993,6 +1002,22 @@ sub menu_color {
     return '#0000cc' if $st eq 'assigned';   # DHCP pool
     return '#9000c0' if $st eq 'active';      # reserved + in use
     return '#cc0000';                          # reserved / in-use (taken)
+}
+
+# Last time $ip was actually seen on the wire: the observed address's
+# last_observed (a live DHCP/ARP/nmap/ping signal) or a lease's last_seen. ''
+# when never seen live (e.g. a paper-only dhcp.master import) — note last_seen
+# on the address row is just any DB touch (= import time), so it's NOT used here.
+sub last_seen_str {
+    my ($model, $ip) = @_;
+    if (my $o = $model->{observed}{$ip}) {
+        return $o->{last_observed}
+            if defined $o->{last_observed} && length $o->{last_observed};
+    }
+    if (my $l = $model->{leased}{$ip}) {
+        return $l->{last_seen} if defined $l->{last_seen} && length $l->{last_seen};
+    }
+    return '';
 }
 
 # Who currently holds $ip: the reservation's name/MAC/group, else the machine
