@@ -244,6 +244,17 @@ sub maybe_refresh {
     my ($host) = NetMgr::Client::split_hostport($listen); $host //= '';
     return undef
         unless $host =~ /^(?:127\.\d+\.\d+\.\d+|::1|localhost)$/;
+    # On the cluster master / a sole node there is nothing to pull — REFRESH is
+    # a no-op there, and the relay proxy may not even be running. Ask the local
+    # daemon's role first and skip the proxy round-trip (and its timeout) when
+    # we're the source of truth.
+    my $role = eval {
+        my $d  = NetMgr::Client->new(listen => $listen, timeout => 3);
+        my $st = $d->status; eval { $d->bye };
+        $st ? $st->{cluster_role} : undef;
+    };
+    return 'already current (this host is the master)'
+        if defined $role && ($role eq 'master' || $role eq 'auto');
     my $cfg = eval {
         NetMgr::Config->load($ENV{NET_MGR_CONF} // '/etc/net-mgr/config') };
     my $addr = ($cfg && $cfg->{cluster}{proxy_listen}) // '127.0.0.1:7532';
