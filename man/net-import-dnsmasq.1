@@ -1,0 +1,93 @@
+.TH NET-IMPORT-DNSMASQ 1 "2026-06-17" "net-mgr" "User Commands"
+.SH NAME
+net-import-dnsmasq \- import dnsmasq dhcp-range pools into net-mgr
+.SH SYNOPSIS
+.B net-import-dnsmasq
+.I HOST ...
+.br
+.B net-import-dnsmasq \-\-auto
+.br
+.B net-import-dnsmasq \-\-local
+.RB [ \-\-print ]
+.RB [ \-\-files
+.IR "'P1 P2'" ]
+.RB [ \-\-listen
+.IR HOST:PORT ]
+.RB [ \-\-ssh\-timeout
+.IR N ]
+.SH DESCRIPTION
+.B net-import-dnsmasq
+scans dnsmasq configuration for
+.B dhcp-range=
+directives and records each dynamic pool in the net-mgr DB as a
+.B kind=dhcp_range
+observation (the
+.B dhcp_ranges
+table). This lets
+.BR net-reserve (1)
+know which addresses are handed out automatically \(em it leaves those ranges
+uncoloured and won't offer them as free statics.
+.PP
+Sources may be combined:
+.TP
+.I HOST ...
+Scan each host over
+.BR net-ssh (1)
+(alias resolution + keys). The scan is a single
+.BR grep (1)
+of the candidate config files, so it is read-only on the device.
+.TP
+.B \-\-auto
+Scan every AP (from the
+.B aps
+table) and gateway (from
+.BR isp_links )
+the daemon knows about. Combine with explicit
+.I HOST
+arguments for gateways not yet in
+.B isp_links
+(e.g.\&
+.BR "net-import-dnsmasq \-\-auto gateway2 gateway3" ).
+.TP
+.B \-\-local
+Scan this host's own dnsmasq config \(em the
+.B [paths] dnsmasq_conf_glob
+plus
+.IR /etc/dnsmasq.conf .
+.PP
+Only dynamic pools are imported: a
+.B dhcp-range
+with a
+.B static
+mode (no pool) is skipped, as are IPv6 ranges. The subnet is taken from the
+range's netmask when present, else assumed
+.BR /24 .
+.SH OPTIONS
+.TP
+.B \-\-print
+Print the observations to stdout instead of sending them.
+.TP
+\fB\-\-files\fR \fI'P1 P2 ...'\fR
+Config paths/globs to grep, overriding the defaults
+.RB ( /etc/dnsmasq.conf ", " /etc/dnsmasq.d/* ", " /tmp/dnsmasq.conf ", "
+.IR /tmp/dnsmasq.d/* ", " /jffs/etc/dnsmasq.conf ).
+.TP
+\fB\-\-listen\fR \fIHOST:PORT\fR
+Manager address (default loopback / config / $NET_MGR_LISTEN).
+.TP
+\fB\-\-ssh\-timeout\fR \fIN\fR
+Per-host net-ssh timeout in seconds (default 12); an unreachable host is
+skipped rather than wedging the run.
+.SH EXAMPLES
+.PP
+.RS
+.nf
+net-import-dnsmasq --auto gateway2 gateway3   # APs + the two gateways
+net-import-dnsmasq --local --print            # dry-run this host's config
+net-import-dnsmasq gateway3 --files /etc/dnsmasq.conf
+.fi
+.RE
+.SH SEE ALSO
+.BR net-reserve (1),
+.BR net-import-dhcp (1),
+.BR net-ssh (1)

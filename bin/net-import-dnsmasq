@@ -1,0 +1,237 @@
+#!/usr/bin/perl
+# net-import-dnsmasq — scan dnsmasq configs for `dhcp-range=` directives and
+# import them into the net-mgr DB as kind=dhcp_range, so net-reserve knows the
+# automatic DHCP pools (and leaves them uncoloured rather than treating their
+# addresses as allocatable statics).
+#
+# Sources (combine freely):
+#   net-import-dnsmasq HOST ...      scan each HOST over net-ssh (APs/gateways)
+#   net-import-dnsmasq --auto        scan every AP (aps table) + gateway
+#                                    (isp_links) the daemon knows about
+#   net-import-dnsmasq --local       scan this host's dnsmasq config glob
+#                                    ([paths] dnsmasq_conf_glob + /etc/dnsmasq.conf)
+# Options:
+#   --print                 print the observations instead of sending them
+#   --files 'P1 P2 ...'     paths/globs to grep (override the defaults)
+#   --listen HOST:PORT      manager address
+#   --ssh-timeout N         per-host net-ssh timeout, seconds (default 12)
+#
+# Remote access uses net-ssh (alias resolution + keys); the scan is a single
+# grep over the candidate config paths, bounded by --ssh-timeout so an
+# unreachable host can't wedge the run.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use Sys::Hostname qw(hostname);
+use NetMgr::Client;
+use NetMgr::Config;
+use NetMgr::Protocol qw(format_kv);
+
+my ($listen, $print_only, $local, $auto, $files_opt);
+my $ssh_timeout = 12;
+GetOptions(
+    'listen=s'      => \$listen,
+    'print'         => \$print_only,
+    'local'         => \$local,
+    'auto'          => \$auto,
+    'files=s'       => \$files_opt,
+    'ssh-timeout=i' => \$ssh_timeout,
+) or die "bad options\n";
+my @hosts = @ARGV;
+
+usage("nothing to scan") unless @hosts || $local || $auto;
+
+# Candidate paths to grep on a remote device (globs expand in the remote shell).
+my @REMOTE_FILES = $files_opt ? split(/\s+/, $files_opt)
+    : qw(/etc/dnsmasq.conf /etc/dnsmasq.d/* /tmp/dnsmasq.conf /tmp/dnsmasq.d/*
+         /jffs/etc/dnsmasq.conf);
+
+# ---- IP helpers -----------------------------------------------------
+sub ip2int {
+    my @o = split /\./, ($_[0] // '');
+    return undef unless @o == 4;
+    my $n = 0;
+    for (@o) { return undef unless /^\d+$/ && $_ <= 255; $n = ($n << 8) | $_ }
+    return $n;
+}
+sub int2ip { my $n = $_[0]; join '.', ($n>>24)&255, ($n>>16)&255, ($n>>8)&255, $n&255 }
+# Prefix length of a dotted netmask (undef if not a contiguous mask).
+sub masklen {
+    my $i = ip2int($_[0]);
+    return undef unless defined $i;
+    my $b = sprintf '%032b', $i;
+    return undef if $b =~ /01/;          # non-contiguous -> not a netmask
+    return ($b =~ tr/1//);
+}
+sub subnet_cidr_of {
+    my ($ip, $len) = @_;
+    $len //= 24;
+    my $i = ip2int($ip);
+    return undef unless defined $i;
+    my $mask = $len == 0 ? 0 : (0xFFFFFFFF << (32 - $len)) & 0xFFFFFFFF;
+    return int2ip($i & $mask) . "/$len";
+}
+
+# ---- parse one `dhcp-range=` value ----------------------------------
+# dnsmasq syntax: dhcp-range=[tag:..,][set:..,]<start>[,<end>|,static]
+#                            [,<mode>][,<netmask>][,<broadcast>][,<lease>]
+# We want the first two IPv4 tokens (start,end) of a *dynamic* pool, plus the
+# netmask if one is given (to derive the CIDR; default /24).
+sub parse_range {
+    my ($val) = @_;
+    $val =~ s/\s+$//;
+    my @toks = split /,/, $val;
+    return () if grep { lc $_ eq 'static' } @toks;   # static-only: no pool
+    my @ips = grep { /^\d{1,3}(?:\.\d{1,3}){3}$/ && defined ip2int($_) } @toks;
+    return () unless @ips >= 2;                       # need start AND end
+    my ($start, $end) = @ips[0, 1];
+    my $len = 24;
+    for my $i (2 .. $#ips) {                           # a netmask after start/end
+        next unless $ips[$i] =~ /^(?:255|254|252|248|240|224|192|128)\./;
+        my $m = masklen($ips[$i]);
+        if (defined $m) { $len = $m; last }
+    }
+    my $cidr = subnet_cidr_of($start, $len) or return ();
+    return { cidr => $cidr, start => $start, end => $end };
+}
+
+# Pull every dhcp-range from a blob of config text.
+sub ranges_from_text {
+    my ($text) = @_;
+    my @r;
+    for my $line (split /\n/, $text // '') {
+        next unless $line =~ /^\s*dhcp-range\s*=\s*(.+?)\s*$/;
+        my $p = parse_range($1) or next;
+        push @r, $p;
+    }
+    return @r;
+}
+
+# ---- local scan -----------------------------------------------------
+sub scan_local {
+    my @globs;
+    if ($files_opt) {
+        @globs = split /\s+/, $files_opt;
+    } else {
+        my $cfg = eval {
+            NetMgr::Config->load($ENV{NET_MGR_CONF} // '/etc/net-mgr/config') } || {};
+        @globs = grep { defined && length }
+                 ($cfg->{paths}{dnsmasq_conf_glob}, '/etc/dnsmasq.conf');
+    }
+    my $text = '';
+    for my $g (@globs) {
+        for my $f (glob $g) {
+            next unless -f $f && -r $f;
+            open my $fh, '<', $f or next;
+            local $/; $text .= <$fh>; close $fh;
+        }
+    }
+    return ranges_from_text($text);
+}
+
+# ---- remote scan over net-ssh (bounded by --ssh-timeout) ------------
+sub scan_remote {
+    my ($host) = @_;
+    my $cmd = "grep -hsE '^[[:space:]]*dhcp-range=' "
+            . join(' ', @REMOTE_FILES) . " 2>/dev/null";
+    my $pid = open(my $fh, '-|', 'net-ssh', $host, $cmd);
+    unless ($pid) { warn "net-import-dnsmasq: $host: net-ssh: $!\n"; return () }
+    my @out;
+    eval {
+        local $SIG{ALRM} = sub { die "timeout after ${ssh_timeout}s\n" };
+        alarm $ssh_timeout;
+        @out = <$fh>;
+        alarm 0;
+    };
+    if (my $e = $@) { kill 'TERM', $pid; warn "net-import-dnsmasq: $host: $e" }
+    close $fh;
+    return ranges_from_text(join '', @out);
+}
+
+# ---- enumerate APs + gateways the daemon knows about ----------------
+sub enumerate_auto {
+    my ($cli) = @_;
+    my $aps  = eval { $cli->snapshot(1, 'aps') }        || [];
+    my $ifs  = eval { $cli->snapshot(2, 'interfaces') } || [];
+    my $mach = eval { $cli->snapshot(3, 'machines') }   || [];
+    my $isp  = eval { $cli->snapshot(4, 'isp_links') }  || [];
+    my %name_of_mid = map { ($_->{id} => $_->{primary_name}) }
+                      grep { defined $_->{primary_name} && length $_->{primary_name} } @$mach;
+    my %mid_of_mac  = map { (lc $_->{mac} => $_->{machine_id}) }
+                      grep { $_->{mac} && $_->{machine_id} } @$ifs;
+    my %names;
+    for my $g (@$isp) {
+        my $n = $name_of_mid{ $g->{gateway_machine_id} // '' };
+        $names{$n} = 1 if defined $n && length $n;
+    }
+    for my $ap (@$aps) {
+        my $mid = $mid_of_mac{ lc($ap->{mac} // '') };
+        my $n   = defined $mid ? $name_of_mid{$mid} : undef;
+        $names{$n} = 1 if defined $n && length $n;
+    }
+    return sort keys %names;
+}
+
+# ---- main -----------------------------------------------------------
+my $need_cli = $auto || !$print_only;
+my $cli;
+if ($need_cli) {
+    $cli = NetMgr::Client->new(listen => $listen);
+    $cli->hello(source => "net-import-dnsmasq", pid => $$);
+}
+
+if ($auto) {
+    my @found = enumerate_auto($cli);
+    print STDERR "auto: ", scalar(@found), " AP/gateway host(s): @found\n";
+    push @hosts, @found;
+}
+{ my %seen; @hosts = grep { !$seen{$_}++ } @hosts; }
+
+# (source-label, range) pairs from every scanned source.
+my @all;
+push @all, map { ['local', $_] } scan_local() if $local;
+for my $h (@hosts) {
+    my @r = scan_remote($h);
+    print STDERR "$h: ", scalar(@r), " dhcp-range\n";
+    push @all, map { [$h, $_] } @r;
+}
+
+my ($found, $sent) = (0, 0);
+my %rseen;
+for my $e (@all) {
+    my ($label, $r) = @$e;
+    my $key = "$r->{cidr}|$r->{start}|$r->{end}";
+    next if $rseen{$key}++;             # same pool reported by several devices
+    $found++;
+    my %kv = (kind => 'dhcp_range', subnet_cidr => $r->{cidr},
+              start_ip => $r->{start}, end_ip => $r->{end},
+              notes => "dnsmasq:$label");
+    if ($print_only) {
+        print "OBSERVE ", format_kv(%kv), "\n";
+    } else {
+        my $resp = $cli->observe(%kv);
+        if ($resp && $resp =~ /^ERR/) {
+            warn "range rejected ($label $r->{cidr} $r->{start}-$r->{end}): $resp\n";
+        } else { $sent++ }
+    }
+}
+
+$cli->bye if $cli;
+print STDERR "found=$found"
+           . ($print_only ? " (print only)\n" : " imported=$sent\n");
+
+sub usage {
+    my ($msg) = @_;
+    print STDERR "net-import-dnsmasq: $msg\n\n" if $msg;
+    print STDERR <<'USAGE';
+usage:
+  net-import-dnsmasq HOST ...          scan each host over net-ssh
+  net-import-dnsmasq --auto            scan all known APs + gateways
+  net-import-dnsmasq --local           scan this host's dnsmasq config
+  options: --print  --files 'P1 P2'  --listen H:P  --ssh-timeout N
+USAGE
+    exit($msg ? 2 : 0);
+}
