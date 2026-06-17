@@ -999,7 +999,14 @@ sub cmd_gui {
         # still exists.
         my $keep = $sessvar;
         $om->configure(-command => undef);
-        $om->configure(-options => [ 'select', @names, $NEWCHAT ]);
+        # Rebuild the menu via the core runtime methods, NOT configure(-options=>...):
+        # some Tk::Optionmenu versions only honor -options at creation, so a
+        # post-creation configure(-options) silently no-ops — the picker never
+        # repopulates and Refresh looks dead. menu->delete + addOptions works
+        # across versions. (-command is nulled above so addOptions' auto-select
+        # of the first entry can't fire a follow mid-rebuild.)
+        $om->menu->delete(0, 'end');
+        $om->addOptions('select', @names, $NEWCHAT);
         $sessvar = (defined $keep && grep { $_ eq $keep } @names) ? $keep : 'select';
         $om->configure(-command => sub {
             $sessvar eq $NEWCHAT ? $new_chat->() : $follow->($sessvar) });
@@ -1225,7 +1232,8 @@ sub cmd_gui {
                 $set_status->('disconnected (daemon gone) -- restart to reconnect');
                 $cur = undef;
                 $sessvar = 'select';
-                $om->configure(-options => ['select']);
+                $om->menu->delete(0, 'end');
+                $om->addOptions('select');
             } elsif (defined $n) {
                 $stream->{buf} .= $b;
             }
