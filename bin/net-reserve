@@ -955,7 +955,7 @@ sub cell_click {
 sub reserve_dialog {
     my ($cli, $S, $ip, $mac, $redraw, $status) = @_;
     my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Reserve $ip",
-        -buttons => ['Reserve', 'Cancel']);
+        -buttons => ['Reserve', 'Reserve+Push', 'Cancel']);
     my %v = (ip => $ip, mac => $mac, name => '', group => '');
     # known groups for convenience
     my %groups; $groups{ $_->{grp} } = 1 for grep { $_->{grp} } values %{ $S->{model}{resv} };
@@ -1025,7 +1025,7 @@ sub reserve_dialog {
         }
     }
     my $ans = $dlg->Show // 'Cancel';
-    return unless $ans eq 'Reserve';
+    return unless $ans eq 'Reserve' || $ans eq 'Reserve+Push';
     ($v{ip}) = $v{ip} =~ /(\d+\.\d+\.\d+\.\d+)/ ? ($1) : ($v{ip});  # tolerate a label
     unless (defined ip2int($v{ip})) {
         $status->configure(-text => " bad IP '$v{ip}' — not reserved"); return;
@@ -1062,14 +1062,21 @@ sub reserve_dialog {
         ($v{group} ne '' ? (grp  => $v{group}) : ()),
         ($force ? (force => 1) : ()));
     if (!defined $r || $r =~ /^ERR/) { $status->configure(-text => " $r"); return }
+    my $msg = " reserved $v{ip} -> $v{mac}";
+    if ($ans eq 'Reserve+Push') {
+        # Also surface this one reservation as a never-seen net-lookup name.
+        $msg .= _push_host($cli, ip => $v{ip}, mac => lc $v{mac},
+                           ($v{name} ne '' ? (name => $v{name}) : ()))
+            ? ' + pushed to net-lookup' : ' (push failed)';
+    }
     $S->{model} = gather($cli); $redraw->();
-    $status->configure(-text => " reserved $v{ip} -> $v{mac}");
+    $status->configure(-text => $msg);
 }
 
 sub release_dialog {
     my ($cli, $S, $ip, $r, $redraw, $status) = @_;
     my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Reservation $ip",
-        -buttons => ['Move', 'Release', 'Cancel']);
+        -buttons => ['Push', 'Move', 'Release', 'Cancel']);
     my $seen = last_seen_str($S->{model}, $ip);
     $dlg->add('Label', -text =>
         sprintf("%s\nMAC:  %s\nName: %s\nGroup: %s\nLast seen: %s",
@@ -1084,6 +1091,13 @@ sub release_dialog {
         $status->configure(-text => " released $ip");
     } elsif ($ans eq 'Move') {
         move_dialog($cli, $S, $ip, $r, $redraw, $status);
+    } elsif ($ans eq 'Push') {
+        # Surface this reservation as a never-seen net-lookup name (kind=host).
+        my $ok = _push_host($cli, ip => $ip, mac => $r->{mac}, name => $r->{name});
+        $S->{model} = gather($cli); $redraw->();
+        $status->configure(-text => $ok
+            ? " pushed $ip (" . ($r->{name} // $r->{mac}) . ") to net-lookup"
+            : " push failed for $ip");
     }
 }
 
