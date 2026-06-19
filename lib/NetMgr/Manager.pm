@@ -122,10 +122,28 @@ sub _load_cluster_state {
                        split /,/, $raw;
         }
     }
+    # Default membership: opting into [cluster] (any key set) without listing
+    # `members` means automatic, unlimited discovery — the node finds the other
+    # net-mgr instances itself instead of a hand-maintained roster. role=excluded
+    # opts back out.
+    if (!defined $c->{members} && %$c && ($c->{role} // 'auto') ne 'excluded') {
+        $auto_spec = NetMgr::AutoDiscover::parse_spec('auto');
+    }
+    # Cluster identity: [cluster] name, else [cluster] domain, else the DNS
+    # domain ([dns] domain). The cluster name defaults to the domain.
+    my $domain = $c->{domain};
+    $domain //= $cfg->{dns}{domain} if ref $cfg->{dns} eq 'HASH';
+    $domain =~ s/^\s+|\s+$//g if defined $domain;
+    $domain = undef unless defined $domain && length $domain;
+    my $cluster_name = $c->{name};
+    $cluster_name =~ s/^\s+|\s+$//g if defined $cluster_name;
+    $cluster_name = $domain unless defined $cluster_name && length $cluster_name;
     my $self_name = _local_member_name();
     my %state = (
         members          => \@members,
         auto_spec        => $auto_spec,        # undef = static members
+        name             => $cluster_name,     # cluster identity; defaults to domain
+        domain           => $domain,           # defaults to [dns] domain
         role             => $c->{role}        // 'auto',  # auto|master|follower|excluded
         priority         => $c->{priority}    // 100,
         prefer_lan       => exists $c->{prefer_lan} ? ($c->{prefer_lan} ? 1 : 0) : 1,
@@ -624,6 +642,8 @@ sub _handle_status {
         triggers_pending   => scalar(keys %{ $self->{triggers} }),
         schema_version     => $schema_v,
         cluster_member     => $cs->{self_name},
+        cluster_name       => $cs->{name}   // '',   # cluster identity (defaults to domain)
+        cluster_domain     => $cs->{domain} // '',
         cluster_role       => $live_role,
         cluster_role_config => $cs->{role},
         cluster_role_reason => $cr->{reason} // '',
