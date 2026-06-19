@@ -172,6 +172,22 @@ sub ip2int {
 sub int2ip { my $n = $_[0]; join '.', ($n >> 24) & 255, ($n >> 16) & 255,
                                        ($n >> 8) & 255, $n & 255 }
 
+# Canonical dotted-quad key for model lookups. The DB can hold an address in a
+# non-canonical form — leading-zero octets ("10.0.223.005"), an inet "/32"
+# suffix, or stray whitespace — but the grid and pop-up look addresses up by
+# int2ip()'s strict form. Key the model the same way or those lookups miss: the
+# cell shows 'free' and the pop-up shows no occupant even though the row is
+# present (it still appears in the side list, which iterates values). Falls back
+# to the trimmed original when it can't be parsed as IPv4.
+sub canon_ip {
+    my ($s) = @_;
+    return $s unless defined $s;
+    (my $t = $s) =~ s/^\s+|\s+$//g;   # trim
+    $t =~ s!/\d+$!!;                  # drop a /len suffix
+    my $i = ip2int($t);
+    return defined $i ? int2ip($i) : $t;
+}
+
 # Parse "A.B.C.D/len" → (network_int, len, first_host_int, last_host_int).
 sub cidr_parts {
     my ($cidr) = @_;
@@ -325,9 +341,11 @@ sub gather {
     my $ifaces   = eval { $cli->snapshot(5, 'interfaces') } || [];
     my $machines = eval { $cli->snapshot(6, 'machines') }   || [];
 
-    my %resv     = map { $_->{ip}  => $_ } @$resv;
-    my %leased   = map { $_->{ip}  => $_ } grep { $_->{ip}  } @$leases;
-    my %observed = map { $_->{addr} => $_ } grep { $_->{addr} } @$addrs;
+    # Key by the canonical address (see canon_ip): the DB may store a
+    # non-canonical form, but classify()/occupant() look up by int2ip()'s form.
+    my %resv     = map { canon_ip($_->{ip})   => $_ } grep { defined $_->{ip} } @$resv;
+    my %leased   = map { canon_ip($_->{ip})   => $_ } grep { $_->{ip}  } @$leases;
+    my %observed = map { canon_ip($_->{addr}) => $_ } grep { $_->{addr} } @$addrs;
 
     my %name_of_mid = map { ($_->{id} => $_->{primary_name}) }
                       grep { defined $_->{primary_name} && length $_->{primary_name} } @$machines;
@@ -939,6 +957,7 @@ sub cmd_gui {
     };
 
     $sync_now->();      # open with a forced pull of the initial subnet
+    _fit_canvas_to_grid($canvas);   # size the window to show the whole grid on launch
     # periodic refresh: lazy (local DB only) — explicit actions force-sync
     my $tick; $tick = sub {
         $S{model} = gather($cli); $refresh_subnets->(); $redraw->();
@@ -994,11 +1013,12 @@ sub side_focus_ip {
     # points you at the closest reservation. undef => the subnet has none.
     my $target = defined _resv_index($t, $ip) ? $ip : _nearest_reserved($S, $ip);
     if (!defined $target) {
-        delete $S->{focus_ip};
+        delete @{$S}{qw(focus_ip focus_exact)};
         $t->tagRemove('nrhit', '1.0', 'end');
         return;
     }
-    $S->{focus_ip} = $target;               # remember so redraw can restore it
+    $S->{focus_ip}    = $target;            # remember so redraw can restore it
+    $S->{focus_exact} = ($target eq $ip) ? 1 : 0;   # exact click vs nearest fallback
     _focus_show($S);
 }
 
@@ -1022,6 +1042,23 @@ sub _nearest_reserved {
     return $best;
 }
 
+# Grow the canvas to fit every drawn box, so the whole subnet shows on launch
+# (the grid is otherwise clipped to the canvas's fixed request size, and there's
+# no canvas scrollbar). Capped to the screen so a large subnet can't open an
+# off-screen window. Returns the (width, height) it settled on, or () if empty.
+sub _fit_canvas_to_grid {
+    my ($canvas) = @_;
+    my @bb = $canvas->bbox('all') or return ();   # extent of all drawn items
+    my $w = $bb[2] + 6;                            # right/bottom edge + small margin
+    my $h = $bb[3] + 6;
+    my $maxw = $canvas->screenwidth  - 360;        # leave room for the side pane + WM
+    my $maxh = $canvas->screenheight - 140;
+    $w = $maxw if $maxw > 0 && $w > $maxw;
+    $h = $maxh if $maxh > 0 && $h > $maxh;
+    $canvas->configure(-width => $w, -height => $h);
+    return ($w, $h);
+}
+
 # Centre the focused IP's line in the pane and highlight it. Re-run at the end
 # of every redraw: the periodic refresh rebuilds the list (delete + reinsert),
 # which both wipes the nrhit tag AND scrolls the view back to the top — so
@@ -1040,7 +1077,10 @@ sub _focus_show {
     my $vis = eval { $t->cget('-height') } || 24;   # visible rows (no wrap here)
     my $top = $line - int($vis / 2);  $top = 1 if $top < 1;
     $t->yviewMoveto(($top - 1) / $total);           # keep the line near the middle
-    $t->tagConfigure('nrhit', -background => '#ffd24d');
+    # Amber when it's the exact IP you clicked; a cooler blue when it's only the
+    # nearest reservation to an unreserved box you clicked.
+    my $color = (defined $S->{focus_exact} && !$S->{focus_exact}) ? '#a8d1ff' : '#ffd24d';
+    $t->tagConfigure('nrhit', -background => $color);
     $t->tagAdd('nrhit', "$idx linestart", "$idx lineend");
     return 1;
 }
@@ -1194,7 +1234,9 @@ sub release_dialog {
         -justify => 'left')->pack(-padx => 8, -pady => 6);
     my $ans = $dlg->Show // 'Cancel';
     if ($ans eq 'Release') {
-        my $resp = $cli->observe(kind => 'dhcp_reservation_delete', ip => $ip);
+        # Use the row's stored IP so the daemon matches the exact record, even
+        # when it was stored in a non-canonical form (see canon_ip).
+        my $resp = $cli->observe(kind => 'dhcp_reservation_delete', ip => ($r->{ip} // $ip));
         if (!defined $resp || $resp =~ /^ERR/) { $status->configure(-text => " $resp"); return }
         $S->{model} = gather($cli); $redraw->();
         $status->configure(-text => " released $ip");
@@ -1224,7 +1266,8 @@ sub move_dialog {
     my $ans = $dlg->Show // 'Cancel';
     return unless $ans eq 'Move';
     unless (defined ip2int($newip)) { $status->configure(-text => " bad IP '$newip'"); return }
-    my $resp = $cli->observe(kind => 'dhcp_reservation_move', ip => $ip, new_ip => $newip);
+    # Match the stored record by its own IP (may be non-canonical; see canon_ip).
+    my $resp = $cli->observe(kind => 'dhcp_reservation_move', ip => ($r->{ip} // $ip), new_ip => $newip);
     if (!defined $resp || $resp =~ /^ERR/) { $status->configure(-text => " $resp"); return }
     $S->{model} = gather($cli); $redraw->();
     $status->configure(-text => " moved $ip -> $newip");
