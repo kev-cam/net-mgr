@@ -23,8 +23,10 @@
 #   net-reserve --push [SUBNET]      push named reservations into net-lookup as
 #                                    never-seen hosts (kind=host, last_observed
 #                                    NULL); --dry-run previews the observations
-#   net-reserve --gui [SUBNET]       Perl/Tk map: click a cell to reserve (pick
-#                                    the target address from a menu), move, release;
+#   net-reserve --gui [SUBNET]       Perl/Tk map: click a cell to select it
+#                                    (centres its reservation in the side list);
+#                                    click it again to reserve (pick the target
+#                                    address from a menu), move, or release;
 #                                    +/- keep or ignore subnets in the picker;
 #                                    reopens on the last subnet you viewed
 #                                    ([net-reserve] show/ignore/last in user config)
@@ -866,6 +868,9 @@ sub cmd_gui {
         unless (defined $cidr) { $status->configure(-text => ' no subnets'); return }
         my ($net, $len, $first, $last) = cidr_parts($cidr);
         unless (defined $net) { $status->configure(-text => " bad subnet $cidr"); return }
+        # A selection only belongs to the subnet it was made in; drop it on a switch.
+        delete @S{qw(armed_ip armed_subnet)}
+            if defined $S{armed_ip} && ($S{armed_subnet} // '') ne $cidr;
         my $model = $S{model};
         # Fixed-size cells. For a /24 (or smaller) the whole subnet fits in one
         # 256-block, so position every cell by its last octet — column = low
@@ -878,8 +883,10 @@ sub cmd_gui {
             my ($i, $x, $y) = @_;
             my $ip = int2ip($i);
             my $st = classify($model, $ip);
+            my $armed = defined $S{armed_ip} && $ip eq $S{armed_ip};   # selected cell
             my $r = $canvas->createRectangle($x, $y, $x + $cw - 2, $y + $ch - 2,
-                -fill => $CELL{$st}, -outline => '#999');
+                -fill => $CELL{$st}, -outline => ($armed ? '#000' : '#999'),
+                -width => ($armed ? 2 : 1));
             my $t = $canvas->createText($x + ($cw - 2) / 2, $y + ($ch - 2) / 2,
                 -text => ($i & 0xFF), -font => 'nrmono');
             for my $item ($r, $t) {
@@ -941,15 +948,27 @@ sub cmd_gui {
     Tk::MainLoop();
 }
 
-# Click handler: free → reserve dialog; reserved → release/edit dialog.
+# Click handler — two-step, so a stray click can't pop a dialog. The first click
+# on a box selects it: centres/highlights its right-pane entry and outlines the
+# cell, but takes no action. A second click on the SAME box opens the pop-up
+# (free → reserve dialog; reserved → release/edit dialog). Clicking a different
+# box just moves the selection there (a fresh first click).
 sub cell_click {
     my ($cli, $S, $ip, $redraw, $status) = @_;
-    # Centre the right-hand Reservations pane on the clicked address (no-op when
-    # it isn't a reservation); paint it before the modal dialog below pops up.
-    side_focus_ip($S, $ip);
-    eval { $S->{anchor}->idletasks } if $S->{anchor};
     my $model = $S->{model};
     my $st = classify($model, $ip);
+    if (($S->{armed_ip} // '') ne $ip) {          # first click: arm + highlight only
+        $S->{armed_ip}     = $ip;
+        $S->{armed_subnet} = $S->{subnet};        # so a subnet change can drop it
+        side_focus_ip($S, $ip);                   # centre the right pane (if reserved)
+        $redraw->();                              # repaint so the armed cell is outlined
+        eval { $S->{anchor}->idletasks } if $S->{anchor};
+        $status->configure(-text => " $ip selected — click again to "
+            . (($st eq 'reserved' || $st eq 'active') ? 'edit / release' : 'reserve'));
+        return;
+    }
+    delete $S->{armed_ip}; delete $S->{armed_subnet};   # second click: consume + act
+    $redraw->();                                  # drop the armed outline before the dialog
     if ($st eq 'reserved' || $st eq 'active') {   # both are reservations
         my $r = $model->{resv}{$ip};
         release_dialog($cli, $S, $ip, $r, $redraw, $status);
@@ -1265,8 +1284,8 @@ usage:
   net-reserve del-range CIDR START
   net-reserve --push [SUBNET]            push named reservations into net-lookup
                                          as never-seen hosts (--dry-run previews)
-  net-reserve --gui [SUBNET]             Perl/Tk map (click a cell; reserve at a
-                                         chosen address, move, or release)
+  net-reserve --gui [SUBNET]             Perl/Tk map (click a cell to select it,
+                                         click again to reserve, move, or release)
 
   --listen H:P / --server NAME           daemon address
   --auth / --no-auth / --key-id / --key-file
