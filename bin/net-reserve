@@ -963,8 +963,10 @@ sub cell_click {
         side_focus_ip($S, $ip);                   # centre the right pane (if reserved)
         $redraw->();                              # repaint so the armed cell is outlined
         eval { $S->{anchor}->idletasks } if $S->{anchor};
+        my $near = $S->{focus_ip};      # nearest reservation side_focus_ip landed on
         $status->configure(-text => " $ip selected — click again to "
-            . (($st eq 'reserved' || $st eq 'active') ? 'edit / release' : 'reserve'));
+            . (($st eq 'reserved' || $st eq 'active') ? 'edit / release' : 'reserve')
+            . (defined $near && $near ne $ip ? " (nearest reservation: $near)" : ''));
         return;
     }
     delete $S->{armed_ip}; delete $S->{armed_subnet};   # second click: consume + act
@@ -987,13 +989,37 @@ sub cell_click {
 sub side_focus_ip {
     my ($S, $ip) = @_;
     my $t = $S->{resv_text} or return;
-    if (!defined _resv_index($t, $ip)) {    # not a reservation: drop focus, un-mark
+    # Highlight the clicked address if it's itself a reservation; otherwise the
+    # nearest reserved address in the same subnet, so clicking a free box still
+    # points you at the closest reservation. undef => the subnet has none.
+    my $target = defined _resv_index($t, $ip) ? $ip : _nearest_reserved($S, $ip);
+    if (!defined $target) {
         delete $S->{focus_ip};
         $t->tagRemove('nrhit', '1.0', 'end');
         return;
     }
-    $S->{focus_ip} = $ip;                   # remember so redraw can restore it
+    $S->{focus_ip} = $target;               # remember so redraw can restore it
     _focus_show($S);
+}
+
+# Nearest reserved address (by numeric distance) to $ip among the current
+# subnet's reservations, or undef if there are none. Ties go to the lower IP.
+sub _nearest_reserved {
+    my ($S, $ip) = @_;
+    my $n = ip2int($ip);
+    return undef unless defined $n;
+    my $cidr = $S->{subnet} // '';
+    my ($best, $bestd);
+    for my $r (values %{ $S->{model}{resv} }) {
+        next unless ($r->{subnet_cidr} // subnet_of($r->{ip}) // '') eq $cidr;
+        my $ri = ip2int($r->{ip});
+        next unless defined $ri;
+        my $d = abs($ri - $n);
+        next if defined $bestd
+            && ($d > $bestd || ($d == $bestd && $ri >= ip2int($best)));
+        ($best, $bestd) = ($r->{ip}, $d);
+    }
+    return $best;
 }
 
 # Centre the focused IP's line in the pane and highlight it. Re-run at the end
