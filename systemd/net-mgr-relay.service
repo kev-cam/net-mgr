@@ -8,7 +8,10 @@ PartOf=net-mgr.service
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/net-mgr-relay --foreground
-Restart=on-failure
+# always (not on-failure): a clean exit 0 must still be restarted — a transient
+# empty roster once left this dead for days. The daemon also no longer exits 0
+# while it can still watch/serve (see sbin/net-mgr-relay idle-watch mode).
+Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal

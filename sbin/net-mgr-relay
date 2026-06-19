@@ -65,18 +65,19 @@ if (@peers_cli) {
     $fixed_peer = (split /,/, $peers_cli[0])[0];
     print STDERR "[net-mgr-relay] fixed-peer mode: $fixed_peer\n";
 } elsif (!@{ $cluster->{members} }) {
-    # No roster and no --peer means nothing to *replicate*. But the REFRESH
-    # proxy is still useful on a sole/master node (it just answers "I'm the
-    # master"), so keep running to serve it — only bail out entirely when the
-    # proxy is disabled too. (Exiting here is what left net-reserve's REFRESH
-    # hanging against a sole-member daemon: no proxy was listening.)
+    # No roster and no --peer means nothing to *replicate* from config. But
+    # never exit: the local daemon's mesh/election can surface a master later,
+    # and the watch loop below subscribes when it does. The REFRESH proxy is
+    # also useful on a sole/master node (it just answers "I'm the master").
+    # Exiting here — combined with the unit's restart policy — is exactly how
+    # the relay silently stayed dead for days.
     if (lc($cfg->{cluster}{proxy_listen} // '') eq 'none') {
         print STDERR "[net-mgr-relay] no roster/--peer and proxy disabled; "
-                   . "nothing to do. Exiting.\n";
-        exit 0;
+                   . "idle-watch mode (will subscribe if the daemon elects a master).\n";
+    } else {
+        print STDERR "[net-mgr-relay] no roster/--peer; proxy-only mode "
+                   . "(serving REFRESH, no replication).\n";
     }
-    print STDERR "[net-mgr-relay] no roster/--peer; proxy-only mode "
-               . "(serving REFRESH, no replication).\n";
 } else {
     print STDERR "[net-mgr-relay] cluster mode: self=$cluster->{self_name} "
                . "roster=" . join(',', @{ $cluster->{members} }) . " "
