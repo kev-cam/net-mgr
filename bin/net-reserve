@@ -847,6 +847,7 @@ sub cmd_gui {
     $side->Label(-text => 'Reservations')->pack(-side => 'top', -anchor => 'w');
     $resv_text = $side->Scrolled('ROText', -width => 38, -height => 24,
         -font => 'nrmono', -scrollbars => 'oe')->pack(-side => 'top', -fill => 'y', -expand => 1);
+    $S{resv_text} = $resv_text;     # so a cell click can centre this pane on its IP
 
     $status = $mw->Label(-anchor => 'w', -relief => 'sunken')
         ->pack(-side => 'bottom', -fill => 'x');
@@ -938,6 +939,10 @@ sub cmd_gui {
 # Click handler: free → reserve dialog; reserved → release/edit dialog.
 sub cell_click {
     my ($cli, $S, $ip, $redraw, $status) = @_;
+    # Centre the right-hand Reservations pane on the clicked address (no-op when
+    # it isn't a reservation); paint it before the modal dialog below pops up.
+    side_focus_ip($S, $ip);
+    eval { $S->{anchor}->idletasks } if $S->{anchor};
     my $model = $S->{model};
     my $st = classify($model, $ip);
     if ($st eq 'reserved' || $st eq 'active') {   # both are reservations
@@ -949,6 +954,40 @@ sub cell_click {
         $mac = $model->{leased}{$ip}{mac}   if $model->{leased}{$ip};
         $mac = $model->{observed}{$ip}{mac} if !$mac && $model->{observed}{$ip};
         reserve_dialog($cli, $S, $ip, $mac, $redraw, $status);
+    }
+}
+
+# Scroll the right-hand Reservations pane so the line for $ip is centred and
+# briefly highlighted. A no-op when $ip has no reservation line (free / in-use /
+# pool address): those don't appear in the list, so there's nothing to centre on.
+sub side_focus_ip {
+    my ($S, $ip) = @_;
+    my $t = $S->{resv_text} or return;
+    $t->tagRemove('nrhit', '1.0', 'end');           # clear any previous highlight
+    my $idx = _resv_index($t, $ip) or return;
+    my ($line)  = $t->index($idx)      =~ /^(\d+)/;
+    my ($total) = $t->index('end -1c') =~ /^(\d+)/;
+    $total ||= 1;
+    my $vis = eval { $t->cget('-height') } || 24;   # visible rows (no wrap here)
+    my $top = $line - int($vis / 2);  $top = 1 if $top < 1;
+    $t->yviewMoveto(($top - 1) / $total);           # put the line near the middle
+    $t->tagConfigure('nrhit', -background => '#ffd24d');
+    $t->tagAdd('nrhit', "$idx linestart", "$idx lineend");
+}
+
+# Text index of the side-list line for $ip, or undef. Exact match, but rejects a
+# prefix hit (so 10.0.0.5 won't land on 10.0.0.50): the char right after the IP
+# must not be another digit. stopIndex 'end' keeps the scan from wrapping.
+sub _resv_index {
+    my ($t, $ip) = @_;
+    my $from = '1.0';
+    while (1) {
+        my $idx = $t->search('-exact', '--', $ip, $from, 'end');
+        return undef unless defined $idx && length $idx;
+        my $after = $t->get("$idx + " . length($ip) . " chars",
+                            "$idx + " . (length($ip) + 1) . " chars");
+        return $idx unless defined $after && $after =~ /\d/;
+        $from = "$idx + 1 chars";
     }
 }
 
