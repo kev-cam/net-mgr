@@ -860,6 +860,7 @@ sub cmd_gui {
 
     $redraw = sub {
         my $cidr = $S{subnet};
+        my @yv = $resv_text->yview;       # remember scroll; the wipe below resets it to the top
         $canvas->delete('all');
         $resv_text->delete('1.0', 'end');
         unless (defined $cidr) { $status->configure(-text => ' no subnets'); return }
@@ -924,7 +925,10 @@ sub cmd_gui {
             }
         }
         $status->configure(-text => sprintf(" %s — %s", $cidr, pool_summary($model, $cidr)));
-        _highlight_focus(\%S);     # redraw wiped the text+tags; restore the click highlight
+        # The wipe above cleared the highlight AND scrolled to the top. Re-centre
+        # on the focused IP (also re-highlights); if it isn't in this view, just
+        # put the scroll back where it was instead of leaving it at the top.
+        _focus_show(\%S) or $resv_text->yviewMoveto($yv[0]);
     };
 
     $sync_now->();      # open with a forced pull of the initial subnet
@@ -964,35 +968,36 @@ sub cell_click {
 sub side_focus_ip {
     my ($S, $ip) = @_;
     my $t = $S->{resv_text} or return;
-    my $idx = _resv_index($t, $ip);
-    if (!defined $idx) {                # not a reservation: drop focus, un-mark
+    if (!defined _resv_index($t, $ip)) {    # not a reservation: drop focus, un-mark
         delete $S->{focus_ip};
         $t->tagRemove('nrhit', '1.0', 'end');
         return;
     }
-    $S->{focus_ip} = $ip;               # remember so redraw can re-apply it
+    $S->{focus_ip} = $ip;                   # remember so redraw can restore it
+    _focus_show($S);
+}
+
+# Centre the focused IP's line in the pane and highlight it. Re-run at the end
+# of every redraw: the periodic refresh rebuilds the list (delete + reinsert),
+# which both wipes the nrhit tag AND scrolls the view back to the top — so
+# without this the highlight vanishes and the pane jumps to the top after ~5s.
+# Returns true if the focused IP was found and shown, false otherwise.
+sub _focus_show {
+    my ($S) = @_;
+    my $t = $S->{resv_text} or return 0;
+    $t->tagRemove('nrhit', '1.0', 'end');
+    my $ip = $S->{focus_ip};
+    return 0 unless defined $ip;
+    my $idx = _resv_index($t, $ip) or return 0;     # focused IP not in this view
     my ($line)  = $t->index($idx)      =~ /^(\d+)/;
     my ($total) = $t->index('end -1c') =~ /^(\d+)/;
     $total ||= 1;
     my $vis = eval { $t->cget('-height') } || 24;   # visible rows (no wrap here)
     my $top = $line - int($vis / 2);  $top = 1 if $top < 1;
-    $t->yviewMoveto(($top - 1) / $total);           # put the line near the middle
-    _highlight_focus($S);
-}
-
-# (Re)apply the amber highlight to the focused IP's line, if any. Called on
-# click and again at the end of every redraw — the periodic refresh wipes the
-# text (and its tags), so without this the highlight would vanish after ~5s.
-# Highlight only, no re-scroll, so the tick doesn't fight a manual scroll.
-sub _highlight_focus {
-    my ($S) = @_;
-    my $t = $S->{resv_text} or return;
-    $t->tagRemove('nrhit', '1.0', 'end');
-    my $ip = $S->{focus_ip};
-    return unless defined $ip;
-    my $idx = _resv_index($t, $ip) or return;       # focused IP not in this view
+    $t->yviewMoveto(($top - 1) / $total);           # keep the line near the middle
     $t->tagConfigure('nrhit', -background => '#ffd24d');
     $t->tagAdd('nrhit', "$idx linestart", "$idx lineend");
+    return 1;
 }
 
 # Text index of the side-list line for $ip, or undef. Exact match, but rejects a
