@@ -956,13 +956,13 @@ sub cmd_gui {
             my $st = classify($model, $ip);
             my $fill = $CELL{$st};
             # DHCP-servers mode: a neutral pick surface — every box drawn blank so
-            # you can pick a range, with only the pools coloured by serving server.
+            # you can pick a range; colour the WHOLE of each pool by its serving
+            # server. Keyed on range membership (range_at), not classify — a
+            # reservation or lease inside a pool otherwise classifies as
+            # reserved/in-use and punches a hole in the colour (fragmented pool).
             if ($S{range_mode}) {
-                $fill = '#fff';
-                if ($st eq 'assigned') {
-                    my $rng = range_at($model, $ip);
-                    $fill = $srv_color->{ server_of_range($rng) } if $rng;
-                }
+                my $rng = range_at($model, $ip);
+                $fill = $rng ? ($srv_color->{ server_of_range($rng) } // '#fff') : '#fff';
             }
             # Outline the selected cell: the armed reservation, or the pool start.
             my $sel = $S{range_mode}
