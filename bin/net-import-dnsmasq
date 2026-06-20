@@ -32,6 +32,7 @@ use NetMgr::Protocol qw(format_kv);
 
 my ($listen, $print_only, $local, $auto, $files_opt, $help);
 my $ssh_timeout = 12;
+my $ssh_cmd     = 'net-ssh';        # override with --ssh-cmd 'ssh -o BatchMode=yes'
 GetOptions(
     'listen=s'      => \$listen,
     'print'         => \$print_only,
@@ -39,6 +40,7 @@ GetOptions(
     'auto'          => \$auto,
     'files=s'       => \$files_opt,
     'ssh-timeout=i' => \$ssh_timeout,
+    'ssh-cmd=s'     => \$ssh_cmd,
     'help|h'        => \$help,
 ) or die "bad options\n";
 usage() if $help;
@@ -160,8 +162,9 @@ sub scan_remote {
     # glob (e.g. /etc/dnsmasq.d/*) otherwise matches dnsmasq-foo~ and *.new too.
     my $cmd = "grep -HsE '^[[:space:]]*dhcp-range=' "
             . join(' ', @REMOTE_FILES) . " 2>/dev/null";
-    my $pid = open(my $fh, '-|', 'net-ssh', $host, $cmd);
-    unless ($pid) { warn "net-import-dnsmasq: $host: net-ssh: $!\n"; return () }
+    my @ssh = split ' ', $ssh_cmd;          # net-ssh by default; --ssh-cmd to override
+    my $pid = open(my $fh, '-|', @ssh, $host, $cmd);
+    unless ($pid) { warn "net-import-dnsmasq: $host: $ssh[0]: $!\n"; return () }
     my @out;
     eval {
         local $SIG{ALRM} = sub { die "timeout after ${ssh_timeout}s\n" };
@@ -263,7 +266,8 @@ usage:
   net-import-dnsmasq HOST ...          scan each host over net-ssh
   net-import-dnsmasq --auto            scan all known APs + gateways
   net-import-dnsmasq --local           scan this host's dnsmasq config
-  options: --print  --files 'P1 P2'  --listen H:P  --ssh-timeout N  -h/--help
+  options: --print  --files 'P1 P2'  --listen H:P  --ssh-timeout N
+           --ssh-cmd 'ssh -o BatchMode=yes'   (default: net-ssh)  -h/--help
 USAGE
     exit($msg ? 2 : 0);
 }
