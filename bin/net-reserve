@@ -734,13 +734,16 @@ sub range_at {
     return undef;
 }
 # Stable server -> colour map over the model's ranges (sorted by server name).
-my @SERVER_COLORS = ('#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd',
-                     '#8c564b','#e377c2','#17becf','#bcbd22','#7f7f7f');
+# The palette is declared inside the sub on purpose: a file-scoped `my` here
+# would never be initialised under `--gui` (the script enters Tk's MainLoop from
+# the dispatch above, before execution ever reaches a later top-level `my`).
 sub server_colors {
     my ($model) = @_;
+    my @colours = ('#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd',
+                   '#8c564b','#e377c2','#17becf','#bcbd22','#7f7f7f');
     my %srv; $srv{ server_of_range($_) } = 1 for @{ $model->{ranges} };
     my %c; my $i = 0;
-    $c{$_} = $SERVER_COLORS[$i++ % @SERVER_COLORS] for sort keys %srv;
+    $c{$_} = $colours[$i++ % @colours] for sort keys %srv;
     return \%c;
 }
 
