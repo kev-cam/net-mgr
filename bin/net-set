@@ -524,6 +524,12 @@ sub ssh_run {
 sub usage {
     my ($rc) = @_;
     print STDERR <<"EOF";
+net-set — point a host's DEFAULT ROUTE at a chosen gateway (egress control).
+It changes ONLY which gateway each TARGET uses to reach the Internet; it does
+not touch DHCP ranges, reservations, DNS, or any other host setting. For
+DD-WRT APs it also flips the advertised default-gateway (DHCP option 3) so
+clients follow at lease renewal.
+
 Usage:
   net-set --gateway HOST   TARGET [TARGET ...] | --all
   net-set --via-isp NAME   TARGET [TARGET ...] | --all
