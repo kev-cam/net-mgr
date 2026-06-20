@@ -876,8 +876,16 @@ sub cmd_gui {
         ->pack(-side => 'left', -padx => 2);
     $top->Button(-text => 'Reload', -command => sub { $sync_now->() })
         ->pack(-side => 'left', -padx => 4);
-    $top->Button(-text => 'Name unnamed', -command => sub { $autoname->() })
-        ->pack(-side => 'left', -padx => 2);
+    # DHCP-servers mode toggle: colour the grid by the AP/gateway serving each
+    # pool and list those servers in the right pane (instead of the reservations).
+    $top->Checkbutton(-text => 'DHCP assigned', -variable => \$S{range_mode},
+        -command => sub {
+            delete @S{qw(armed_ip armed_subnet range_start range_subnet)};
+            $redraw->();
+            $status->configure(-text => $S{range_mode}
+                ? ' DHCP servers — pools coloured by server; click pool START then END to assign, click a pool to remove'
+                : ' reservation mode');
+        })->pack(-side => 'left', -padx => 2);
 
     # legend
     my %CELL = (
@@ -889,23 +897,7 @@ sub cmd_gui {
     for my $st (qw(free in-use reserved active assigned)) {
         $leg->Label(-text => '  ', -background => $CELL{$st},
                     -relief => 'solid', -borderwidth => 1)->pack(-side => 'left');
-        if ($st eq 'assigned') {
-            # Doubles as a mode toggle: flip into "DHCP servers" mode, where the
-            # grid is colour-coded by the AP/gateway serving each pool and the
-            # right pane lists those servers. Click pool START then END to assign.
-            $leg->Checkbutton(
-                -text => state_label($st) . ' ', -variable => \$S{range_mode},
-                -command => sub {
-                    delete @S{qw(armed_ip armed_subnet range_start range_subnet)};
-                    $redraw->();
-                    $status->configure(-text => $S{range_mode}
-                        ? ' DHCP servers — pools coloured by server; click pool START then END to assign, click a pool to remove'
-                        : ' reservation mode');
-                },
-            )->pack(-side => 'left');
-        } else {
-            $leg->Label(-text => state_label($st) . ' ')->pack(-side => 'left');
-        }
+        $leg->Label(-text => state_label($st) . ' ')->pack(-side => 'left');
     }
 
     my $body = $mw->Frame->pack(-side => 'top', -fill => 'both', -expand => 1);
@@ -1040,6 +1032,9 @@ sub cmd_gui {
 
     $sync_now->();      # open with a forced pull of the initial subnet
     _fit_canvas_to_grid($canvas);   # size the window to show the whole grid on launch
+    # Name any nameless reservations on launch (was the "Name unnamed" button);
+    # scheduled so the window paints first. A no-op when nothing needs naming.
+    $mw->after(300, sub { $autoname->() });
     # periodic refresh: lazy (local DB only) — explicit actions force-sync
     my $tick; $tick = sub {
         $S{model} = gather($cli); $refresh_subnets->(); $redraw->();
