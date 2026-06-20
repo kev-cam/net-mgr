@@ -712,6 +712,38 @@ sub cmd_del_range {
     print "deleted range $cidr $start\n";
 }
 
+# ---- DHCP-range / server helpers (GUI "DHCP servers" mode) -----------
+# Each dynamic pool is served by some DHCP server (an AP or gateway). The
+# importer stamps that on the range's notes as "dnsmasq:<host>"; fall back to
+# the zone, then 'unknown'.
+sub server_of_range {
+    my ($r) = @_;
+    return $1 if defined $r->{notes} && $r->{notes} =~ /dnsmasq:(\S+)/;
+    return $r->{zone} if defined $r->{zone} && length $r->{zone};
+    return 'unknown';
+}
+# The dhcp_range row whose [start_ip, end_ip] covers $ip, or undef.
+sub range_at {
+    my ($model, $ip) = @_;
+    my $i = ip2int($ip);
+    return undef unless defined $i;
+    for my $r (@{ $model->{ranges} }) {
+        my $lo = ip2int($r->{start_ip}); my $hi = ip2int($r->{end_ip});
+        return $r if defined $lo && defined $hi && $i >= $lo && $i <= $hi;
+    }
+    return undef;
+}
+# Stable server -> colour map over the model's ranges (sorted by server name).
+my @SERVER_COLORS = ('#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd',
+                     '#8c564b','#e377c2','#17becf','#bcbd22','#7f7f7f');
+sub server_colors {
+    my ($model) = @_;
+    my %srv; $srv{ server_of_range($_) } = 1 for @{ $model->{ranges} };
+    my %c; my $i = 0;
+    $c{$_} = $SERVER_COLORS[$i++ % @SERVER_COLORS] for sort keys %srv;
+    return \%c;
+}
+
 # ---- Perl/Tk GUI -----------------------------------------------------
 
 sub cmd_gui {
@@ -857,14 +889,31 @@ sub cmd_gui {
     for my $st (qw(free in-use reserved active assigned)) {
         $leg->Label(-text => '  ', -background => $CELL{$st},
                     -relief => 'solid', -borderwidth => 1)->pack(-side => 'left');
-        $leg->Label(-text => state_label($st) . ' ')->pack(-side => 'left');
+        if ($st eq 'assigned') {
+            # Doubles as a mode toggle: flip into "DHCP servers" mode, where the
+            # grid is colour-coded by the AP/gateway serving each pool and the
+            # right pane lists those servers. Click pool START then END to assign.
+            $leg->Checkbutton(
+                -text => state_label($st) . ' ', -variable => \$S{range_mode},
+                -command => sub {
+                    delete @S{qw(armed_ip armed_subnet range_start range_subnet)};
+                    $redraw->();
+                    $status->configure(-text => $S{range_mode}
+                        ? ' DHCP servers — pools coloured by server; click pool START then END to assign, click a pool to remove'
+                        : ' reservation mode');
+                },
+            )->pack(-side => 'left');
+        } else {
+            $leg->Label(-text => state_label($st) . ' ')->pack(-side => 'left');
+        }
     }
 
     my $body = $mw->Frame->pack(-side => 'top', -fill => 'both', -expand => 1);
     $canvas = $body->Canvas(-width => 16*34, -height => 16*22, -background => '#fff')
         ->pack(-side => 'left', -fill => 'both', -expand => 1, -padx => 4, -pady => 4);
     my $side = $body->Frame->pack(-side => 'right', -fill => 'y');
-    $side->Label(-text => 'Reservations')->pack(-side => 'top', -anchor => 'w');
+    $S{side_title} = 'Reservations';
+    $side->Label(-textvariable => \$S{side_title})->pack(-side => 'top', -anchor => 'w');
     $resv_text = $side->Scrolled('ROText', -width => 38, -height => 24,
         -font => 'nrmono', -scrollbars => 'oe')->pack(-side => 'top', -fill => 'y', -expand => 1);
     $S{resv_text} = $resv_text;     # so a cell click can centre this pane on its IP
@@ -889,7 +938,13 @@ sub cmd_gui {
         # A selection only belongs to the subnet it was made in; drop it on a switch.
         delete @S{qw(armed_ip armed_subnet)}
             if defined $S{armed_ip} && ($S{armed_subnet} // '') ne $cidr;
+        delete @S{qw(range_start range_subnet)}
+            if defined $S{range_start} && ($S{range_subnet} // '') ne $cidr;
         my $model = $S{model};
+        # "DHCP servers" mode: colour each pool by its serving AP/gateway and list
+        # those servers in the side pane instead of the reservations.
+        $S{side_title} = $S{range_mode} ? 'DHCP servers' : 'Reservations';
+        my $srv_color  = $S{range_mode} ? server_colors($model) : {};
         # Fixed-size cells. For a /24 (or smaller) the whole subnet fits in one
         # 256-block, so position every cell by its last octet — column = low
         # nibble, row = high nibble — giving a regular 16-wide grid you can read
@@ -901,10 +956,19 @@ sub cmd_gui {
             my ($i, $x, $y) = @_;
             my $ip = int2ip($i);
             my $st = classify($model, $ip);
-            my $armed = defined $S{armed_ip} && $ip eq $S{armed_ip};   # selected cell
+            my $fill = $CELL{$st};
+            # DHCP-servers mode: paint each pool address in its server's colour.
+            if ($S{range_mode} && $st eq 'assigned') {
+                my $rng = range_at($model, $ip);
+                $fill = $srv_color->{ server_of_range($rng) } if $rng;
+            }
+            # Outline the selected cell: the armed reservation, or the pool start.
+            my $sel = $S{range_mode}
+                    ? (defined $S{range_start} && $ip eq $S{range_start})
+                    : (defined $S{armed_ip}    && $ip eq $S{armed_ip});
             my $r = $canvas->createRectangle($x, $y, $x + $cw - 2, $y + $ch - 2,
-                -fill => $CELL{$st}, -outline => ($armed ? '#000' : '#999'),
-                -width => ($armed ? 2 : 1));
+                -fill => $fill, -outline => ($sel ? '#000' : '#999'),
+                -width => ($sel ? 2 : 1));
             my $t = $canvas->createText($x + ($cw - 2) / 2, $y + ($ch - 2) / 2,
                 -text => ($i & 0xFF), -font => 'nrmono');
             for my $item ($r, $t) {
@@ -937,16 +1001,34 @@ sub cmd_gui {
                 $rown++ if ++$col % 16 == 0;
             }
         }
-        # side list, grouped
-        my @mine = sort { ip2int($a->{ip}) <=> ip2int($b->{ip}) }
-                   grep { ($_->{subnet_cidr} // subnet_of($_->{ip}) // '') eq $cidr }
-                   values %{ $model->{resv} };
-        my %by_grp; push @{ $by_grp{ $_->{grp} // '(ungrouped)' } }, $_ for @mine;
-        for my $g (sort keys %by_grp) {
-            $resv_text->insert('end', "[$g]\n");
-            for my $rr (@{ $by_grp{$g} }) {
-                $resv_text->insert('end',
-                    sprintf("  %-15s %s\n", $rr->{ip}, ($rr->{name} // $rr->{mac})));
+        if ($S{range_mode}) {
+            # DHCP servers, colour-keyed to the grid, with each one's pools.
+            my %by_srv; push @{ $by_srv{ server_of_range($_) } }, $_ for @{ $model->{ranges} };
+            $resv_text->insert('end', "  (no DHCP ranges yet)\n") unless %by_srv;
+            for my $srv (sort keys %by_srv) {
+                (my $tag = "srv_$srv") =~ s/\W/_/g;
+                $resv_text->tagConfigure($tag, -background => ($srv_color->{$srv} // '#fff'));
+                $resv_text->insert('end', '  ');
+                $resv_text->insert('end', '  ', $tag);          # colour swatch
+                $resv_text->insert('end', " $srv\n");
+                for my $r (sort { ip2int($a->{start_ip}) <=> ip2int($b->{start_ip}) }
+                           @{ $by_srv{$srv} }) {
+                    $resv_text->insert('end', sprintf("       %-18s %s-%s\n",
+                        $r->{subnet_cidr}, $r->{start_ip}, $r->{end_ip}));
+                }
+            }
+        } else {
+            # side list, grouped (reservations)
+            my @mine = sort { ip2int($a->{ip}) <=> ip2int($b->{ip}) }
+                       grep { ($_->{subnet_cidr} // subnet_of($_->{ip}) // '') eq $cidr }
+                       values %{ $model->{resv} };
+            my %by_grp; push @{ $by_grp{ $_->{grp} // '(ungrouped)' } }, $_ for @mine;
+            for my $g (sort keys %by_grp) {
+                $resv_text->insert('end', "[$g]\n");
+                for my $rr (@{ $by_grp{$g} }) {
+                    $resv_text->insert('end',
+                        sprintf("  %-15s %s\n", $rr->{ip}, ($rr->{name} // $rr->{mac})));
+                }
             }
         }
         $status->configure(-text => sprintf(" %s — %s", $cidr, pool_summary($model, $cidr)));
@@ -974,6 +1056,7 @@ sub cmd_gui {
 # box just moves the selection there (a fresh first click).
 sub cell_click {
     my ($cli, $S, $ip, $redraw, $status) = @_;
+    return range_click($cli, $S, $ip, $redraw, $status) if $S->{range_mode};
     my $model = $S->{model};
     my $st = classify($model, $ip);
     if (($S->{armed_ip} // '') ne $ip) {          # first click: arm + highlight only
@@ -1000,6 +1083,75 @@ sub cell_click {
         $mac = $model->{observed}{$ip}{mac} if !$mac && $model->{observed}{$ip};
         reserve_dialog($cli, $S, $ip, $mac, $redraw, $status);
     }
+}
+
+# DHCP-servers mode click: click inside an existing pool to remove it; otherwise
+# click the pool START then the END to assign a new range to an AP/gateway.
+sub range_click {
+    my ($cli, $S, $ip, $redraw, $status) = @_;
+    if (my $r = range_at($S->{model}, $ip)) {           # inside a pool -> remove
+        delete @{$S}{qw(range_start range_subnet)}; $redraw->();
+        range_delete_dialog($cli, $S, $r, $redraw, $status);
+        return;
+    }
+    if (!defined $S->{range_start}) {                   # first click: pool start
+        $S->{range_start}  = $ip;
+        $S->{range_subnet} = $S->{subnet};
+        $redraw->();
+        $status->configure(-text => " DHCP pool start $ip — click the END address");
+        return;
+    }
+    my ($a, $b) = (ip2int($S->{range_start}), ip2int($ip));   # second click: end
+    ($a, $b) = ($b, $a) if $a > $b;
+    delete @{$S}{qw(range_start range_subnet)};
+    range_assign_dialog($cli, $S, int2ip($a), int2ip($b), $redraw, $status);
+}
+
+# Assign a new pool start-end to a DHCP server (AP/gateway).
+sub range_assign_dialog {
+    my ($cli, $S, $start, $end, $redraw, $status) = @_;
+    my $cidr = $S->{subnet};
+    my $dlg = ($S->{anchor} // $status)->DialogBox(
+        -title => "DHCP pool $start - $end", -buttons => ['Assign', 'Cancel']);
+    $dlg->add('Label', -justify => 'left',
+        -text => "Assign a DHCP pool in $cidr:\n    $start  ->  $end\n")
+        ->pack(-padx => 8, -pady => 4);
+    my %v = (server => '');
+    my %srv; $srv{ server_of_range($_) } = 1 for @{ $S->{model}{ranges} };
+    my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 2);
+    $row->Label(-text => 'Server:', -width => 8, -anchor => 'w')->pack(-side => 'left');
+    $row->Entry(-textvariable => \$v{server}, -width => 22)->pack(-side => 'left');
+    if (grep { $_ ne 'unknown' } keys %srv) {
+        my $r2 = $dlg->add('Frame')->pack(-fill => 'x');
+        $r2->Label(-text => '', -width => 8)->pack(-side => 'left');
+        for my $s (sort grep { $_ ne 'unknown' } keys %srv) {
+            $r2->Button(-text => $s, -command => sub { $v{server} = $s })->pack(-side => 'left');
+        }
+    }
+    my $ans = $dlg->Show // 'Cancel';
+    return unless $ans eq 'Assign';
+    my $r = $cli->observe(kind => 'dhcp_range', subnet_cidr => $cidr,
+        start_ip => $start, end_ip => $end,
+        ($v{server} ne '' ? (notes => "dnsmasq:$v{server}", zone => $v{server}) : ()));
+    if (!defined $r || $r =~ /^ERR/) { $status->configure(-text => " $r"); return }
+    $S->{model} = gather($cli); $redraw->();
+    $status->configure(-text => " assigned DHCP pool $start-$end"
+        . ($v{server} ne '' ? " -> $v{server}" : ''));
+}
+
+# Remove an existing DHCP pool.
+sub range_delete_dialog {
+    my ($cli, $S, $r, $redraw, $status) = @_;
+    my $ans = lc(($S->{anchor} // $status)->messageBox(
+        -type => 'yesno', -icon => 'question', -title => 'Remove DHCP pool',
+        -message => "Remove DHCP pool\n$r->{subnet_cidr}  $r->{start_ip} - $r->{end_ip}"
+            . "  (" . server_of_range($r) . ")?"));
+    return unless $ans eq 'yes';
+    my $resp = $cli->observe(kind => 'dhcp_range_delete',
+        subnet_cidr => $r->{subnet_cidr}, start_ip => $r->{start_ip});
+    if (!defined $resp || $resp =~ /^ERR/) { $status->configure(-text => " $resp"); return }
+    $S->{model} = gather($cli); $redraw->();
+    $status->configure(-text => " removed DHCP pool $r->{start_ip}-$r->{end_ip}");
 }
 
 # Scroll the right-hand Reservations pane so the line for $ip is centred and
