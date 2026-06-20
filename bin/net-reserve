@@ -876,8 +876,11 @@ sub cmd_gui {
         ->pack(-side => 'left', -padx => 2);
     $top->Button(-text => 'Reload', -command => sub { $sync_now->() })
         ->pack(-side => 'left', -padx => 4);
-    # DHCP-servers mode toggle: colour the grid by the AP/gateway serving each
+    # DHCP-servers mode toggle, with the white "assigned" swatch beside it (the
+    # legend no longer repeats it): colour the grid by the AP/gateway serving each
     # pool and list those servers in the right pane (instead of the reservations).
+    $top->Label(-text => '  ', -background => '#fff', -relief => 'solid', -borderwidth => 1)
+        ->pack(-side => 'left', -padx => 2);
     $top->Checkbutton(-text => 'DHCP assigned', -variable => \$S{range_mode},
         -command => sub {
             delete @S{qw(armed_ip armed_subnet range_start range_subnet)};
@@ -885,7 +888,7 @@ sub cmd_gui {
             $status->configure(-text => $S{range_mode}
                 ? ' DHCP servers — pools coloured by server; click pool START then END to assign, click a pool to remove'
                 : ' reservation mode');
-        })->pack(-side => 'left', -padx => 2);
+        })->pack(-side => 'left');
 
     # legend
     my %CELL = (
@@ -894,7 +897,7 @@ sub cmd_gui {
         'in-use' => '#e8821e', free => '#3a3',
     );
     my $leg = $top->Frame->pack(-side => 'right');
-    for my $st (qw(free in-use reserved active assigned)) {
+    for my $st (qw(free in-use reserved active)) {     # 'assigned' lives on the toggle
         $leg->Label(-text => '  ', -background => $CELL{$st},
                     -relief => 'solid', -borderwidth => 1)->pack(-side => 'left');
         $leg->Label(-text => state_label($st) . ' ')->pack(-side => 'left');
@@ -949,10 +952,14 @@ sub cmd_gui {
             my $ip = int2ip($i);
             my $st = classify($model, $ip);
             my $fill = $CELL{$st};
-            # DHCP-servers mode: paint each pool address in its server's colour.
-            if ($S{range_mode} && $st eq 'assigned') {
-                my $rng = range_at($model, $ip);
-                $fill = $srv_color->{ server_of_range($rng) } if $rng;
+            # DHCP-servers mode: a neutral pick surface — every box drawn blank so
+            # you can pick a range, with only the pools coloured by serving server.
+            if ($S{range_mode}) {
+                $fill = '#fff';
+                if ($st eq 'assigned') {
+                    my $rng = range_at($model, $ip);
+                    $fill = $srv_color->{ server_of_range($rng) } if $rng;
+                }
             }
             # Outline the selected cell: the armed reservation, or the pool start.
             my $sel = $S{range_mode}
