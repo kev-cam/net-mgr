@@ -112,6 +112,24 @@ sub ranges_from_text {
     return @r;
 }
 
+# Editor backups / package drafts / temp files that dnsmasq itself would not
+# load. Scanning them re-imports stale or draft ranges — the classic "net-reserve
+# shows a DHCP pool that doesn't match the live config" — because the scan globs
+# (dnsmasq-* locally, /etc/dnsmasq.d/* remotely) otherwise match dnsmasq-foo~,
+# *.new, *.bak and friends alongside the active file.
+sub is_backup_file {
+    my ($path) = @_;
+    (my $base = $path) =~ s{.*/}{};
+    return 1 if $base =~ /~\z/;                 # vi/emacs backup     foo~
+    return 1 if $base =~ /\A\#.*\#\z/;          # emacs autosave      #foo#
+    return 1 if $base =~ /\A\./;                # dotfile / vi swap   .foo.swp
+    return 1 if $base =~ /\.(?:bak|old|orig|save|swp|swo|tmp|new
+                               |dpkg-(?:old|new|dist)
+                               |rpm(?:new|save|orig)
+                               |ucf-(?:old|new|dist))\z/xi;
+    return 0;
+}
+
 # ---- local scan -----------------------------------------------------
 sub scan_local {
     my @globs;
@@ -127,6 +145,7 @@ sub scan_local {
     for my $g (@globs) {
         for my $f (glob $g) {
             next unless -f $f && -r $f;
+            next if is_backup_file($f);              # skip *~ / *.new / *.bak ...
             open my $fh, '<', $f or next;
             local $/; $text .= <$fh>; close $fh;
         }
@@ -137,7 +156,9 @@ sub scan_local {
 # ---- remote scan over net-ssh (bounded by --ssh-timeout) ------------
 sub scan_remote {
     my ($host) = @_;
-    my $cmd = "grep -hsE '^[[:space:]]*dhcp-range=' "
+    # -H so we can drop editor backups / drafts by filename: the remote shell's
+    # glob (e.g. /etc/dnsmasq.d/*) otherwise matches dnsmasq-foo~ and *.new too.
+    my $cmd = "grep -HsE '^[[:space:]]*dhcp-range=' "
             . join(' ', @REMOTE_FILES) . " 2>/dev/null";
     my $pid = open(my $fh, '-|', 'net-ssh', $host, $cmd);
     unless ($pid) { warn "net-import-dnsmasq: $host: net-ssh: $!\n"; return () }
@@ -150,7 +171,16 @@ sub scan_remote {
     };
     if (my $e = $@) { kill 'TERM', $pid; warn "net-import-dnsmasq: $host: $e" }
     close $fh;
-    return ranges_from_text(join '', @out);
+    my @r;
+    for my $line (@out) {
+        $line =~ s/\r?\n\z//;
+        my ($file, $rest) = $line =~ /^([^:]+):(.*)$/ or next;
+        next if is_backup_file($file);              # skip *~ / *.new / *.bak ...
+        next unless $rest =~ /^\s*dhcp-range\s*=\s*(.+?)\s*$/;
+        my $p = parse_range($1) or next;
+        push @r, $p;
+    }
+    return @r;
 }
 
 # ---- enumerate APs + gateways the daemon knows about ----------------
