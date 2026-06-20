@@ -27,11 +27,30 @@ use NetMgr::Protocol qw(format_kv);
 my @files;
 my $print_only;
 my $listen;
+my $help;
 GetOptions(
     'file=s@'   => \@files,
     'print'     => \$print_only,
     'listen=s'  => \$listen,
-) or die "bad options\n";
+    'help|h'    => \$help,
+) or usage(2);
+usage(0) if $help;
+
+sub usage {
+    my ($code) = @_;
+    print STDERR <<'USAGE';
+usage:
+  net-import-dhcp                      import both /etc/net-mgr/dhcp.master + dhcp.extra
+  net-import-dhcp --file FILE          import just one file (repeatable)
+  net-import-dhcp --print              dump observations to stdout, don't send
+  net-import-dhcp --listen HOST:PORT   override the manager address
+  net-import-dhcp --help               this message
+
+Each host block is pushed as a kind=host observation and a kind=dhcp_reservation
+(the permanent MAC->IP), so net-reserve shows it reserved + named.
+USAGE
+    exit($code // 0);
+}
 
 unless (@files) {
     @files = grep { -f $_ } qw(/etc/net-mgr/dhcp.master /etc/net-mgr/dhcp.extra);

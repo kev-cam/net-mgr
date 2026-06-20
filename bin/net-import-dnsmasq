@@ -30,7 +30,7 @@ use NetMgr::Client;
 use NetMgr::Config;
 use NetMgr::Protocol qw(format_kv);
 
-my ($listen, $print_only, $local, $auto, $files_opt);
+my ($listen, $print_only, $local, $auto, $files_opt, $help);
 my $ssh_timeout = 12;
 GetOptions(
     'listen=s'      => \$listen,
@@ -39,7 +39,9 @@ GetOptions(
     'auto'          => \$auto,
     'files=s'       => \$files_opt,
     'ssh-timeout=i' => \$ssh_timeout,
+    'help|h'        => \$help,
 ) or die "bad options\n";
+usage() if $help;
 my @hosts = @ARGV;
 
 usage("nothing to scan") unless @hosts || $local || $auto;
@@ -231,7 +233,7 @@ usage:
   net-import-dnsmasq HOST ...          scan each host over net-ssh
   net-import-dnsmasq --auto            scan all known APs + gateways
   net-import-dnsmasq --local           scan this host's dnsmasq config
-  options: --print  --files 'P1 P2'  --listen H:P  --ssh-timeout N
+  options: --print  --files 'P1 P2'  --listen H:P  --ssh-timeout N  -h/--help
 USAGE
     exit($msg ? 2 : 0);
 }

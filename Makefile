@@ -35,7 +35,8 @@ SBINS = net-mgr net-mgr-setup net-dns net-mgr-relay
 RECOVERYS = net-recover-tlsg2424
 UNITS = net-mgr.service net-dns.service net-mgr-relay.service
 MAN1S = net-alias.1 net-chat.1 net-connect.1 net-diag.1 net-discover.1 net-fix.1 \
-        net-gen-dnsmasq.1 net-import-dhcp.1 net-name.1 net-ping.1 \
+        net-gen-dnsmasq.1 net-import-dhcp.1 net-import-dnsmasq.1 \
+        net-import-ssh-forwards.1 net-name.1 net-ping.1 \
         net-poll-ap.1 net-report.1 net-reserve.1 net-roam.1 net-router.1 net-scan.1 \
         net-show.1 net-tp-scan.1 net-var.1 net-watch.1
 MAN7S = net-mgr.7

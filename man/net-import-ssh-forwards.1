@@ -1,0 +1,114 @@
+.TH NET-IMPORT-SSH-FORWARDS 1 "2026-06-19" "net-mgr" "User Commands"
+.SH NAME
+net-import-ssh-forwards \- import ssh -L/-R/-D port-forwards into net-mgr
+.SH SYNOPSIS
+.B net-import-ssh-forwards
+.RB [ \-\-host
+.IR HOST ]
+.RB [ \-\-file
+.IR PATH ]
+.RB [ \-\-source\-host
+.IR NAME ]
+.RB [ \-\-listen
+.IR HOST:PORT ]
+.RB [ \-\-ssh\-user
+.IR USER ]
+.RB [ \-\-ssh\-timeout
+.IR N ]
+.RB [ \-\-no\-ui ]
+.RB [ \-\-dry\-run | \-n ]
+.RB [ \-\-print ]
+.SH DESCRIPTION
+.B net-import-ssh-forwards
+harvests the
+.BR \-L ", " \-R " and " \-D
+port-forwards from running
+.BR ssh (1)
+processes on a firewall (or any host) and records each one in the net-mgr
+.B forwarding_rules
+table as an
+.B OBSERVE kind=forward
+observation. It reads
+.B "pgrep -lfa ssh"
+output \(em locally, from a remote host over ssh, or from a saved file \(em
+parses the forward specs plus the ssh endpoint, and (by default) lets you pick
+which rules to import from a Tk picker.
+.PP
+With no source option it scans the local host; otherwise the source is taken
+from
+.B \-\-host
+(or
+.B \-\-source\-host
+with
+.BR \-\-file ),
+so the imported rows carry the right origin tag.
+.SH OPTIONS
+.TP
+\fB\-\-host\fR \fIHOST\fR
+ssh to
+.I HOST
+and run
+.BR "pgrep -lfa ssh" .
+.TP
+\fB\-\-file\fR \fIPATH\fR
+Read
+.BR "pgrep -lfa ssh" \-style
+output from
+.I PATH
+instead of running it (testing/replay). Requires
+.B \-\-source\-host
+unless the output already names the host.
+.TP
+\fB\-\-source\-host\fR \fINAME\fR
+Override the source-host tag (default: the
+.B \-\-host
+value, or the local hostname when neither
+.B \-\-host
+nor
+.B \-\-file
+is given).
+.TP
+\fB\-\-listen\fR \fIHOST:PORT\fR
+net-mgr daemon address (default
+.IR 127.0.0.1:7531 ,
+or
+.BR $NET_MGR_LISTEN ).
+.TP
+\fB\-\-ssh\-user\fR \fIUSER\fR
+ssh as
+.IR USER @ HOST
+(default
+.IR root ).
+.TP
+\fB\-\-ssh\-timeout\fR \fIN\fR
+ssh
+.B ConnectTimeout
+in seconds (default 10).
+.TP
+.B \-\-no\-ui
+Skip the Tk picker and import every parsed rule.
+.TP
+.BR \-\-dry\-run ", " \-n
+Parse and display the picker but don't talk to net-mgr.
+.TP
+.B \-\-print
+Emit one key=value line per parsed rule on stdout \(em no UI, no DB write \(em
+for tools (e.g.\&
+.BR net-fw (1))
+that want the current state without committing it.
+.TP
+.BR \-h ", " \-\-help
+Print a usage summary and exit.
+.SH EXAMPLES
+.PP
+.RS
+.nf
+net-import-ssh-forwards --host firewall1        # scan a firewall, pick rules
+net-import-ssh-forwards --no-ui --host firewall1 # import every rule, no picker
+net-import-ssh-forwards --print                 # current local forwards as kv
+.fi
+.RE
+.SH SEE ALSO
+.BR net-fw (1),
+.BR net-connect (1),
+.BR ssh (1)
