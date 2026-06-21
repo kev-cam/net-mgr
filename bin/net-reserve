@@ -416,7 +416,7 @@ sub classify {
 sub use_color { -t STDOUT }
 
 sub state_label {
-    my %L = (reserved => 'reserved', active => 'reserved + in use',
+    my %L = (reserved => 'reserved', active => '+ in use',
              assigned => 'DHCP assigned', 'in-use' => 'in use',
              free => 'free static');
     return $L{$_[0]} // $_[0];
@@ -722,6 +722,54 @@ sub server_of_range {
     return $r->{zone} if defined $r->{zone} && length $r->{zone};
     return 'unknown';
 }
+# Best-guess management address for the AP/gateway that serves a pool, so the UI
+# can deep-link to its web admin. Match a reservation named after the DHCP
+# server (exact, then loose substring), preferring one in the same subnet as the
+# server's own pools (a dual-homed AP has up/down hosts); fall back to DNS.
+# Returns undef when nothing is known — the caller leaves the name unlinked.
+sub server_host_ip {
+    my ($model, $srv) = @_;
+    return undef if !defined $srv || $srv eq '' || lc $srv eq 'unknown';
+    my %srv_net;        # subnets this server actually hands out in
+    for my $r (@{ $model->{ranges} }) {
+        next unless lc(server_of_range($r)) eq lc $srv;
+        my $s = subnet_of($r->{start_ip}); $srv_net{$s} = 1 if $s;
+    }
+    my $pick = sub {        # prefer a candidate reachable in one of those subnets
+        my @c = @_;  return undef unless @c;
+        for my $r (@c) { my $s = subnet_of($r->{ip}); return $r->{ip} if $s && $srv_net{$s}; }
+        return $c[0]{ip};
+    };
+    my @resv = grep { defined $_->{ip} && length($_->{name} // '') } values %{ $model->{resv} };
+    my $ip = $pick->( grep { lc $_->{name} eq lc $srv } @resv );
+    $ip  //= $pick->( grep { $_->{name} =~ /\Q$srv\E/i || $srv =~ /\Q$_->{name}\E/i } @resv );
+    return $ip if $ip;
+    my @h = gethostbyname($srv);    # system resolver appends the search domain
+    return join('.', unpack('C4', $h[4])) if @h >= 5 && length($h[4]) == 4;
+    return undef;
+}
+# Open $url in the user's browser without blocking the GUI. Double-fork so the
+# browser is reparented to init (no zombie to reap); try the common launchers in
+# turn — exec only returns on failure, so the loop falls through to the next.
+sub open_url {
+    my ($url) = @_;
+    return unless defined $url && length $url;
+    my @browsers = ([qw(xdg-open)], [qw(sensible-browser)], [qw(x-www-browser)],
+                    [qw(firefox)], [qw(chromium)], [qw(google-chrome)]);
+    my $pid = fork();
+    return unless defined $pid;
+    if ($pid == 0) {
+        my $p2 = fork();
+        CORE::exit(127) unless defined $p2;
+        CORE::exit(0)   if $p2;                 # intermediate child exits at once
+        open STDIN,  '<', '/dev/null';
+        open STDOUT, '>', '/dev/null';
+        open STDERR, '>', '/dev/null';
+        for my $b (@browsers) { no warnings; exec { $b->[0] } @$b, $url; }
+        CORE::exit(127);
+    }
+    waitpid($pid, 0);                           # reap the intermediate child
+}
 # The dhcp_range row whose [start_ip, end_ip] covers $ip, or undef.
 sub range_at {
     my ($model, $ip) = @_;
@@ -804,6 +852,45 @@ sub cmd_gui {
     # coderefs are assigned further down but only ever *called* at event time.
     my ($subnet_be, $status, $canvas, $resv_text, $redraw, $refresh_subnets,
         $sync_now);
+
+    # About box — client build info plus live daemon STATUS (schema, role, mesh).
+    my $about = sub {
+        my $w = $mw->Toplevel(-title => 'About net-reserve');
+        $w->transient($mw);
+        my @st    = stat($0);
+        my $built = @st ? scalar localtime($st[9]) : '(unknown)';
+        my $s     = eval { $cli->status } || {};
+        my $start = $s->{started_at} ? scalar localtime(int $s->{started_at}) : '?';
+        my @lines = (
+            'net-reserve — DHCP reservations + dynamic ranges',
+            '',
+            'Client',
+            sprintf('  program    %s', $0),
+            sprintf('  installed  %s', $built),
+            sprintf('  perl       %vd', $^V),
+            sprintf('  Tk         %s', $Tk::VERSION // '?'),
+            sprintf('  host       %s', eval { hostname() } // '?'),
+            '',
+            "Daemon  ($listen)",
+            (%$s
+                ? ( sprintf('  schema     v%s', $s->{schema_version} // '?'),
+                    sprintf('  role       %s', $s->{cluster_role}    // '?'),
+                    sprintf('  master     %s', $s->{cluster_master}  // '?'),
+                    sprintf('  cluster    %s', $s->{cluster_name} || $s->{cluster_domain} || '(unnamed)'),
+                    sprintf('  clients    %s', $s->{clients} // '?'),
+                    sprintf('  started    %s', $start),
+                    sprintf('  mesh       %s', $s->{cluster_mesh} || '(none)') )
+                : ('  (unreachable)') ),
+        );
+        my $body = join("\n", @lines);
+        my $txt = $w->Scrolled('ROText', -scrollbars => 'oe', -wrap => 'none',
+                               -width => 64, -height => scalar(@lines) + 1,
+                               -font => 'nrmono')
+                    ->pack(-fill => 'both', -expand => 1, -padx => 6, -pady => 6);
+        $txt->insert('end', $body);
+        $w->Button(-text => 'Close', -command => sub { $w->destroy })
+          ->pack(-side => 'bottom', -pady => 4);
+    };
 
     # The picker offers the union of discovered subnets, any pinned
     # (manually-entered) ones, the persistent "show" list, and the current
@@ -909,6 +996,8 @@ sub cmd_gui {
                 ? ' DHCP servers — pools coloured by AP/gateway; red = overlap (pools must be disjoint); click free START then END to add a pool; click a pool (grid) or a range (right pane) to remove'
                 : ' reservation mode');
         })->pack(-side => 'left');
+    $top->Button(-text => 'About', -command => sub { $about->() })
+        ->pack(-side => 'right', -padx => 4);
 
     # legend
     my %CELL = (
@@ -1035,7 +1124,23 @@ sub cmd_gui {
                 $resv_text->tagConfigure($tag, -background => ($srv_color->{$srv} // '#fff'));
                 $resv_text->insert('end', '  ');
                 $resv_text->insert('end', '  ', $tag);          # colour swatch
-                $resv_text->insert('end', " $srv\n");
+                # Click the server (host) name to open its web admin in a browser;
+                # only linkify when we can resolve an address (else plain text).
+                my $hip = server_host_ip($model, $srv);
+                if ($hip) {
+                    (my $htag = "host_$srv") =~ s/\W/_/g;
+                    my $url = "http://$hip/";
+                    $resv_text->insert('end', " $srv", $htag);
+                    $resv_text->insert('end', "  ($hip)\n");
+                    $resv_text->tagConfigure($htag, -foreground => '#06c', -underline => 1);
+                    $resv_text->tagBind($htag, '<Button-1>', sub { open_url($url) });
+                    $resv_text->tagBind($htag, '<Enter>', sub {
+                        $resv_text->configure(-cursor => 'hand2'); });
+                    $resv_text->tagBind($htag, '<Leave>', sub {
+                        $resv_text->configure(-cursor => ''); });
+                } else {
+                    $resv_text->insert('end', " $srv\n");
+                }
                 for my $r (sort { ip2int($a->{start_ip}) <=> ip2int($b->{start_ip}) }
                            @{ $by_srv{$srv} }) {
                     my $rtag = 'rng' . $ri++;       # one tag per range line
