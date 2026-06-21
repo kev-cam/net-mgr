@@ -748,6 +748,57 @@ sub server_host_ip {
     return join('.', unpack('C4', $h[4])) if @h >= 5 && length($h[4]) == 4;
     return undef;
 }
+# Resolve a DHCP-server tag to its IP via net-lookup — the same alias-aware,
+# POV-scored resolver net-ssh used to reach the AP when it imported the pool
+# (the tag is the AP's *self-name*, not a hostname nas3 knows, so plain DNS /
+# reservation matching misses it; net-lookup's friendly_names/aliases catch it).
+# Cached per server (resolution is stable) so we don't fork on every redraw;
+# '' cached means "couldn't resolve" — don't retry. Bounded so a slow daemon
+# can't stall the GUI.
+sub server_link_ip {
+    my ($S, $srv) = @_;
+    return undef if !defined $srv || $srv eq '' || lc $srv eq 'unknown';
+    my $cache = $S->{srv_ip} ||= {};
+    return ($cache->{$srv} || undef) if exists $cache->{$srv};
+    my $bin = (-x "$FindBin::Bin/net-lookup") ? "$FindBin::Bin/net-lookup" : 'net-lookup';
+    my $listen = $S->{listen} // '127.0.0.1:7531';
+    my $ip = '';
+    eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm 3;
+        if (open my $fh, '-|', $bin, '--family', 'v4', '--listen', $listen, "=$srv") {
+            while (<$fh>) { if (/(\d+\.\d+\.\d+\.\d+)/) { $ip = $1; last } }
+            close $fh;
+        }
+        alarm 0;
+    };
+    alarm 0;
+    $cache->{$srv} = $ip;
+    return $ip || undef;
+}
+# A clickable web-admin URL for a DHCP server, plus the IP to show (if any).
+# Always returns a URL so every server is linkable: net-lookup's address, else
+# the model's reservation/DNS guess, else an FQDN the browser can try.
+sub server_url {
+    my ($S, $model, $srv) = @_;
+    my $ip = server_link_ip($S, $srv) // server_host_ip($model, $srv);
+    return ("http://$ip/", $ip) if $ip;
+    my $dom  = $S->{domain};
+    my $host = (defined $dom && length $dom) ? "$srv.$dom" : $srv;
+    return ("http://$host/", undef);
+}
+# Cluster/DNS domain, for FQDN-guessing a server link when no address is known.
+sub gui_domain {
+    my ($cli) = @_;
+    my $d = eval { my $s = $cli->status; $s->{cluster_domain} || $s->{cluster_name} } // '';
+    $d = '' unless $d =~ /[A-Za-z]/;        # ignore empty / IP-ish values
+    unless (length $d) {
+        $d = eval { NetMgr::Config->load($ENV{NET_MGR_CONF} // '/etc/net-mgr/config')
+                        ->{dns}{domain} } // '';
+    }
+    $d =~ s/^\s+|\s+$//g if defined $d;
+    return $d // '';
+}
 # Open $url in the user's browser without blocking the GUI. Double-fork so the
 # browser is reparented to init (no zombie to reap); try the common launchers in
 # turn — exec only returns on failure, so the loop falls through to the next.
@@ -822,7 +873,8 @@ sub cmd_gui {
 
     my $cli = connect_client();   # auth on remote so reserve/release work
     my %S = (subnet => undef, model => gather($cli), cur => undef, pinned => {},
-             show => _read_cidr_list('show'), ignore => _read_cidr_list('ignore'));
+             show => _read_cidr_list('show'), ignore => _read_cidr_list('ignore'),
+             listen => $listen, domain => gui_domain($cli), srv_ip => {});
     # Seed the picker with this machine's own attached subnets, so your LANs
     # are pickable even before the DB has ranges/leases for them.
     $S{pinned}{$_} = 1 for @{ local_subnets() };
@@ -1115,46 +1167,69 @@ sub cmd_gui {
             }
         }
         if ($S{range_mode}) {
-            # DHCP servers, colour-keyed to the grid, with each one's pools.
-            my %by_srv; push @{ $by_srv{ server_of_range($_) } }, $_ for @{ $model->{ranges} };
-            $resv_text->insert('end', "  (no DHCP ranges yet)\n") unless %by_srv;
+            # DHCP pools grouped by SUBNET. The current subnet's pools show in
+            # full colour; other subnets are greyed and their headers click
+            # through to that subnet. Each pool lists its serving AP/gateway as a
+            # link to the box's web admin and the range (click to delete).
+            my %by_net;
+            for my $r (@{ $model->{ranges} }) {
+                my $net = $r->{subnet_cidr} || subnet_of($r->{start_ip}) || '(unknown)';
+                push @{ $by_net{$net} }, $r;
+            }
+            $resv_text->insert('end', "  (no DHCP ranges yet)\n") unless %by_net;
+            my @nets = sort {
+                (ip2int((split m{/}, $a)[0]) // 0) <=> (ip2int((split m{/}, $b)[0]) // 0)
+            } keys %by_net;
             my $ri = 0;
-            for my $srv (sort keys %by_srv) {
-                (my $tag = "srv_$srv") =~ s/\W/_/g;
-                $resv_text->tagConfigure($tag, -background => ($srv_color->{$srv} // '#fff'));
-                $resv_text->insert('end', '  ');
-                $resv_text->insert('end', '  ', $tag);          # colour swatch
-                # Click the server (host) name to open its web admin in a browser;
-                # only linkify when we can resolve an address (else plain text).
-                my $hip = server_host_ip($model, $srv);
-                if ($hip) {
-                    (my $htag = "host_$srv") =~ s/\W/_/g;
-                    my $url = "http://$hip/";
-                    $resv_text->insert('end', " $srv", $htag);
-                    $resv_text->insert('end', "  ($hip)\n");
-                    $resv_text->tagConfigure($htag, -foreground => '#06c', -underline => 1);
-                    $resv_text->tagBind($htag, '<Button-1>', sub { open_url($url) });
-                    $resv_text->tagBind($htag, '<Enter>', sub {
-                        $resv_text->configure(-cursor => 'hand2'); });
-                    $resv_text->tagBind($htag, '<Leave>', sub {
-                        $resv_text->configure(-cursor => ''); });
-                } else {
-                    $resv_text->insert('end', " $srv\n");
+            for my $net (@nets) {
+                my $here = ($net eq $cidr);
+                # subnet header — current in black; others a link that jumps there
+                (my $ntag = "net_$net") =~ s/\W/_/g;
+                $resv_text->insert('end',
+                    $net . ($here ? '  (current)' : '  → view') . "\n", $ntag);
+                $resv_text->tagConfigure($ntag,
+                    -foreground => ($here ? '#000' : '#36c'),
+                    ($here ? () : (-underline => 1)));
+                unless ($here) {
+                    $resv_text->tagBind($ntag, '<Button-1>', sub {
+                        $S{subnet} = $net; $S{pinned}{$net} = 1; $sync_now->(); });
+                    $resv_text->tagBind($ntag, '<Enter>',
+                        sub { $resv_text->configure(-cursor => 'hand2'); });
+                    $resv_text->tagBind($ntag, '<Leave>',
+                        sub { $resv_text->configure(-cursor => ''); });
                 }
                 for my $r (sort { ip2int($a->{start_ip}) <=> ip2int($b->{start_ip}) }
-                           @{ $by_srv{$srv} }) {
-                    my $rtag = 'rng' . $ri++;       # one tag per range line
-                    # Flag a pool that intersects any other — it must be made
-                    # disjoint so an address maps to exactly one server.
+                           @{ $by_net{$net} }) {
+                    my $srv = server_of_range($r);
+                    my $grey = $here ? undef : '#9a9a9a';
+                    # colour swatch (muted for greyed subnets)
+                    (my $stag = "sw$ri") =~ s/\W/_/g;
+                    $resv_text->tagConfigure($stag, -background =>
+                        ($here ? ($srv_color->{$srv} // '#fff') : '#e6e6e6'));
+                    $resv_text->insert('end', '    ');
+                    $resv_text->insert('end', '  ', $stag);
+                    # server name -> link to its web admin (every server linkable)
+                    my ($url, $iptxt) = server_url(\%S, $model, $srv);
+                    (my $htag = "host$ri") =~ s/\W/_/g;
+                    $resv_text->insert('end', " $srv", $htag);
+                    $resv_text->tagConfigure($htag,
+                        -foreground => ($here ? '#06c' : '#9ab'), -underline => 1);
+                    $resv_text->tagBind($htag, '<Button-1>', sub { open_url($url) });
+                    $resv_text->tagBind($htag, '<Enter>',
+                        sub { $resv_text->configure(-cursor => 'hand2'); });
+                    $resv_text->tagBind($htag, '<Leave>',
+                        sub { $resv_text->configure(-cursor => ''); });
+                    # the range itself -> click to delete; flag overlaps
                     my $ov = grep { $_ != $r
                             && ip2int($_->{end_ip})   >= ip2int($r->{start_ip})
                             && ip2int($_->{start_ip}) <= ip2int($r->{end_ip}) }
                         @{ $model->{ranges} };
-                    $resv_text->insert('end', sprintf("       %-18s %s-%s%s\n",
-                        $r->{subnet_cidr}, $r->{start_ip}, $r->{end_ip},
-                        $ov ? '  *** overlap' : ''), $rtag);
-                    # Click a range in the list to delete that pool; hand cursor +
-                    # red hover mark it as actionable.
+                    (my $rtag = "rng$ri") =~ s/\W/_/g;
+                    $resv_text->insert('end', sprintf("  %s-%s%s%s\n",
+                        $r->{start_ip}, $r->{end_ip},
+                        ($iptxt ? "  ($iptxt)" : ''), ($ov ? '  *** overlap' : '')),
+                        $rtag);
+                    $resv_text->tagConfigure($rtag, -foreground => $grey) if $grey;
                     $resv_text->tagBind($rtag, '<Button-1>',
                         sub { range_delete_dialog($cli, \%S, $r, $redraw, $status) });
                     $resv_text->tagBind($rtag, '<Enter>', sub {
@@ -1163,6 +1238,7 @@ sub cmd_gui {
                     $resv_text->tagBind($rtag, '<Leave>', sub {
                         $resv_text->configure(-cursor => '');
                         $resv_text->tagConfigure($rtag, -background => ''); });
+                    $ri++;
                 }
             }
         } else {
