@@ -198,8 +198,13 @@ sub parse_line {
         $cmd->{where} = $where_clause if defined $where_clause;
     }
     elsif ($verb eq 'OK' || $verb eq 'ERR' || $verb eq 'READY'
-        || $verb eq 'ROW' || $verb eq 'EOS') {
-        # server-originated; parse for clients that want to consume them
+        || $verb eq 'ROW' || $verb eq 'EOS' || $verb eq 'HEARTBEAT') {
+        # server-originated; parse for clients that want to consume them.
+        # HEARTBEAT belongs here too: the daemon dispatches it to
+        # _handle_heartbeat (mesh record), but without it parse_line croaked
+        # "unknown verb 'HEARTBEAT'" first, so every mesh heartbeat was rejected
+        # with ERR — last_hb_rx never updated and the election never reached
+        # quorum.
         if ($verb eq 'ERR') {
             $cmd->{msg} = join ' ', @toks;
         } else {
