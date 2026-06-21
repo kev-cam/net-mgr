@@ -889,7 +889,7 @@ sub cmd_gui {
             delete @S{qw(armed_ip armed_subnet range_start range_subnet)};
             $redraw->();
             $status->configure(-text => $S{range_mode}
-                ? ' DHCP servers — pools coloured by server; click pool START then END to assign, click a pool to remove'
+                ? ' DHCP servers — pools coloured by AP/gateway; click free START then END to add a pool; click a pool (grid) or a range (right pane) to remove'
                 : ' reservation mode');
         })->pack(-side => 'left');
 
@@ -1007,6 +1007,7 @@ sub cmd_gui {
             # DHCP servers, colour-keyed to the grid, with each one's pools.
             my %by_srv; push @{ $by_srv{ server_of_range($_) } }, $_ for @{ $model->{ranges} };
             $resv_text->insert('end', "  (no DHCP ranges yet)\n") unless %by_srv;
+            my $ri = 0;
             for my $srv (sort keys %by_srv) {
                 (my $tag = "srv_$srv") =~ s/\W/_/g;
                 $resv_text->tagConfigure($tag, -background => ($srv_color->{$srv} // '#fff'));
@@ -1015,8 +1016,19 @@ sub cmd_gui {
                 $resv_text->insert('end', " $srv\n");
                 for my $r (sort { ip2int($a->{start_ip}) <=> ip2int($b->{start_ip}) }
                            @{ $by_srv{$srv} }) {
+                    my $rtag = 'rng' . $ri++;       # one tag per range line
                     $resv_text->insert('end', sprintf("       %-18s %s-%s\n",
-                        $r->{subnet_cidr}, $r->{start_ip}, $r->{end_ip}));
+                        $r->{subnet_cidr}, $r->{start_ip}, $r->{end_ip}), $rtag);
+                    # Click a range in the list to delete that pool; hand cursor +
+                    # red hover mark it as actionable.
+                    $resv_text->tagBind($rtag, '<Button-1>',
+                        sub { range_delete_dialog($cli, \%S, $r, $redraw, $status) });
+                    $resv_text->tagBind($rtag, '<Enter>', sub {
+                        $resv_text->configure(-cursor => 'hand2');
+                        $resv_text->tagConfigure($rtag, -background => '#fdd'); });
+                    $resv_text->tagBind($rtag, '<Leave>', sub {
+                        $resv_text->configure(-cursor => '');
+                        $resv_text->tagConfigure($rtag, -background => ''); });
                 }
             }
         } else {
