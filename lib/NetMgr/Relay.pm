@@ -78,8 +78,15 @@ sub _run_session {
     }
 
     while (defined(my $line = $cli->recv_line)) {
-        my $cmd = parse_line($line);
-        next unless $cmd;
+        # Don't let one unparsable line tear down the whole subscription (which
+        # then reconnects and re-streams from scratch). parse_line croaks on a
+        # malformed line; log + skip it and keep replicating.
+        my $cmd = eval { parse_line($line) };
+        if ($@ || !$cmd) {
+            _log($log, "[relay] skipping unparsable line: "
+                     . substr($line // '', 0, 80)) if $@;
+            next;
+        }
         if ($cmd->{verb} eq 'ROW') {
             my $kv     = $cmd->{kv};
             my $table  = $kv->{table};

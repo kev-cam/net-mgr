@@ -535,7 +535,22 @@ sub _send {
     while ($left > 0) {
         my $n = syswrite($cli->{sock}, $data, $left, $off);
         if (!defined $n) {
-            return if $!{EAGAIN} || $!{EWOULDBLOCK};
+            if ($!{EAGAIN} || $!{EWOULDBLOCK}) {
+                # Send buffer full — happens under a big burst (e.g. a
+                # snapshot+stream subscription to every table, esp. when the
+                # peer reads slowly because it applies each row to its DB).
+                # Do NOT return: that truncates this line mid-write, and the
+                # next _send concatenates onto the stump — the peer then sees
+                # merged lines (…last_seenROW…) and its parser dies, killing
+                # replication. Wait (bounded) for the socket to drain and finish.
+                my $wv = ''; vec($wv, fileno($cli->{sock}), 1) = 1;
+                my $ready = select(undef, my $w = $wv, undef, 30);
+                if (!$ready) {
+                    $self->_drop_client(fileno($cli->{sock}), "write stalled");
+                    return;
+                }
+                next;            # retry syswrite from the same offset
+            }
             $self->_drop_client(fileno($cli->{sock}), "write error: $!");
             return;
         }
