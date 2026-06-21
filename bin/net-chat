@@ -571,6 +571,7 @@ sub cmd_gui {
     $mw->optionAdd('*font' => 'ncui', 81);
 
     my %created_by;          # session -> created_by (for request ownership)
+    my %status;              # session -> 'open'|'closed' (closed = restartable)
     my $cur;                 # session currently followed
     my %seen_req;            # "$session/$principal" -> 1 (dedupe pop-ups)
     my $statusvar = 'connecting...';
@@ -971,6 +972,14 @@ sub cmd_gui {
         return if $name eq 'select' || $name eq '(no open chats)'
                || $name eq $NEWCHAT;
         return if defined $cur && $cur eq $name;
+        # A closed session is still listed (it can be restarted): reopen it
+        # before joining, so picking it from the list just works.
+        if (($status{$name} // 'open') eq 'closed') {
+            my $ok = eval { $ctrl->chat_open(name => $name); 1 };
+            unless ($ok) { my $e = $@; chomp $e;
+                           $set_status->("couldn't restart $name: $e"); return }
+            $status{$name} = 'open';
+        }
         $stream->send_line('UNSUB sub=1') if defined $cur;
         $clear->();
         $cur = $name;
@@ -988,12 +997,19 @@ sub cmd_gui {
     };
 
     my $refresh = sub {
-        my $rows = eval { $ctrl->snapshot(9, 'chat_sessions',
-                                          where => "status = 'open'") };
+        # List ALL sessions, not just open ones — a closed session is still
+        # joinable (it gets restarted when you pick it), so it should stay in
+        # the list rather than vanishing.
+        my $rows = eval { $ctrl->snapshot(9, 'chat_sessions') };
         if ($@) { $set_status->("refresh failed: $@"); return }
         $rows ||= [];
         %created_by = map { ($_->{name} => ($_->{created_by} // '')) } @$rows;
-        my @names = sort map { $_->{name} } @$rows;
+        %status     = map { ($_->{name} => ($_->{status}     // 'open')) } @$rows;
+        # open first, then closed (restartable); alphabetical within each.
+        my @names = sort {
+            (($status{$a} // '') eq 'closed') <=> (($status{$b} // '') eq 'closed')
+                || $a cmp $b
+        } map { $_->{name} } @$rows;
         # Repopulate the menu WITHOUT firing -command (which would re-follow /
         # switch sessions mid-refresh), and keep the current selection if it
         # still exists.
@@ -1006,7 +1022,12 @@ sub cmd_gui {
         # across versions. (-command is nulled above so addOptions' auto-select
         # of the first entry can't fire a follow mid-rebuild.)
         $om->menu->delete(0, 'end');
-        $om->addOptions('select', @names, $NEWCHAT);
+        # Closed sessions show a "(closed)" label but keep their bare name as the
+        # value, so $follow (which restarts them) still gets the real session name.
+        $om->addOptions('select',
+            (map { ($status{$_} // 'open') eq 'closed' ? [ "$_  (closed)" => $_ ] : $_ }
+                 @names),
+            $NEWCHAT);
         $sessvar = (defined $keep && grep { $_ eq $keep } @names) ? $keep : 'select';
         $om->configure(-command => sub {
             $sessvar eq $NEWCHAT ? $new_chat->() : $follow->($sessvar) });
@@ -1019,9 +1040,9 @@ sub cmd_gui {
             $stream->send_line("SUBSCRIBE sub=1 mode=stream"
                              . " FROM chat_messages WHERE session = '$cur'");
             $seed_recent->(10);
-            $set_status->("refreshed $cur - " . scalar(@names) . ' open chat(s)');
+            $set_status->("refreshed $cur - " . scalar(@names) . ' chat(s)');
         } else {
-            $set_status->(scalar(@names) . ' open chat(s)');
+            $set_status->(scalar(@names) . ' chat(s)');
         }
     };
     # History: each click pulls in the single next-older message (the newest one
