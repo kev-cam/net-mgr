@@ -727,11 +727,16 @@ sub range_at {
     my ($model, $ip) = @_;
     my $i = ip2int($ip);
     return undef unless defined $i;
+    # Smallest (most specific) covering range wins, so a pool nested inside a
+    # bigger one still renders instead of being hidden by the first match.
+    my ($best, $bestw);
     for my $r (@{ $model->{ranges} }) {
         my $lo = ip2int($r->{start_ip}); my $hi = ip2int($r->{end_ip});
-        return $r if defined $lo && defined $hi && $i >= $lo && $i <= $hi;
+        next unless defined $lo && defined $hi && $i >= $lo && $i <= $hi;
+        my $w = $hi - $lo;
+        ($best, $bestw) = ($r, $w) if !defined $bestw || $w < $bestw;
     }
-    return undef;
+    return $best;
 }
 # Stable server -> colour map over the model's ranges (sorted by server name).
 # The palette is declared inside the sub on purpose: a file-scoped `my` here
