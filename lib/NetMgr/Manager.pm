@@ -122,11 +122,12 @@ sub _load_cluster_state {
                        split /,/, $raw;
         }
     }
-    # Default membership: opting into [cluster] (any key set) without listing
-    # `members` means automatic, unlimited discovery — the node finds the other
-    # net-mgr instances itself instead of a hand-maintained roster. role=excluded
-    # opts back out.
-    if (!defined $c->{members} && %$c && ($c->{role} // 'auto') ne 'excluded') {
+    # Default membership: auto-discover / follow. A node joins the cluster
+    # automatically — no [cluster] section required — finding the other net-mgr
+    # instances itself instead of a hand-maintained roster. role=excluded opts
+    # back out; role=master (set explicitly, e.g. on nas3) makes a node the
+    # authority. Everyone else defaults to follower (see role default below).
+    if (!defined $c->{members} && ($c->{role} // 'follower') ne 'excluded') {
         $auto_spec = NetMgr::AutoDiscover::parse_spec('auto');
     }
     # Cluster identity: [cluster] name, else [cluster] domain, else the DNS
@@ -144,7 +145,7 @@ sub _load_cluster_state {
         auto_spec        => $auto_spec,        # undef = static members
         name             => $cluster_name,     # cluster identity; defaults to domain
         domain           => $domain,           # defaults to [dns] domain
-        role             => $c->{role}        // 'auto',  # auto|master|follower|excluded
+        role             => $c->{role}        // 'follower',  # auto|master|follower|excluded; default follow
         priority         => $c->{priority}    // 100,
         prefer_lan       => exists $c->{prefer_lan} ? ($c->{prefer_lan} ? 1 : 0) : 1,
         internet_facing  => $c->{internet_facing},        # 0|1|undef (=auto)
@@ -1757,6 +1758,10 @@ sub _check_periodic_triggers {
 
     for my $name (qw(scan-ap presence discover find-peers)) {
         my $interval = $sched->{$name} // 0;
+        # find-peers powers cluster auto-discovery: default it to 5 min when this
+        # node auto-discovers and the operator hasn't set a [scheduling] cadence,
+        # so a fresh follower bootstraps the mesh without any extra config.
+        $interval ||= 300 if $name eq 'find-peers' && $self->{cluster}{auto_spec};
         next unless $interval && $interval > 0;
         my $last = $self->{periodic_last}{$name} // 0;
         next if ($now - $last) < $interval;
@@ -1793,6 +1798,10 @@ sub _fire_periodic {
         # logic there avoids duplicating it in this dispatcher.
         $bin  = $self->_producer_path('net-find-peers');
         @args = ('--quiet');
+        # Cold start: when auto-discovering, let net-find-peers fall back to a
+        # direct local-/24 sweep if the peers table is still empty (the normal
+        # scan only probes already-known addresses, which a fresh follower lacks).
+        push @args, '--bootstrap' if $self->{cluster}{auto_spec};
     } else {
         return;
     }

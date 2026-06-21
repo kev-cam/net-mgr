@@ -29,17 +29,21 @@ my $port        = 7531;
 my $timeout     = 2;
 my $quiet;
 my $print_only;
+my $bootstrap;
 my $help;
 
 GetOptions(
-    'listen=s'  => \$listen,
-    'port=i'    => \$port,
-    'timeout=i' => \$timeout,
-    'quiet|q'   => \$quiet,
-    'print|n'   => \$print_only,
-    'help|h'    => \$help,
+    'listen=s'   => \$listen,
+    'port=i'     => \$port,
+    'timeout=f'  => \$timeout,
+    'quiet|q'    => \$quiet,
+    'print|n'    => \$print_only,
+    'bootstrap'  => \$bootstrap,
+    'help|h'     => \$help,
 ) or usage();
 usage() if $help;
+# Cold-start sweeps a whole /24; keep each probe short unless overridden.
+$timeout = 0.5 if $bootstrap && $timeout == 2;
 
 # Local daemon — for snapshots + identifying our own addresses so we
 # don't probe ourselves.
@@ -89,6 +93,23 @@ my %known;
 if ($db) {
     for my $row (@{ $db->query_table('peers') }) {
         $known{"$row->{host}:$row->{port}"} = 1;
+    }
+}
+
+# Cold-start bootstrap (--bootstrap): the normal candidate list comes from
+# already-known addresses (port-22 hosts in the DB). A fresh cluster follower
+# has none — its DB is empty until it relays — so auto-discovery can never find
+# the master. When we have no peers recorded yet (or in --print mode), sweep the
+# host's own IPv4 /24s directly for port-7531 responders. That's enough to find
+# the master; once it's in the peers table this guard switches the sweep back
+# off and the cheap address-based scan takes over.
+if ($bootstrap && ($print_only || !%known)) {
+    my %have = map { $_ => 1 } @ips;
+    my @boot = grep { !$have{$_} && !$self_listeners{$_} } _local_subnet_hosts();
+    if (@boot) {
+        warn scalar(@boot), " bootstrap IPs from local /24(s)\n" unless $quiet;
+        push @ips, @boot;
+        @ips = sort { _ipkey($a) cmp _ipkey($b) } @ips;
     }
 }
 
@@ -200,12 +221,34 @@ sub _iso_time {
         $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0];
 }
 
+# Every host address in each local IPv4 /24 (cold-start bootstrap targets).
+# Bounded to the /24 containing each interface address — the master is normally
+# on the same LAN segment, and 254 probes stays cheap — even when the interface
+# carries a wider prefix. Excludes loopback, link-local, and our own addresses.
+sub _local_subnet_hosts {
+    my (@nets, %self_ip, %seen_net, @hosts);
+    open my $fh, '-|', 'ip', '-o', '-4', 'addr', 'show' or return ();
+    while (<$fh>) {
+        next unless /\binet\s+(\d+)\.(\d+)\.(\d+)\.(\d+)\/\d+/;
+        my ($a, $b, $c, $d) = ($1, $2, $3, $4);
+        next if $a == 127 || ($a == 169 && $b == 254);
+        $self_ip{"$a.$b.$c.$d"} = 1;
+        push @nets, "$a.$b.$c";
+    }
+    close $fh;
+    for my $net (@nets) {
+        next if $seen_net{$net}++;
+        push @hosts, grep { !$self_ip{$_} } map { "$net.$_" } 1 .. 254;
+    }
+    return @hosts;
+}
+
 sub usage {
     print <<USAGE;
 net-find-peers — discover other net-mgr instances on the LAN.
 
 Usage:
-  net-find-peers [--port 7531] [--timeout 2] [--quiet] [--print]
+  net-find-peers [--port 7531] [--timeout 2] [--quiet] [--print] [--bootstrap]
   net-find-peers --listen HOST:PORT      # override local daemon
 
 Probes TCP/--port on every IP the local daemon knows has port 22 open
@@ -214,6 +257,10 @@ STATUS. Successful replies are upserted into the peers DB table.
 
   --quiet, -q   only report newly-discovered peers (cron-friendly)
   --print, -n   don't write to the DB, just print findings
+  --bootstrap   cold start: if the peers table is empty (or with --print),
+                also sweep the host's own /24(s) directly, so a fresh
+                cluster follower can find the master before its DB fills.
+                Uses a 0.5s probe timeout unless --timeout is given.
 USAGE
     exit 1;
 }
