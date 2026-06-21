@@ -738,6 +738,18 @@ sub range_at {
     }
     return $best;
 }
+# Every range covering $ip — used to flag overlaps. Disjoint pools (the goal:
+# an address maps to exactly one server) cover any IP at most once; 2+ means
+# the address would be handed out by multiple servers.
+sub ranges_at {
+    my ($model, $ip) = @_;
+    my $i = ip2int($ip);
+    return () unless defined $i;
+    grep {
+        my $lo = ip2int($_->{start_ip}); my $hi = ip2int($_->{end_ip});
+        defined $lo && defined $hi && $i >= $lo && $i <= $hi;
+    } @{ $model->{ranges} };
+}
 # Stable server -> colour map over the model's ranges (sorted by server name).
 # The palette is declared inside the sub on purpose: a file-scoped `my` here
 # would never be initialised under `--gui` (the script enters Tk's MainLoop from
@@ -894,7 +906,7 @@ sub cmd_gui {
             delete @S{qw(armed_ip armed_subnet range_start range_subnet)};
             $redraw->();
             $status->configure(-text => $S{range_mode}
-                ? ' DHCP servers — pools coloured by AP/gateway; click free START then END to add a pool; click a pool (grid) or a range (right pane) to remove'
+                ? ' DHCP servers — pools coloured by AP/gateway; red = overlap (pools must be disjoint); click free START then END to add a pool; click a pool (grid) or a range (right pane) to remove'
                 : ' reservation mode');
         })->pack(-side => 'left');
 
@@ -955,6 +967,7 @@ sub cmd_gui {
         my ($cw, $ch, $pad) = (30, 22, 1);
         my ($hx, $hy) = (24, 16);        # left + top header gutters
         my $octet_mode = $len >= 24;
+        my $overlap_n = 0;               # addresses covered by 2+ pools (range mode)
         my $draw_cell = sub {
             my ($i, $x, $y) = @_;
             my $ip = int2ip($i);
@@ -962,12 +975,16 @@ sub cmd_gui {
             my $fill = $CELL{$st};
             # DHCP-servers mode: a neutral pick surface — every box drawn blank so
             # you can pick a range; colour the WHOLE of each pool by its serving
-            # server. Keyed on range membership (range_at), not classify — a
+            # server. Keyed on range membership (ranges_at), not classify — a
             # reservation or lease inside a pool otherwise classifies as
             # reserved/in-use and punches a hole in the colour (fragmented pool).
+            # An address in 2+ pools is an overlap — pools must be disjoint so a
+            # device's IP identifies one server — flag those red.
             if ($S{range_mode}) {
-                my $rng = range_at($model, $ip);
-                $fill = $rng ? ($srv_color->{ server_of_range($rng) } // '#fff') : '#fff';
+                my @rs = ranges_at($model, $ip);
+                if    (@rs >= 2) { $fill = '#f00'; $overlap_n++; }
+                elsif (@rs == 1) { $fill = $srv_color->{ server_of_range($rs[0]) } // '#fff'; }
+                else             { $fill = '#fff'; }
             }
             # Outline the selected cell: the armed reservation, or the pool start.
             my $sel = $S{range_mode}
@@ -1022,8 +1039,15 @@ sub cmd_gui {
                 for my $r (sort { ip2int($a->{start_ip}) <=> ip2int($b->{start_ip}) }
                            @{ $by_srv{$srv} }) {
                     my $rtag = 'rng' . $ri++;       # one tag per range line
-                    $resv_text->insert('end', sprintf("       %-18s %s-%s\n",
-                        $r->{subnet_cidr}, $r->{start_ip}, $r->{end_ip}), $rtag);
+                    # Flag a pool that intersects any other — it must be made
+                    # disjoint so an address maps to exactly one server.
+                    my $ov = grep { $_ != $r
+                            && ip2int($_->{end_ip})   >= ip2int($r->{start_ip})
+                            && ip2int($_->{start_ip}) <= ip2int($r->{end_ip}) }
+                        @{ $model->{ranges} };
+                    $resv_text->insert('end', sprintf("       %-18s %s-%s%s\n",
+                        $r->{subnet_cidr}, $r->{start_ip}, $r->{end_ip},
+                        $ov ? '  *** overlap' : ''), $rtag);
                     # Click a range in the list to delete that pool; hand cursor +
                     # red hover mark it as actionable.
                     $resv_text->tagBind($rtag, '<Button-1>',
@@ -1050,7 +1074,13 @@ sub cmd_gui {
                 }
             }
         }
-        $status->configure(-text => sprintf(" %s — %s", $cidr, pool_summary($model, $cidr)));
+        if ($S{range_mode} && $overlap_n) {
+            $status->configure(-text => sprintf(
+                " %s — %d address(es) in OVERLAPPING pools (red); pools must be disjoint",
+                $cidr, $overlap_n));
+        } else {
+            $status->configure(-text => sprintf(" %s — %s", $cidr, pool_summary($model, $cidr)));
+        }
         # The wipe above cleared the highlight AND scrolled to the top. Re-centre
         # on the focused IP (also re-highlights); if it isn't in this view, just
         # put the scroll back where it was instead of leaving it at the top.
