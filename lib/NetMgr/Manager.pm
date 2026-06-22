@@ -1905,7 +1905,7 @@ sub _obs_self_update {
         for my $c (values %{ $self->{clients}   }) { close $c->{sock} if $c->{sock} }
         for my $l (values %{ $self->{listeners} }) { close $l->{sock} if $l->{sock} }
         $ENV{NET_MGR_REPO} = $repo;     # the script pulls/installs this checkout
-        exec $script;
+        { no warnings; exec $script; } # exec replaces us; _exit only on failure
         POSIX::_exit(127);
     }
     $self->{triggers}{$pid} = { name => 'self-update', started_at => time(),
