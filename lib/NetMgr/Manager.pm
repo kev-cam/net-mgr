@@ -711,17 +711,16 @@ sub _run_election {
     # single-node deploy with no cluster intent — leave role alone.
     return unless @{ $cs->{members} // [] } || $cs->{auto_spec};
 
-    # When deciding, treat *self* as 'auto' (eligible) regardless of
-    # what the runtime override currently says — otherwise once we
-    # demote ourselves to follower we can never re-promote even if
-    # the master goes away.  The static [cluster] role value is what
-    # configured eligibility looks like; runtime is just the latest
-    # decision.
+    # Decide with the configured role AS-IS. A 'follower' is NEVER an election
+    # candidate: it follows the elected master, or waits headless if none is
+    # reachable yet — it must not self-promote. (This used to coerce a
+    # config-follower to 'auto' so it could re-promote if the master vanished.
+    # But with auto-discover/follow as the DEFAULT role, that made every node
+    # self-elect master the moment it booted isolated: a fresh follower with an
+    # empty mesh wins its own election, then advertises master and the real
+    # master defers to it — a split brain. For failover, configure role=auto,
+    # not follower.)
     my $self_role_for_decide = $cs->{role};
-    $self_role_for_decide = 'auto'
-        if $self_role_for_decide && $self_role_for_decide eq 'follower'
-        && (!$self->{cluster_runtime}
-            || ($self->{cluster_runtime}{role} // '') ne 'follower');
     my $decision = NetMgr::Election::decide(
         self_name  => $cs->{self_name},
         self_state => {
