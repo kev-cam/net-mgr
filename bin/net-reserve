@@ -807,17 +807,24 @@ sub open_url {
     return unless defined $url && length $url;
     my @browsers = ([qw(xdg-open)], [qw(sensible-browser)], [qw(x-www-browser)],
                     [qw(firefox)], [qw(chromium)], [qw(google-chrome)]);
+    require POSIX;
     my $pid = fork();
     return unless defined $pid;
     if ($pid == 0) {
-        my $p2 = fork();
-        CORE::exit(127) unless defined $p2;
-        CORE::exit(0)   if $p2;                 # intermediate child exits at once
+        # This child is a fork of the Tk app. Use POSIX::_exit, NEVER exit/CORE::
+        # exit: a normal exit runs Perl global destruction here, and Tk's XS
+        # cleanup then dumps its internal SVs (REFCNT/FLAGS/IV) to the terminal
+        # and can disturb the parent's X connection. _exit skips all of that.
+        # Redirect the std fds before the second fork so neither child can write
+        # to the terminal regardless.
         open STDIN,  '<', '/dev/null';
         open STDOUT, '>', '/dev/null';
         open STDERR, '>', '/dev/null';
+        my $p2 = fork();
+        POSIX::_exit(127) unless defined $p2;
+        POSIX::_exit(0)   if $p2;               # intermediate child exits at once
         for my $b (@browsers) { no warnings; exec { $b->[0] } @$b, $url; }
-        CORE::exit(127);
+        POSIX::_exit(127);
     }
     waitpid($pid, 0);                           # reap the intermediate child
 }
