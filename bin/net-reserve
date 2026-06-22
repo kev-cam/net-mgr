@@ -855,7 +855,10 @@ sub ranges_at {
 # the dispatch above, before execution ever reaches a later top-level `my`).
 sub server_colors {
     my ($model) = @_;
-    my @colours = ('#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd',
+    # No red in this palette: red is reserved for flagging overlapping pools (a
+    # conflict) — see the '#f00' fill in draw_cell. '#d62728' (brick red) was
+    # replaced with a teal so a server's pool can never be mistaken for a clash.
+    my @colours = ('#1f77b4','#ff7f0e','#2ca02c','#17a589','#9467bd',
                    '#8c564b','#e377c2','#17becf','#bcbd22','#7f7f7f');
     my %srv; $srv{ server_of_range($_) } = 1 for @{ $model->{ranges} };
     my %c; my $i = 0;
