@@ -232,6 +232,24 @@ sub _ts {
 
 # ---- listener / loop --------------------------------------------------
 
+# A host:port the daemon's own forked children (and local tools) can connect()
+# to in order to reach us. Derived from the actual bound listeners, never the
+# raw bind spec: a wildcard bind (0.0.0.0 / ::, or 'auto' which resolves to it)
+# is reachable on loopback, so prefer 127.0.0.1:<port>; otherwise hand back a
+# concrete bound address.
+sub _self_connect_addr {
+    my ($self) = @_;
+    my @l = values %{ $self->{listeners} || {} };
+    return '127.0.0.1:7531' unless @l;
+    for my $b (@l) {
+        return "127.0.0.1:$b->{port}"
+            if $b->{host} eq '0.0.0.0' || $b->{host} eq '::'
+            || $b->{host} =~ /^127\./;
+    }
+    my $b = $l[0];
+    return "$b->{host}:$b->{port}";
+}
+
 sub start_listener {
     my ($self) = @_;
     my $spec = $self->{config}{manager}{listen} || 'auto';
@@ -1811,8 +1829,13 @@ sub _fire_periodic {
     if ($pid == 0) {
         for my $c (values %{ $self->{clients} }) { close $c->{sock} if $c->{sock} }
         close $self->{listen} if $self->{listen};
-        $ENV{NET_MGR_LISTEN} = $self->{config}{manager}{listen}
-                            // '127.0.0.1:7531';
+        # A connectable address for the child to reach US — NOT the raw config
+        # 'listen' value, which may be a bind spec like 'auto' or '0.0.0.0:7531'
+        # that you can't connect() to ("connect auto:7531: Invalid argument").
+        # That silently broke net-find-peers (and every forked producer) on any
+        # node configured `listen = auto`: the child died before populating the
+        # peers table, so auto-discovery never found a master.
+        $ENV{NET_MGR_LISTEN} = $self->_self_connect_addr;
         exec $bin, @args;
         exit 127;
     }
