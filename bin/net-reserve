@@ -1080,8 +1080,11 @@ sub cmd_gui {
     my $side = $body->Frame->pack(-side => 'right', -fill => 'y');
     $S{side_title} = 'Reservations';
     $side->Label(-textvariable => \$S{side_title})->pack(-side => 'top', -anchor => 'w');
+    # Vertical scrollbar always present ('e', not optional 'oe'): otherwise it
+    # appears/disappears with the row count — e.g. when toggling to the DHCP-range
+    # view, which has fewer rows — and the pane visibly resizes each time.
     $resv_text = $side->Scrolled('ROText', -width => 38, -height => 24,
-        -font => 'nrmono', -scrollbars => 'oe')->pack(-side => 'top', -fill => 'y', -expand => 1);
+        -font => 'nrmono', -scrollbars => 'e')->pack(-side => 'top', -fill => 'y', -expand => 1);
     $S{resv_text} = $resv_text;     # so a cell click can centre this pane on its IP
 
     $status = $mw->Label(-anchor => 'w', -relief => 'sunken')
