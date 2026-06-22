@@ -85,13 +85,20 @@ sub decide {
         push @eligible, $c;
     }
 
+    # Headless role (no master found): keep a configured follower/excluded as
+    # what it is — its runtime role is advertised to peers, and a follower that
+    # falls back to 'auto' here looks electable to everyone else (and on a score
+    # tie can steal the master role). Only an 'auto' node stays 'auto' (it may
+    # legitimately win a later round).
+    my $headless = (($self_state->{role} // 'auto') =~ /^(?:follower|excluded)$/)
+                   ? $self_state->{role} : 'auto';
     if (!$quorum_ok) {
-        return _result('auto', '', undef,
+        return _result($headless, '', undef,
                        "no quorum ($reachable/$roster_n)",
                        $reachable, $roster_n, $quorum_ok);
     }
     if (!@eligible) {
-        return _result('auto', '', undef,
+        return _result($headless, '', undef,
                        "no eligible candidates",
                        $reachable, $roster_n, $quorum_ok);
     }
