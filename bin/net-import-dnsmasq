@@ -30,7 +30,7 @@ use NetMgr::Client;
 use NetMgr::Config;
 use NetMgr::Protocol qw(format_kv);
 
-my ($listen, $print_only, $local, $auto, $files_opt, $help, $verbose);
+my ($listen, $print_only, $local, $auto, $files_opt, $help, $verbose, $no_prune);
 my $ssh_timeout = 12;
 my $ssh_cmd     = 'net-ssh';        # override with --ssh-cmd 'ssh -o BatchMode=yes'
 GetOptions(
@@ -42,6 +42,7 @@ GetOptions(
     'ssh-timeout=i' => \$ssh_timeout,
     'ssh-cmd=s'     => \$ssh_cmd,
     'verbose|v'     => \$verbose,
+    'no-prune'      => \$no_prune,
     'help|h'        => \$help,
 ) or die "bad options\n";
 usage() if $help;
@@ -245,8 +246,12 @@ for my $h (@hosts) {
 
 my ($found, $sent) = (0, 0);
 my %rseen;
+my %found_by_host;                      # host -> { "cidr|start" => 1 } seen this run
 for my $e (@all) {
     my ($label, $r) = @$e;
+    # Record per host BEFORE the cross-host dedup: a pool this host still serves
+    # must never be pruned, even if another device reported it first.
+    $found_by_host{$label}{ "$r->{cidr}|$r->{start}" } = 1;
     if ($verbose) {                     # report every source, incl. duplicates
         my $src = ($label eq 'local' ? '' : "$label:")
                 . (defined $r->{file} ? "$r->{file}:" . ($r->{line} // '?') : '?');
@@ -269,9 +274,45 @@ for my $e (@all) {
     }
 }
 
+# Reconcile: drop a server's previously-imported pools that it no longer serves
+# (a removed pool, or one whose start/subnet changed — which otherwise upserts a
+# new row and leaves the old one behind). Scoped per host and SAFE: we only prune
+# a host that reported at least one pool this run (so a host that returns nothing
+# — e.g. an unreachable AP or a transient ssh failure — is never touched, since
+# it has no %found_by_host entry). Deleting requires auth, same as the upserts.
+my $pruned = 0;
+if (!$no_prune && $cli) {
+    my $existing = eval { $cli->snapshot(60, 'dhcp_ranges') } || [];
+    for my $row (@$existing) {
+        my $notes = $row->{notes} // '';
+        next unless $notes =~ /^dnsmasq:(.+)$/;
+        my $owner = $1;
+        next unless $found_by_host{$owner};                 # host not scanned/empty -> leave alone
+        my $k = "$row->{subnet_cidr}|$row->{start_ip}";
+        next if $found_by_host{$owner}{$k};                 # still served -> keep
+        my %dkv = (kind => 'dhcp_range_delete',
+                   subnet_cidr => $row->{subnet_cidr}, start_ip => $row->{start_ip});
+        if ($print_only) {
+            print "OBSERVE ", format_kv(%dkv), "\n";
+            $pruned++;
+        } else {
+            my $resp = $cli->observe(%dkv);
+            if ($resp && $resp =~ /^ERR/) {
+                warn "prune rejected ($owner $row->{subnet_cidr} $row->{start_ip}): $resp\n";
+            } else {
+                $pruned++;
+                printf STDERR "  pruned stale  %-12s %s %s-%s\n",
+                    $owner, $row->{subnet_cidr}, $row->{start_ip}, ($row->{end_ip} // '?')
+                    if $verbose;
+            }
+        }
+    }
+}
+
 $cli->bye if $cli;
 print STDERR "found=$found"
-           . ($print_only ? " (print only)\n" : " imported=$sent\n");
+           . ($print_only ? " (print only)" : " imported=$sent")
+           . ($no_prune ? "" : " pruned=$pruned") . "\n";
 
 sub usage {
     my ($msg) = @_;
@@ -284,6 +325,10 @@ usage:
   options: --print  --verbose  --files 'P1 P2'  --listen H:P  --ssh-timeout N
            --ssh-cmd 'ssh -o BatchMode=yes'   (default: net-ssh)  -h/--help
   --verbose, -v   report each range's source file:line (and host, for remotes)
+  --no-prune      keep a server's old pools even when it no longer serves them
+                  (default: prune stale pools for every host that was scanned and
+                   reported at least one pool — a host that reports none is never
+                   touched, so a transient ssh failure can't wipe its data)
 USAGE
     exit($msg ? 2 : 0);
 }
