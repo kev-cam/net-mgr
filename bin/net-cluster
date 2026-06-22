@@ -67,6 +67,9 @@ usage(0) if $help;
 my $cmd = shift @ARGV;
 usage(2) unless defined $cmd;
 
+# `update` fans out the auth-gated self_update OBSERVE — sign by default.
+$auth = 1 if $cmd eq 'update' && !$auth;
+
 # Build the Multi. Auth is wired as an empty hash so NetMgr::Client
 # falls back to its default key_id / key_file detection.
 my %mk_args = (
@@ -98,6 +101,7 @@ elsif ($cmd eq 'status')   { cmd_status($multi) }
 elsif ($cmd eq 'snapshot') { cmd_snapshot($multi) }
 elsif ($cmd eq 'diff')     { $rc = cmd_diff($multi) }
 elsif ($cmd eq 'observe')  { $rc = cmd_observe($multi) }
+elsif ($cmd eq 'update')   { unshift @ARGV, 'kind=self_update'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'master')   { $rc = cmd_master($multi) }
 else { warn "net-cluster: unknown command '$cmd'\n"; usage(2) }
 
@@ -301,6 +305,8 @@ Usage:
                            [--where=SQL] [--quiet-diff]
   net-cluster observe kind=K k=v ...    (fan out to every connected peer)
   net-cluster master  kind=K k=v ...    (send only to cluster master)
+  net-cluster update                    (pull+reinstall+re-exec every peer;
+                                         needs [manager] repo set on each node)
 
 Common flags:
   --listen HOST:PORT     local seed daemon for discovery (127.0.0.1:7531)

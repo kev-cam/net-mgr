@@ -1857,12 +1857,78 @@ sub _reap_triggers {
         next unless $t;
         $self->_log("trigger $t->{name} pid=$pid done exit=$exit"
                   . " elapsed=" . (time() - $t->{started_at}) . "s");
+        if ($t->{name} eq 'self-update') {
+            if ($exit == 0) {
+                $self->_log("self-update OK — re-execing into the new code");
+                $self->_reexec;            # does not return on success
+            } else {
+                $self->_log("self-update FAILED (exit=$exit) — keeping current version");
+            }
+            next;
+        }
         next unless defined $t->{cli_fd};
         my $cli = $self->{clients}{ $t->{cli_fd} };
         next unless $cli;
         $self->_send($cli, format_ready(name => $t->{name}, pid => $pid,
                                         exit => $exit));
     }
+}
+
+# OBSERVE kind=self_update — run the configured update script (pull + reinstall
+# the [manager] repo) and, on success, re-exec into the new code. Auth-gated.
+# Lets `net-cluster update` redeploy the whole cluster in one shot instead of
+# hand-running git pull / make install / restart on every node. The actual steps
+# live in a versioned, overridable script (sbin/net-mgr-self-update), not here,
+# so an operator can adapt them without touching the daemon. The work runs in a
+# forked child so the run loop keeps serving; on success _reap_triggers re-execs.
+sub _obs_self_update {
+    my ($self, $cli, $kv) = @_;
+    my ($who) = $self->_chat_identity($cli, $kv);
+    die "self_update: not authorized\n" unless defined $who;
+    my $repo = $self->{config}{manager}{repo};
+    die "self_update: no repo configured (set [manager] repo = /path/to/checkout)\n"
+        unless defined $repo && length $repo;
+    $repo =~ m{^[\w./-]+$}
+        or die "self_update: refusing suspicious repo path '$repo'\n";
+    -d "$repo/.git" or die "self_update: '$repo' is not a git checkout\n";
+    # Default to the INSTALLED script: a `git pull` of the repo copy can't rewrite
+    # it out from under us mid-run. [manager] update_script overrides it.
+    my $script = $self->{config}{manager}{update_script}
+              // '/usr/local/sbin/net-mgr-self-update';
+    -x $script or die "self_update: update script '$script' is not executable\n";
+    die "self_update: already in progress\n"
+        if grep { $_->{name} eq 'self-update' } values %{ $self->{triggers} };
+
+    my $pid = fork();
+    die "self_update: fork failed: $!\n" unless defined $pid;
+    if ($pid == 0) {
+        for my $c (values %{ $self->{clients}   }) { close $c->{sock} if $c->{sock} }
+        for my $l (values %{ $self->{listeners} }) { close $l->{sock} if $l->{sock} }
+        $ENV{NET_MGR_REPO} = $repo;     # the script pulls/installs this checkout
+        exec $script;
+        POSIX::_exit(127);
+    }
+    $self->{triggers}{$pid} = { name => 'self-update', started_at => time(),
+                                cli_fd => undef, who => $who };
+    $self->_log("self-update started pid=$pid by $who (repo=$repo script=$script)");
+    return ();   # OBSERVE OK now; the daemon re-execs when the child succeeds
+}
+
+# Re-exec the daemon into freshly installed code (after self_update). Relaunch
+# with the exact original argv via /proc/self/cmdline. Perl marks our sockets
+# close-on-exec, so the replacement process rebinds cleanly.
+sub _reexec {
+    my ($self) = @_;
+    my @argv;
+    if (open my $fh, '<', '/proc/self/cmdline') {
+        local $/; my $raw = <$fh> // ''; close $fh;
+        @argv = grep { length } split /\0/, $raw;
+    }
+    @argv = ($^X, $0, @ARGV) unless @argv;
+    $self->_log("self-update: re-exec @argv");
+    { no warnings; exec { $argv[0] } @argv; }
+    $self->_log("self-update: re-exec failed: $! — exiting for systemd to restart");
+    exit 1;     # Restart=on-failure brings us back up on the new code
 }
 
 # ---- POLL ----------------------------------------------------------------
@@ -2713,6 +2779,7 @@ sub _handle_observe {
         elsif ($kind eq 'dhcp_range')  { @events = $self->_obs_dhcp_range($cli, $kv) }
         elsif ($kind eq 'dhcp_range_delete')
                                        { @events = $self->_obs_dhcp_range_delete($cli, $kv) }
+        elsif ($kind eq 'self_update') { @events = $self->_obs_self_update($cli, $kv) }
         else {
             die "unknown observation kind '$kind'\n";
         }

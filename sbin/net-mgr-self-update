@@ -1,0 +1,33 @@
+#!/bin/sh
+# net-mgr-self-update — update the local net-mgr checkout and reinstall it.
+#
+# Run by the daemon (as root) on an authenticated `self_update` OBSERVE — the
+# daemon re-execs itself when this exits 0 (see NetMgr::Manager::_obs_self_update
+# / _reexec) — or by hand. Trigger across the cluster with `net-cluster update`.
+#
+# The checkout to update comes from $NET_MGR_REPO (the daemon passes
+# [manager] repo). By hand:
+#     NET_MGR_REPO=/usr/local/src/net-mgr net-mgr-self-update
+#
+# Steps: pull as the repo's OWNER (who holds the git creds + known_hosts —
+# running git as root trips 'dubious ownership' and lacks the deploy key),
+# install as root, syntax-check the installed daemon so a bad commit can't wedge
+# it into a crash loop, then bounce the relay. `set -e` means any failure exits
+# non-zero, so the daemon keeps the current version instead of re-execing.
+set -e
+
+repo=${NET_MGR_REPO:?set NET_MGR_REPO to the net-mgr checkout path}
+[ -d "$repo/.git" ] || { echo "net-mgr-self-update: $repo is not a git checkout" >&2; exit 2; }
+
+owner=$(stat -c %U "$repo")
+echo "net-mgr-self-update: repo=$repo owner=$owner"
+
+before=$(su - "$owner" -c "git -C '$repo' rev-parse --short HEAD")
+su - "$owner" -c "git -C '$repo' pull --ff-only"
+after=$(su - "$owner" -c "git -C '$repo' rev-parse --short HEAD")
+
+make -C "$repo" install
+perl -c /usr/local/sbin/net-mgr >/dev/null
+systemctl try-restart net-mgr-relay 2>/dev/null || true
+
+echo "net-mgr-self-update: done ($before -> $after)"
