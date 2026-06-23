@@ -799,34 +799,61 @@ sub gui_domain {
     $d =~ s/^\s+|\s+$//g if defined $d;
     return $d // '';
 }
-# Open $url in the user's browser without blocking the GUI. Double-fork so the
-# browser is reparented to init (no zombie to reap); try the common launchers in
-# turn — exec only returns on failure, so the loop falls through to the next.
-sub open_url {
-    my ($url) = @_;
-    return unless defined $url && length $url;
-    my @browsers = ([qw(xdg-open)], [qw(sensible-browser)], [qw(x-www-browser)],
-                    [qw(firefox)], [qw(chromium)], [qw(google-chrome)]);
+# Spawn the first of several candidate commands that exists, detached from the
+# GUI. Each arg is a full argv arrayref; exec only returns on failure, so it
+# falls through to the next. Double-fork so the app is reparented to init (no
+# zombie). Use POSIX::_exit, NEVER exit/CORE::exit, in the forked children: a
+# normal exit runs Perl global destruction here, and Tk's XS cleanup then dumps
+# its SVs (REFCNT/FLAGS/IV) to the terminal and can disturb the parent's X
+# connection. Redirect the std fds before the second fork so neither child can
+# write to the terminal regardless.
+sub _spawn_first {
+    my (@cmds) = @_;
     require POSIX;
     my $pid = fork();
     return unless defined $pid;
     if ($pid == 0) {
-        # This child is a fork of the Tk app. Use POSIX::_exit, NEVER exit/CORE::
-        # exit: a normal exit runs Perl global destruction here, and Tk's XS
-        # cleanup then dumps its internal SVs (REFCNT/FLAGS/IV) to the terminal
-        # and can disturb the parent's X connection. _exit skips all of that.
-        # Redirect the std fds before the second fork so neither child can write
-        # to the terminal regardless.
         open STDIN,  '<', '/dev/null';
         open STDOUT, '>', '/dev/null';
         open STDERR, '>', '/dev/null';
         my $p2 = fork();
         POSIX::_exit(127) unless defined $p2;
         POSIX::_exit(0)   if $p2;               # intermediate child exits at once
-        for my $b (@browsers) { no warnings; exec { $b->[0] } @$b, $url; }
+        for my $c (@cmds) { next unless @$c; no warnings; exec { $c->[0] } @$c; }
         POSIX::_exit(127);
     }
     waitpid($pid, 0);                           # reap the intermediate child
+}
+
+# Open $url in the user's browser.
+sub open_url {
+    my ($url) = @_;
+    return unless defined $url && length $url;
+    _spawn_first(map { [$_, $url] }
+        qw(xdg-open sensible-browser x-www-browser firefox chromium google-chrome));
+}
+
+# Play a media URL (rtsp://…) in VLC.
+sub launch_vlc {
+    my ($url) = @_;
+    return unless defined $url && length $url;
+    _spawn_first(['vlc', $url], ['cvlc', $url], ['xdg-open', $url]);
+}
+
+# Run @cmd (e.g. ssh/telnet to a host) in a terminal emulator. Terminals differ
+# in how they take the command, so try the common ones with their own flag.
+sub launch_terminal {
+    my (@cmd) = @_;
+    return unless @cmd;
+    _spawn_first(
+        ['x-terminal-emulator', '-e', @cmd],
+        ['gnome-terminal', '--', @cmd],
+        ['konsole', '-e', @cmd],
+        ['xfce4-terminal', '-x', @cmd],
+        ['alacritty', '-e', @cmd],
+        ['kitty', @cmd],
+        ['xterm', '-e', @cmd],
+    );
 }
 # The dhcp_range row whose [start_ip, end_ip] covers $ip, or undef.
 sub range_at {
@@ -1672,14 +1699,30 @@ sub oui_vendor {
     return $OUI{$oui};
 }
 
+# A launch action (coderef) for a known service on a port, or undef. $ip is the
+# target; default ports drop the :port from the URL.
+sub _port_action {
+    my ($ip, $port, $svc) = @_;
+    $svc = lc($svc // '');
+    my $p = (defined $port && $port =~ /^\d+$/) ? $port + 0 : 0;
+    if ($svc eq 'http'   || $p == 80)  { my $u = "http://$ip"  . ($p && $p != 80  ? ":$p" : '') . '/'; return sub { open_url($u) } }
+    if ($svc eq 'https'  || $p == 443) { my $u = "https://$ip" . ($p && $p != 443 ? ":$p" : '') . '/'; return sub { open_url($u) } }
+    if ($svc eq 'rtsp'   || $p == 554) { my $u = "rtsp://$ip"  . ($p && $p != 554 ? ":$p" : '') . '/'; return sub { launch_vlc($u) } }
+    if ($svc eq 'ssh'    || $p == 22)  { my @c = ('ssh', ($p && $p != 22 ? ('-p', $p) : ()), $ip);     return sub { launch_terminal(@c) } }
+    if ($svc eq 'telnet' || $p == 23)  { my @c = ('telnet', $ip, ($p && $p != 23 ? ($p) : ()));        return sub { launch_terminal(@c) } }
+    return undef;
+}
+
 # Read-only "everything we know about this host" pop-up: identity, vendor (from
-# the MAC), AP board/SSIDs, and the open ports/services we've observed.
+# the MAC), AP board/SSIDs, and the open ports/services we've observed. Known
+# services are clickable — http/https open the browser, ssh/telnet a terminal,
+# rtsp VLC.
 sub probe_dialog {
     my ($cli, $S, $ip, $r) = @_;
     my $mac  = $r->{mac} // '';
     my $macq = ($mac =~ /^[0-9a-f:]{1,17}$/i) ? $mac : '';   # safe to put in a WHERE
     my $seen = last_seen_str($S->{model}, $ip);
-    my @out = (
+    my @head = (
         "IP:        $ip",
         "MAC:       " . ($mac || '(unknown)'),
         "Name:      " . ($r->{name} // ''),
@@ -1687,34 +1730,46 @@ sub probe_dialog {
         "Last seen: " . (length $seen ? $seen : 'never'),
     );
     my $cur = $mac ? $S->{model}{mac_cur_ip}{ lc $mac } : undef;
-    push @out, "Seen at:   $cur" if $cur && $cur ne $ip;
+    push @head, "Seen at:   $cur" if $cur && $cur ne $ip;
+    my $ports = [];
     if ($macq) {
         my $ifs = eval { $cli->snapshot(60, 'interfaces', where => "mac = '$macq'") } || [];
         my $vendor = $ifs->[0]{vendor};
         $vendor = oui_vendor($mac) unless defined $vendor && length $vendor;
-        push @out, "Vendor:    " . ($vendor // '(unknown)');
+        push @head, "Vendor:    " . ($vendor // '(unknown)');
         my $aps = eval { $cli->snapshot(61, 'aps', where => "mac = '$macq'") } || [];
         if (@$aps) {
-            push @out, "AP board:  $aps->[0]{board}" if $aps->[0]{board};
-            push @out, "AP SSIDs:  $aps->[0]{ssid}"  if $aps->[0]{ssid};
+            push @head, "AP board:  $aps->[0]{board}" if $aps->[0]{board};
+            push @head, "AP SSIDs:  $aps->[0]{ssid}"  if $aps->[0]{ssid};
         }
-        my $ports = eval { $cli->snapshot(62, 'ports', where => "mac = '$macq'") } || [];
-        push @out, '', sprintf('Open ports (%d):', scalar @$ports);
-        if (@$ports) {
-            for my $p (sort { ($a->{port} // 0) <=> ($b->{port} // 0)
-                           || ($a->{proto} // '') cmp ($b->{proto} // '') } @$ports) {
-                push @out, sprintf('  %5s/%-4s %s',
-                    $p->{port} // '?', $p->{proto} // '?', $p->{service} // '');
-            }
-        } else {
-            push @out, '  (none observed)';
-        }
+        $ports = eval { $cli->snapshot(62, 'ports', where => "mac = '$macq'") } || [];
     }
     my $dlg = ($S->{anchor})->DialogBox(-title => "Probe $ip", -buttons => ['Close']);
     my $txt = $dlg->add('Scrolled', 'ROText', -scrollbars => 'oe',
-        -width => 50, -height => 18, -font => 'nrmono', -wrap => 'none')
+        -width => 54, -height => 18, -font => 'nrmono', -wrap => 'none')
         ->pack(-padx => 6, -pady => 6, -fill => 'both', -expand => 1);
-    $txt->insert('end', join("\n", @out));
+    $txt->insert('end', join("\n", @head) . "\n\n");
+    $txt->insert('end', sprintf('Open ports (%d):', scalar @$ports));
+    $txt->insert('end', @$ports ? "   (click to launch)\n" : "\n");
+    my $i = 0;
+    for my $p (sort { ($a->{port} // 0) <=> ($b->{port} // 0)
+                   || ($a->{proto} // '') cmp ($b->{proto} // '') } @$ports) {
+        my $line = sprintf('  %5s/%-4s %s',
+            $p->{port} // '?', $p->{proto} // '?', $p->{service} // '');
+        my $act = _port_action($ip, $p->{port}, $p->{service});
+        if ($act) {
+            my $tag = 'p' . $i++;
+            $txt->insert('end', $line, $tag);
+            $txt->insert('end', "\n");
+            $txt->tagConfigure($tag, -foreground => '#06c', -underline => 1);
+            $txt->tagBind($tag, '<Button-1>', $act);
+            $txt->tagBind($tag, '<Enter>', sub { $txt->configure(-cursor => 'hand2') });
+            $txt->tagBind($tag, '<Leave>', sub { $txt->configure(-cursor => '') });
+        } else {
+            $txt->insert('end', "$line\n");
+        }
+    }
+    $txt->insert('end', "  (none observed)\n") unless @$ports;
     $dlg->Show;
 }
 
