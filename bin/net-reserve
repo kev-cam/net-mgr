@@ -1121,6 +1121,7 @@ sub cmd_gui {
         my ($cw, $ch, $pad) = (30, 22, 1);
         my ($hx, $hy) = (24, 16);        # left + top header gutters
         my $octet_mode = $len >= 24;
+        my $ncol = $S{grid_cols} || 16;  # boxes per row; toggled via the corner slot
         my $overlap_n = 0;               # addresses covered by 2+ pools (range mode)
         my $draw_cell = sub {
             my ($i, $x, $y) = @_;
@@ -1155,28 +1156,44 @@ sub cmd_gui {
             }
         };
         if ($octet_mode) {
-            # column headers (low nibble, hex) ...
-            for my $c (0 .. 15) {
-                $canvas->createText($hx + $c * $cw + ($cw - 2) / 2, $hy / 2,
-                    -text => sprintf('%X', $c), -font => 'nrmono', -fill => '#888');
+            # Corner toggle (the 0/0 header slot): flip the grid between 16 and 10
+            # boxes per row. Shows the current count; click to switch. Re-fit the
+            # canvas after, since 10-wide is taller/narrower than 16-wide.
+            my $cr = $canvas->createRectangle(0, 0, $hx - 2, $hy - 1,
+                -fill => '#eee', -outline => '#bbb');
+            my $ct = $canvas->createText(($hx - 2) / 2, ($hy - 1) / 2,
+                -text => $ncol, -font => 'nrmono', -fill => '#444');
+            for my $item ($cr, $ct) {
+                $canvas->bind($item, '<Button-1>', [ sub {
+                    $S{grid_cols} = $ncol == 16 ? 10 : 16;
+                    $redraw->(); _fit_canvas_to_grid($canvas);
+                } ]);
+                $canvas->bind($item, '<Enter>', sub { $canvas->configure(-cursor => 'hand2') });
+                $canvas->bind($item, '<Leave>', sub { $canvas->configure(-cursor => '') });
             }
-            my %rows;  $rows{ ($_ & 0xFF) >> 4 } = 1 for ($first .. $last);
+            # column headers (0..ncol-1; hex digits when 16-wide so A-F line up)
+            for my $c (0 .. $ncol - 1) {
+                $canvas->createText($hx + $c * $cw + ($cw - 2) / 2, $hy / 2,
+                    -text => ($ncol == 16 ? sprintf('%X', $c) : $c),
+                    -font => 'nrmono', -fill => '#888');
+            }
+            my %rows;  $rows{ int(($_ & 0xFF) / $ncol) } = 1 for ($first .. $last);
             # ... row labels (base octet of each used row)
             for my $rr (sort { $a <=> $b } keys %rows) {
                 $canvas->createText($hx - 3, $hy + $rr * $ch + ($ch - 2) / 2,
-                    -text => $rr * 16, -font => 'nrmono', -fill => '#888',
+                    -text => $rr * $ncol, -font => 'nrmono', -fill => '#888',
                     -anchor => 'e');
             }
             for my $i ($first .. $last) {
                 my $oct = $i & 0xFF;
-                $draw_cell->($i, $hx + ($oct & 0x0F) * $cw + $pad,
-                                 $hy + ($oct >> 4)   * $ch + $pad);
+                $draw_cell->($i, $hx + ($oct % $ncol)   * $cw + $pad,
+                                 $hy + int($oct / $ncol) * $ch + $pad);
             }
         } else {
             my $col = 0; my $rown = 0;
             for my $i ($first .. $last) {
-                $draw_cell->($i, ($col % 16) * $cw + $pad, $rown * $ch + $pad);
-                $rown++ if ++$col % 16 == 0;
+                $draw_cell->($i, ($col % $ncol) * $cw + $pad, $rown * $ch + $pad);
+                $rown++ if ++$col % $ncol == 0;
             }
         }
         if ($S{range_mode}) {
