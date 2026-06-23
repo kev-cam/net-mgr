@@ -2843,6 +2843,14 @@ sub _associate_machine {
         }
         $self->_upsert('interfaces', 'upsert_interface',
             mac => $mac, machine_id => $mid);
+    } else {
+        # The machine exists but may be nameless (e.g. first seen by a portless
+        # scan). Adopt this name as its primary_name when nothing better is set —
+        # use the device's own (DHCP) name if none other is given.
+        my ($pn) = $self->{db}->dbh->selectrow_array(
+            "SELECT primary_name FROM machines WHERE id = ?", undef, $mid);
+        $self->_upsert('machines', 'upsert_machine', id => $mid, primary_name => $name)
+            unless defined $pn && length $pn;
     }
     $self->_upsert('hostnames', 'upsert_hostname',
         machine_id => $mid, name => $name, source => $source);

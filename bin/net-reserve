@@ -1576,7 +1576,12 @@ sub reserve_dialog {
     my ($cli, $S, $ip, $mac, $redraw, $status) = @_;
     my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Reserve $ip",
         -buttons => ['Probe', 'Reserve', 'Reserve+Push', 'Cancel']);
-    my %v = (ip => $ip, mac => $mac, name => '', group => '');
+    # Default the name to what we already know the device by — its machine name,
+    # or failing that the hostname it gave over DHCP — so reserving a device uses
+    # its own name when none other is given (e.g. KP200 from its lease).
+    my $known = $S->{model}{mac_name}{ lc($mac // '') };
+    $known //= $S->{model}{leased}{$ip}{hostname} if $S->{model}{leased}{$ip};
+    my %v = (ip => $ip, mac => $mac, name => ($known // ''), group => '');
     # known groups for convenience
     my %groups; $groups{ $_->{grp} } = 1 for grep { $_->{grp} } values %{ $S->{model}{resv} };
     # Target address: a menu of the subnet's addresses with the occupant
