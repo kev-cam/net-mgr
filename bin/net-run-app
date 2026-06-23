@@ -27,8 +27,10 @@
 #                  for rsync and scp.
 #   vnc-style    — host[:display|::port].
 #
-# The host alias is resolved with `net-lookup --verify $host.*` so a
-# dead candidate IP doesn't get handed to the app. A leading
+# The host alias is resolved with `net-lookup --verify` — the exact name
+# (=$host) first, then `$host.*` as a fallback for interface-suffix aliases —
+# so a dead candidate IP doesn't get handed to the app, and a precise alias
+# isn't hijacked by a longer-named sibling. A leading
 # `--server NAME` or `--listen HOST:PORT` (before the host token) is
 # forwarded to that net-lookup call, picking which net-mgr daemon does
 # the resolving (see ~/.config/net-mgr/config [servers]). If the original
@@ -622,7 +624,22 @@ sub _find_exe {
 
 sub lookup_host {
     my ($host) = @_;
-    open my $fh, '-|', 'net-lookup', @NM_LOOKUP_OPTS, '--verify', "$host.*"
+    # Resolve the EXACT alias first. The '$host.*' glob is unanchored, so it
+    # also matches longer SIBLING names — 'Nighthawk' otherwise resolves to
+    # 'NighthawkX6-1'/'NighthawkX6-2', sending ssh (and net-import-dnsmasq
+    # through it) to the wrong box. Fall back to the glob only when there is no
+    # exact match, for interface-suffix aliases (nas3 → nas3-up/down/dwn2).
+    my $ip = _net_lookup_ip("=$host") // _net_lookup_ip("$host.*");
+    # Seed the host-key identity map against the alias we just resolved, so
+    # the machine is recognisable next time it floats to a different IP. Fully
+    # fire-and-forget — never delays or fails the launch.
+    _record_host_key_bg($host, $ip) if defined $ip;
+    return $ip;
+}
+
+sub _net_lookup_ip {
+    my ($pat) = @_;
+    open my $fh, '-|', 'net-lookup', @NM_LOOKUP_OPTS, '--verify', $pat
         or return undef;
     my $ip;
     while (my $line = <$fh>) {
@@ -630,10 +647,6 @@ sub lookup_host {
         if ($line =~ /^(\d+\.\d+\.\d+\.\d+)\z/) { $ip = $1; last }
     }
     close $fh;
-    # Seed the host-key identity map against the alias we just resolved, so
-    # the machine is recognisable next time it floats to a different IP. Fully
-    # fire-and-forget — never delays or fails the launch.
-    _record_host_key_bg($host, $ip) if defined $ip;
     return $ip;
 }
 
