@@ -220,6 +220,36 @@ sub enumerate_auto {
     return sort keys %names;
 }
 
+# Resolve an AP/gateway name to its IP via net-lookup (the daemon's alias-aware
+# resolver — the dnsmasq tag is the device's self-name, which plain DNS misses).
+# Cached; '' when it can't be resolved (just shows the bare name then).
+my %ip_cache;
+sub ap_ip {
+    my ($host) = @_;
+    return $ip_cache{$host} if exists $ip_cache{$host};
+    my $bin = (-x "$FindBin::Bin/net-lookup") ? "$FindBin::Bin/net-lookup" : 'net-lookup';
+    my @ll  = defined $listen ? ('--listen', $listen) : ();
+    my $ip  = '';
+    if (open my $fh, '-|', $bin, '--family', 'v4', @ll, "=$host") {
+        while (<$fh>) { if (/(\d+\.\d+\.\d+\.\d+)/) { $ip = $1; last } }
+        close $fh;
+    }
+    return $ip_cache{$host} = $ip;
+}
+
+# A pool's range as bare host octets when it sits inside the CIDR's /24 (e.g.
+# 90-109), since the CIDR already names the subnet. Falls back to full start-end
+# if the range somehow spans the /24.
+sub short_range {
+    my ($cidr, $start, $end) = @_;
+    my ($pfx) = $cidr =~ m{^(\d+\.\d+\.\d+)\.\d+/\d+$};
+    if (defined $pfx && $start =~ /^\Q$pfx\E\.(\d+)$/) {
+        my $s = $1;
+        return "$s-$1" if $end =~ /^\Q$pfx\E\.(\d+)$/;
+    }
+    return "$start-$end";
+}
+
 # ---- main -----------------------------------------------------------
 my $need_cli = $auto || !$print_only;
 my $cli;
@@ -253,10 +283,14 @@ for my $e (@all) {
     # must never be pruned, even if another device reported it first.
     $found_by_host{$label}{ "$r->{cidr}|$r->{start}" } = 1;
     if ($verbose) {                     # report every source, incl. duplicates
-        my $src = ($label eq 'local' ? '' : "$label:")
-                . (defined $r->{file} ? "$r->{file}:" . ($r->{line} // '?') : '?');
-        printf STDERR "  %-46s -> %s %s-%s\n",
-            $src, $r->{cidr}, $r->{start}, $r->{end};
+        # Show the AP's IP next to its name (two devices reporting the same pool
+        # — e.g. Nighthawk and NighthawkX6-2 — are otherwise indistinguishable),
+        # and the range as bare host octets since the CIDR already gives the net.
+        my $who = $label eq 'local' ? '(local)'
+                : $label . (ap_ip($label) ? ' (' . ap_ip($label) . ')' : '');
+        my $loc = defined $r->{file} ? "$r->{file}:" . ($r->{line} // '?') : '';
+        printf STDERR "  %-34s %-26s -> %-18s %s\n",
+            $who, $loc, $r->{cidr}, short_range($r->{cidr}, $r->{start}, $r->{end});
     }
     my $key = "$r->{cidr}|$r->{start}|$r->{end}";
     next if $rseen{$key}++;             # same pool reported by several devices
