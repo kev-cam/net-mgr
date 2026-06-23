@@ -1835,16 +1835,11 @@ sub move_dialog {
     my $suggest = next_free($S->{model}, subnet_of($ip)) // '';
     my $newip = $suggest;
     my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Move $ip",
-        -buttons => ['Probe', 'Move', 'Cancel']);
+        -buttons => ['Move', 'Cancel']);
     my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 4, -padx => 6);
     $row->Label(-text => "$ip ($r->{mac}) -> ")->pack(-side => 'left');
     $row->Entry(-textvariable => \$newip, -width => 16)->pack(-side => 'left');
-    my $ans;
-    while (1) {
-        $ans = $dlg->Show // 'Cancel';
-        last unless $ans eq 'Probe';
-        probe_dialog($cli, $S, $ip, $r);
-    }
+    my $ans = $dlg->Show // 'Cancel';
     return unless $ans eq 'Move';
     unless (defined ip2int($newip)) { $status->configure(-text => " bad IP '$newip'"); return }
     # Match the stored record by its own IP (may be non-canonical; see canon_ip).
