@@ -30,7 +30,8 @@ use NetMgr::Client;
 use NetMgr::Config;
 use NetMgr::Protocol qw(format_kv);
 
-my ($listen, $print_only, $local, $auto, $files_opt, $help, $verbose, $no_prune);
+my ($listen, $print_only, $local, $auto, $files_opt, $help, $verbose, $no_prune,
+    $leases);
 my $ssh_timeout = 12;
 my $ssh_cmd     = 'net-ssh';        # override with --ssh-cmd 'ssh -o BatchMode=yes'
 GetOptions(
@@ -43,6 +44,7 @@ GetOptions(
     'ssh-cmd=s'     => \$ssh_cmd,
     'verbose|v'     => \$verbose,
     'no-prune'      => \$no_prune,
+    'leases'        => \$leases,
     'help|h'        => \$help,
 ) or die "bad options\n";
 usage() if $help;
@@ -54,6 +56,12 @@ usage("nothing to scan") unless @hosts || $local || $auto;
 my @REMOTE_FILES = $files_opt ? split(/\s+/, $files_opt)
     : qw(/etc/dnsmasq.conf /etc/dnsmasq.d/* /tmp/dnsmasq.conf /tmp/dnsmasq.d/*
          /jffs/etc/dnsmasq.conf);
+
+# Where dnsmasq keeps its active lease db on the kinds of AP/gateway we ssh into
+# (Debian/standard, OpenWrt, Asus/Merlin, ...). --leases cats whichever exist.
+my @LEASE_FILES = qw(/var/lib/misc/dnsmasq.leases /var/lib/dnsmasq/dnsmasq.leases
+                     /tmp/dnsmasq.leases /tmp/dhcp.leases /tmp/var/lib/misc/dnsmasq.leases
+                     /jffs/dnsmasq/dnsmasq.leases);
 
 # ---- IP helpers -----------------------------------------------------
 sub ip2int {
@@ -164,13 +172,10 @@ sub scan_local {
 }
 
 # ---- remote scan over net-ssh (bounded by --ssh-timeout) ------------
-sub scan_remote {
-    my ($host) = @_;
-    # -Hn so we can drop editor backups / drafts by filename (the remote shell's
-    # glob, e.g. /etc/dnsmasq.d/*, otherwise matches dnsmasq-foo~ and *.new too)
-    # and report the source file:line under --verbose.
-    my $cmd = "grep -HnsE '^[[:space:]]*dhcp-range=' "
-            . join(' ', @REMOTE_FILES) . " 2>/dev/null";
+# Run $cmd on $host over net-ssh and return its output lines, bounded by
+# --ssh-timeout so an unreachable host can't wedge the run.
+sub _ssh_lines {
+    my ($host, $cmd) = @_;
     my @ssh = split ' ', $ssh_cmd;          # net-ssh by default; --ssh-cmd to override
     my $pid = open(my $fh, '-|', @ssh, $host, $cmd);
     unless ($pid) { warn "net-import-dnsmasq: $host: $ssh[0]: $!\n"; return () }
@@ -183,6 +188,47 @@ sub scan_remote {
     };
     if (my $e = $@) { kill 'TERM', $pid; warn "net-import-dnsmasq: $host: $e" }
     close $fh;
+    return @out;
+}
+
+# Parse dnsmasq lease lines: <expiry-epoch> <mac> <ip> <hostname|*> <client-id>.
+# Skips IPv6/DUID and other non-v4 lines.
+sub _parse_leases {
+    my @leases;
+    for my $line (@_) {
+        $line =~ s/\r?\n\z//;
+        my ($exp, $mac, $ip, $name) = $line =~
+            /^(\d+)\s+([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)/
+            or next;
+        push @leases, { expiry => $exp + 0, mac => lc $mac, ip => $ip,
+                        host => ($name eq '*' ? '' : $name) };
+    }
+    return @leases;
+}
+
+# Current DHCP leases from a remote AP/gateway's dnsmasq lease db. Catches
+# devices that answer no active scan — sleepy battery sensors, smart plugs —
+# because their lease persists until it expires.
+sub scan_remote_leases {
+    my ($host) = @_;
+    return _parse_leases(_ssh_lines($host, 'cat ' . join(' ', @LEASE_FILES) . ' 2>/dev/null'));
+}
+
+# Leases from this host's own dnsmasq (for --local).
+sub scan_local_leases {
+    my @lines;
+    for my $f (@LEASE_FILES) { open my $fh, '<', $f or next; push @lines, <$fh>; close $fh }
+    return _parse_leases(@lines);
+}
+
+sub scan_remote {
+    my ($host) = @_;
+    # -Hn so we can drop editor backups / drafts by filename (the remote shell's
+    # glob, e.g. /etc/dnsmasq.d/*, otherwise matches dnsmasq-foo~ and *.new too)
+    # and report the source file:line under --verbose.
+    my $cmd = "grep -HnsE '^[[:space:]]*dhcp-range=' "
+            . join(' ', @REMOTE_FILES) . " 2>/dev/null";
+    my @out = _ssh_lines($host, $cmd);
     my @r;
     for my $line (@out) {
         $line =~ s/\r?\n\z//;
@@ -275,6 +321,37 @@ if ($auto) {
     push @hosts, @found;
 }
 { my %seen; @hosts = grep { !$seen{$_}++ } @hosts; }
+
+# --leases: import each AP/gateway's current DHCP leases as live host sightings,
+# so devices that never answer an active scan (sleepy sensors, smart plugs) still
+# land in the DB. Distinct from the default range import.
+if ($leases) {
+    my ($found, $sent, %seen) = (0, 0);
+    my @work;
+    push @work, ['local', [scan_local_leases()]] if $local;
+    push @work, [$_, undef] for @hosts;
+    for my $w (@work) {
+        my ($h, $pre) = @$w;
+        my @lz = defined $pre ? @$pre : scan_remote_leases($h);
+        print STDERR "$h: ", scalar(@lz), " lease(s)\n";
+        for my $l (@lz) {
+            next if $seen{"$l->{mac}|$l->{ip}"}++;
+            $found++;
+            printf STDERR "  %-17s %-15s %s\n", $l->{mac}, $l->{ip}, $l->{host} if $verbose;
+            my %kv = (kind => 'lease', mac => $l->{mac}, ip => $l->{ip},
+                      source => "net-import-dnsmasq:$h",
+                      ($l->{host}   ? (hostname => $l->{host})   : ()),
+                      ($l->{expiry} ? (expires  => $l->{expiry}) : ()));   # 0 = infinite
+            if ($print_only) { print "OBSERVE ", format_kv(%kv), "\n"; $sent++; next }
+            my $resp = $cli->observe(%kv);
+            if ($resp && $resp =~ /^ERR/) { warn "lease rejected ($l->{mac} $l->{ip}): $resp\n" }
+            else { $sent++ }
+        }
+    }
+    $cli->bye if $cli;
+    print STDERR "leases found=$found" . ($print_only ? " (print only)\n" : " imported=$sent\n");
+    exit 0;
+}
 
 # (source-label, range) pairs from every scanned source.
 my @all;
@@ -385,6 +462,9 @@ usage:
   net-import-dnsmasq HOST ...          scan each host over net-ssh
   net-import-dnsmasq --auto            scan all known APs + gateways
   net-import-dnsmasq --local           scan this host's dnsmasq config
+  net-import-dnsmasq --auto --leases   import APs'/gateways' current DHCP leases
+                                       (catches sleepy devices an active scan
+                                        misses); records them as host sightings
   options: --print  --verbose  --files 'P1 P2'  --listen H:P  --ssh-timeout N
            --ssh-cmd 'ssh -o BatchMode=yes'   (default: net-ssh)  -h/--help
   --verbose, -v   report each range's source file:line (and host, for remotes)
