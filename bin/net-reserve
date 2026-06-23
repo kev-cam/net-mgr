@@ -416,8 +416,11 @@ sub classify {
         return ($model->{leased}{$ip} || $model->{observed}{$ip})
                ? 'active' : 'reserved';
     }
-    return 'assigned' if in_pool($model, $i);
+    # An occupied address shows as in-use even INSIDE a DHCP pool — otherwise a
+    # device that took a dynamic lease from the pool (e.g. the KP200 smart plug)
+    # blends into the pool colour and looks like free space.
     return 'in-use'   if $model->{leased}{$ip} || $model->{observed}{$ip};
+    return 'assigned' if in_pool($model, $i);
     return 'free';
 }
 
