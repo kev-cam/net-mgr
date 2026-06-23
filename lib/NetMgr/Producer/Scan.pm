@@ -82,11 +82,22 @@ sub discover_network {
     }
     close $fh;
 
-    # Backfill missing MACs from ip-neigh (e.g. for our own subnet hosts
-    # nmap may not capture if they responded only via TCP).
+    # Active sweep + neigh merge so reachable hosts that answer ARP/ping but
+    # listen on none of our scanned ports (e.g. a smart plug) get recorded too.
+    # nmap --open only reports hosts with an open port in the list, and we only
+    # iterate those — so a quiet device would silently never appear. fping
+    # refreshes the neigh cache; fall back to nmap's own ARP entries for the
+    # network if fping isn't available.
+    my ($net3) = $cidr =~ /^(\d+\.\d+\.\d+)\./;
+    my $sweep  = (defined $net3) ? fping_presence(map { "$net3.$_" } 1 .. 254)
+                                 : { alive => [] };
     my %nb = neighbours();
-    for my $ip (keys %hosts) {
-        $hosts{$ip}{mac} //= $nb{$ip};
+    for my $ip (keys %hosts) { $hosts{$ip}{mac} //= $nb{$ip} }
+    my @reachable = @{ $sweep->{alive} || [] };
+    @reachable = grep { defined $net3 && /^\Q$net3\E\./ } keys %nb unless @reachable;
+    for my $ip (@reachable) {
+        next if $hosts{$ip} || !$nb{$ip};
+        $hosts{$ip} = { mac => $nb{$ip}, ports => [] };   # alive, MAC known, no scanned port
     }
 
     my @obs;
