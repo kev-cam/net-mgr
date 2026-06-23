@@ -1087,7 +1087,11 @@ sub cmd_gui {
         -font => 'nrmono', -scrollbars => 'e')->pack(-side => 'top', -fill => 'y', -expand => 1);
     $S{resv_text} = $resv_text;     # so a cell click can centre this pane on its IP
 
-    $status = $mw->Label(-anchor => 'w', -relief => 'sunken')
+    # -width => 1 so a long status string (e.g. the DHCP-mode help) can't drive
+    # the window wider — it just clips. Otherwise toggling to DHCP mode widened
+    # the window (the grid grew with it) until the periodic tick reset the text.
+    # -fill => x still stretches it to the real window width.
+    $status = $mw->Label(-anchor => 'w', -relief => 'sunken', -width => 1)
         ->pack(-side => 'bottom', -fill => 'x');
 
     $refresh_subnets = sub {
