@@ -90,9 +90,19 @@ sub _run_session {
         if ($cmd->{verb} eq 'ROW') {
             my $kv     = $cmd->{kv};
             my $table  = $kv->{table};
-            my $apply  = __PACKAGE__->can("_apply_$table") or next;
-            eval { $apply->($db, $kv, \%idmap, $repl_from) };
-            _log($log, "[relay] apply $table: $@") if $@;
+            if (($kv->{op} // '') eq 'delete') {
+                # Propagate the master's deletions. Without this the relay
+                # upserts a delete event's row straight back in, resurrecting it
+                # — a pool the master removed never went away on followers.
+                if (my $del = __PACKAGE__->can("_delete_$table")) {
+                    eval { $del->($db, $kv) };
+                    _log($log, "[relay] delete $table: $@") if $@;
+                }
+            } else {
+                my $apply = __PACKAGE__->can("_apply_$table") or next;
+                eval { $apply->($db, $kv, \%idmap, $repl_from) };
+                _log($log, "[relay] apply $table: $@") if $@;
+            }
         } elsif ($cmd->{verb} eq 'ERR') {
             _log($log, "[relay] peer ERR: $cmd->{msg}");
         }
@@ -280,9 +290,26 @@ sub _apply_dhcp_ranges {
         zone        => $row->{zone},
         notes       => $row->{notes},
     );
+    # An AP serves a single pool: once its current range is in, drop any OTHER
+    # range still tagged to the same server (a stale replica the master changed
+    # or moved but whose delete we missed — e.g. Nighthawk's pool moving from
+    # 192.168.223.x to 192.168.15.x). Guarded on a non-empty server tag so
+    # untagged ranges never clobber each other.
+    if (defined $row->{notes} && length $row->{notes}) {
+        $db->dbh->do(
+            "DELETE FROM dhcp_ranges
+              WHERE notes = ? AND NOT (subnet_cidr = ? AND start_ip = ?)",
+            undef, $row->{notes}, $row->{subnet_cidr}, $row->{start_ip});
+    }
     _stamp($db, 'dhcp_ranges', $repl_from,
            'subnet_cidr = ? AND start_ip = ?',
            $row->{subnet_cidr}, $row->{start_ip});
+}
+
+sub _delete_dhcp_ranges {
+    my ($db, $row) = @_;
+    return unless $row->{subnet_cidr} && $row->{start_ip};
+    $db->delete_dhcp_range($row->{subnet_cidr}, $row->{start_ip});
 }
 
 sub _apply_dhcp_reservations {
