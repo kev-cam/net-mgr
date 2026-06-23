@@ -354,7 +354,16 @@ sub gather {
     # Key by the canonical address (see canon_ip): the DB may store a
     # non-canonical form, but classify()/occupant() look up by int2ip()'s form.
     my %resv     = map { canon_ip($_->{ip})   => $_ } grep { defined $_->{ip} } @$resv;
-    my %leased   = map { canon_ip($_->{ip})   => $_ } grep { $_->{ip}  } @$leases;
+    # Key by IP, but when an address has several leases over time (DHCP reuse —
+    # the same IP handed to different MACs) keep the one with the latest expiry,
+    # i.e. the current holder. Plain last-wins would surface a months-old stale
+    # lease and hide the device that actually holds the address now.
+    my %leased;
+    for my $l (grep { $_->{ip} } @$leases) {
+        my $ip  = canon_ip($l->{ip});
+        my $cur = $leased{$ip};
+        $leased{$ip} = $l if !$cur || ($l->{expires} // '') gt ($cur->{expires} // '');
+    }
     my %observed = map { canon_ip($_->{addr}) => $_ } grep { $_->{addr} } @$addrs;
 
     my %name_of_mid = map { ($_->{id} => $_->{primary_name}) }
@@ -1338,6 +1347,28 @@ sub cmd_gui {
                 for my $rr (@{ $by_grp{$g} }) {
                     $resv_text->insert('end',
                         sprintf("  %-15s %s\n", $rr->{ip}, ($rr->{name} // $rr->{mac})));
+                }
+            }
+            # Active addresses: leased/observed but not reserved (e.g. the KP200,
+            # which took a dynamic lease). List them by name so they're not just
+            # an in-use cell with no label in the pane.
+            my %active;
+            for my $src ($model->{leased}, $model->{observed}) {
+                for my $aip (keys %$src) {
+                    next if $model->{resv}{$aip};
+                    next unless (subnet_of($aip) // '') eq $cidr;
+                    my $mac = $src->{$aip}{mac} or next;
+                    $active{$aip} //= $mac;
+                }
+            }
+            if (%active) {
+                $resv_text->insert('end', "[in use]\n");
+                for my $aip (sort { ip2int($a) <=> ip2int($b) } keys %active) {
+                    my $mac  = $active{$aip};
+                    my $name = $model->{mac_name}{ lc $mac }
+                            // ($model->{leased}{$aip} ? $model->{leased}{$aip}{hostname} : undef)
+                            // $mac;
+                    $resv_text->insert('end', sprintf("  %-15s %s\n", $aip, $name));
                 }
             }
         }
