@@ -235,7 +235,7 @@ my %ACTIVE = (
     mysql      => [qw(db defaults section)],
     scanner    => [qw(presence_interval
                        dnsmasq_event_port dnsmasq_event_check_interval)],
-    scheduling => [qw(scan-ap presence discover find-peers)],
+    scheduling => [qw(scan-ap presence discover find-peers import-leases)],
     paths      => '*',
     dns        => '*',
     bindings   => '*',                        # parsed for future use

@@ -1773,7 +1773,7 @@ sub _check_periodic_triggers {
     my $now   = time();
     $self->{periodic_last} //= {};
 
-    for my $name (qw(scan-ap presence discover find-peers)) {
+    for my $name (qw(scan-ap presence discover find-peers import-leases)) {
         my $interval = $sched->{$name} // 0;
         # find-peers powers cluster auto-discovery: default it to 5 min when this
         # node auto-discovers and the operator hasn't set a [scheduling] cadence,
@@ -1819,6 +1819,12 @@ sub _fire_periodic {
         # direct local-/24 sweep if the peers table is still empty (the normal
         # scan only probes already-known addresses, which a fresh follower lacks).
         push @args, '--bootstrap' if $self->{cluster}{auto_spec};
+    } elsif ($name eq 'import-leases') {
+        # Pull the APs'/gateways' current DHCP leases — catches devices that
+        # never answer an active scan (sleepy sensors, smart plugs). Opt-in via
+        # [scheduling] import-leases (it ssh's out to every AP/gateway).
+        $bin  = $self->_producer_path('net-import-dnsmasq');
+        @args = ('--auto', '--leases');
     } else {
         return;
     }
