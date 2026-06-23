@@ -1572,7 +1572,7 @@ sub _resv_index {
 sub reserve_dialog {
     my ($cli, $S, $ip, $mac, $redraw, $status) = @_;
     my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Reserve $ip",
-        -buttons => ['Reserve', 'Reserve+Push', 'Cancel']);
+        -buttons => ['Probe', 'Reserve', 'Reserve+Push', 'Cancel']);
     my %v = (ip => $ip, mac => $mac, name => '', group => '');
     # known groups for convenience
     my %groups; $groups{ $_->{grp} } = 1 for grep { $_->{grp} } values %{ $S->{model}{resv} };
@@ -1641,7 +1641,16 @@ sub reserve_dialog {
                 ->pack(-side => 'left');
         }
     }
-    my $ans = $dlg->Show // 'Cancel';
+    # Loop so Probe can pop the read-only detail dialog (on the current IP/MAC,
+    # which may have been edited) and return here with the form intact.
+    my $ans;
+    while (1) {
+        $ans = $dlg->Show // 'Cancel';
+        last unless $ans eq 'Probe';
+        my ($pip) = ($v{ip} // '') =~ /(\d+\.\d+\.\d+\.\d+)/;
+        probe_dialog($cli, $S, ($pip // $v{ip}),
+            { mac => $v{mac}, name => $v{name}, grp => $v{group} });
+    }
     return unless $ans eq 'Reserve' || $ans eq 'Reserve+Push';
     ($v{ip}) = $v{ip} =~ /(\d+\.\d+\.\d+\.\d+)/ ? ($1) : ($v{ip});  # tolerate a label
     unless (defined ip2int($v{ip})) {
@@ -1826,11 +1835,16 @@ sub move_dialog {
     my $suggest = next_free($S->{model}, subnet_of($ip)) // '';
     my $newip = $suggest;
     my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Move $ip",
-        -buttons => ['Move', 'Cancel']);
+        -buttons => ['Probe', 'Move', 'Cancel']);
     my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 4, -padx => 6);
     $row->Label(-text => "$ip ($r->{mac}) -> ")->pack(-side => 'left');
     $row->Entry(-textvariable => \$newip, -width => 16)->pack(-side => 'left');
-    my $ans = $dlg->Show // 'Cancel';
+    my $ans;
+    while (1) {
+        $ans = $dlg->Show // 'Cancel';
+        last unless $ans eq 'Probe';
+        probe_dialog($cli, $S, $ip, $r);
+    }
     return unless $ans eq 'Move';
     unless (defined ip2int($newip)) { $status->configure(-text => " bad IP '$newip'"); return }
     # Match the stored record by its own IP (may be non-canonical; see canon_ip).
