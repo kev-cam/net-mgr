@@ -1223,6 +1223,16 @@ sub cmd_gui {
                     $resv_text->insert('end', '  ', $stag);
                     # server name -> link to its web admin (every server linkable)
                     my ($url, $iptxt) = server_url(\%S, $model, $srv);
+                    # Mis-homed pool: the serving device lives in a different /24
+                    # than the pool it hands out (e.g. Nighthawk @ 192.168.15.151
+                    # tagged to a 192.168.223.x pool) — almost always a stale or
+                    # mis-imported dhcp-range. Flag it on the line below.
+                    my $offnet;
+                    if ($iptxt) {
+                        my $ssub = subnet_of($iptxt);
+                        my $psub = subnet_of($r->{start_ip});
+                        $offnet = $ssub if defined $ssub && defined $psub && $ssub ne $psub;
+                    }
                     (my $htag = "host$ri") =~ s/\W/_/g;
                     $resv_text->insert('end', " $srv", $htag);
                     $resv_text->tagConfigure($htag,
@@ -1238,9 +1248,11 @@ sub cmd_gui {
                             && ip2int($_->{start_ip}) <= ip2int($r->{end_ip}) }
                         @{ $model->{ranges} };
                     (my $rtag = "rng$ri") =~ s/\W/_/g;
-                    $resv_text->insert('end', sprintf("  %s-%s%s%s\n",
+                    $resv_text->insert('end', sprintf("  %s-%s%s%s%s\n",
                         $r->{start_ip}, $r->{end_ip},
-                        ($iptxt ? "  ($iptxt)" : ''), ($ov ? '  *** overlap' : '')),
+                        ($iptxt ? "  ($iptxt)" : ''),
+                        ($offnet ? "  *** server on $offnet" : ''),
+                        ($ov ? '  *** overlap' : '')),
                         $rtag);
                     $resv_text->tagConfigure($rtag, -foreground => $grey) if $grey;
                     $resv_text->tagBind($rtag, '<Button-1>',
