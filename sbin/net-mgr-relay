@@ -493,11 +493,15 @@ sub apply_election {
 # daemon refuses non-loopback CLUSTER_ROLE writes. Best-effort —
 # if the daemon's down or restarting, we silently skip and try
 # again next tick.
-my $last_pushed = '';
+# Declared here (before the sub) so the closure captures it. Left undef, not '':
+# the election loop above never returns, so a top-level '= ...' initialiser here
+# would never actually run — _push_local_role treats undef as "nothing pushed
+# yet" via the defined() guard below.
+my $last_pushed;
 sub _push_local_role {
     my ($role, %args) = @_;
     my $key = $role . '|' . ($args{master} // '');
-    return if $key eq $last_pushed;     # nothing new to say
+    return if defined $last_pushed && $key eq $last_pushed;   # nothing new to say
     my $cli = eval {
         NetMgr::Client->new(listen => '127.0.0.1:7531', timeout => 3);
     };
