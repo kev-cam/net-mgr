@@ -1653,17 +1653,88 @@ sub reserve_dialog {
     $status->configure(-text => $msg);
 }
 
+# OUI vendor for a MAC from the IEEE oui.csv — fallback when the interface row
+# has no stored vendor. Cached; undef if the file/entry isn't present.
+my (%OUI, $oui_loaded);
+sub oui_vendor {
+    my ($mac) = @_;
+    return undef unless $mac && $mac =~ /^([0-9a-f]{2}):([0-9a-f]{2}):([0-9a-f]{2}):/i;
+    my $oui = uc "$1$2$3";
+    if (!$oui_loaded) {
+        $oui_loaded = 1;
+        my $f = eval { NetMgr::Config->load($ENV{NET_MGR_CONF} // '/etc/net-mgr/config')
+                            ->{paths}{oui_csv} } || '/var/lib/ieee-data/oui.csv';
+        if (open my $fh, '<', $f) {
+            while (<$fh>) { next unless /^MA-L,([0-9A-F]{6}),"?([^",]+)/; $OUI{$1} = $2 }
+            close $fh;
+        }
+    }
+    return $OUI{$oui};
+}
+
+# Read-only "everything we know about this host" pop-up: identity, vendor (from
+# the MAC), AP board/SSIDs, and the open ports/services we've observed.
+sub probe_dialog {
+    my ($cli, $S, $ip, $r) = @_;
+    my $mac  = $r->{mac} // '';
+    my $macq = ($mac =~ /^[0-9a-f:]{1,17}$/i) ? $mac : '';   # safe to put in a WHERE
+    my $seen = last_seen_str($S->{model}, $ip);
+    my @out = (
+        "IP:        $ip",
+        "MAC:       " . ($mac || '(unknown)'),
+        "Name:      " . ($r->{name} // ''),
+        "Group:     " . ($r->{grp}  // ''),
+        "Last seen: " . (length $seen ? $seen : 'never'),
+    );
+    my $cur = $mac ? $S->{model}{mac_cur_ip}{ lc $mac } : undef;
+    push @out, "Seen at:   $cur" if $cur && $cur ne $ip;
+    if ($macq) {
+        my $ifs = eval { $cli->snapshot(60, 'interfaces', where => "mac = '$macq'") } || [];
+        my $vendor = $ifs->[0]{vendor};
+        $vendor = oui_vendor($mac) unless defined $vendor && length $vendor;
+        push @out, "Vendor:    " . ($vendor // '(unknown)');
+        my $aps = eval { $cli->snapshot(61, 'aps', where => "mac = '$macq'") } || [];
+        if (@$aps) {
+            push @out, "AP board:  $aps->[0]{board}" if $aps->[0]{board};
+            push @out, "AP SSIDs:  $aps->[0]{ssid}"  if $aps->[0]{ssid};
+        }
+        my $ports = eval { $cli->snapshot(62, 'ports', where => "mac = '$macq'") } || [];
+        push @out, '', sprintf('Open ports (%d):', scalar @$ports);
+        if (@$ports) {
+            for my $p (sort { ($a->{port} // 0) <=> ($b->{port} // 0)
+                           || ($a->{proto} // '') cmp ($b->{proto} // '') } @$ports) {
+                push @out, sprintf('  %5s/%-4s %s',
+                    $p->{port} // '?', $p->{proto} // '?', $p->{service} // '');
+            }
+        } else {
+            push @out, '  (none observed)';
+        }
+    }
+    my $dlg = ($S->{anchor})->DialogBox(-title => "Probe $ip", -buttons => ['Close']);
+    my $txt = $dlg->add('Scrolled', 'ROText', -scrollbars => 'oe',
+        -width => 50, -height => 18, -font => 'nrmono', -wrap => 'none')
+        ->pack(-padx => 6, -pady => 6, -fill => 'both', -expand => 1);
+    $txt->insert('end', join("\n", @out));
+    $dlg->Show;
+}
+
 sub release_dialog {
     my ($cli, $S, $ip, $r, $redraw, $status) = @_;
-    my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Reservation $ip",
-        -buttons => ['Push', 'Move', 'Release', 'Cancel']);
-    my $seen = last_seen_str($S->{model}, $ip);
-    $dlg->add('Label', -text =>
-        sprintf("%s\nMAC:  %s\nName: %s\nGroup: %s\nLast seen: %s",
-            $ip, $r->{mac}, ($r->{name} // ''), ($r->{grp} // ''),
-            (length $seen ? $seen : 'never')),
-        -justify => 'left')->pack(-padx => 8, -pady => 6);
-    my $ans = $dlg->Show // 'Cancel';
+    my $ans;
+    # Loop so 'Probe' can pop the read-only detail dialog and return here.
+    while (1) {
+        my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Reservation $ip",
+            -buttons => ['Probe', 'Push', 'Move', 'Release', 'Cancel']);
+        my $seen = last_seen_str($S->{model}, $ip);
+        $dlg->add('Label', -text =>
+            sprintf("%s\nMAC:  %s\nName: %s\nGroup: %s\nLast seen: %s",
+                $ip, $r->{mac}, ($r->{name} // ''), ($r->{grp} // ''),
+                (length $seen ? $seen : 'never')),
+            -justify => 'left')->pack(-padx => 8, -pady => 6);
+        $ans = $dlg->Show // 'Cancel';
+        last unless $ans eq 'Probe';
+        probe_dialog($cli, $S, $ip, $r);
+    }
     if ($ans eq 'Release') {
         # Use the row's stored IP so the daemon matches the exact record, even
         # when it was stored in a non-canonical form (see canon_ip).
