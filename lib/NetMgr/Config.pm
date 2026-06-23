@@ -113,7 +113,8 @@ my %DURATION_KEYS = (
     ap_poll    => { interval => 1, ssh_timeout => 1 },
     timeouts   => { ap => 1, fping => 1, nmap => 1, dhcp => 1 },
     dns        => { ttl => 1 },
-    scheduling => { 'scan-ap' => 1, presence => 1, discover => 1 },
+    scheduling => { 'scan-ap' => 1, presence => 1, discover => 1,
+                    'find-peers' => 1, 'import-leases' => 1 },
 );
 
 sub load {
