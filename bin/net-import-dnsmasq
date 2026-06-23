@@ -250,6 +250,17 @@ sub short_range {
     return "$start-$end";
 }
 
+# Is $ip inside $cidr? Used to attribute a shared pool to the device that
+# actually lives in its subnet.
+sub ip_in_subnet {
+    my ($ip, $cidr) = @_;
+    my ($net, $len) = $cidr =~ m{^(\d+\.\d+\.\d+\.\d+)/(\d+)$} or return 0;
+    my $i = ip2int($ip)  // return 0;
+    my $n = ip2int($net) // return 0;
+    my $mask = $len == 0 ? 0 : (0xFFFFFFFF << (32 - $len)) & 0xFFFFFFFF;
+    return ($i & $mask) == ($n & $mask) ? 1 : 0;
+}
+
 # ---- main -----------------------------------------------------------
 my $need_cli = $auto || !$print_only;
 my $cli;
@@ -275,11 +286,12 @@ for my $h (@hosts) {
 }
 
 my ($found, $sent) = (0, 0);
-my %rseen;
 my %found_by_host;                      # host -> { "cidr|start" => 1 } seen this run
+my %by_range;                           # "cidr|start|end" -> [ [label,$r], ... ]
+my @range_order;                        # first-seen order of unique ranges
 for my $e (@all) {
     my ($label, $r) = @$e;
-    # Record per host BEFORE the cross-host dedup: a pool this host still serves
+    # Record per host (used by the prune pass): a pool this host still serves
     # must never be pruned, even if another device reported it first.
     $found_by_host{$label}{ "$r->{cidr}|$r->{start}" } = 1;
     if ($verbose) {                     # report every source, incl. duplicates
@@ -293,7 +305,24 @@ for my $e (@all) {
             $who, $loc, $r->{cidr}, short_range($r->{cidr}, $r->{start}, $r->{end});
     }
     my $key = "$r->{cidr}|$r->{start}|$r->{end}";
-    next if $rseen{$key}++;             # same pool reported by several devices
+    push @range_order, $key unless $by_range{$key};
+    push @{ $by_range{$key} }, $e;
+}
+
+# One pool per unique range. When several devices report the same range,
+# attribute it to the one whose own IP sits in the pool's subnet — the actual
+# server — rather than whichever was scanned first. e.g. a 192.168.223.x pool
+# reported by both Nighthawk (192.168.15.151) and NighthawkX6-2 (192.168.223.79)
+# belongs to NighthawkX6-2.
+for my $key (@range_order) {
+    my @srcs = @{ $by_range{$key} };
+    my ($owner) = grep {
+        my ($l, $rr) = @$_;
+        my $ip = $l eq 'local' ? undef : ap_ip($l);
+        $ip && ip_in_subnet($ip, $rr->{cidr});
+    } @srcs;
+    $owner //= $srcs[0];
+    my ($label, $r) = @$owner;
     $found++;
     my %kv = (kind => 'dhcp_range', subnet_cidr => $r->{cidr},
               start_ip => $r->{start}, end_ip => $r->{end},
