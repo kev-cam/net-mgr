@@ -227,10 +227,11 @@ sub _apply_aps {
     my ($db, $row, $idmap, $repl_from) = @_;
     return unless $row->{mac};
     $db->upsert_ap(
-        mac   => $row->{mac},
-        ssid  => $row->{ssid},
-        model => $row->{model},
-        board => $row->{board},
+        mac     => $row->{mac},
+        ssid    => $row->{ssid},
+        model   => $row->{model},
+        board   => $row->{board},
+        exclude => $row->{exclude},
     );
     _stamp($db, 'aps', $repl_from, 'mac = ?', lc $row->{mac});
 }

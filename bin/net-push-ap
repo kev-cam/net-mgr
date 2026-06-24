@@ -1,0 +1,276 @@
+#!/usr/bin/perl
+# net-push-ap — push per-subnet DHCP static reservations from the (relayed)
+# net-mgr DB to DD-WRT access points (NVRAM `static_leases`).
+#
+# DD-WRT stores fixed leases in the `static_leases` NVRAM var as a single
+# space-joined string of `MAC=name=IP=lease` entries, with a companion
+# `static_leasenum`, applied with `/sbin/restart_dns`. net-mgr is the source of
+# truth (dhcp_reservations); this regenerates that block from the DB, scoped to
+# the AP's own subnet (an AP only serves its lan_ipaddr's /24), and pushes it.
+#
+# Dry-run by default: it reads the AP's current value and prints the diff + the
+# exact commands it WOULD run. --apply actually writes NVRAM + restarts dnsmasq.
+#
+# Usage:
+#   net-push-ap [HOST ...]            push to the named AP(s) (name or IP)
+#   net-push-ap --auto               every AP in the aps table (default if no HOST)
+#   net-push-ap --apply HOST         actually set NVRAM + commit + restart_dns
+#   net-push-ap --listen ADDR        manager to read dhcp_reservations from
+#   net-push-ap --ssh-cmd 'CMD'      ssh wrapper (default net-ssh)
+#   net-push-ap --ssh-user USER      login user (default root; DD-WRT = root)
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use NetMgr::Client;
+
+my ($auto, $apply, $listen, $help, $set_exclude, $clear_exclude);
+my $ssh_cmd     = 'net-ssh';
+my $ssh_user    = 'root';
+my $lease       = 1440;
+my $ssh_timeout = 20;
+my @exclude_opt;
+GetOptions(
+    'auto'          => \$auto,
+    'apply'         => \$apply,
+    'listen=s'      => \$listen,
+    'ssh-cmd=s'     => \$ssh_cmd,
+    'ssh-user=s'    => \$ssh_user,
+    'lease=i'       => \$lease,
+    'ssh-timeout=i' => \$ssh_timeout,
+    'exclude=s@'    => \@exclude_opt,
+    'set-exclude=s' => \$set_exclude,
+    'clear-exclude' => \$clear_exclude,
+    'force'         => \my $force,    # push even to APs with no dhcp-range (DNS-only)
+    'help|h'        => \$help,
+) or usage(2);
+usage(0) if $help;
+
+# Global host blacklist applied to EVERY AP — servers/VMs/gateways/virtual
+# interfaces aren't AP DHCP clients. PER-AP additions live in the DB
+# (aps.exclude, set with --set-exclude). Globs (*, ?) match the reservation
+# name. /etc/net-mgr/ap-exclude (one glob per line, # comments) and repeated
+# --exclude also add to these globals.
+my @EXCLUDE = qw(dkcw95* nas3* gateway* usb*);
+if (open my $xf, '<', '/etc/net-mgr/ap-exclude') {
+    while (<$xf>) { s/#.*//; s/^\s+|\s+$//g; push @EXCLUDE, $_ if length }
+    close $xf;
+}
+push @EXCLUDE, @exclude_opt;
+
+# Compile globs to anchored, case-insensitive regexes; match a name against a list.
+sub compile_globs {
+    return [ map { (my $g = quotemeta $_) =~ s/\\\*/.*/g; $g =~ s/\\\?/./g; qr/^$g$/i }
+             grep { defined && length } @_ ];
+}
+sub match_any { my ($n, $re) = @_; $n //= ''; for (@$re) { return 1 if $n =~ $_ } return 0 }
+
+sub usage {
+    my $c = shift // 0;
+    print STDERR <<'EOT';
+net-push-ap — push per-subnet DD-WRT static_leases from the net-mgr DB.
+  net-push-ap [HOST ...]      dry-run for the named AP(s) (name or IP)
+  net-push-ap --auto          dry-run for every AP in the aps table
+  net-push-ap --apply HOST    actually write NVRAM + restart_dns
+  net-push-ap --set-exclude 'glob…' HOST   set that AP's per-AP host blacklist
+  net-push-ap --clear-exclude HOST         clear that AP's per-AP blacklist
+  --exclude GLOB  add a GLOB to the GLOBAL blacklist (repeatable)
+  --listen ADDR   manager address (default: local relayed replica)
+  --ssh-cmd CMD   ssh wrapper (default: net-ssh)
+  --ssh-user U    login user (default: root)
+  --lease N       lease minutes written into each entry (default: 1440)
+Dry-run unless --apply. An AP only gets its own lan_ipaddr /24's reservations.
+Blacklist = global defaults (dkcw95*/nas3*/gateway*/usb* + /etc/net-mgr/ap-exclude
++ --exclude) plus the per-AP aps.exclude globs stored in the DB.
+EOT
+    exit $c;
+}
+
+# ---- pull reservations + AP list (with per-AP exclude) from the DB -----
+my $cli = NetMgr::Client->new(listen => $listen, timeout => 8);
+$cli->hello(consumer => "net-push-ap.$$");
+my $resv = $cli->snapshot(1, 'dhcp_reservations') || [];
+my $aps  = $cli->snapshot(2, 'aps')        || [];
+my $ifs  = $cli->snapshot(3, 'interfaces') || [];
+my $mach = $cli->snapshot(4, 'machines')   || [];
+
+my %nm  = map { $_->{id} => $_->{primary_name} }
+          grep { defined $_->{primary_name} && length $_->{primary_name} } @$mach;
+my %mid = map { lc $_->{mac} => $_->{machine_id} }
+          grep { $_->{mac} && $_->{machine_id} } @$ifs;
+my (%ap_by_name, @ap_names);
+for my $ap (@$aps) {
+    my $mac = lc($ap->{mac} // '') or next;
+    my $n   = $nm{ $mid{$mac} // '' };
+    next unless defined $n && length $n;
+    $ap_by_name{$n} = { mac => $mac, exclude => $ap->{exclude} };
+    push @ap_names, $n unless $ap_by_name{$n}{seen}++;
+}
+
+# --set-exclude '<globs>' / --clear-exclude: update aps.exclude for the named
+# AP(s) (or all with --auto) and exit — no push.
+if (defined $set_exclude || $clear_exclude) {
+    my @targets = @ARGV ? @ARGV : ($auto ? @ap_names : ());
+    die "net-push-ap: name an AP (or --auto) to set its exclude\n" unless @targets;
+    my $val = $clear_exclude ? '' : $set_exclude;
+    for my $t (@targets) {
+        my $ap = $ap_by_name{$t};
+        unless ($ap) { warn "## $t: not a known AP (no aps row) — skipped\n"; next }
+        my $r = $cli->observe(kind => 'ap_exclude', mac => $ap->{mac}, exclude => $val);
+        if (defined $r && $r =~ /^ERR/) { warn "## $t: $r\n" }
+        else { print "set exclude for $t ($ap->{mac}) = '$val'\n" }
+    }
+    $cli->bye;
+    exit 0;
+}
+$cli->bye;
+
+my @hosts = @ARGV;
+@hosts = @ap_names if $auto || !@hosts;
+die "net-push-ap: no APs to push to\n" unless @hosts;
+
+# Short form for the dhcp/static-lease name: strip the gateway/server SIDE
+# suffix (-up/-down/-dmz/-home); keep -air (a distinct wifi interface). The
+# suffixed names live only in the DNS/hosts view, not in DHCP.
+sub short_form { my $n = shift // ''; $n =~ s/-(up|down|dmz|home)$//; return $n }
+
+# Compare key: lowercase the MAC so original- vs canonical-case isn't a "change".
+sub norm_entry { my @p = split /=/, ($_[0] // ''), 4; $p[0] = lc($p[0] // ''); return join '=', @p }
+
+# ---- DD-WRT static_leases block for one /24, from the DB -----------
+# Returns ($entries_arrayref, $warnings_arrayref). Dedup by MAC keeps the first
+# (name-sorted) and warns on the rest, matching net-gen-dnsmasq.
+sub leases_for_subnet {
+    my ($net24, $exclude_re) = @_;
+    my (%seen, @e, @warn);
+    # Alphabetical by the short (displayed) name, IP as tiebreak.
+    for my $r (sort { lc(short_form($a->{name})) cmp lc(short_form($b->{name}))
+                        or ($a->{ip}//'') cmp ($b->{ip}//'') } @$resv) {
+        my $ip = $r->{ip} // next;
+        next unless $ip =~ /^\Q$net24\E\.\d+$/ && $r->{mac};
+        my $name = $r->{name};
+        unless (defined $name && length $name) {
+            push @warn, "skip $ip ($r->{mac}): no name (DD-WRT needs a name field)";
+            next;
+        }
+        if (match_any($name, $exclude_re)) { push @warn, "exclude $name ($ip): blacklisted"; next }
+        $name = short_form($name);     # DHCP name is the short form
+        my $m = lc $r->{mac};
+        if (my $first = $seen{$m}) {
+            push @warn, "dup mac $m ($name $ip): skipping (kept $first)";
+            next;
+        }
+        $seen{$m} = "$name\@$ip";
+        push @e, "$m=$name=$ip=$lease";
+    }
+    return (\@e, \@warn);
+}
+
+# ---- run a remote command, bounded by --ssh-timeout ----------------
+sub ssh_run {
+    my ($ip, $remote) = @_;
+    my @cmd = (split(' ', $ssh_cmd), "$ssh_user\@$ip", $remote);
+    my $pid = open(my $fh, '-|', @cmd);
+    return (undef, "spawn failed: $!") unless $pid;
+    my $out = '';
+    eval {
+        local $SIG{ALRM} = sub { die "timeout after ${ssh_timeout}s\n" };
+        alarm $ssh_timeout;
+        local $/;
+        $out = <$fh> // '';
+        alarm 0;
+    };
+    my $err = $@;
+    close $fh;
+    kill('TERM', $pid) if $err;
+    return ($out, $err);
+}
+
+sub net24_of { my @o = split /\./, ($_[0] // ''); @o >= 3 ? "$o[0].$o[1].$o[2]" : undef }
+sub ip_of    { my $e = shift; $e =~ /=(\d+\.\d+\.\d+\.\d+)=/ ? $1 : '' }
+
+# ---- per-AP -------------------------------------------------------
+my $rc = 0;
+for my $host (@hosts) {
+    # Per-AP blacklist = global defaults + this AP's DB aps.exclude globs.
+    my $ap = $ap_by_name{$host};
+    my $exclude_re = compile_globs(@EXCLUDE,
+        ($ap && defined $ap->{exclude} && length $ap->{exclude})
+            ? split(' ', $ap->{exclude}) : ());
+    my $ip = $host;
+    unless ($ip =~ /^\d+\.\d+\.\d+\.\d+$/) {
+        my $ll = $listen ? "--listen $listen " : '';
+        chomp(my $r = `$FindBin::Bin/net-lookup --family v4 $ll=$host 2>/dev/null`);
+        ($ip) = $r =~ /(\d+\.\d+\.\d+\.\d+)/;
+    }
+    unless ($ip) { warn "## $host: cannot resolve to an IP — skipped\n"; $rc = 1; next }
+
+    # Read the AP's subnet + current static leases + whether it serves DHCP.
+    my ($out, $err) = ssh_run($ip,
+        'echo "LAN:$(nvram get lan_ipaddr)"; '
+      . 'echo "NUM:$(nvram get static_leasenum)"; '
+      . 'echo "RANGE:$(grep -c ^dhcp-range /tmp/dnsmasq.conf 2>/dev/null)"; '
+      . 'echo "SL:$(nvram get static_leases)"');
+    if ($err || !defined $out) { warn "## $host ($ip): ssh failed: ${\($err//'no output')}\n"; $rc = 1; next }
+    my ($lan)     = $out =~ /^LAN:(\S*)/m;
+    my ($curnum)  = $out =~ /^NUM:(\S*)/m;
+    my ($range)   = $out =~ /^RANGE:(\d+)/m;
+    my ($cur_sl)  = $out =~ /^SL:(.*)$/m;
+    $cur_sl //= ''; $range //= 0;
+    my $net24 = net24_of($lan);
+    unless ($net24) { warn "## $host ($ip): no lan_ipaddr from AP — skipped\n"; $rc = 1; next }
+    # A DNS-only AP (no dhcp-range) doesn't serve DHCP, so static leases are moot.
+    unless ($range || $force) {
+        print "=== $host ($ip) — subnet $net24.0/24 ===\n";
+        print "  no dhcp-range (DNS-only AP) — skipping static-lease push (--force to override)\n\n";
+        next;
+    }
+
+    my ($entries, $warns) = leases_for_subnet($net24, $exclude_re);
+    my @cur = grep { length } split /\s+/, $cur_sl;
+    my %cur_by_ip = map { ip_of($_) => norm_entry($_) } @cur;
+    my %new_by_ip = map { ip_of($_) => norm_entry($_) } @$entries;
+
+    my @added   = grep { !exists $cur_by_ip{ ip_of($_) } } @$entries;
+    my @removed = grep { !exists $new_by_ip{ ip_of($_) } } @cur;
+    my @changed = grep { exists $cur_by_ip{ ip_of($_) } && $cur_by_ip{ ip_of($_) } ne norm_entry($_) } @$entries;
+
+    my $val = join ' ', @$entries;
+    print "=== $host ($ip) — subnet $net24.0/24 ===\n";
+    printf "  per-AP exclude: %s\n", $ap->{exclude}
+        if $ap && defined $ap->{exclude} && length $ap->{exclude};
+    printf "  AP now: %s entries (static_leasenum=%s)\n", scalar(@cur), ($curnum // '?');
+    printf "  DB gen: %s entries (%d added, %d removed, %d changed)\n",
+        scalar(@$entries), scalar(@added), scalar(@removed), scalar(@changed);
+    print "    + $_\n"        for @added;
+    print "    - $_\n"        for @removed;
+    print "    ~ $_\n"        for @changed;
+    warn  "    ! $_\n"        for @$warns;
+
+    if (!$apply) {
+        printf "  DRY-RUN — would run on %s:\n", $ip;
+        printf "    nvram set static_leases='…%d bytes…'\n", length($val);
+        printf "    nvram set static_leasenum=%d\n", scalar(@$entries);
+        print  "    nvram commit && /sbin/restart_dns\n";
+        print  "  (use --apply to push)\n\n";
+        next;
+    }
+
+    my $reordered = join(' ', map { norm_entry($_) } @cur)
+                 ne join(' ', map { norm_entry($_) } @$entries);
+    print "  (order changed)\n" if $reordered && !@added && !@removed && !@changed;
+    if (!@added && !@removed && !@changed && !$reordered) { print "  already current — skipping apply\n\n"; next }
+    my $remote = "nvram set static_leases='$val'; "
+               . "nvram set static_leasenum=" . scalar(@$entries) . "; "
+               . "nvram commit && /sbin/restart_dns && echo NETPUSH_OK";
+    my ($aout, $aerr) = ssh_run($ip, $remote);
+    if ($aerr || ($aout // '') !~ /NETPUSH_OK/) {
+        warn "## $host ($ip): apply FAILED: ${\($aerr || $aout || 'no output')}\n";
+        $rc = 1;
+    } else {
+        print "  APPLIED + restarted dnsmasq on $ip\n\n";
+    }
+}
+exit $rc;

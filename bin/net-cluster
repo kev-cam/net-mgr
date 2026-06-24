@@ -107,6 +107,7 @@ elsif ($cmd eq 'diff')     { $rc = cmd_diff($multi) }
 elsif ($cmd eq 'observe')  { $rc = cmd_observe($multi) }
 elsif ($cmd eq 'update')   { unshift @ARGV, 'kind=self_update'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'deploy')   { unshift @ARGV, 'kind=self_update'; $rc = cmd_observe($multi) }
+elsif ($cmd eq 'regen')    { unshift @ARGV, 'kind=regen_dnsmasq'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'master')   { $rc = cmd_master($multi) }
 else { warn "net-cluster: unknown command '$cmd'\n"; usage(2) }
 

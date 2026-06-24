@@ -85,6 +85,18 @@ my %DEFAULTS = (
     dhcp => {
         out_dir => '/etc/net-mgr/dnsmasq.d',
     },
+    # How a node keeps its dnsmasq in sync with the federated DB (net-gen-dnsmasq
+    # --from-db / net-push-ap). mode: off (default, ignore) | auto (regenerate
+    # THIS node's dnsmasq from the DB replica + reload whenever dhcp_reservations
+    # change — the gateway path) | command (regen only when told via
+    # OBSERVE kind=regen_dnsmasq / `net-cluster regen`). out_dir is where the
+    # per-zone files are written (a gateway's include dir). push_aps (master
+    # only) also pushes DD-WRT AP static_leases on reservation changes.
+    dnsmasq => {
+        mode     => 'off',
+        out_dir  => '/usr/local/sgy/conf.d',
+        push_aps => 0,
+    },
     # Named net-mgr daemons client tools can connect to. Each key is a short
     # name mapped to host[:port]; the special key 'default' names the preferred
     # entry. Usually set in the per-user file (~/.config/net-mgr/config) and
@@ -114,7 +126,7 @@ my %DURATION_KEYS = (
     timeouts   => { ap => 1, fping => 1, nmap => 1, dhcp => 1 },
     dns        => { ttl => 1 },
     scheduling => { 'scan-ap' => 1, presence => 1, discover => 1,
-                    'find-peers' => 1, 'import-leases' => 1 },
+                    'find-peers' => 1, 'import-leases' => 1, 'push-dnsmasq' => 1 },
 );
 
 sub load {
@@ -236,7 +248,7 @@ my %ACTIVE = (
     mysql      => [qw(db defaults section)],
     scanner    => [qw(presence_interval
                        dnsmasq_event_port dnsmasq_event_check_interval)],
-    scheduling => [qw(scan-ap presence discover find-peers import-leases)],
+    scheduling => [qw(scan-ap presence discover find-peers import-leases push-dnsmasq)],
     paths      => '*',
     dns        => '*',
     bindings   => '*',                        # parsed for future use
@@ -247,6 +259,7 @@ my %ACTIVE = (
                                               # loopback REFRESH socket
     uplinks    => '*',                        # consumed by net-uplink-probe
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
+    dnsmasq    => [qw(mode out_dir push_aps)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
     forward    => [qw(method allow_peers)],   # net-connect FORWARD backend
     servers    => '*',                        # client server list (see servers())
     chat       => [qw(archive_dir)],          # net-chat archive location

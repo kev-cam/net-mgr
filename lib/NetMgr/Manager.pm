@@ -1773,12 +1773,18 @@ sub _check_periodic_triggers {
     my $now   = time();
     $self->{periodic_last} //= {};
 
-    for my $name (qw(scan-ap presence discover find-peers import-leases)) {
+    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq)) {
         my $interval = $sched->{$name} // 0;
         # find-peers powers cluster auto-discovery: default it to 5 min when this
         # node auto-discovers and the operator hasn't set a [scheduling] cadence,
         # so a fresh follower bootstraps the mesh without any extra config.
         $interval ||= 300 if $name eq 'find-peers' && $self->{cluster}{auto_spec};
+        # push-dnsmasq polls dhcp_reservations for changes and regenerates/pushes
+        # when this node opts in ([dhcp] gen_local / push_aps). Default 30s when
+        # opted in; otherwise interval 0 = inert (never runs).
+        $interval ||= 30 if $name eq 'push-dnsmasq'
+            && ((($self->{config}{dnsmasq}{mode} // 'off') eq 'auto')
+                 || $self->{config}{dnsmasq}{push_aps});
         next unless $interval && $interval > 0;
         my $last = $self->{periodic_last}{$name} // 0;
         next if ($now - $last) < $interval;
@@ -1794,6 +1800,7 @@ sub _check_periodic_triggers {
 
 sub _fire_periodic {
     my ($self, $name) = @_;
+    if ($name eq 'push-dnsmasq') { $self->_sync_dnsmasq; return }
     my ($bin, @args);
     if ($name eq 'scan-ap') {
         my @ips = $self->_known_ap_ips;
@@ -1851,6 +1858,59 @@ sub _fire_periodic {
         name       => $name,
         started_at => time(),
     };
+}
+
+# Regenerate / push dnsmasq config when dhcp_reservations has changed. Gated by
+# [dnsmasq] mode = auto (this node regenerates its OWN dnsmasq from the local DB
+# replica + reload — the gateway "do it automatically on reservation updates"
+# path) and, on the master, [dnsmasq] push_aps (push DD-WRT AP static_leases).
+# Default OFF, so this is inert until a node opts in. Change is detected by a
+# (count | max updated_at) signature so rapid edits coalesce into one
+# regen/push; the first observation after startup only primes the signature (no
+# push on restart). Work runs in forked children, reaped like any other trigger.
+# (An operator/master can also force a regen out-of-band via OBSERVE
+# kind=regen_dnsmasq -> _obs_regen_dnsmasq, independent of the auto poll.)
+sub _sync_dnsmasq {
+    my ($self) = @_;
+    my $cfg       = $self->{config}{dnsmasq} || {};
+    my $is_master = (($self->{cluster_runtime}{role} // $self->{cluster}{role} // '') eq 'master');
+    my $want_gen  = (($cfg->{mode} // 'off') eq 'auto') ? 1 : 0;   # gateway: self-regen on change
+    my $want_aps  = ($is_master && $cfg->{push_aps})    ? 1 : 0;   # master: push DD-WRT APs
+    return unless $want_gen || $want_aps;
+
+    my $sig = eval {
+        my $r = $self->{db}->dbh->selectrow_arrayref(
+            "SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM dhcp_reservations");
+        $r ? ($r->[0] . '|' . $r->[1]) : '';
+    };
+    $sig //= '';
+    my $primed = exists $self->{dnsmasq_sig};
+    return if $primed && $self->{dnsmasq_sig} eq $sig;
+    $self->{dnsmasq_sig} = $sig;
+    return unless $primed;          # first run after start: prime only, don't push
+
+    $self->_log("dnsmasq sync: reservations changed (sig=$sig) gen=$want_gen aps=$want_aps");
+    my @jobs;
+    push @jobs, [ $self->_producer_path('net-gen-dnsmasq'), '--from-db', '--reload' ] if $want_gen;
+    push @jobs, [ $self->_producer_path('net-push-ap'),     '--apply', '--auto'     ] if $want_aps;
+    for my $j (@jobs) {
+        my ($bin, @args) = @$j;
+        unless ($bin && -x $bin) {
+            $self->_log("dnsmasq sync: skip — not executable: " . ($bin // '?'));
+            next;
+        }
+        my $pid = fork();
+        next unless defined $pid;
+        if ($pid == 0) {
+            for my $c (values %{ $self->{clients} }) { close $c->{sock} if $c->{sock} }
+            close $self->{listen} if $self->{listen};
+            $ENV{NET_MGR_LISTEN} = $self->_self_connect_addr;
+            exec $bin, @args;
+            exit 127;
+        }
+        $self->_log("dnsmasq sync: $bin @args pid=$pid");
+        $self->{triggers}{$pid} = { cli_fd => undef, name => 'push-dnsmasq', started_at => time() };
+    }
 }
 
 # Non-blocking reap of any TRIGGER children that have exited.
@@ -2746,6 +2806,49 @@ sub _obs_dhcp_range_delete {
     return ();
 }
 
+# kind=regen_dnsmasq — the master (or an operator, e.g. `net-cluster regen`)
+# tells this node to regenerate its own dnsmasq config from its DB replica and
+# reload. Honoured only if [dnsmasq] mode isn't 'off' (i.e. this node manages a
+# local dnsmasq). Forked + reaped like any trigger; a single regen at a time.
+sub _obs_regen_dnsmasq {
+    my ($self, $cli, $kv) = @_;
+    my $mode = $self->{config}{dnsmasq}{mode} // 'off';
+    if ($mode eq 'off') { $self->_log("regen_dnsmasq: ignored ([dnsmasq] mode=off)"); return () }
+    my $bin = $self->_producer_path('net-gen-dnsmasq');
+    unless ($bin && -x $bin) { $self->_log("regen_dnsmasq: net-gen-dnsmasq missing"); return () }
+    if (grep { ($_->{name} // '') eq 'regen-dnsmasq' } values %{ $self->{triggers} }) {
+        return ();   # one in flight already
+    }
+    my $pid = fork();
+    return () unless defined $pid;
+    if ($pid == 0) {
+        for my $c (values %{ $self->{clients} }) { close $c->{sock} if $c->{sock} }
+        close $self->{listen} if $self->{listen};
+        $ENV{NET_MGR_LISTEN} = $self->_self_connect_addr;
+        exec $bin, '--from-db', '--reload';
+        exit 127;
+    }
+    $self->_log("regen_dnsmasq: net-gen-dnsmasq --from-db --reload pid=$pid (told by "
+              . ($cli->{ident} // '?') . ")");
+    $self->{triggers}{$pid} = { cli_fd => undef, name => 'regen-dnsmasq', started_at => time() };
+    return ();
+}
+
+# kind=ap_exclude — set the per-AP host blacklist (space-separated globs of
+# names NOT to push to that AP's DHCP static leases; net-push-ap reads it).
+# '' clears it. Stored on aps.exclude, kept across AP rescans (upsert_ap only
+# rewrites it when given). Replicates via the normal aps change stream.
+sub _obs_ap_exclude {
+    my ($self, $cli, $kv) = @_;
+    my $mac = lc($kv->{mac} // '');
+    die "ap_exclude: valid mac required\n"
+        unless $mac =~ /^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$/;
+    $self->_upsert('aps', 'upsert_ap',
+        mac => $mac, exclude => (defined $kv->{exclude} ? $kv->{exclude} : ''));
+    $self->_log("ap_exclude $mac = '" . ($kv->{exclude} // '') . "'");
+    return ();
+}
+
 # ---- OBSERVE dispatch ------------------------------------------------
 
 sub _handle_observe {
@@ -2785,6 +2888,8 @@ sub _handle_observe {
         elsif ($kind eq 'dhcp_range')  { @events = $self->_obs_dhcp_range($cli, $kv) }
         elsif ($kind eq 'dhcp_range_delete')
                                        { @events = $self->_obs_dhcp_range_delete($cli, $kv) }
+        elsif ($kind eq 'ap_exclude')  { @events = $self->_obs_ap_exclude($cli, $kv) }
+        elsif ($kind eq 'regen_dnsmasq'){ @events = $self->_obs_regen_dnsmasq($cli, $kv) }
         elsif ($kind eq 'self_update') { @events = $self->_obs_self_update($cli, $kv) }
         else {
             die "unknown observation kind '$kind'\n";

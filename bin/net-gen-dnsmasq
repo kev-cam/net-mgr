@@ -35,6 +35,10 @@ my $out_dir;
 my @files;
 my $listen;
 my $help;
+my $from_db;       # generate from the (relayed) DB instead of dhcp.master
+my $test;          # write <file>.new instead of <file>
+my $domain_opt;
+my @zone_opt;      # CIDR=name overrides for the subnet->zone map
 GetOptions(
     'print'    => \$print_only,
     'reload'   => \$reload,
@@ -42,6 +46,10 @@ GetOptions(
     'out=s'    => \$out_dir,
     'file=s@'  => \@files,
     'listen=s' => \$listen,
+    'from-db'  => \$from_db,
+    'test'     => \$test,
+    'domain=s' => \$domain_opt,
+    'zone=s@'  => \@zone_opt,
     'help|h'   => \$help,
 ) or do { print STDERR usage(); exit 2 };
 
@@ -67,7 +75,15 @@ EOT
 }
 
 my $cfg = NetMgr::Config->load;
-my %dhcp_cfg = %{ $cfg->{dhcp} || {} };
+my %dhcp_cfg    = %{ $cfg->{dhcp}    || {} };
+my %dnsmasq_cfg = %{ $cfg->{dnsmasq} || {} };   # --from-db output dir (gateway include dir)
+
+# DB-driven mode: build the per-zone files from the (relayed) dhcp_reservations
+# + machine names rather than dhcp.master, then run through the same
+# print/diff/write/reload path. This is what a gateway node runs against its
+# local replica. Self-contained so the dhcp.master path below is untouched.
+if ($from_db) { gen_from_db(); exit 0 }
+
 $out_dir //= $dhcp_cfg{out_dir} // '/etc/net-mgr/dnsmasq.d';
 
 unless (@files) {
@@ -313,4 +329,115 @@ sub sighup_dnsmasq {
         return 0;
     }
     return 1;
+}
+
+# ---- DB-driven generation (--from-db) -------------------------------
+
+sub _net24 { my @o = split /\./, ($_[0] // ''); "$o[0].$o[1].$o[2]" }
+sub _ipkey { my @o = split /\./, ($_[0] // '0.0.0.0'); (($o[0]*256+$o[1])*256+$o[2])*256+$o[3] }
+# dhcp-host name is the short form: strip the side suffix (-up/-down/-dmz/-home),
+# keep -air (a distinct wifi interface). Suffixed names stay in the hosts file.
+sub _short { my $n = shift // ''; $n =~ s/-(up|down|dmz|home)$//; return $n }
+sub _dbpath {
+    my $base = shift;
+    my $dir  = $out_dir // $dnsmasq_cfg{out_dir} // '/usr/local/sgy/conf.d';
+    return "$dir/$base" . ($test ? '.new' : '');
+}
+
+# Build the per-zone files from dhcp_reservations (+ machine names) and run
+# them through the shared print/diff/write/reload path.
+#   dnsmasq-<zone>: dhcp-host=MAC,<short name>,IP,<lease>   (name-sort, dedup by MAC)
+#   hosts-<zone>:   <ip><suffixed per-side name>\t<fqdn>\tM<mac>  (IP-sort, dedup by IP)
+sub gen_from_db {
+    my $domain = $domain_opt // $dhcp_cfg{domain} // 'grfx.com';
+    my $lease  = $dhcp_cfg{host_lease} // 1440;
+
+    # subnet(/24) -> zone. Site defaults; --zone CIDR=name adds/overrides.
+    my %zone_of_24 = ('192.168.15' => 'dmz', '192.168.223' => 'home');
+    for my $z (@zone_opt) {
+        my ($cidr, $name) = split /=/, $z, 2;
+        next unless $cidr && defined $name && length $name;
+        $cidr =~ s{/\d+$}{}; $cidr =~ s/\.0$//;      # 192.168.15.0/24 -> 192.168.15
+        $zone_of_24{$cidr} = $name;
+    }
+
+    my $cli = NetMgr::Client->new(listen => $listen);
+    $cli->hello(consumer => "net-gen-dnsmasq.$$");
+    my $resv = $cli->snapshot(1, 'dhcp_reservations') || [];
+    my $M    = $cli->snapshot(2, 'machines')          || [];
+    my $IF   = $cli->snapshot(3, 'interfaces')        || [];
+    $cli->bye;
+
+    # mac -> suffixed per-side machine name (for the hosts/DNS file)
+    my %mname = map { $_->{id} => $_->{primary_name} } grep { $_->{primary_name} } @$M;
+    my %mac2host;
+    for my $i (@$IF) {
+        next unless $i->{mac} && $i->{machine_id};
+        my $n = $mname{ $i->{machine_id} } or next;
+        $mac2host{ lc $i->{mac} } = $n;
+    }
+
+    my (%by_zone, $skipped);
+    for my $r (@$resv) {
+        next unless $r->{ip} && $r->{mac};
+        my $zone = $zone_of_24{ _net24($r->{ip}) };
+        if (!$zone) { $skipped++; next }
+        push @{ $by_zone{$zone} }, $r;
+    }
+    warn "net-gen-dnsmasq: skipped $skipped reservation(s) on subnets with no zone mapping\n" if $skipped;
+
+    my %generated;
+    for my $zone (sort keys %by_zone) {
+        my @rs = @{ $by_zone{$zone} };
+
+        # dnsmasq-<zone>: curated SHORT name, name-sort, dedup by MAC (keep first + warn)
+        my (%seenmac, @dh);
+        for my $r (sort { _short($a->{name}) cmp _short($b->{name}) or _ipkey($a->{ip}) <=> _ipkey($b->{ip}) } @rs) {
+            my $mac = lc $r->{mac};
+            my $sn  = _short($r->{name});
+            if (my $first = $seenmac{$mac}) {
+                warn "WARN dnsmasq-$zone duplicate mac $r->{mac}: skipping '$sn' at $r->{ip} (kept $first)\n";
+                next;
+            }
+            $seenmac{$mac} = "$sn\@" . $r->{ip};
+            push @dh, "dhcp-host=$mac,$sn,$r->{ip},$lease\n";
+        }
+        $generated{ _dbpath("dnsmasq-$zone") } = join '', @dh;
+
+        # hosts-<zone>: suffixed per-side machine name, IP-sort, dedup by IP (keep first + warn)
+        my (%seenip, @hl);
+        for my $r (sort { _ipkey($a->{ip}) <=> _ipkey($b->{ip}) } @rs) {
+            if (my $first = $seenip{ $r->{ip} }) {
+                warn "WARN hosts-$zone duplicate ip $r->{ip}: skipping (kept $first)\n";
+                next;
+            }
+            $seenip{ $r->{ip} } = ($r->{name} // '?');
+            my $mac  = lc $r->{mac};
+            my $name = $mac2host{$mac} // $r->{name};
+            next unless defined $name && length $name;
+            (my $macid = $mac) =~ s/:/_/g;
+            push @hl, sprintf("%-25s%s\t%s\tM%s\n", $r->{ip}, $name, "$name.$domain", $macid);
+        }
+        $generated{ _dbpath("hosts-$zone") } = join '', @hl;
+    }
+
+    _emit_generated(\%generated);
+}
+
+sub _emit_generated {
+    my ($gen) = @_;
+    unless (%$gen) { warn "net-gen-dnsmasq: nothing to generate (no reservations in mapped zones)\n"; return }
+    if ($print_only) {
+        for my $p (sort keys %$gen) { print "# === $p ===\n", $gen->{$p} }
+        return;
+    }
+    if ($diff) {
+        show_diff($_, $gen->{$_}) for sort keys %$gen;
+        return;
+    }
+    for my $p (sort keys %$gen) {
+        write_atomic($p, $gen->{$p});
+        print "wrote $p\n";
+    }
+    if ($reload) { my $rc = sighup_dnsmasq(); print "reloaded dnsmasq\n" if $rc }
 }

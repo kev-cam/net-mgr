@@ -70,19 +70,31 @@ my $imported = 0;
 my $reserved = 0;
 my $skipped  = 0;
 for my $file (@files) {
-    my $bname = basename($file);   # 'dhcp.master' or 'dhcp.extra'
+    my $bname = basename($file);   # 'dhcp.master' / 'dhcp.extra' / 'dnsmasq-<zone>'
     my $src   = "$my_host:$bname";
-    my @hosts = NetMgr::Producer::DhcpMaster::hosts_only(
-                   NetMgr::Producer::DhcpMaster::parse_file($file));
-    print STDERR "$file: ", scalar(@hosts), " host blocks\n";
+    # Accept either the ISC `host {}` master format or the generated dnsmasq
+    # `dhcp-host=` files. dnsmasq files carry only the curated SHORT name, so
+    # they seed dhcp_reservations only (the suffixed per-side machine names
+    # come from the hosts-<zone> import / live observation, not from here).
+    my $is_dnsmasq = NetMgr::Producer::DhcpMaster::is_dnsmasq_format($file);
+    my @hosts = $is_dnsmasq
+        ? NetMgr::Producer::DhcpMaster::parse_dnsmasq_hosts($file)
+        : NetMgr::Producer::DhcpMaster::hosts_only(
+              NetMgr::Producer::DhcpMaster::parse_file($file));
+    print STDERR "$file: ", scalar(@hosts),
+        $is_dnsmasq ? " dhcp-host lines (dnsmasq; reservation-only)\n" : " host blocks\n";
 
     for my $h (@hosts) {
         # Skip the `deadend` sentinel — it's a black-hole MAC used to
         # null-route traffic between subnets, not a real device.
-        if ($h->{name} eq 'deadend' || $h->{mac} eq '12:34:56:78:90:ab') {
+        if (($h->{name}//'') eq 'deadend' || $h->{mac} eq '12:34:56:78:90:ab') {
             $skipped++;
             next;
         }
+        # ISC host blocks also seed the discovery tables (kind=host with the
+        # block's name). dnsmasq files skip this — their name is the short
+        # form and would clobber the suffixed machine name.
+        unless ($is_dnsmasq) {
         my %kv = (
             kind        => 'host',
             mac         => $h->{mac},
@@ -102,6 +114,7 @@ for my $file (@files) {
             } else {
                 $imported++;
             }
+        }
         }
 
         # A `host { fixed-address }` block IS a permanent reservation, so also

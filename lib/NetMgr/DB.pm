@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 25;
+our $SCHEMA_VERSION = 26;
 
 sub new {
     my ($class, %args) = @_;
@@ -675,6 +675,15 @@ CREATE TABLE IF NOT EXISTS chat_authorized_keys (
 SQL
         return;
     }
+    if ($v == 26) {
+        # aps.exclude: per-AP globs of hosts NOT to push to that AP's DHCP
+        # static leases (net-push-ap). Set via OBSERVE kind=ap_exclude; AP
+        # rescans (upsert_ap) leave it untouched. See sql/schema.sql.
+        $self->{dbh}->do(
+            "ALTER TABLE aps ADD COLUMN exclude TEXT NULL AFTER board"
+        );
+        return;
+    }
     croak "no migration for schema v$v";
 }
 
@@ -1137,7 +1146,7 @@ sub upsert_ap {
         my @changed;
         my @set;
         my @bind;
-        for my $k (qw(ssid model board)) {
+        for my $k (qw(ssid model board exclude)) {
             next unless exists $f{$k};
             my $old = $was->{$k}; my $new = $f{$k};
             next if (!defined $old && !defined $new);
@@ -1155,12 +1164,12 @@ sub upsert_ap {
                  changed_fields => \@changed, was => $was, now => $now };
     }
     $self->{dbh}->do(
-        "INSERT INTO aps (mac, ssid, model, board) VALUES (?, ?, ?, ?)",
-        undef, $f{mac}, $f{ssid}, $f{model}, $f{board}
+        "INSERT INTO aps (mac, ssid, model, board, exclude) VALUES (?, ?, ?, ?, ?)",
+        undef, $f{mac}, $f{ssid}, $f{model}, $f{board}, $f{exclude}
     );
     my $now = $self->{dbh}->selectrow_hashref(
         "SELECT * FROM aps WHERE mac = ?", undef, $f{mac});
-    return { op => 'insert', changed_fields => [qw(ssid model board)],
+    return { op => 'insert', changed_fields => [qw(ssid model board exclude)],
              was => undef, now => $now };
 }
 

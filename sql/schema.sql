@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS aps (
     ssid         TEXT,                       -- comma-joined when multiple
     model        VARCHAR(128),
     board        VARCHAR(128),
+    exclude      TEXT,                        -- globs of hosts NOT to push to this AP (net-push-ap)
     last_seen    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_aps_iface
         FOREIGN KEY (mac) REFERENCES interfaces(mac) ON DELETE CASCADE
