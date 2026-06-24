@@ -255,7 +255,10 @@ my %ACTIVE = (
     bindings   => '*',                        # parsed for future use
     peers      => '*',                        # consumed by net-mgr-relay
     cluster    => [qw(members role priority prefer_lan internet_facing
-                       election_interval proxy_listen)],  # cluster role / election
+                       election_interval proxy_listen control_prefix)],  # cluster role / election
+                                              # control_prefix: ULA CIDR scoping
+                                              # which v6 'auto' binds for the
+                                              # control plane (IPV6-TRANSPORT-SPEC.md)
                                               # proxy_listen: net-mgr-relay's
                                               # loopback REFRESH socket
     uplinks    => '*',                        # consumed by net-uplink-probe

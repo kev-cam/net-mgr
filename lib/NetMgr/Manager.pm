@@ -15,6 +15,8 @@ use strict;
 use warnings;
 use Carp qw(croak);
 use IO::Socket::INET;
+use IO::Socket::IP;     # IPv6-capable listener (control plane); INET kept for dnsmasq event listeners
+use NetMgr::Addr qw(split_hostport join_hostport local_addrs);
 use IO::Select;
 use Time::HiRes qw(time);
 use FindBin ();
@@ -244,26 +246,30 @@ sub _self_connect_addr {
     for my $b (@l) {
         return "127.0.0.1:$b->{port}"
             if $b->{host} eq '0.0.0.0' || $b->{host} eq '::'
-            || $b->{host} =~ /^127\./;
+            || $b->{host} eq '::1' || $b->{host} =~ /^127\./;
     }
     my $b = $l[0];
-    return "$b->{host}:$b->{port}";
+    return join_hostport($b->{host}, $b->{port});   # brackets a v6 host
 }
 
 sub start_listener {
     my ($self) = @_;
     my $spec = $self->{config}{manager}{listen} || 'auto';
-    my @binds = _resolve_listen_spec($spec);
+    my @binds = _resolve_listen_spec($spec, $self->{config}{cluster}{control_prefix});
     croak "no listen addresses resolved from '$spec'" unless @binds;
 
     $self->{select} = IO::Select->new;
     for my $b (@binds) {
-        my $sock = IO::Socket::INET->new(
+        # IO::Socket::IP binds either family; V6Only on v6 binds so a v6 listener
+        # doesn't shadow the matching v4 one (we bind them as separate sockets).
+        my $is_v6 = ($b->{host} // '') =~ /:/;
+        my $sock = IO::Socket::IP->new(
             LocalAddr => $b->{host},
             LocalPort => $b->{port},
             Listen    => 16,
             ReuseAddr => 1,
             Proto     => 'tcp',
+            ($is_v6 ? (V6Only => 1) : ()),
         );
         if (!$sock) {
             $self->_log("WARN: bind $b->{host}:$b->{port} failed: $!");
@@ -359,25 +365,28 @@ sub _auto_spec_desc {
 # 'a, b, …'     → ditto, port 7531 implicit
 # 'host'        → single entry, port 7531
 sub _resolve_listen_spec {
-    my ($spec) = @_;
+    my ($spec, $control_prefix) = @_;
     my $default_port = 7531;
     my @out;
-    my %seen;
+    my %seen;   # "host|port" — '|' not ':', since v6 hosts contain ':'
     for my $tok (grep { length } map { s/^\s+|\s+$//gr } split /,/, $spec) {
         if (lc $tok eq 'auto') {
-            for my $ip (_local_192_168_ips()) {
-                next if $seen{"$ip:$default_port"}++;
+            my @autos = _local_192_168_ips();
+            # Control-plane IPv6: only addresses inside [cluster] control_prefix
+            # (so 'auto' doesn't bind every global v6 the node happens to have).
+            push @autos, local_addrs('v6', $control_prefix) if $control_prefix;
+            for my $ip (@autos) {
+                next if $seen{"$ip|$default_port"}++;
                 push @out, { host => $ip, port => $default_port };
             }
-            my $lo = "127.0.0.1:$default_port";
             push @out, { host => '127.0.0.1', port => $default_port }
-                unless $seen{$lo}++;
+                unless $seen{"127.0.0.1|$default_port"}++;
             next;
         }
-        my ($host, $port) = $tok =~ /^(.+):(\d+)$/
-            ? ($1, $2 + 0)
-            : ($tok, $default_port);
-        next if $seen{"$host:$port"}++;
+        my ($host, $port) = split_hostport($tok);   # bracket-aware ([v6]:port)
+        $host = $tok unless defined $host && length $host;
+        $port //= $default_port;
+        next if $seen{"$host|$port"}++;
         push @out, { host => $host, port => $port };
     }
     return @out;

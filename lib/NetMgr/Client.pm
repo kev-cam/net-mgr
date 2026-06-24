@@ -8,29 +8,10 @@ use Carp qw(croak);
 use IO::Socket::IP;     # both IPv4 and IPv6, unlike IO::Socket::INET
 use NetMgr::Protocol qw(parse_line format_kv);
 
-# Split an endpoint into ($host, $port), $port undef when absent. Handles:
-#   host:port      -> (host, port)
-#   [v6]:port      -> (v6,   port)    brackets stripped
-#   [v6]           -> (v6,   undef)
-#   bare-host      -> (host, undef)
-#   bare IPv6      -> (v6,   undef)    2+ colons and no brackets (e.g. ::1)
-# The bracket form is the only way to attach a port to an IPv6 literal —
-# an unbracketed value with multiple colons is taken as a portless v6 host.
-sub split_hostport {
-    my ($s) = @_;
-    return (undef, undef) unless defined $s && length $s;
-    return ($1, $2) if $s =~ /^\[([^\]]*)\](?::(\d+))?$/;   # [v6] / [v6]:port
-    return ($1, $2) if $s =~ /^([^:]+):(\d+)$/;             # host:port
-    return ($s, undef);                                     # bare host / bare v6
-}
-
-# Inverse of split_hostport: format ($host, $port) as an endpoint string,
-# bracketing an IPv6 host (one containing ':'). Port omitted when undef.
-sub join_hostport {
-    my ($host, $port) = @_;
-    my $h = (defined $host && $host =~ /:/) ? "[$host]" : ($host // '');
-    return defined $port && length $port ? "$h:$port" : $h;
-}
+# Endpoint (host:port) + IPv6-literal handling now lives in NetMgr::Addr. Import
+# the names so existing NetMgr::Client::split_hostport / ::join_hostport callers
+# (net-reserve, net-chat, net-mgr-relay, net-mgr-setup) keep resolving.
+use NetMgr::Addr qw(split_hostport join_hostport);
 
 sub new {
     my ($class, %args) = @_;

@@ -46,6 +46,8 @@ package NetMgr::Mesh;
 use strict;
 use warnings;
 use IO::Socket::INET;
+use IO::Socket::IP;     # IPv6-capable peer connect (control plane)
+use NetMgr::Addr qw(split_hostport);
 use Time::HiRes ();
 
 sub new {
@@ -298,9 +300,14 @@ sub shutdown {
 sub _try_connect {
     my ($self, $name, $p, $now) = @_;
     # Bypass for self-loops or member names we can't resolve.
-    my $sock = IO::Socket::INET->new(
-        PeerAddr => $name,
-        PeerPort => $self->{port},
+    # A member spec is a host/name, or a bracketed v6 ([fd…]) optionally with a
+    # port. split_hostport keeps a v6 literal intact; a bare name resolves over
+    # v4+v6 via IO::Socket::IP (so an AAAA on the control VLAN is used).
+    my ($ph, $pp) = split_hostport($name);
+    $ph = $name unless defined $ph && length $ph;
+    my $sock = IO::Socket::IP->new(
+        PeerHost => $ph,
+        PeerPort => ($pp // $self->{port}),
         Proto    => 'tcp',
         Timeout  => $self->{connect_timeout},
     );
