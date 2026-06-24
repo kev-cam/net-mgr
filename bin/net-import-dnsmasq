@@ -277,7 +277,13 @@ sub ap_ip {
     my @ll  = defined $listen ? ('--listen', $listen) : ();
     my $ip  = '';
     if (open my $fh, '-|', $bin, '--family', 'v4', @ll, "=$host") {
-        while (<$fh>) { if (/(\d+\.\d+\.\d+\.\d+)/) { $ip = $1; last } }
+        # Use a lexical, NOT $_: ap_ip() is called from inside a grep block (the
+        # pool-owner selection), and `while (<$fh>)` would clobber that grep's $_
+        # to this IP line — making grep return the IP string instead of the
+        # [label,range] pair ("Can't use string as an ARRAY ref" at the deref).
+        while (defined(my $line = <$fh>)) {
+            if ($line =~ /(\d+\.\d+\.\d+\.\d+)/) { $ip = $1; last }
+        }
         close $fh;
     }
     return $ip_cache{$host} = $ip;
