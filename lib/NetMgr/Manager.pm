@@ -301,11 +301,9 @@ sub _attach_control_vlan {
     my $attach = lc($cs->{control_attach} // 'on');
     return if $attach =~ /^(off|no|0|false|disabled)$/;
 
-    my $prefix = $cs->{control_prefix};
-    unless ($prefix) {
-        my $net = $self->_dmz_subnet_net;
-        $prefix = NetMgr::Vlan::derive_prefix($net) if $net;
-    }
+    my $dmz_net = $self->_dmz_subnet_net;            # e.g. 192.168.15.0
+    my $prefix  = $cs->{control_prefix}
+               || ($dmz_net && NetMgr::Vlan::derive_prefix($dmz_net));
     my $vname = $cs->{control_vlan_name} // 'network_management';
     unless ($prefix) {
         $self->_log("control-vlan: no control_prefix and no dmz subnet to derive one; skipping $vname attach");
@@ -324,13 +322,28 @@ sub _attach_control_vlan {
         return;
     }
 
-    my ($ifname, $addr, $err) = NetMgr::Vlan::attach(
-        parent => $parent,
-        id     => $id,
-        prefix => $prefix,
-        name   => $vname,
-        addr   => $cs->{control_addr} // 'slaac',
-        log    => sub { $self->_log($_[0]) },
+    my $mode = $cs->{control_addr} // 'ipv4';
+    # ipv4 mode: this host's DMZ IPv4 addresses (one control address derived per).
+    # The dmz /24 is recovered from the control prefix, so a follower without
+    # local subnet definitions still picks the right interface address.
+    my @dmz_ipv4;
+    if ($mode eq 'ipv4') {
+        my $p24 = NetMgr::Vlan::prefix_ipv4_24($prefix);
+        @dmz_ipv4 = grep { index($_, $p24) == 0 } local_addrs('v4') if $p24;
+        unless (@dmz_ipv4) {
+            $self->_log("control-vlan: no DMZ IPv4 (".($p24 // '?')."*) on this host; skipping $vname attach");
+            return;
+        }
+    }
+
+    my ($ifname, $addrs, $err) = NetMgr::Vlan::attach(
+        parent     => $parent,
+        id         => $id,
+        prefix     => $prefix,
+        name       => $vname,
+        addr       => $mode,
+        ipv4_addrs => \@dmz_ipv4,
+        log        => sub { $self->_log($_[0]) },
     );
     $self->_log("control-vlan: $err") if $err;
 

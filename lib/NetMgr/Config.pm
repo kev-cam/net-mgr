@@ -104,11 +104,13 @@ my %DEFAULTS = (
     # opts a node out. control_vlan_id MUST match the switch trunk and so has no
     # safe default — without it net-mgr logs and skips (won't mis-tag traffic).
     # control_prefix defaults to a ULA derived from the dmz subnet (192.168.15 ->
-    # fdc0:a80f::/64). control_addr: slaac (default, address from an RA source) |
-    # eui64 (self-assign prefix+MAC) | a static address.
+    # fdc0:a80f::/64). control_addr: ipv4 (default — derive a predictable address
+    # from each DMZ IPv4, e.g. 192.168.15.222 -> fdc0:a80f::c0a8:fde, so nodes are
+    # easy to find) | slaac (address from a gateway RA source) | eui64 (prefix+MAC)
+    # | a static address.
     cluster => {
         control_vlan_name => 'network_management',
-        control_addr      => 'slaac',
+        control_addr      => 'ipv4',
         control_attach    => 'on',
     },
     # Named net-mgr daemons client tools can connect to. Each key is a short
