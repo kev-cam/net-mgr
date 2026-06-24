@@ -181,17 +181,25 @@ sub connect_client {
 
 # ---- commands --------------------------------------------------------
 
+# Display label for a session's status. A 'closed' session is still listed and
+# restartable (the messages/archive remain), so show it as "Dormant" rather than
+# "closed" — the wire/DB value stays 'closed'.
+sub status_label {
+    my $s = shift // '?';
+    return $s eq 'closed' ? 'Dormant' : $s;
+}
+
 sub cmd_ls {
     my $cli = connect_client(want_auth => 0);
     my $where = $show_all ? undef : "status = 'open'";
     my $rows = $cli->snapshot(1, 'chat_sessions', ($where ? (where => $where) : ()));
     @$rows = sort { ($b->{last_activity}//'') cmp ($a->{last_activity}//'') } @$rows;
     unless (@$rows) { print "no chat sessions\n"; return }
-    printf "%-20s %-8s %-7s %-20s %s\n",
+    printf "%-20s %-8s %-8s %-20s %s\n",
         'NAME', 'MODE', 'STATUS', 'OWNER', 'TOPIC';
     for my $s (@$rows) {
-        printf "%-20s %-8s %-7s %-20s %s\n",
-            $s->{name}, $s->{access_mode} // '?', $s->{status} // '?',
+        printf "%-20s %-8s %-8s %-20s %s\n",
+            $s->{name}, $s->{access_mode} // '?', status_label($s->{status}),
             trunc($s->{created_by} // '', 20), $s->{topic} // '';
     }
 }
@@ -1022,10 +1030,11 @@ sub cmd_gui {
         # across versions. (-command is nulled above so addOptions' auto-select
         # of the first entry can't fire a follow mid-rebuild.)
         $om->menu->delete(0, 'end');
-        # Closed sessions show a "(closed)" label but keep their bare name as the
-        # value, so $follow (which restarts them) still gets the real session name.
+        # Dormant (closed-but-restartable) sessions show a "(dormant)" label but
+        # keep their bare name as the value, so $follow (which restarts them)
+        # still gets the real session name.
         $om->addOptions('select',
-            (map { ($status{$_} // 'open') eq 'closed' ? [ "$_  (closed)" => $_ ] : $_ }
+            (map { ($status{$_} // 'open') eq 'closed' ? [ "$_  (dormant)" => $_ ] : $_ }
                  @names),
             $NEWCHAT);
         $sessvar = (defined $keep && grep { $_ eq $keep } @names) ? $keep : 'select';
