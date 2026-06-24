@@ -96,6 +96,7 @@ my %DEFAULTS = (
         mode     => 'off',
         out_dir  => '/usr/local/sgy/conf.d',
         push_aps => 0,
+        gateways => '',    # space/comma list of DHCP gateways for net-import-dnsmasq --auto
     },
     # Named net-mgr daemons client tools can connect to. Each key is a short
     # name mapped to host[:port]; the special key 'default' names the preferred
@@ -259,7 +260,7 @@ my %ACTIVE = (
                                               # loopback REFRESH socket
     uplinks    => '*',                        # consumed by net-uplink-probe
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
-    dnsmasq    => [qw(mode out_dir push_aps)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
+    dnsmasq    => [qw(mode out_dir push_aps gateways)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
     forward    => [qw(method allow_peers)],   # net-connect FORWARD backend
     servers    => '*',                        # client server list (see servers())
     chat       => [qw(archive_dir)],          # net-chat archive location

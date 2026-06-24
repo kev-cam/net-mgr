@@ -263,6 +263,14 @@ sub enumerate_auto {
         my $n   = defined $mid ? $name_of_mid{$mid} : undef;
         $names{$n} = 1 if defined $n && length $n;
     }
+    # The DHCP gateways usually aren't in the aps table, and isp_links is often
+    # empty — so list them explicitly in [dnsmasq] gateways (space/comma names
+    # or IPs; net-ssh resolves names). This is what makes --auto cover them
+    # without naming them on every run.
+    my $cfg = eval { NetMgr::Config->load($ENV{NET_MGR_CONF} // '/etc/net-mgr/config') } || {};
+    for my $g (split /[,\s]+/, ($cfg->{dnsmasq}{gateways} // '')) {
+        $names{$g} = 1 if length $g;
+    }
     return sort keys %names;
 }
 
@@ -466,7 +474,8 @@ sub usage {
     print STDERR <<'USAGE';
 usage:
   net-import-dnsmasq HOST ...          scan each host over net-ssh
-  net-import-dnsmasq --auto            scan all known APs + gateways
+  net-import-dnsmasq --auto            scan all known APs (aps table) +
+                                       [dnsmasq] gateways from the config
   net-import-dnsmasq --local           scan this host's dnsmasq config
   net-import-dnsmasq --auto --leases   import APs'/gateways' current DHCP leases
                                        (catches sleepy devices an active scan
