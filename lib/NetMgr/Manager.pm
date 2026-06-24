@@ -80,6 +80,15 @@ sub new {
             signers_path    => '/etc/net-mgr/allowed_chat',
             authorized_keys => undef,
         ),
+        # Self-update authorization: a dedicated allowlist of keys permitted to
+        # fire `self_update` (git pull --ff-only + reinstall) over the mesh — so
+        # an authorized operator can redeploy a node without ssh, but a merely
+        # auth'd peer cannot. Strict (no authorized_keys fallback). A key here can
+        # AUTH (Tier 3) and is flagged may_update; loopback/local root is exempt.
+        update_auth_state => NetMgr::Auth::new_state(
+            signers_path    => '/etc/net-mgr/allowed_updaters',
+            authorized_keys => undef,
+        ),
         version => _read_version(),
         cluster => _load_cluster_state($args{config}),
     }, $class;
@@ -1486,8 +1495,10 @@ sub _handle_auth_response {
 
     # Tier 1: the full allowlist (allowed_signers + authorized_keys) grants
     # scope='full' — mesh mutation + chat + auth-gated reads. Tier 2: the
-    # chat-only allowlist (allowed_chat) grants scope='chat'. verify() is
-    # stateless w.r.t. the nonce, so trying both with the same nonce is safe.
+    # chat-only allowlist (allowed_chat) grants scope='chat'. Tier 3: the
+    # updater allowlist (allowed_updaters) grants scope='update' (self_update
+    # only). verify() is stateless w.r.t. the nonce, so trying each with the
+    # same nonce is safe.
     my ($ok, $err) = NetMgr::Auth::verify(
         $self->{auth_state}, $auth->{key_id}, $auth->{nonce}, $sig);
     my $scope = 'full';
@@ -1497,6 +1508,12 @@ sub _handle_auth_response {
         if ($cok) { $ok = 1; $scope = 'chat'; }
         else      { $err = $cerr // $err; }
     }
+    if (!$ok) {
+        my ($uok, $uerr) = NetMgr::Auth::verify(
+            $self->{update_auth_state}, $auth->{key_id}, $auth->{nonce}, $sig);
+        if ($uok) { $ok = 1; $scope = 'update'; }
+        else      { $err = $uerr // $err; }
+    }
     # Always invalidate the nonce — one-shot regardless of outcome.
     delete $auth->{nonce};
     if (!$ok) {
@@ -1504,8 +1521,13 @@ sub _handle_auth_response {
         $self->_log("auth FAIL $cli->{peer} key-id=$auth->{key_id}: $err");
         return $self->_send($cli, format_err("AUTH failed: $err"));
     }
-    $cli->{auth} = { key_id => $auth->{key_id}, verified => 1, scope => $scope };
-    $self->_log("auth OK $cli->{peer} key_id=$auth->{key_id} scope=$scope");
+    # may_update is orthogonal to scope: a full-scope operator key listed in
+    # allowed_updaters also gets it.
+    my $may_update = $self->_is_allowed_updater($auth->{key_id});
+    $cli->{auth} = { key_id => $auth->{key_id}, verified => 1,
+                     scope => $scope, may_update => $may_update };
+    $self->_log("auth OK $cli->{peer} key_id=$auth->{key_id} scope=$scope"
+              . ($may_update ? " +update" : ""));
     $self->_send($cli, format_ok(key_id => $auth->{key_id}, scope => $scope));
 }
 
@@ -1530,6 +1552,15 @@ sub _peer_may_mutate {
     my ($self, $cli) = @_;
     return 1 if $self->_auth_is_full($cli);
     return $self->_peer_may_forward($cli);
+}
+
+# True if $key_id is named in /etc/net-mgr/allowed_updaters — the allowlist of
+# keys permitted to fire self_update over the mesh.
+sub _is_allowed_updater {
+    my ($self, $key_id) = @_;
+    return 0 unless defined $key_id && length $key_id;
+    return scalar grep { $_ eq $key_id }
+        NetMgr::Auth::principals('/etc/net-mgr/allowed_updaters');
 }
 
 sub _peer_is_loopback {
@@ -2038,6 +2069,12 @@ sub _obs_self_update {
     my ($self, $cli, $kv) = @_;
     my ($who) = $self->_chat_identity($cli, $kv);
     die "self_update: not authorized\n" unless defined $who;
+    # A remote caller must be on /etc/net-mgr/allowed_updaters; loopback/local
+    # root is implicitly trusted (it can already run the script directly).
+    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_update})) {
+        die "self_update: '$who' is not an allowed updater "
+          . "(add the key to /etc/net-mgr/allowed_updaters)\n";
+    }
     my $repo = $self->{config}{manager}{repo};
     die "self_update: no repo configured (set [manager] repo = /path/to/checkout)\n"
         unless defined $repo && length $repo;

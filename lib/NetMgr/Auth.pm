@@ -166,6 +166,32 @@ sub _authorized_to_allowed {
     return undef;
 }
 
+# Return the principals (key_ids) named in an allowlist file — for capability
+# checks like "is this verified key_id an allowed updater?". Accepts the same
+# line forms as merged_signers_path: authorized_keys/pubkey lines (principal =
+# comment), native allowed_signers lines (principal = first token), and bare
+# principal tokens. '#' comments and blanks ignored.
+sub principals {
+    my ($path) = @_;
+    my @out;
+    return @out unless defined $path && -r $path;
+    local $/ = "\n";
+    open my $fh, '<', $path or return @out;
+    while (my $line = <$fh>) {
+        chomp $line;
+        $line =~ s/^\s+|\s+$//g;
+        next if $line eq '' || $line =~ /^#/;
+        if ($line =~ /^(?:ssh-(?:rsa|ed25519|dss)|ecdsa-sha2-\S+|sk-\S+)\s/) {
+            my $conv = _authorized_to_allowed($line);     # "PRINCIPAL namespaces=.. KT KEY"
+            push @out, $1 if defined $conv && $conv =~ /^(\S+)\s/;
+        } else {
+            push @out, (split /\s+/, $line, 2)[0];         # allowed_signers / bare principal
+        }
+    }
+    close $fh;
+    return @out;
+}
+
 # ---- verify ---------------------------------------------------------
 
 # Returns (1, undef) on success, (0, $error_message) on failure.
