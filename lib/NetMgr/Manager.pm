@@ -18,6 +18,7 @@ use IO::Socket::INET;
 use IO::Socket::IP;     # IPv6-capable listener (control plane); INET kept for dnsmasq event listeners
 use NetMgr::Addr qw(split_hostport join_hostport local_addrs);
 use NetMgr::Vlan ();
+use NetMgr::Tunnel ();
 use IO::Select;
 use Time::HiRes qw(time);
 use FindBin ();
@@ -267,6 +268,7 @@ sub start_listener {
     # Join the control VLAN first so its address exists before the v6 'auto'
     # enumeration below picks it up (sets control_prefix as a side effect).
     $self->_attach_control_vlan;
+    $self->_he_net_startup;     # HE 6in4 uplink if [he_net] mode=on
     my $spec = $self->{config}{manager}{listen} || 'auto';
     my @binds = _resolve_listen_spec($spec, $self->{config}{cluster}{control_prefix});
     croak "no listen addresses resolved from '$spec'" unless @binds;
@@ -358,6 +360,21 @@ sub _attach_control_vlan {
 
     # Let the listener's v6 'auto' enumerate the control-prefix address.
     $self->{config}{cluster}{control_prefix} = $prefix;
+}
+
+# Bring the HE 6in4 uplink (he_net) up at startup if [he_net] mode=on. The
+# OBSERVE handler (_obs_he_net) drives it on demand regardless of mode.
+sub _he_net_startup {
+    my ($self) = @_;
+    my $hc = $self->{config}{he_net} || {};
+    return unless lc($hc->{mode} // 'off') eq 'on';
+    my (undef, $err) = NetMgr::Tunnel::up(
+        name => $hc->{name}, server => $hc->{server}, prefix => $hc->{prefix},
+        local_suffix => $hc->{local_suffix}, forwarding => $hc->{forwarding},
+        ext_if => ($hc->{ext_if} || undef),
+        log  => sub { $self->_log($_[0]) },
+    );
+    $self->_log("he_net: startup bring-up failed: $err") if $err;
 }
 
 # The dmz subnet's network address (e.g. 192.168.15.0), for deriving the
@@ -2973,6 +2990,36 @@ sub _obs_ap_exclude {
     return ();
 }
 
+# OBSERVE kind=he_net action=up|down — bring the HE 6in4 uplink up or down on
+# demand. Params come from [he_net], overridable per-call (server=, prefix=,
+# local_suffix=, name=, ext_if=, forwarding=). Full-scope auth required — it
+# runs `ip tunnel`/`sysctl` as root. Lets an operator establish the IPv6 uplink
+# on a gateway over the mesh with no ssh.
+sub _obs_he_net {
+    my ($self, $cli, $kv) = @_;
+    $self->_auth_is_full($cli)
+        or die "he_net: full-scope auth required\n";
+    my $hc = $self->{config}{he_net} || {};
+    my $action = $kv->{action} // 'up';
+    if ($action eq 'down') {
+        NetMgr::Tunnel::down(name => $kv->{name} // $hc->{name},
+                             log => sub { $self->_log($_[0]) });
+        return ();
+    }
+    my ($addr, $err) = NetMgr::Tunnel::up(
+        name         => $kv->{name}         // $hc->{name},
+        server       => $kv->{server}       // $hc->{server},
+        prefix       => $kv->{prefix}       // $hc->{prefix},
+        local_suffix => $kv->{local_suffix} // $hc->{local_suffix} // '2',
+        forwarding   => (defined $kv->{forwarding} ? $kv->{forwarding} : $hc->{forwarding}),
+        ext_if       => (($kv->{ext_if} // $hc->{ext_if}) || undef),
+        log          => sub { $self->_log($_[0]) },
+    );
+    die "he_net: $err\n" if $err;
+    $self->_log("he_net: up via OBSERVE — local6=$addr");
+    return ();
+}
+
 # ---- OBSERVE dispatch ------------------------------------------------
 
 sub _handle_observe {
@@ -3015,6 +3062,7 @@ sub _handle_observe {
         elsif ($kind eq 'ap_exclude')  { @events = $self->_obs_ap_exclude($cli, $kv) }
         elsif ($kind eq 'regen_dnsmasq'){ @events = $self->_obs_regen_dnsmasq($cli, $kv) }
         elsif ($kind eq 'self_update') { @events = $self->_obs_self_update($cli, $kv) }
+        elsif ($kind eq 'he_net')      { @events = $self->_obs_he_net($cli, $kv) }
         else {
             die "unknown observation kind '$kind'\n";
         }

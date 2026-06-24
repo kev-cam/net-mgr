@@ -113,6 +113,20 @@ my %DEFAULTS = (
         control_addr      => 'ipv4',
         control_attach    => 'on',
     },
+    # he_net: the Hurricane Electric 6in4 IPv6 uplink (NetMgr::Tunnel) — a
+    # re-implementation of the legacy /usr/local/bin/he-ipv6. mode=on brings it
+    # up at startup; either way `OBSERVE kind=he_net action=up|down` drives it on
+    # demand over the mesh. server=HE remote IPv4, prefix=routed /64, this end =
+    # prefix::local_suffix. MINIMAL: failover / ddns / firewall glue deferred.
+    he_net => {
+        mode         => 'off',         # off | on (bring up at startup)
+        name         => 'he-ipv6',
+        server       => '',            # HE tunnel-server IPv4 (e.g. 216.66.88.98)
+        prefix       => '',            # routed /64 (e.g. 2001:470:1f1c:d10::/64)
+        local_suffix => '2',           # this end's host part (GW=2 in he-ipv6)
+        forwarding   => 1,             # enable IPv6 forwarding (it routes)
+        ext_if       => '',            # external iface (blank = default-route auto)
+    },
     # Named net-mgr daemons client tools can connect to. Each key is a short
     # name mapped to host[:port]; the special key 'default' names the preferred
     # entry. Usually set in the per-user file (~/.config/net-mgr/config) and
@@ -283,6 +297,7 @@ my %ACTIVE = (
     uplinks    => '*',                        # consumed by net-uplink-probe
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
     dnsmasq    => [qw(mode out_dir push_aps gateways)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
+    he_net     => [qw(mode name server prefix local_suffix forwarding ext_if)], # HE 6in4 uplink (NetMgr::Tunnel)
     forward    => [qw(method allow_peers)],   # net-connect FORWARD backend
     servers    => '*',                        # client server list (see servers())
     chat       => [qw(archive_dir)],          # net-chat archive location
