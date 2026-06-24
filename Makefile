@@ -40,7 +40,7 @@ MAN1S = net-alias.1 net-chat.1 net-connect.1 net-diag.1 net-discover.1 net-fix.1
         net-poll-ap.1 net-report.1 net-reserve.1 net-roam.1 net-router.1 net-scan.1 \
         net-show.1 net-tp-scan.1 net-var.1 net-watch.1
 MAN7S = net-mgr.7
-LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Addr.pm NetMgr/Config.pm NetMgr/DB.pm \
+LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Addr.pm NetMgr/Vlan.pm NetMgr/Config.pm NetMgr/DB.pm \
         NetMgr/Manager.pm NetMgr/Client.pm NetMgr/Multi.pm NetMgr/Mesh.pm \
         NetMgr/Election.pm NetMgr/AutoDiscover.pm NetMgr/Resolver.pm \
         NetMgr/Relay.pm NetMgr/Vendor.pm NetMgr/Subnets.pm \

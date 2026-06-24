@@ -98,6 +98,19 @@ my %DEFAULTS = (
         push_aps => 0,
         gateways => '',    # space/comma list of DHCP gateways for net-import-dnsmasq --auto
     },
+    # Control-VLAN attachment. By default every node joins the "network_management"
+    # control VLAN (net-mgr creates the 802.1Q sub-interface and addresses it) so
+    # the cluster control plane rides a dedicated IPv6 segment. control_attach=off
+    # opts a node out. control_vlan_id MUST match the switch trunk and so has no
+    # safe default — without it net-mgr logs and skips (won't mis-tag traffic).
+    # control_prefix defaults to a ULA derived from the dmz subnet (192.168.15 ->
+    # fdc0:a80f::/64). control_addr: slaac (default, address from an RA source) |
+    # eui64 (self-assign prefix+MAC) | a static address.
+    cluster => {
+        control_vlan_name => 'network_management',
+        control_addr      => 'slaac',
+        control_attach    => 'on',
+    },
     # Named net-mgr daemons client tools can connect to. Each key is a short
     # name mapped to host[:port]; the special key 'default' names the preferred
     # entry. Usually set in the per-user file (~/.config/net-mgr/config) and
@@ -255,8 +268,12 @@ my %ACTIVE = (
     bindings   => '*',                        # parsed for future use
     peers      => '*',                        # consumed by net-mgr-relay
     cluster    => [qw(members role priority prefer_lan internet_facing
-                       election_interval proxy_listen control_prefix)],  # cluster role / election
+                       election_interval proxy_listen control_prefix
+                       control_vlan_name control_vlan_id control_addr
+                       control_attach)],      # cluster role / election
                                               # control_prefix: ULA CIDR scoping
+                                              # control_vlan_*/control_addr/attach:
+                                              # network_management VLAN (NetMgr::Vlan)
                                               # which v6 'auto' binds for the
                                               # control plane (IPV6-TRANSPORT-SPEC.md)
                                               # proxy_listen: net-mgr-relay's

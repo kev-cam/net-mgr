@@ -17,6 +17,7 @@ use Carp qw(croak);
 use IO::Socket::INET;
 use IO::Socket::IP;     # IPv6-capable listener (control plane); INET kept for dnsmasq event listeners
 use NetMgr::Addr qw(split_hostport join_hostport local_addrs);
+use NetMgr::Vlan ();
 use IO::Select;
 use Time::HiRes qw(time);
 use FindBin ();
@@ -254,6 +255,9 @@ sub _self_connect_addr {
 
 sub start_listener {
     my ($self) = @_;
+    # Join the control VLAN first so its address exists before the v6 'auto'
+    # enumeration below picks it up (sets control_prefix as a side effect).
+    $self->_attach_control_vlan;
     my $spec = $self->{config}{manager}{listen} || 'auto';
     my @binds = _resolve_listen_spec($spec, $self->{config}{cluster}{control_prefix});
     croak "no listen addresses resolved from '$spec'" unless @binds;
@@ -283,6 +287,67 @@ sub start_listener {
     croak "no listeners could be bound from '$spec'" unless %{ $self->{listeners} };
     $self->_start_mesh;
     return [ map { $_->{sock} } values %{ $self->{listeners} } ];
+}
+
+# Attach this node to the "network_management" control VLAN: create the 802.1Q
+# sub-interface and address it (NetMgr::Vlan). On by default; [cluster]
+# control_attach=off opts out. control_prefix defaults to a ULA derived from the
+# dmz subnet. Requires control_vlan_id (must match the switch trunk) — without it
+# we log and skip rather than create a mis-tagged interface. Sets control_prefix
+# so the listener's v6 'auto' binds the new address.
+sub _attach_control_vlan {
+    my ($self) = @_;
+    my $cs = $self->{config}{cluster} || {};
+    my $attach = lc($cs->{control_attach} // 'on');
+    return if $attach =~ /^(off|no|0|false|disabled)$/;
+
+    my $prefix = $cs->{control_prefix};
+    unless ($prefix) {
+        my $net = $self->_dmz_subnet_net;
+        $prefix = NetMgr::Vlan::derive_prefix($net) if $net;
+    }
+    my $vname = $cs->{control_vlan_name} // 'network_management';
+    unless ($prefix) {
+        $self->_log("control-vlan: no control_prefix and no dmz subnet to derive one; skipping $vname attach");
+        return;
+    }
+
+    my $id = $cs->{control_vlan_id};
+    unless (defined $id && $id ne '' && $id =~ /^\d+$/) {
+        $self->_log("control-vlan: control_vlan_id not set; not creating the '$vname' VLAN (the 802.1Q tag must match your switches). Set [cluster] control_vlan_id.");
+        return;
+    }
+
+    my $parent = NetMgr::Vlan::parent_for_subnet();
+    unless ($parent) {
+        $self->_log("control-vlan: no parent interface (no 192.168.* address found); skipping $vname attach");
+        return;
+    }
+
+    my ($ifname, $addr, $err) = NetMgr::Vlan::attach(
+        parent => $parent,
+        id     => $id,
+        prefix => $prefix,
+        name   => $vname,
+        addr   => $cs->{control_addr} // 'slaac',
+        log    => sub { $self->_log($_[0]) },
+    );
+    $self->_log("control-vlan: $err") if $err;
+
+    # Let the listener's v6 'auto' enumerate the control-prefix address.
+    $self->{config}{cluster}{control_prefix} = $prefix;
+}
+
+# The dmz subnet's network address (e.g. 192.168.15.0), for deriving the
+# default control prefix. Returns undef if no dmz subnet is known.
+sub _dmz_subnet_net {
+    my ($self) = @_;
+    require NetMgr::Subnets;
+    for my $s (NetMgr::Subnets::all()) {
+        return $s->{net}
+            if (($s->{zone} // '') eq 'dmz') || (($s->{name} // '') =~ /^dmz$/i);
+    }
+    return undef;
 }
 
 # Bring up the cluster mesh — one persistent outbound TCP connection
