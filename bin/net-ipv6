@@ -1,0 +1,82 @@
+#!/usr/bin/perl
+# net-ipv6 — operate + debug the Hurricane Electric 6in4 uplink (he_net) on a
+# gateway: start / stop / status. Drives NetMgr::Tunnel directly (standalone of
+# the daemon — works even if it's wedged); params default to [he_net] in
+# /etc/net-mgr/config, overridable on the CLI. Run as root (it runs `ip tunnel`).
+#
+# Usage:
+#   net-ipv6 status                       interface + addr + route + ping checks
+#   net-ipv6 start [--server IP] [--prefix CIDR] [--local-suffix N]
+#                  [--ext-if IF] [--no-forward]
+#   net-ipv6 stop
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use NetMgr::Config;
+use NetMgr::Tunnel;
+use Getopt::Long;
+
+my %opt;
+GetOptions(\%opt, 'server=s', 'prefix=s', 'name=s', 'local-suffix=s',
+                  'ext-if=s', 'no-forward', 'help') or usage();
+usage() if $opt{help};
+my $cmd = shift @ARGV // 'status';
+
+my $cfg = eval { NetMgr::Config->load } || {};
+my $hc  = $cfg->{he_net} || {};
+my $name   = $opt{name}           // $hc->{name}   // 'he-ipv6';
+my $server = $opt{server}         // $hc->{server};
+my $prefix = $opt{prefix}         // $hc->{prefix};
+my $suffix = $opt{'local-suffix'} // $hc->{local_suffix} // '2';
+
+if ($cmd eq 'start') {
+    my ($addr, $err) = NetMgr::Tunnel::up(
+        name => $name, server => $server, prefix => $prefix, local_suffix => $suffix,
+        forwarding => ($opt{'no-forward'} ? 0 : ($hc->{forwarding} // 1)),
+        ext_if => ($opt{'ext-if'} // $hc->{ext_if} || undef),
+        log => sub { print "  $_[0]\n" },
+    );
+    die "net-ipv6: start failed: $err\n" if $err;
+    print "net-ipv6: $name up — local6=$addr\n\n";
+    status($name, $prefix);
+} elsif ($cmd eq 'stop') {
+    NetMgr::Tunnel::down(name => $name, log => sub { print "  $_[0]\n" });
+    print "net-ipv6: $name down\n";
+} elsif ($cmd eq 'status') {
+    status($name, $prefix);
+} else {
+    usage();
+}
+
+sub status {
+    my ($name, $prefix) = @_;
+    chomp(my $link = `ip -o link show $name 2>/dev/null`);
+    unless ($link) { print "tunnel $name: DOWN (no interface)\n"; exit 1 }
+    print "tunnel $name: UP\n";
+    chomp(my $sit = `ip -d link show $name 2>/dev/null | grep -oE 'link/sit [0-9.]+ peer [0-9.]+'`);
+    print "  endpoint:   $sit\n" if $sit;
+    my @a = (`ip -6 -o addr show dev $name scope global 2>/dev/null`) =~ /inet6 (\S+)/g;
+    print "  address:    @a\n";
+    chomp(my $route = `ip -6 route show default 2>/dev/null`);
+    print "  v6 default: $route\n";
+    if ($prefix) {
+        my $peer = NetMgr::Tunnel::tunnel_addr($prefix, '1');     # HE end (::1)
+        print "  peer $peer: ", (ping6($peer) ? "reachable" : "NO reply"), "\n";
+    }
+    my $pub = '2606:4700:4700::1111';                             # Cloudflare v6
+    print "  internet ($pub): ", (ping6($pub) ? "reachable" : "NO reply"), "\n";
+}
+
+sub ping6 { my ($a) = @_; return system("ping -6 -c1 -W2 $a >/dev/null 2>&1") == 0 }
+
+sub usage {
+    print STDERR <<'USAGE';
+net-ipv6 — operate/debug the Hurricane Electric 6in4 uplink (he_net)
+  net-ipv6 status
+  net-ipv6 start [--server IP] [--prefix CIDR] [--local-suffix N] [--ext-if IF] [--no-forward]
+  net-ipv6 stop
+Params default to [he_net] in /etc/net-mgr/config.
+USAGE
+    exit 1;
+}

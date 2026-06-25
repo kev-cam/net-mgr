@@ -1,0 +1,77 @@
+#!/usr/bin/perl
+# net-ddns — exercise + inspect the WAN-IP-change DDNS hooks (NetMgr::Ddns), the
+# same mechanism the daemon runs periodically. Reads [ddns] from the config.
+#
+# Usage:
+#   net-ddns status            current WAN IP, last-seen, configured dir, hooks
+#   net-ddns list              list the hook scripts (full paths)
+#   net-ddns check             run the real check — fires hooks iff the IP changed
+#   net-ddns run [--ip IP]     force-run every hook with the current (or given) IP
+#
+# `run` is the way to test a hook without waiting for a real IP change; `check`
+# confirms the live detect-and-fire path the daemon uses.
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use NetMgr::Config;
+use NetMgr::Ddns;
+use NetMgr::Tunnel;
+use Getopt::Long;
+
+my %opt;
+GetOptions(\%opt, 'ip=s', 'old=s', 'dir=s', 'help') or usage();
+usage() if $opt{help};
+my $cmd = shift @ARGV // 'status';
+
+my $cfg = eval { NetMgr::Config->load } || {};
+my $dc  = $cfg->{ddns} || {};
+my $dir = $opt{dir} // $dc->{dir} // '/etc/net-mgr/ddns';
+my $sf  = $dc->{statefile} // '/var/lib/net-mgr/wan-ip';
+my $ext = $dc->{ext_if} || undef;
+
+if ($cmd eq 'status') {
+    my ($iface, $ip) = NetMgr::Tunnel::external_ipv4($ext);
+    print "ddns dir:    $dir\n";
+    print "wan iface:   ", ($iface // '?'), "\n";
+    print "current IP:  ", ($ip // '(none)'), "\n";
+    print "last-seen:   ", (read_state($sf) // '(none)'), "\n";
+    my @h = map { (my $b = $_) =~ s{.*/}{}; $b } NetMgr::Ddns::hooks($dir);
+    print "hooks:       ", (@h ? join(", ", @h) : '(none)'), "\n";
+} elsif ($cmd eq 'list') {
+    print "$_\n" for NetMgr::Ddns::hooks($dir);
+} elsif ($cmd eq 'check') {
+    my ($changed, $ip) = NetMgr::Ddns::check(
+        dir => $dir, statefile => $sf, ext_if => $ext,
+        log => sub { print "  $_[0]\n" });
+    print "result: ", ($changed ? "CHANGED — hooks ran" : "no change"),
+          " (ip=", ($ip // '?'), ")\n";
+} elsif ($cmd eq 'run') {
+    my ($iface, $ip0) = NetMgr::Tunnel::external_ipv4($ext);
+    my $ip = $opt{ip} // $ip0;
+    die "net-ddns: no current WAN IP; pass --ip\n" unless defined $ip;
+    my $n = NetMgr::Ddns::run_hooks(
+        dir => $dir, new => $ip, old => $opt{old}, iface => $iface,
+        log => sub { print "  $_[0]\n" });
+    print "ran $n hook(s) with new=$ip\n";
+} else {
+    usage();
+}
+
+sub read_state {
+    my ($f) = @_;
+    open my $fh, '<', $f or return undef;
+    chomp(my $v = <$fh> // ''); close $fh;
+    return length $v ? $v : undef;
+}
+
+sub usage {
+    print STDERR <<'USAGE';
+net-ddns — exercise/inspect the WAN-IP-change DDNS hooks
+  net-ddns status            current WAN IP, last-seen, hooks
+  net-ddns list              list hook scripts
+  net-ddns check             run the real check (fires hooks iff IP changed)
+  net-ddns run [--ip IP]     force-run every hook with the current (or given) IP
+USAGE
+    exit 1;
+}
