@@ -90,6 +90,15 @@ sub new {
             signers_path    => '/etc/net-mgr/allowed_updaters',
             authorized_keys => undef,
         ),
+        # he_net (internet-uplink) authorization: a dedicated allowlist of keys
+        # permitted to drive `he_net` (bring the HE 6in4 tunnel up/down) over the
+        # mesh. Same model as allowed_updaters — a key here can AUTH (Tier 4) and
+        # is flagged may_internet; loopback/local root is exempt. Lets an operator
+        # manage a gateway's uplink without full scope or ssh.
+        internet_auth_state => NetMgr::Auth::new_state(
+            signers_path    => '/etc/net-mgr/allowed_internet',
+            authorized_keys => undef,
+        ),
         version => _read_version(),
         cluster => _load_cluster_state($args{config}),
     }, $class;
@@ -1531,6 +1540,12 @@ sub _handle_auth_response {
         if ($uok) { $ok = 1; $scope = 'update'; }
         else      { $err = $uerr // $err; }
     }
+    if (!$ok) {
+        my ($iok, $ierr) = NetMgr::Auth::verify(
+            $self->{internet_auth_state}, $auth->{key_id}, $auth->{nonce}, $sig);
+        if ($iok) { $ok = 1; $scope = 'internet'; }
+        else      { $err = $ierr // $err; }
+    }
     # Always invalidate the nonce — one-shot regardless of outcome.
     delete $auth->{nonce};
     if (!$ok) {
@@ -1538,13 +1553,14 @@ sub _handle_auth_response {
         $self->_log("auth FAIL $cli->{peer} key-id=$auth->{key_id}: $err");
         return $self->_send($cli, format_err("AUTH failed: $err"));
     }
-    # may_update is orthogonal to scope: a full-scope operator key listed in
-    # allowed_updaters also gets it.
-    my $may_update = $self->_is_allowed_updater($auth->{key_id});
-    $cli->{auth} = { key_id => $auth->{key_id}, verified => 1,
-                     scope => $scope, may_update => $may_update };
+    # may_* capabilities are orthogonal to scope: a full-scope operator key
+    # listed in allowed_updaters/allowed_internet also gets them.
+    my $may_update   = $self->_is_allowed_updater($auth->{key_id});
+    my $may_internet = $self->_is_allowed_internet($auth->{key_id});
+    $cli->{auth} = { key_id => $auth->{key_id}, verified => 1, scope => $scope,
+                     may_update => $may_update, may_internet => $may_internet };
     $self->_log("auth OK $cli->{peer} key_id=$auth->{key_id} scope=$scope"
-              . ($may_update ? " +update" : ""));
+              . ($may_update ? " +update" : "") . ($may_internet ? " +internet" : ""));
     $self->_send($cli, format_ok(key_id => $auth->{key_id}, scope => $scope));
 }
 
@@ -1578,6 +1594,15 @@ sub _is_allowed_updater {
     return 0 unless defined $key_id && length $key_id;
     return scalar grep { $_ eq $key_id }
         NetMgr::Auth::principals('/etc/net-mgr/allowed_updaters');
+}
+
+# True if $key_id is named in /etc/net-mgr/allowed_internet — the allowlist of
+# keys permitted to drive the he_net uplink over the mesh.
+sub _is_allowed_internet {
+    my ($self, $key_id) = @_;
+    return 0 unless defined $key_id && length $key_id;
+    return scalar grep { $_ eq $key_id }
+        NetMgr::Auth::principals('/etc/net-mgr/allowed_internet');
 }
 
 sub _peer_is_loopback {
@@ -2992,13 +3017,17 @@ sub _obs_ap_exclude {
 
 # OBSERVE kind=he_net action=up|down — bring the HE 6in4 uplink up or down on
 # demand. Params come from [he_net], overridable per-call (server=, prefix=,
-# local_suffix=, name=, ext_if=, forwarding=). Full-scope auth required — it
-# runs `ip tunnel`/`sysctl` as root. Lets an operator establish the IPv6 uplink
-# on a gateway over the mesh with no ssh.
+# local_suffix=, name=, ext_if=, forwarding=). Gated on /etc/net-mgr/
+# allowed_internet (may_internet) — it runs `ip tunnel`/`sysctl` as root. Lets an
+# operator establish the IPv6 uplink on a gateway over the mesh with no ssh, with
+# a narrow per-capability grant (no full scope needed).
 sub _obs_he_net {
     my ($self, $cli, $kv) = @_;
-    $self->_auth_is_full($cli)
-        or die "he_net: full-scope auth required\n";
+    # Gated on the dedicated allowed_internet capability (or loopback/local
+    # root). Full scope is not required — this is a narrow, per-capability grant.
+    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_internet})) {
+        die "he_net: not authorized (add the key to /etc/net-mgr/allowed_internet)\n";
+    }
     my $hc = $self->{config}{he_net} || {};
     my $action = $kv->{action} // 'up';
     if ($action eq 'down') {
