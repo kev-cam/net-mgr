@@ -100,6 +100,16 @@ sub new {
             signers_path    => '/etc/net-mgr/allowed_internet',
             authorized_keys => undef,
         ),
+        # debug/query authorization: a dedicated allowlist of keys permitted to
+        # run POLL (read-only state probes — ipv6/ifaces/routes/fw_state) over the
+        # mesh. Same model as above — a key here can AUTH (Tier 5) and is flagged
+        # may_debug; loopback/local root is exempt. This allowlist only RESTRICTS
+        # when it exists AND [debug] enabled is on; absent file = POLL is open
+        # (back-compat), [debug] enabled=off = POLL is refused for everyone.
+        debug_auth_state => NetMgr::Auth::new_state(
+            signers_path    => '/etc/net-mgr/allowed_debug',
+            authorized_keys => undef,
+        ),
         version => _read_version(),
         cluster => _load_cluster_state($args{config}),
     }, $class;
@@ -1699,6 +1709,12 @@ sub _handle_auth_response {
         if ($iok) { $ok = 1; $scope = 'internet'; }
         else      { $err = $ierr // $err; }
     }
+    if (!$ok) {
+        my ($dok, $derr) = NetMgr::Auth::verify(
+            $self->{debug_auth_state}, $auth->{key_id}, $auth->{nonce}, $sig);
+        if ($dok) { $ok = 1; $scope = 'debug'; }
+        else      { $err = $derr // $err; }
+    }
     # Always invalidate the nonce — one-shot regardless of outcome.
     delete $auth->{nonce};
     if (!$ok) {
@@ -1710,10 +1726,13 @@ sub _handle_auth_response {
     # listed in allowed_updaters/allowed_internet also gets them.
     my $may_update   = $self->_is_allowed_updater($auth->{key_id});
     my $may_internet = $self->_is_allowed_internet($auth->{key_id});
+    my $may_debug    = $self->_is_allowed_debug($auth->{key_id});
     $cli->{auth} = { key_id => $auth->{key_id}, verified => 1, scope => $scope,
-                     may_update => $may_update, may_internet => $may_internet };
+                     may_update => $may_update, may_internet => $may_internet,
+                     may_debug => $may_debug };
     $self->_log("auth OK $cli->{peer} key_id=$auth->{key_id} scope=$scope"
-              . ($may_update ? " +update" : "") . ($may_internet ? " +internet" : ""));
+              . ($may_update ? " +update" : "") . ($may_internet ? " +internet" : "")
+              . ($may_debug ? " +debug" : ""));
     $self->_send($cli, format_ok(key_id => $auth->{key_id}, scope => $scope));
 }
 
@@ -1756,6 +1775,16 @@ sub _is_allowed_internet {
     return 0 unless defined $key_id && length $key_id;
     return scalar grep { $_ eq $key_id }
         NetMgr::Auth::principals('/etc/net-mgr/allowed_internet');
+}
+
+# True if $key_id is named in /etc/net-mgr/allowed_debug — the allowlist of keys
+# permitted to run POLL probes over the mesh when [debug] enabled is on and the
+# allowlist exists (an empty/absent allowlist leaves POLL open, per _handle_poll).
+sub _is_allowed_debug {
+    my ($self, $key_id) = @_;
+    return 0 unless defined $key_id && length $key_id;
+    return scalar grep { $_ eq $key_id }
+        NetMgr::Auth::principals('/etc/net-mgr/allowed_debug');
 }
 
 sub _peer_is_loopback {
@@ -2429,6 +2458,22 @@ SH
         require NetMgr::HostDebug;
         return NetMgr::HostDebug::format_report();
     },
+    # IPv6 state — for debugging the ipv6_vlan model (control VLAN, he6in4 tunnel,
+    # relay) on a node you can't ssh to.
+    ipv6 => <<'SH',
+echo "=== global v6 addresses (which iface has what) ==="
+ip -6 -br addr show 2>/dev/null | grep -vE "^lo " | grep -iE "2[0-9a-f:]+|fd[0-9a-f:]+" || ip -6 addr show scope global 2>/dev/null
+echo "=== default v6 route(s) ==="
+ip -6 route show default 2>/dev/null
+echo "=== sit tunnels (he6in4) ==="
+ip -d link show type sit 2>/dev/null | grep -E ":|link/sit"
+echo "=== forwarding ==="
+sysctl net.ipv6.conf.all.forwarding 2>/dev/null
+echo "=== v6 neighbors ==="
+ip -6 neigh show 2>/dev/null | grep -vi fe80 | head -10
+SH
+    ifaces => 'ip -br addr show 2>/dev/null',
+    routes => 'echo "== v4 =="; ip -4 route show 2>/dev/null; echo "== v6 =="; ip -6 route show 2>/dev/null',
 );
 
 # Coderef POLLs that need access to the daemon object (for in-memory
@@ -2449,6 +2494,20 @@ my %POLL_METHODS = (
 
 sub _handle_poll {
     my ($self, $cli, $cmd) = @_;
+    # Debug/query gate. [debug] enabled (default on) is the master switch; turn it
+    # off to refuse all POLL. When /etc/net-mgr/allowed_debug exists, restrict POLL
+    # to loopback or keys flagged may_debug; with no allowlist POLL stays open
+    # (read-only probes, same trust boundary as TRIGGER — back-compat).
+    my $en = lc($self->{config}{debug}{enabled} // 'on');
+    if ($en =~ /^(off|no|0|false|disabled)$/) {
+        return $self->_send($cli, format_err("POLL disabled ([debug] enabled=off)"));
+    }
+    if (NetMgr::Auth::principals('/etc/net-mgr/allowed_debug')) {
+        unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_debug})) {
+            return $self->_send($cli,
+                format_err("POLL: not authorized (add the key to /etc/net-mgr/allowed_debug)"));
+        }
+    }
     my $name = $cmd->{name} // '';
     my $method = $POLL_METHODS{$name};
     my $handler = $POLL_SCRIPTS{$name};

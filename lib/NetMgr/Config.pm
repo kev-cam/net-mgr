@@ -138,6 +138,13 @@ my %DEFAULTS = (
         interval  => 0,
         ext_if    => '',
     },
+    # debug: gates the POLL verb (read-only state probes — ipv6/ifaces/routes/
+    # fw_state — run over the mesh). enabled=on (default) allows POLL; off refuses
+    # it for everyone. Independently, /etc/net-mgr/allowed_debug (if present)
+    # restricts POLL to loopback or listed keys (may_debug); absent = open.
+    debug => {
+        enabled => 'on',
+    },
     # Named net-mgr daemons client tools can connect to. Each key is a short
     # name mapped to host[:port]; the special key 'default' names the preferred
     # entry. Usually set in the per-user file (~/.config/net-mgr/config) and
@@ -332,6 +339,7 @@ my %ACTIVE = (
     servers    => '*',                        # client server list (see servers())
     chat       => [qw(archive_dir)],          # net-chat archive location
     deploy     => [qw(hosts user sudo ssh_opts make_args)],  # make deploy targets
+    debug      => [qw(enabled)],              # gates POLL probes (NetMgr::Manager)
 );
 
 # Returns a list of "[section] key" strings for entries in $path that

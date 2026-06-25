@@ -108,6 +108,7 @@ elsif ($cmd eq 'observe')  { $rc = cmd_observe($multi) }
 elsif ($cmd eq 'update')   { unshift @ARGV, 'kind=self_update'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'deploy')   { unshift @ARGV, 'kind=self_update'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'regen')    { unshift @ARGV, 'kind=regen_dnsmasq'; $rc = cmd_observe($multi) }
+elsif ($cmd eq 'poll')     { $rc = cmd_poll($multi) }
 elsif ($cmd eq 'master')   { $rc = cmd_master($multi) }
 else { warn "net-cluster: unknown command '$cmd'\n"; usage(2) }
 
@@ -256,6 +257,42 @@ sub cmd_observe {
     return $any_err ? 1 : 0;
 }
 
+sub cmd_poll {
+    my ($m) = @_;
+    my $name = shift @ARGV
+        or do { warn "poll: need <probe> (ipv6, ifaces, routes, fw_state, ssh_forwards, host-debug)\n"; return 2 };
+    my (%out, $any_err);
+    for my $p ($m->peers) {
+        unless ($p->{client}) {
+            $out{$p->{name}} = { error => ($p->{error} // 'not connected') };
+            $any_err = 1; next;
+        }
+        my $text = eval { $p->{client}->poll($name) };
+        if (!defined $text) {
+            my $e = $@; chomp $e if $e;
+            $e =~ s/ at \S+ line \d+\.?\s*$// if $e;   # drop croak location
+            $out{$p->{name}} = { error => ($e || 'no reply') };
+            $any_err = 1; next;
+        }
+        $out{$p->{name}} = { output => $text };
+    }
+    if ($json) {
+        require JSON::PP;
+        print JSON::PP->new->canonical(1)->pretty->encode(\%out);
+        return $any_err ? 1 : 0;
+    }
+    for my $p ($m->peers) {
+        my $r = $out{ $p->{name} } or next;
+        print "── $p->{name} ──\n";
+        if ($r->{error}) { print "  ERR $r->{error}\n"; next; }
+        my $text = $r->{output} // '';
+        $text =~ s/\n\z//;
+        if (length $text) { print "  ", join("\n  ", split /\n/, $text, -1), "\n" }
+        else              { print "  (no output)\n" }
+    }
+    return $any_err ? 1 : 0;
+}
+
 sub cmd_master {
     my ($m) = @_;
     my %kv = _parse_kv(@ARGV) or do { warn "master: need kind=… …\n"; return 2 };
@@ -310,6 +347,10 @@ Usage:
   net-cluster diff <table> [--key=col1,col2] [--ignore=col,col]
                            [--where=SQL] [--quiet-diff]
   net-cluster observe kind=K k=v ...    (fan out to every connected peer)
+  net-cluster poll <probe>              (read-only state from every peer;
+                                         probes: ipv6 ifaces routes fw_state
+                                         ssh_forwards host-debug — gated by
+                                         [debug] enabled + allowed_debug)
   net-cluster master  kind=K k=v ...    (send only to cluster master)
   net-cluster update                    (pull+reinstall+re-exec EVERY peer;
                                          needs [manager] repo + cross-node auth)
