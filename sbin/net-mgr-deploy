@@ -9,19 +9,24 @@
 # The checkout comes from $NET_MGR_REPO (the daemon passes [manager] repo). By
 # hand:  NET_MGR_REPO=/usr/local/src/net-mgr net-mgr-deploy
 #
-# Runs `make deploy` as the deploy user — defaults to the repo OWNER, override
-# with [deploy] user (passed as $NET_MGR_DEPLOY_USER) when the ssh deploy keys
-# belong to someone else (e.g. root). `make deploy` reads [deploy]
-# hosts/ssh_opts/sudo/make_args from the config and installs onto each host.
+# Runs `make deploy` as ROOT — net-mgr's own user, which holds the gateway ssh
+# deploy keys (the git pull in net-mgr-self-update su's to the repo owner only
+# for git creds; the deploy itself doesn't need that). [deploy] user (passed as
+# $NET_MGR_DEPLOY_USER) overrides if the keys belong to a non-root user.
+# `make deploy` reads [deploy] hosts/ssh_opts/sudo/make_args and installs onto
+# each host.
 set -e
 
 repo=${NET_MGR_REPO:?set NET_MGR_REPO to the net-mgr checkout path}
 [ -d "$repo/.git" ] || { echo "net-mgr-deploy: $repo is not a git checkout" >&2; exit 2; }
 
-owner=$(stat -c %U "$repo")
-deploy_user=${NET_MGR_DEPLOY_USER:-$owner}
+deploy_user=${NET_MGR_DEPLOY_USER:-root}
 echo "net-mgr-deploy: repo=$repo user=$deploy_user — make deploy"
 
-su - "$deploy_user" -c "make -C '$repo' deploy"
+if [ "$deploy_user" = root ]; then
+    make -C "$repo" deploy
+else
+    su - "$deploy_user" -c "make -C '$repo' deploy"
+fi
 
 echo "net-mgr-deploy: done"
