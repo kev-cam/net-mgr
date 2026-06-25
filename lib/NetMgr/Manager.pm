@@ -319,7 +319,7 @@ sub start_listener {
 sub _attach_ipv6_vlans {
     my ($self) = @_;
     my $nets = $self->_ipv6_vlan_networks;
-    for my $name (sort keys %$nets) {
+    for my $name ($self->_ipv6_vlan_order($nets)) {
         my $e = $nets->{$name};
         my $type = lc($e->{type} // 'he6in4');
         if    ($type eq 'vlan')   { $self->_attach_vlan_network($name, $e) }
@@ -355,6 +355,18 @@ sub _ipv6_vlan_networks {
         $nets{$name} = { type => $type, %defs, %$e };
     }
     return \%nets;
+}
+
+# Network names in attach order: vlan (control plane) first, then he6in4, then
+# relay (which rides the control VLAN, so it must come after it). Ties broken by
+# name for determinism.
+sub _ipv6_vlan_order {
+    my ($self, $nets) = @_;
+    my %pri = (vlan => 0, he6in4 => 1, relay => 2);
+    return sort {
+        (($pri{ lc($nets->{$a}{type} // 'he6in4') } // 9)
+         <=> ($pri{ lc($nets->{$b}{type} // 'he6in4') } // 9)) || $a cmp $b
+    } keys %$nets;
 }
 
 # Attach a type=vlan IPv6 network (the control plane) — create the 802.1Q
@@ -497,7 +509,7 @@ sub _attach_relay_network {
 sub _check_ipv6_vlans {
     my ($self) = @_;
     my $nets = $self->_ipv6_vlan_networks;
-    for my $name (sort keys %$nets) {
+    for my $name ($self->_ipv6_vlan_order($nets)) {
         my $e = $nets->{$name};
         my $type = lc($e->{type} // 'he6in4');
         # relay has no single interface to test — its attach is idempotent, so
