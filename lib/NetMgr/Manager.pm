@@ -463,10 +463,14 @@ sub _attach_relay_network {
     my $nets   = $self->_ipv6_vlan_networks;
     my $nm     = $nets->{network_management} || {};
     my $parent = NetMgr::Vlan::parent_for_subnet();
-    my $ctrl_if = ($parent && defined $nm->{id} && $nm->{id} =~ /^\d+$/)
+    my $vlan_if = ($parent && defined $nm->{id} && $nm->{id} =~ /^\d+$/)
                 ? "$parent.$nm->{id}" : undef;
-    unless ($ctrl_if && `ip -o link show $ctrl_if 2>/dev/null`) {
-        $self->_log("ipv6_vlan '$name' (relay): control VLAN not attached; skipping");
+    # Ride the control VLAN if it's attached; otherwise the parent LAN interface
+    # — the uplink (gateway3) is reachable there too (same .15 segment).
+    my $ctrl_if = ($vlan_if && `ip -o link show $vlan_if 2>/dev/null`)
+                ? $vlan_if : $parent;
+    unless ($ctrl_if) {
+        $self->_log("ipv6_vlan '$name' (relay): no interface to ride (no control VLAN, no LAN parent); skipping");
         return;
     }
     # This node's DMZ IPv4(s) — dmz /24 recovered from the control prefix.
