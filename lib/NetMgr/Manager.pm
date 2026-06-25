@@ -19,6 +19,7 @@ use IO::Socket::IP;     # IPv6-capable listener (control plane); INET kept for d
 use NetMgr::Addr qw(split_hostport join_hostport local_addrs);
 use NetMgr::Vlan ();
 use NetMgr::Tunnel ();
+use NetMgr::Ddns ();
 use IO::Select;
 use Time::HiRes qw(time);
 use FindBin ();
@@ -384,6 +385,19 @@ sub _he_net_startup {
         log  => sub { $self->_log($_[0]) },
     );
     $self->_log("he_net: startup bring-up failed: $err") if $err;
+}
+
+# Periodic DDNS check: if the WAN IP changed, run the /etc/net-mgr/ddns hooks
+# (NetMgr::Ddns). Fired by _check_periodic_triggers at the [ddns] interval.
+sub _check_ddns {
+    my ($self) = @_;
+    my $dc = $self->{config}{ddns} || {};
+    NetMgr::Ddns::check(
+        dir       => $dc->{dir}       || '/etc/net-mgr/ddns',
+        statefile => $dc->{statefile} || '/var/lib/net-mgr/wan-ip',
+        ext_if    => ($dc->{ext_if} || undef),
+        log       => sub { $self->_log($_[0]) },
+    );
 }
 
 # The dmz subnet's network address (e.g. 192.168.15.0), for deriving the
@@ -1933,8 +1947,16 @@ sub _check_periodic_triggers {
     my $now   = time();
     $self->{periodic_last} //= {};
 
-    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq)) {
+    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq ddns)) {
         my $interval = $sched->{$name} // 0;
+        # ddns: watch the WAN IP and run /etc/net-mgr/ddns hooks on change. Cadence
+        # from [ddns] interval; auto-enable at 120s when that dir has hooks, so
+        # dropping a script in activates it without extra config.
+        if ($name eq 'ddns') {
+            $interval = $self->{config}{ddns}{interval} // 0;
+            $interval ||= 120 if NetMgr::Ddns::hooks($self->{config}{ddns}{dir}
+                                                     || '/etc/net-mgr/ddns');
+        }
         # find-peers powers cluster auto-discovery: default it to 5 min when this
         # node auto-discovers and the operator hasn't set a [scheduling] cadence,
         # so a fresh follower bootstraps the mesh without any extra config.
@@ -1961,6 +1983,7 @@ sub _check_periodic_triggers {
 sub _fire_periodic {
     my ($self, $name) = @_;
     if ($name eq 'push-dnsmasq') { $self->_sync_dnsmasq; return }
+    if ($name eq 'ddns')         { $self->_check_ddns;   return }
     my ($bin, @args);
     if ($name eq 'scan-ap') {
         my @ips = $self->_known_ap_ips;

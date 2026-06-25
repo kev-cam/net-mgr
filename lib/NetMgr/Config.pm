@@ -127,6 +127,17 @@ my %DEFAULTS = (
         forwarding   => 1,             # enable IPv6 forwarding (it routes)
         ext_if       => '',            # external iface (blank = default-route auto)
     },
+    # ddns: run hooks when the WAN (Internet) IPv4 changes (NetMgr::Ddns). Drop
+    # executables/symlinks in `dir` — they're run run-parts style with
+    # (new_ip old_ip iface) + NET_MGR_WAN_IP* env — to push the new address to a
+    # dynamic-DNS provider or re-point the he_net tunnel. interval 0 auto-enables
+    # to 120s when `dir` has hooks. ext_if blank = the default-route interface.
+    ddns => {
+        dir       => '/etc/net-mgr/ddns',
+        statefile => '/var/lib/net-mgr/wan-ip',
+        interval  => 0,
+        ext_if    => '',
+    },
     # Named net-mgr daemons client tools can connect to. Each key is a short
     # name mapped to host[:port]; the special key 'default' names the preferred
     # entry. Usually set in the per-user file (~/.config/net-mgr/config) and
@@ -157,6 +168,7 @@ my %DURATION_KEYS = (
     dns        => { ttl => 1 },
     scheduling => { 'scan-ap' => 1, presence => 1, discover => 1,
                     'find-peers' => 1, 'import-leases' => 1, 'push-dnsmasq' => 1 },
+    ddns       => { interval => 1 },
 );
 
 sub load {
@@ -298,6 +310,7 @@ my %ACTIVE = (
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
     dnsmasq    => [qw(mode out_dir push_aps gateways)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
     he_net     => [qw(mode name server prefix local_suffix forwarding ext_if)], # HE 6in4 uplink (NetMgr::Tunnel)
+    ddns       => [qw(dir statefile interval ext_if)], # WAN-IP-change hooks (NetMgr::Ddns)
     forward    => [qw(method allow_peers)],   # net-connect FORWARD backend
     servers    => '*',                        # client server list (see servers())
     chat       => [qw(archive_dir)],          # net-chat archive location
