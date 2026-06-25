@@ -3280,6 +3280,25 @@ sub _obs_he_net {
     return ();
 }
 
+# OBSERVE kind=relay action=up — set up a type=relay IPv6 network on demand (a
+# global address from the routed prefix on the control VLAN / LAN, and ::/0 via
+# the uplink unless this node IS the uplink). Params from kv: prefix (routed /64),
+# gateway (the uplink's DMZ IPv4), name. Gated on may_internet, like he_net —
+# lets an operator stand up the relay on a gateway/node over the mesh, no ssh.
+sub _obs_relay {
+    my ($self, $cli, $kv) = @_;
+    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_internet})) {
+        die "relay: not authorized (add the key to /etc/net-mgr/allowed_internet)\n";
+    }
+    my $name = $kv->{name} // 'he_net_relay';
+    $self->_attach_relay_network($name, {
+        type    => 'relay',
+        prefix  => $kv->{prefix},
+        gateway => $kv->{gateway},
+    });
+    return ();
+}
+
 # ---- OBSERVE dispatch ------------------------------------------------
 
 sub _handle_observe {
@@ -3324,6 +3343,7 @@ sub _handle_observe {
         elsif ($kind eq 'self_update') { @events = $self->_obs_self_update($cli, $kv) }
         elsif ($kind eq 'deploy')      { @events = $self->_obs_deploy($cli, $kv) }
         elsif ($kind eq 'he_net')      { @events = $self->_obs_he_net($cli, $kv) }
+        elsif ($kind eq 'relay')       { @events = $self->_obs_relay($cli, $kv) }
         else {
             die "unknown observation kind '$kind'\n";
         }
