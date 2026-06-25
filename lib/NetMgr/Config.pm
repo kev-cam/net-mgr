@@ -113,14 +113,18 @@ my %DEFAULTS = (
         control_addr      => 'ipv4',
         control_attach    => 'on',
     },
-    # he_net: the Hurricane Electric 6in4 IPv6 uplink (NetMgr::Tunnel) — a
-    # re-implementation of the legacy /usr/local/bin/he-ipv6. mode=on brings it
-    # up at startup; either way `OBSERVE kind=he_net action=up|down` drives it on
-    # demand over the mesh. server=HE remote IPv4, prefix=routed /64, this end =
-    # prefix::local_suffix. MINIMAL: failover / ddns / firewall glue deferred.
-    he_net => {
+    # ipv6_vlan: a net-mgr-managed IPv6 network. type=he6in4 is the Hurricane
+    # Electric 6in4 uplink (NetMgr::Tunnel), a re-implementation of the legacy
+    # /usr/local/bin/he-ipv6. `name` is the network + interface name (default
+    # he_net). mode=on brings it up at startup; either way
+    # `OBSERVE kind=he_net action=up|down` (gated on allowed_internet) drives it
+    # over the mesh. server=HE remote IPv4, prefix=routed /64, this end =
+    # prefix::local_suffix. MINIMAL: failover / firewall glue deferred; WAN-IP
+    # DDNS refresh lives in its own [ddns] section.
+    ipv6_vlan => {
+        name         => 'he_net',      # network + interface name
+        type         => 'he6in4',      # he6in4 = HE 6in4 SIT tunnel
         mode         => 'off',         # off | on (bring up at startup)
-        name         => 'he-ipv6',
         server       => '',            # HE tunnel-server IPv4 (e.g. 216.66.88.98)
         prefix       => '',            # routed /64 (e.g. 2001:470:1f1c:d10::/64)
         local_suffix => '2',           # this end's host part (GW=2 in he-ipv6)
@@ -309,7 +313,7 @@ my %ACTIVE = (
     uplinks    => '*',                        # consumed by net-uplink-probe
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
     dnsmasq    => [qw(mode out_dir push_aps gateways)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
-    he_net     => [qw(mode name server prefix local_suffix forwarding ext_if)], # HE 6in4 uplink (NetMgr::Tunnel)
+    ipv6_vlan  => [qw(name type mode server prefix local_suffix forwarding ext_if)], # managed IPv6 net (NetMgr::Tunnel)
     ddns       => [qw(dir statefile interval ext_if)], # WAN-IP-change hooks (NetMgr::Ddns)
     forward    => [qw(method allow_peers)],   # net-connect FORWARD backend
     servers    => '*',                        # client server list (see servers())

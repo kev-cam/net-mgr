@@ -278,7 +278,7 @@ sub start_listener {
     # Join the control VLAN first so its address exists before the v6 'auto'
     # enumeration below picks it up (sets control_prefix as a side effect).
     $self->_attach_control_vlan;
-    $self->_he_net_startup;     # HE 6in4 uplink if [he_net] mode=on
+    $self->_he_net_startup;     # he_net uplink if [ipv6_vlan] mode=on
     my $spec = $self->{config}{manager}{listen} || 'auto';
     my @binds = _resolve_listen_spec($spec, $self->{config}{cluster}{control_prefix});
     croak "no listen addresses resolved from '$spec'" unless @binds;
@@ -372,11 +372,11 @@ sub _attach_control_vlan {
     $self->{config}{cluster}{control_prefix} = $prefix;
 }
 
-# Bring the HE 6in4 uplink (he_net) up at startup if [he_net] mode=on. The
-# OBSERVE handler (_obs_he_net) drives it on demand regardless of mode.
+# Bring the he_net uplink up at startup if [ipv6_vlan] mode=on. The OBSERVE
+# handler (_obs_he_net) drives it on demand regardless of mode.
 sub _he_net_startup {
     my ($self) = @_;
-    my $hc = $self->{config}{he_net} || {};
+    my $hc = $self->{config}{ipv6_vlan} || {};
     return unless lc($hc->{mode} // 'off') eq 'on';
     my (undef, $err) = NetMgr::Tunnel::up(
         name => $hc->{name}, server => $hc->{server}, prefix => $hc->{prefix},
@@ -3079,7 +3079,7 @@ sub _obs_ap_exclude {
 }
 
 # OBSERVE kind=he_net action=up|down — bring the HE 6in4 uplink up or down on
-# demand. Params come from [he_net], overridable per-call (server=, prefix=,
+# demand. Params come from [ipv6_vlan], overridable per-call (server=, prefix=,
 # local_suffix=, name=, ext_if=, forwarding=). Gated on /etc/net-mgr/
 # allowed_internet (may_internet) — it runs `ip tunnel`/`sysctl` as root. Lets an
 # operator establish the IPv6 uplink on a gateway over the mesh with no ssh, with
@@ -3091,7 +3091,7 @@ sub _obs_he_net {
     unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_internet})) {
         die "he_net: not authorized (add the key to /etc/net-mgr/allowed_internet)\n";
     }
-    my $hc = $self->{config}{he_net} || {};
+    my $hc = $self->{config}{ipv6_vlan} || {};
     my $action = $kv->{action} // 'up';
     if ($action eq 'down') {
         NetMgr::Tunnel::down(name => $kv->{name} // $hc->{name},
