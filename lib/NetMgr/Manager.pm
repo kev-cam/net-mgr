@@ -2495,6 +2495,20 @@ my %POLL_METHODS = (
         }
         return join("\n", @lines) . "\n";
     },
+    # Recent daemon log — the tail of [manager] log, or journald if the daemon
+    # logs to stderr under systemd. Read-only window into what the daemon just
+    # did (ipv6_vlan attach decisions, election, errors) on a node you can't ssh
+    # to. Gated like every POLL probe (see _handle_poll).
+    'netmgr-log' => sub {
+        my ($self) = @_;
+        my $log = $self->{config}{manager}{log} || '/var/log/net-mgr.log';
+        if (-r $log) {
+            return "== tail -120 $log ==\n" . `tail -n 120 "$log" 2>/dev/null`;
+        }
+        my $unit = $self->{config}{manager}{unit} || 'net-mgr';
+        return "== journalctl -u $unit -n 120 ==\n"
+             . `journalctl -u "$unit" -n 120 --no-pager 2>/dev/null`;
+    },
 );
 
 sub _handle_poll {
