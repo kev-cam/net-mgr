@@ -274,7 +274,7 @@ sub _deep_copy {
 # Keep in sync with the grep:
 #   grep -rE '\$cfg->\{|config\}\{' lib bin sbin
 my %ACTIVE = (
-    manager    => [qw(listen log offline_after event_retention_days repo update_script)],
+    manager    => [qw(listen log offline_after event_retention_days repo update_script deploy_script)],
     mysql      => [qw(db defaults section)],
     scanner    => [qw(presence_interval
                        dnsmasq_event_port dnsmasq_event_check_interval)],

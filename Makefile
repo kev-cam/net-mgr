@@ -29,7 +29,7 @@ BINS  = net-alias net-chat net-poll-ap net-audit net-audit-aps net-cluster net-c
 # behavior from basename($0) so adding a new wrapper is a one-line
 # entry in net-run-app's %SPEC + a name here.
 RUN_APP_LINKS = net-ssh net-mosh net-sftp net-scp net-rsync net-vnc
-SBINS = net-mgr net-mgr-setup net-dns net-mgr-relay net-mgr-self-update
+SBINS = net-mgr net-mgr-setup net-dns net-mgr-relay net-mgr-self-update net-mgr-deploy
 # Recovery scripts live off PATH so net-find-lost can enumerate them
 # without polluting BINDIR. Each script must support --describe.
 RECOVERYS = net-recover-tlsg2424

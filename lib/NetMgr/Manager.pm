@@ -2146,6 +2146,46 @@ sub _obs_self_update {
     return ();   # OBSERVE OK now; the daemon re-execs when the child succeeds
 }
 
+# OBSERVE kind=deploy — push this checkout to the [deploy] hosts (`make deploy`),
+# for a deploy HUB (e.g. nas3) feeding leaf nodes that have no repo of their own
+# (the gateways). Runs the configured deploy script in a forked child so the run
+# loop keeps serving; _reap_triggers just logs the result (no re-exec — this node
+# isn't the one changing). Auth-gated on may_update, same as self_update.
+sub _obs_deploy {
+    my ($self, $cli, $kv) = @_;
+    my ($who) = $self->_chat_identity($cli, $kv);
+    die "deploy: not authorized\n" unless defined $who;
+    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_update})) {
+        die "deploy: '$who' is not an allowed updater "
+          . "(add the key to /etc/net-mgr/allowed_updaters)\n";
+    }
+    my $repo = $self->{config}{manager}{repo};
+    die "deploy: no repo configured (set [manager] repo = /path/to/checkout)\n"
+        unless defined $repo && length $repo;
+    $repo =~ m{^[\w./-]+$}
+        or die "deploy: refusing suspicious repo path '$repo'\n";
+    -d "$repo/.git" or die "deploy: '$repo' is not a git checkout\n";
+    my $script = $self->{config}{manager}{deploy_script}
+              // '/usr/local/sbin/net-mgr-deploy';
+    -x $script or die "deploy: deploy script '$script' is not executable\n";
+    die "deploy: already in progress\n"
+        if grep { $_->{name} eq 'deploy' } values %{ $self->{triggers} };
+
+    my $pid = fork();
+    die "deploy: fork failed: $!\n" unless defined $pid;
+    if ($pid == 0) {
+        for my $c (values %{ $self->{clients}   }) { close $c->{sock} if $c->{sock} }
+        for my $l (values %{ $self->{listeners} }) { close $l->{sock} if $l->{sock} }
+        $ENV{NET_MGR_REPO} = $repo;
+        { no warnings; exec $script; }
+        POSIX::_exit(127);
+    }
+    $self->{triggers}{$pid} = { name => 'deploy', started_at => time(),
+                                cli_fd => undef, who => $who };
+    $self->_log("deploy started pid=$pid by $who (make deploy, repo=$repo script=$script)");
+    return ();
+}
+
 # Re-exec the daemon into freshly installed code (after self_update). Relaunch
 # with the exact original argv via /proc/self/cmdline. Perl marks our sockets
 # close-on-exec, so the replacement process rebinds cleanly.
@@ -3091,6 +3131,7 @@ sub _handle_observe {
         elsif ($kind eq 'ap_exclude')  { @events = $self->_obs_ap_exclude($cli, $kv) }
         elsif ($kind eq 'regen_dnsmasq'){ @events = $self->_obs_regen_dnsmasq($cli, $kv) }
         elsif ($kind eq 'self_update') { @events = $self->_obs_self_update($cli, $kv) }
+        elsif ($kind eq 'deploy')      { @events = $self->_obs_deploy($cli, $kv) }
         elsif ($kind eq 'he_net')      { @events = $self->_obs_he_net($cli, $kv) }
         else {
             die "unknown observation kind '$kind'\n";

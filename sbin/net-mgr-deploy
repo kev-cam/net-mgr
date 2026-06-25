@@ -1,0 +1,25 @@
+#!/bin/sh
+# net-mgr-deploy — push the local net-mgr checkout to the [deploy] hosts.
+#
+# Run by the daemon (as root) on an authenticated `deploy` OBSERVE, or by hand.
+# Trigger over the mesh with: net-cluster --peers HUB --auth observe kind=deploy
+# Use on a deploy HUB (e.g. nas3) whose [deploy] hosts list the leaf nodes —
+# gateways that have no checkout of their own and so can't self_update.
+#
+# The checkout comes from $NET_MGR_REPO (the daemon passes [manager] repo). By
+# hand:  NET_MGR_REPO=/usr/local/src/net-mgr net-mgr-deploy
+#
+# Runs `make deploy` as the repo OWNER, who holds the ssh deploy keys +
+# known_hosts (root usually lacks them). `make deploy` reads [deploy]
+# hosts/ssh_opts/sudo/make_args from the config and installs onto each host.
+set -e
+
+repo=${NET_MGR_REPO:?set NET_MGR_REPO to the net-mgr checkout path}
+[ -d "$repo/.git" ] || { echo "net-mgr-deploy: $repo is not a git checkout" >&2; exit 2; }
+
+owner=$(stat -c %U "$repo")
+echo "net-mgr-deploy: repo=$repo owner=$owner — make deploy"
+
+su - "$owner" -c "make -C '$repo' deploy"
+
+echo "net-mgr-deploy: done"
