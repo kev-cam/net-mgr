@@ -2501,13 +2501,16 @@ my %POLL_METHODS = (
     # to. Gated like every POLL probe (see _handle_poll).
     'netmgr-log' => sub {
         my ($self) = @_;
-        my $log = $self->{config}{manager}{log} || '/var/log/net-mgr.log';
-        if (-r $log) {
-            return "== tail -120 $log ==\n" . `tail -n 120 "$log" 2>/dev/null`;
-        }
+        # Prefer journald: net-mgr.service logs StandardOutput=journal, so the
+        # [manager] log FILE is usually a stale relic. Fall back to the file only
+        # when journald has nothing for us (non-systemd host, older build).
         my $unit = $self->{config}{manager}{unit} || 'net-mgr';
-        return "== journalctl -u $unit -n 120 ==\n"
-             . `journalctl -u "$unit" -n 120 --no-pager 2>/dev/null`;
+        my $j = `journalctl -u "$unit.service" -n 120 --no-pager 2>/dev/null`;
+        $j = `journalctl -t "$unit" -n 120 --no-pager 2>/dev/null` if $j !~ /\S/;
+        return "== journalctl $unit -n 120 ==\n$j" if $j =~ /\S/;
+        my $log = $self->{config}{manager}{log} || '/var/log/net-mgr.log';
+        return "== tail -120 $log ==\n" . `tail -n 120 "$log" 2>/dev/null` if -r $log;
+        return "(no journald entries for $unit and no readable $log)\n";
     },
 );
 
