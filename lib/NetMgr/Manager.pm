@@ -324,6 +324,7 @@ sub _attach_ipv6_vlans {
         my $type = lc($e->{type} // 'he6in4');
         if    ($type eq 'vlan')   { $self->_attach_vlan_network($name, $e) }
         elsif ($type eq 'he6in4') { $self->_he_net_startup_net($name, $e) }
+        elsif ($type eq 'relay')  { $self->_attach_relay_network($name, $e) }
         else { $self->_log("ipv6_vlan '$name': unknown type '$type'") }
     }
 }
@@ -431,6 +432,62 @@ sub _check_ddns {
     );
 }
 
+# Attach a type=relay IPv6 network: relay the he_net uplink to this node over the
+# control VLAN. This node gets a global address from the HE routed prefix on the
+# control-VLAN interface (routed_prefix + its DMZ IPv4, the same derivation as the
+# control addresses) and — unless it IS the uplink — routes ::/0 to the uplink's
+# routed-prefix address. Idempotent. keys:
+#   prefix   the HE routed /64 (global, distinct from the he6in4 tunnel /64)
+#   gateway  the uplink's DMZ IPv4 (its routed-prefix address is derived)
+sub _attach_relay_network {
+    my ($self, $name, $e) = @_;
+    my $prefix  = $e->{prefix};
+    my $gw_ipv4 = $e->{gateway};
+    unless ($prefix && $gw_ipv4) {
+        $self->_log("ipv6_vlan '$name' (relay): needs prefix (routed /64) + gateway (uplink DMZ IPv4); skipping");
+        return;
+    }
+    # Ride the control VLAN (network_management).
+    my $nets   = $self->_ipv6_vlan_networks;
+    my $nm     = $nets->{network_management} || {};
+    my $parent = NetMgr::Vlan::parent_for_subnet();
+    my $ctrl_if = ($parent && defined $nm->{id} && $nm->{id} =~ /^\d+$/)
+                ? "$parent.$nm->{id}" : undef;
+    unless ($ctrl_if && `ip -o link show $ctrl_if 2>/dev/null`) {
+        $self->_log("ipv6_vlan '$name' (relay): control VLAN not attached; skipping");
+        return;
+    }
+    # This node's DMZ IPv4(s) — dmz /24 recovered from the control prefix.
+    my $cprefix = $nm->{prefix};
+    $cprefix = NetMgr::Vlan::derive_prefix($self->_dmz_subnet_net)
+        if !$cprefix || lc($cprefix) eq 'auto';
+    my $p24 = $cprefix ? NetMgr::Vlan::prefix_ipv4_24($cprefix) : undef;
+    my @my_ipv4 = $p24 ? grep { index($_, $p24) == 0 } local_addrs('v4') : ();
+    unless (@my_ipv4) {
+        $self->_log("ipv6_vlan '$name' (relay): no DMZ IPv4 to derive a global address; skipping");
+        return;
+    }
+    # Self-assign global addresses from the routed prefix on the control VLAN.
+    my $is_gw = grep { $_ eq $gw_ipv4 } @my_ipv4;
+    my $have  = `ip -6 -o addr show dev $ctrl_if 2>/dev/null`;
+    for my $ip (@my_ipv4) {
+        my $addr = NetMgr::Vlan::ipv4_addr($ip, $prefix) or next;
+        if (index($have, $addr) < 0) {
+            system('ip', '-6', 'addr', 'add', "$addr/64", 'dev', $ctrl_if, 'nodad');
+            $self->_log("ipv6_vlan '$name' (relay): $ctrl_if global $addr");
+        }
+    }
+    # Default route via the uplink, unless we ARE the uplink (he_net set ::/0).
+    unless ($is_gw) {
+        my $gw_addr = NetMgr::Vlan::ipv4_addr($gw_ipv4, $prefix);
+        my $route = `ip -6 route show default 2>/dev/null`;
+        if ($gw_addr && $route !~ /\Q$gw_addr\E/) {
+            system('ip', '-6', 'route', 'replace', '::/0', 'via', $gw_addr, 'dev', $ctrl_if);
+            $self->_log("ipv6_vlan '$name' (relay): ::/0 via $gw_addr dev $ctrl_if");
+        }
+    }
+}
+
 # Periodic ipv6_vlan keep-up: re-establish any managed IPv6 network that should
 # be up but isn't — the WAN wasn't ready at boot, the he6in4 tunnel was lost, a
 # VLAN sub-interface went away, etc. Re-runs the type-appropriate attach (both
@@ -443,6 +500,9 @@ sub _check_ipv6_vlans {
     for my $name (sort keys %$nets) {
         my $e = $nets->{$name};
         my $type = lc($e->{type} // 'he6in4');
+        # relay has no single interface to test — its attach is idempotent, so
+        # just re-run it (re-adds the global address / ::/0 route if they're gone).
+        if ($type eq 'relay') { $self->_attach_relay_network($name, $e); next }
         my ($ifname, $want);
         if ($type eq 'vlan') {
             $want = lc($e->{attach} // 'on') !~ /^(off|no|0|false|disabled)$/
@@ -2022,7 +2082,10 @@ sub _check_periodic_triggers {
             my $want = length($vl->{network_management}{id} // $cl->{control_vlan_id} // '');
             unless ($want) {
                 for my $e (values %$vl) {
-                    $want = 1, last if ref $e eq 'HASH' && lc($e->{mode} // 'off') eq 'on';
+                    next unless ref $e eq 'HASH';
+                    $want = 1, last
+                        if lc($e->{mode} // 'off') eq 'on'
+                        || lc($e->{type} // '') eq 'relay';
                 }
             }
             $interval = 60 if $want;
