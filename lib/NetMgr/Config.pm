@@ -153,6 +153,7 @@ my %DEFAULTS = (
     # every host and map onto install-on's options.
     deploy => {
         hosts     => '',     # e.g. "nas3, bigsony, clevo"
+        user      => '',     # run `make deploy` as this user (default: repo owner)
         sudo      => '',     # "sudo" to run the remote install as root
         ssh_opts  => '',     # e.g. "-p 2222 -i ~/.ssh/firewall"
         make_args => '',     # e.g. "FORCE=1"
@@ -329,7 +330,7 @@ my %ACTIVE = (
     forward    => [qw(method allow_peers)],   # net-connect FORWARD backend
     servers    => '*',                        # client server list (see servers())
     chat       => [qw(archive_dir)],          # net-chat archive location
-    deploy     => [qw(hosts sudo ssh_opts make_args)],  # make deploy targets
+    deploy     => [qw(hosts user sudo ssh_opts make_args)],  # make deploy targets
 );
 
 # Returns a list of "[section] key" strings for entries in $path that

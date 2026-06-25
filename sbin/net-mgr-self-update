@@ -30,4 +30,18 @@ make -C "$repo" install
 perl -c /usr/local/sbin/net-mgr >/dev/null
 systemctl try-restart net-mgr-relay 2>/dev/null || true
 
+# Deploy hubs (a node with [deploy] hosts — the daemon sets $NET_MGR_DEPLOY)
+# push the freshly-installed code to their leaf nodes (gateways with no checkout
+# of their own). Best-effort + OUTSIDE set -e: a deploy failure must not make
+# this script exit non-zero, or the daemon would skip its own re-exec and stay
+# on the old code.
+if [ -n "${NET_MGR_DEPLOY:-}" ] && [ -x /usr/local/sbin/net-mgr-deploy ]; then
+    echo "net-mgr-self-update: deploy hub — running net-mgr-deploy"
+    set +e
+    NET_MGR_REPO="$repo" /usr/local/sbin/net-mgr-deploy
+    drc=$?
+    set -e
+    [ "$drc" = 0 ] || echo "net-mgr-self-update: deploy failed rc=$drc (non-fatal)"
+fi
+
 echo "net-mgr-self-update: done ($before -> $after)"

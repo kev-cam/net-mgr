@@ -2191,6 +2191,13 @@ sub _obs_self_update {
         for my $c (values %{ $self->{clients}   }) { close $c->{sock} if $c->{sock} }
         for my $l (values %{ $self->{listeners} }) { close $l->{sock} if $l->{sock} }
         $ENV{NET_MGR_REPO} = $repo;     # the script pulls/installs this checkout
+        # A deploy hub ([deploy] hosts set) also pushes the new code to its leaf
+        # nodes after installing (the script runs net-mgr-deploy, best-effort).
+        if (($self->{config}{deploy}{hosts} // '') =~ /\S/) {
+            $ENV{NET_MGR_DEPLOY} = '1';
+            my $du = $self->{config}{deploy}{user};
+            $ENV{NET_MGR_DEPLOY_USER} = $du if defined $du && length $du;
+        }
         { no warnings; exec $script; } # exec replaces us; _exit only on failure
         POSIX::_exit(127);
     }
@@ -2231,6 +2238,8 @@ sub _obs_deploy {
         for my $c (values %{ $self->{clients}   }) { close $c->{sock} if $c->{sock} }
         for my $l (values %{ $self->{listeners} }) { close $l->{sock} if $l->{sock} }
         $ENV{NET_MGR_REPO} = $repo;
+        my $du = $self->{config}{deploy}{user};
+        $ENV{NET_MGR_DEPLOY_USER} = $du if defined $du && length $du;
         { no warnings; exec $script; }
         POSIX::_exit(127);
     }
