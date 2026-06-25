@@ -412,6 +412,7 @@ deploy: .version
 	fi; \
 	sudo_v=`get sudo`; sshopts_v=`get ssh_opts`; makeargs_v=`get make_args`; \
 	echo "==> deploy (sudo='$$sudo_v' ssh='$$sshopts_v' default make_args='$$makeargs_v'; per-host (..) overrides)"; \
+	failed=''; \
 	for entry in $$entries; do \
 	  h="$${entry%%(*}"; \
 	  case "$$entry" in \
@@ -421,8 +422,11 @@ deploy: .version
 	  echo; echo "===== $$h (make_args='$$margs') ====="; \
 	  $(MAKE) --no-print-directory install-on TARGET="$$h" \
 	      SUDO="$$sudo_v" SSHOPTS="$$sshopts_v" MAKEARGS="$$margs" \
-	    || { echo "deploy: $$h FAILED — stopping"; exit 1; }; \
+	    || { echo "deploy: $$h FAILED — continuing"; failed="$$failed $$h"; }; \
 	done; \
+	if [ -n "$$failed" ]; then \
+	  echo; echo "==> deploy finished with FAILURES:$$failed"; exit 1; \
+	fi; \
 	echo; echo "==> deploy complete"
 
 # --- xpra-pod net-mgr image -----------------------------------------
