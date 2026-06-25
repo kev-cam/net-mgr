@@ -23,9 +23,9 @@ GetOptions(\%opt, 'server=s', 'prefix=s', 'name=s', 'local-suffix=s',
 usage() if $opt{help};
 my $cmd = shift @ARGV // 'status';
 
-my $cfg = eval { NetMgr::Config->load } || {};
-my $hc  = $cfg->{ipv6_vlan} || {};
-my $name   = $opt{name}           // $hc->{name}   // 'he_net';
+my $cfg  = eval { NetMgr::Config->load } || {};
+my $name = $opt{name} // 'he_net';
+my $hc   = ($cfg->{ipv6_vlan} || {})->{$name} || {};
 my $server = $opt{server}         // $hc->{server};
 my $prefix = $opt{prefix}         // $hc->{prefix};
 my $suffix = $opt{'local-suffix'} // $hc->{local_suffix} // '2';

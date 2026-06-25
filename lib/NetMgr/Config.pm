@@ -113,24 +113,20 @@ my %DEFAULTS = (
         control_addr      => 'ipv4',
         control_attach    => 'on',
     },
-    # ipv6_vlan: a net-mgr-managed IPv6 network. type=he6in4 is the Hurricane
-    # Electric 6in4 uplink (NetMgr::Tunnel), a re-implementation of the legacy
-    # /usr/local/bin/he-ipv6. `name` is the network + interface name (default
-    # he_net). mode=on brings it up at startup; either way
-    # `OBSERVE kind=he_net action=up|down` (gated on allowed_internet) drives it
-    # over the mesh. server=HE remote IPv4, prefix=routed /64, this end =
-    # prefix::local_suffix. MINIMAL: failover / firewall glue deferred; WAN-IP
-    # DDNS refresh lives in its own [ddns] section.
-    ipv6_vlan => {
-        name         => 'he_net',      # network + interface name
-        type         => 'he6in4',      # he6in4 = HE 6in4 SIT tunnel
-        mode         => 'off',         # off | on (bring up at startup)
-        server       => '',            # HE tunnel-server IPv4 (e.g. 216.66.88.98)
-        prefix       => '',            # routed /64 (e.g. 2001:470:1f1c:d10::/64)
-        local_suffix => '2',           # this end's host part (GW=2 in he-ipv6)
-        forwarding   => 1,             # enable IPv6 forwarding (it routes)
-        ext_if       => '',            # external iface (blank = default-route auto)
-    },
+    # ipv6_vlan: net-mgr-managed IPv6 networks, one per [ipv6_vlan "<name>"]
+    # named section, dispatched by `type`. The defaults (including the default-on
+    # network_management control VLAN) and [cluster] control_* back-compat are
+    # synthesized in NetMgr::Manager::_ipv6_vlan_networks, so config carries only
+    # overrides. Types:
+    #   vlan    — 802.1Q control VLAN (NetMgr::Vlan). defaults: attach=on,
+    #             addr=ipv4, prefix=auto (derive from dmz). id (the 802.1Q tag)
+    #             must be set for it to attach.
+    #   he6in4  — Hurricane Electric 6in4 uplink (NetMgr::Tunnel), the legacy
+    #             he-ipv6. keys: mode (on=at startup), server (HE remote IPv4),
+    #             prefix (routed /64), local_suffix (default 2), forwarding,
+    #             ext_if. Driven on demand by `OBSERVE kind=he_net` (gated on
+    #             allowed_internet) and bin/net-ipv6.
+    ipv6_vlan => {},
     # ddns: run hooks when the WAN (Internet) IPv4 changes (NetMgr::Ddns). Drop
     # executables/symlinks in `dir` — they're run run-parts style with
     # (new_ip old_ip iface) + NET_MGR_WAN_IP* env — to push the new address to a
@@ -183,6 +179,7 @@ sub load {
     if (-e $path) {
         open my $fh, '<', $path or croak "open $path: $!";
         my $section;
+        my $subsection;     # for named sections like [ipv6_vlan "he_net"]
         my $lineno = 0;
         while (my $line = <$fh>) {
             $lineno++;
@@ -191,7 +188,16 @@ sub load {
             $line =~ s/\s+$//;
             next if $line eq '' || $line =~ /^[#;]/;
             if ($line =~ /^\[([^\]]+)\]\s*$/) {
-                $section = lc $1;
+                my $hdr = $1;
+                # Named sub-section: [ipv6_vlan "name"] -> $cfg->{ipv6_vlan}{name}.
+                if ($hdr =~ /^ipv6_vlan\s+"?([^"\]]+?)"?\s*$/i) {
+                    $section = 'ipv6_vlan';
+                    $subsection = $1;
+                    $cfg->{ipv6_vlan}{$subsection} //= {};
+                    next;
+                }
+                $section = lc $hdr;
+                $subsection = undef;
                 $cfg->{$section} //= {};
                 next;
             }
@@ -246,6 +252,10 @@ sub load {
             if ($line =~ /^([A-Za-z_][\w-]*)\s*=\s*(.*)$/) {
                 my ($k, $v) = ($1, $2);
                 $v =~ s/^"(.*)"$/$1/;
+                if (defined $subsection) {
+                    $cfg->{$section}{$subsection}{$k} = $v;
+                    next;
+                }
                 if ($DURATION_KEYS{$section} && $DURATION_KEYS{$section}{$k}) {
                     $v = parse_duration($v);
                 }
@@ -313,7 +323,8 @@ my %ACTIVE = (
     uplinks    => '*',                        # consumed by net-uplink-probe
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
     dnsmasq    => [qw(mode out_dir push_aps gateways)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
-    ipv6_vlan  => [qw(name type mode server prefix local_suffix forwarding ext_if)], # managed IPv6 net (NetMgr::Tunnel)
+    ipv6_vlan  => [qw(type name mode server prefix local_suffix forwarding ext_if
+                      id addr attach)], # managed IPv6 nets (vlan | he6in4)
     ddns       => [qw(dir statefile interval ext_if)], # WAN-IP-change hooks (NetMgr::Ddns)
     forward    => [qw(method allow_peers)],   # net-connect FORWARD backend
     servers    => '*',                        # client server list (see servers())
@@ -335,7 +346,11 @@ sub dead_keys {
         $line =~ s/^\s+//;
         $line =~ s/\s+$//;
         next if $line eq '' || $line =~ /^[#;]/;
-        if ($line =~ /^\[([^\]]+)\]\s*$/) { $section = lc $1; next; }
+        if ($line =~ /^\[([^\]]+)\]\s*$/) {
+            my $h = $1;
+            $section = ($h =~ /^ipv6_vlan\b/i) ? 'ipv6_vlan' : lc $h;
+            next;
+        }
         next unless defined $section;
         next unless $line =~ /^([\w-]+)\s*=/;
         my $key = $1;

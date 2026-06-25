@@ -275,10 +275,10 @@ sub _self_connect_addr {
 
 sub start_listener {
     my ($self) = @_;
-    # Join the control VLAN first so its address exists before the v6 'auto'
-    # enumeration below picks it up (sets control_prefix as a side effect).
-    $self->_attach_control_vlan;
-    $self->_he_net_startup;     # he_net uplink if [ipv6_vlan] mode=on
+    # Attach our IPv6 networks first (control VLAN + any he6in4 uplink). A vlan
+    # sets control_prefix as a side effect, so its address exists before the v6
+    # 'auto' enumeration below picks it up.
+    $self->_attach_ipv6_vlans;
     my $spec = $self->{config}{manager}{listen} || 'auto';
     my @binds = _resolve_listen_spec($spec, $self->{config}{cluster}{control_prefix});
     croak "no listen addresses resolved from '$spec'" unless @binds;
@@ -316,75 +316,106 @@ sub start_listener {
 # dmz subnet. Requires control_vlan_id (must match the switch trunk) — without it
 # we log and skip rather than create a mis-tagged interface. Sets control_prefix
 # so the listener's v6 'auto' binds the new address.
-sub _attach_control_vlan {
+sub _attach_ipv6_vlans {
     my ($self) = @_;
-    my $cs = $self->{config}{cluster} || {};
-    my $attach = lc($cs->{control_attach} // 'on');
+    my $nets = $self->_ipv6_vlan_networks;
+    for my $name (sort keys %$nets) {
+        my $e = $nets->{$name};
+        my $type = lc($e->{type} // 'he6in4');
+        if    ($type eq 'vlan')   { $self->_attach_vlan_network($name, $e) }
+        elsif ($type eq 'he6in4') { $self->_he_net_startup_net($name, $e) }
+        else { $self->_log("ipv6_vlan '$name': unknown type '$type'") }
+    }
+}
+
+# Effective IPv6 networks: the config's [ipv6_vlan "name"] entries, plus the
+# default-on network_management VLAN, with per-type defaults filled and the
+# legacy [cluster] control_* mapped in for back-compat. Explicit config wins
+# over both, so the config file carries only overrides.
+sub _ipv6_vlan_networks {
+    my ($self) = @_;
+    my $cfg  = $self->{config};
+    my %nets = %{ $cfg->{ipv6_vlan} || {} };       # named sections from config
+
+    my $cl = $cfg->{cluster} || {};
+    my %nm;
+    $nm{id}     = $cl->{control_vlan_id} if defined $cl->{control_vlan_id} && length $cl->{control_vlan_id};
+    $nm{prefix} = $cl->{control_prefix}  if defined $cl->{control_prefix}  && length $cl->{control_prefix};
+    $nm{addr}   = $cl->{control_addr}    if defined $cl->{control_addr}    && length $cl->{control_addr};
+    $nm{attach} = $cl->{control_attach}  if defined $cl->{control_attach}  && length $cl->{control_attach};
+    $nets{network_management} = { type => 'vlan', %nm, %{ $nets{network_management} || {} } };
+
+    for my $name (keys %nets) {
+        my $e = $nets{$name};
+        my $type = lc($e->{type} // 'he6in4');
+        my %defs = $type eq 'vlan'   ? (attach => 'on', addr => 'ipv4', prefix => 'auto')
+                 : $type eq 'he6in4' ? (mode => 'off', local_suffix => '2', forwarding => 1)
+                 : ();
+        $nets{$name} = { type => $type, %defs, %$e };
+    }
+    return \%nets;
+}
+
+# Attach a type=vlan IPv6 network (the control plane) — create the 802.1Q
+# sub-interface and address it (NetMgr::Vlan). Reads the network's
+# id/prefix/addr/attach; prefix=auto derives from the dmz subnet.
+sub _attach_vlan_network {
+    my ($self, $name, $e) = @_;
+    my $attach = lc($e->{attach} // 'on');
     return if $attach =~ /^(off|no|0|false|disabled)$/;
 
-    my $dmz_net = $self->_dmz_subnet_net;            # e.g. 192.168.15.0
-    my $prefix  = $cs->{control_prefix}
-               || ($dmz_net && NetMgr::Vlan::derive_prefix($dmz_net));
-    my $vname = $cs->{control_vlan_name} // 'network_management';
+    my $prefix = $e->{prefix} // 'auto';
+    if (!length $prefix || lc($prefix) eq 'auto') {
+        my $dmz_net = $self->_dmz_subnet_net;       # e.g. 192.168.15.0
+        $prefix = $dmz_net && NetMgr::Vlan::derive_prefix($dmz_net);
+    }
     unless ($prefix) {
-        $self->_log("control-vlan: no control_prefix and no dmz subnet to derive one; skipping $vname attach");
+        $self->_log("ipv6_vlan '$name': no prefix and no dmz subnet to derive one; skipping");
         return;
     }
-
-    my $id = $cs->{control_vlan_id};
+    my $id = $e->{id};
     unless (defined $id && $id ne '' && $id =~ /^\d+$/) {
-        $self->_log("control-vlan: control_vlan_id not set; not creating the '$vname' VLAN (the 802.1Q tag must match your switches). Set [cluster] control_vlan_id.");
+        $self->_log("ipv6_vlan '$name': id (802.1Q tag) not set; not creating the VLAN. Set [ipv6_vlan \"$name\"] id = <tag>.");
         return;
     }
-
     my $parent = NetMgr::Vlan::parent_for_subnet();
     unless ($parent) {
-        $self->_log("control-vlan: no parent interface (no 192.168.* address found); skipping $vname attach");
+        $self->_log("ipv6_vlan '$name': no parent interface (no 192.168.* address); skipping");
         return;
     }
-
-    my $mode = $cs->{control_addr} // 'ipv4';
-    # ipv4 mode: this host's DMZ IPv4 addresses (one control address derived per).
-    # The dmz /24 is recovered from the control prefix, so a follower without
-    # local subnet definitions still picks the right interface address.
+    my $mode = $e->{addr} // 'ipv4';
     my @dmz_ipv4;
     if ($mode eq 'ipv4') {
         my $p24 = NetMgr::Vlan::prefix_ipv4_24($prefix);
         @dmz_ipv4 = grep { index($_, $p24) == 0 } local_addrs('v4') if $p24;
         unless (@dmz_ipv4) {
-            $self->_log("control-vlan: no DMZ IPv4 (".($p24 // '?')."*) on this host; skipping $vname attach");
+            $self->_log("ipv6_vlan '$name': no DMZ IPv4 (" . ($p24 // '?') . "*); skipping");
             return;
         }
     }
-
-    my ($ifname, $addrs, $err) = NetMgr::Vlan::attach(
-        parent     => $parent,
-        id         => $id,
-        prefix     => $prefix,
-        name       => $vname,
-        addr       => $mode,
-        ipv4_addrs => \@dmz_ipv4,
-        log        => sub { $self->_log($_[0]) },
+    my (undef, undef, $err) = NetMgr::Vlan::attach(
+        parent => $parent, id => $id, prefix => $prefix, name => $name,
+        addr => $mode, ipv4_addrs => \@dmz_ipv4,
+        log => sub { $self->_log($_[0]) },
     );
-    $self->_log("control-vlan: $err") if $err;
-
-    # Let the listener's v6 'auto' enumerate the control-prefix address.
+    $self->_log("ipv6_vlan '$name': $err") if $err;
+    # The control plane rides this VLAN — let the listener's v6 'auto' bind it.
     $self->{config}{cluster}{control_prefix} = $prefix;
 }
 
-# Bring the he_net uplink up at startup if [ipv6_vlan] mode=on. The OBSERVE
-# handler (_obs_he_net) drives it on demand regardless of mode.
-sub _he_net_startup {
-    my ($self) = @_;
-    my $hc = $self->{config}{ipv6_vlan} || {};
-    return unless lc($hc->{mode} // 'off') eq 'on';
+# Bring a type=he6in4 network up at startup if mode=on (NetMgr::Tunnel). The
+# OBSERVE handler (_obs_he_net) drives it on demand regardless of mode.
+sub _he_net_startup_net {
+    my ($self, $name, $e) = @_;
+    return unless lc($e->{mode} // 'off') eq 'on';
     my (undef, $err) = NetMgr::Tunnel::up(
-        name => $hc->{name}, server => $hc->{server}, prefix => $hc->{prefix},
-        local_suffix => $hc->{local_suffix}, forwarding => $hc->{forwarding},
-        ext_if => ($hc->{ext_if} || undef),
-        log  => sub { $self->_log($_[0]) },
+        name => $name, server => $e->{server}, prefix => $e->{prefix},
+        local_suffix => ($e->{local_suffix} // '2'),
+        forwarding => (defined $e->{forwarding} ? $e->{forwarding} : 1),
+        ext_if => ($e->{ext_if} || undef),
+        log => sub { $self->_log($_[0]) },
     );
-    $self->_log("he_net: startup bring-up failed: $err") if $err;
+    $self->_log("ipv6_vlan '$name': startup bring-up failed: $err") if $err;
 }
 
 # Periodic DDNS check: if the WAN IP changed, run the /etc/net-mgr/ddns hooks
@@ -3091,20 +3122,21 @@ sub _obs_he_net {
     unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_internet})) {
         die "he_net: not authorized (add the key to /etc/net-mgr/allowed_internet)\n";
     }
-    my $hc = $self->{config}{ipv6_vlan} || {};
+    my $name = $kv->{name} // 'he_net';
+    my $e = ($self->{config}{ipv6_vlan} || {})->{$name} || {};
     my $action = $kv->{action} // 'up';
     if ($action eq 'down') {
-        NetMgr::Tunnel::down(name => $kv->{name} // $hc->{name},
-                             log => sub { $self->_log($_[0]) });
+        NetMgr::Tunnel::down(name => $name, log => sub { $self->_log($_[0]) });
         return ();
     }
     my ($addr, $err) = NetMgr::Tunnel::up(
-        name         => $kv->{name}         // $hc->{name},
-        server       => $kv->{server}       // $hc->{server},
-        prefix       => $kv->{prefix}       // $hc->{prefix},
-        local_suffix => $kv->{local_suffix} // $hc->{local_suffix} // '2',
-        forwarding   => (defined $kv->{forwarding} ? $kv->{forwarding} : $hc->{forwarding}),
-        ext_if       => (($kv->{ext_if} // $hc->{ext_if}) || undef),
+        name         => $name,
+        server       => $kv->{server}       // $e->{server},
+        prefix       => $kv->{prefix}       // $e->{prefix},
+        local_suffix => $kv->{local_suffix} // $e->{local_suffix} // '2',
+        forwarding   => (defined $kv->{forwarding} ? $kv->{forwarding}
+                                                   : (defined $e->{forwarding} ? $e->{forwarding} : 1)),
+        ext_if       => (($kv->{ext_if} // $e->{ext_if}) || undef),
         log          => sub { $self->_log($_[0]) },
     );
     die "he_net: $err\n" if $err;
