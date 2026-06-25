@@ -431,6 +431,39 @@ sub _check_ddns {
     );
 }
 
+# Periodic ipv6_vlan keep-up: re-establish any managed IPv6 network that should
+# be up but isn't — the WAN wasn't ready at boot, the he6in4 tunnel was lost, a
+# VLAN sub-interface went away, etc. Re-runs the type-appropriate attach (both
+# idempotent), only when the interface lacks LOWER_UP, so it's quiet when
+# everything is up. Fired by _check_periodic_triggers at the [scheduling]
+# ipv6_vlan cadence (auto-enabled to 60s when there's a network to keep up).
+sub _check_ipv6_vlans {
+    my ($self) = @_;
+    my $nets = $self->_ipv6_vlan_networks;
+    for my $name (sort keys %$nets) {
+        my $e = $nets->{$name};
+        my $type = lc($e->{type} // 'he6in4');
+        my ($ifname, $want);
+        if ($type eq 'vlan') {
+            $want = lc($e->{attach} // 'on') !~ /^(off|no|0|false|disabled)$/
+                 && defined $e->{id} && $e->{id} =~ /^\d+$/;
+            if ($want) {
+                my $parent = NetMgr::Vlan::parent_for_subnet();
+                $ifname = $parent ? "$parent.$e->{id}" : undef;
+            }
+        } elsif ($type eq 'he6in4') {
+            $want   = lc($e->{mode} // 'off') eq 'on';
+            $ifname = $name;
+        }
+        next unless $want && $ifname;
+        my $st = `ip -o link show $ifname 2>/dev/null`;
+        next if $st =~ /LOWER_UP/;            # already up
+        $self->_log("ipv6_vlan '$name' ($ifname): not up — re-establishing");
+        if    ($type eq 'vlan')   { $self->_attach_vlan_network($name, $e) }
+        elsif ($type eq 'he6in4') { $self->_he_net_startup_net($name, $e) }
+    }
+}
+
 # The dmz subnet's network address (e.g. 192.168.15.0), for deriving the
 # default control prefix. Returns undef if no dmz subnet is known.
 sub _dmz_subnet_net {
@@ -1978,8 +2011,22 @@ sub _check_periodic_triggers {
     my $now   = time();
     $self->{periodic_last} //= {};
 
-    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq ddns)) {
+    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq ddns ipv6_vlan)) {
         my $interval = $sched->{$name} // 0;
+        # ipv6_vlan keep-up: re-establish a managed IPv6 net that's down. Auto-
+        # enable at 60s when there's one to keep up (the control VLAN has an id,
+        # or an he6in4 network is mode=on).
+        if ($name eq 'ipv6_vlan' && !$interval) {
+            my $vl = $self->{config}{ipv6_vlan} || {};
+            my $cl = $self->{config}{cluster}   || {};
+            my $want = length($vl->{network_management}{id} // $cl->{control_vlan_id} // '');
+            unless ($want) {
+                for my $e (values %$vl) {
+                    $want = 1, last if ref $e eq 'HASH' && lc($e->{mode} // 'off') eq 'on';
+                }
+            }
+            $interval = 60 if $want;
+        }
         # ddns: watch the WAN IP and run /etc/net-mgr/ddns hooks on change. Cadence
         # from [ddns] interval; auto-enable at 120s when that dir has hooks, so
         # dropping a script in activates it without extra config.
@@ -2015,6 +2062,7 @@ sub _fire_periodic {
     my ($self, $name) = @_;
     if ($name eq 'push-dnsmasq') { $self->_sync_dnsmasq; return }
     if ($name eq 'ddns')         { $self->_check_ddns;   return }
+    if ($name eq 'ipv6_vlan')    { $self->_check_ipv6_vlans; return }
     my ($bin, @args);
     if ($name eq 'scan-ap') {
         my @ips = $self->_known_ap_ips;

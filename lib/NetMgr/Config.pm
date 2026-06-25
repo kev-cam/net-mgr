@@ -168,7 +168,8 @@ my %DURATION_KEYS = (
     timeouts   => { ap => 1, fping => 1, nmap => 1, dhcp => 1 },
     dns        => { ttl => 1 },
     scheduling => { 'scan-ap' => 1, presence => 1, discover => 1,
-                    'find-peers' => 1, 'import-leases' => 1, 'push-dnsmasq' => 1 },
+                    'find-peers' => 1, 'import-leases' => 1, 'push-dnsmasq' => 1,
+                    ipv6_vlan => 1 },
     ddns       => { interval => 1 },
 );
 
@@ -305,7 +306,7 @@ my %ACTIVE = (
     mysql      => [qw(db defaults section)],
     scanner    => [qw(presence_interval
                        dnsmasq_event_port dnsmasq_event_check_interval)],
-    scheduling => [qw(scan-ap presence discover find-peers import-leases push-dnsmasq)],
+    scheduling => [qw(scan-ap presence discover find-peers import-leases push-dnsmasq ipv6_vlan)],
     paths      => '*',
     dns        => '*',
     bindings   => '*',                        # parsed for future use
