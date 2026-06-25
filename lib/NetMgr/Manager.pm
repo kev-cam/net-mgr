@@ -469,16 +469,21 @@ sub _attach_relay_network {
         $self->_log("ipv6_vlan '$name' (relay): needs prefix (routed /64) + gateway (uplink DMZ IPv4); skipping");
         return;
     }
-    # The dmz /24 (from the control prefix) is the LAN segment the uplink is on.
+    # The LAN segment the uplink is on is the gateway's own /24 — derive it
+    # straight from the gateway IPv4. This is robust everywhere: it doesn't
+    # depend on a dmz-zoned subnet or a control prefix being known on THIS node
+    # (a gateway/leaf may know neither), and the gateway address inherently names
+    # the segment the relay clients (and the uplink itself) share.
     my $nets    = $self->_ipv6_vlan_networks;
     my $nm      = $nets->{network_management} || {};
-    my $cprefix = $nm->{prefix};
-    $cprefix = NetMgr::Vlan::derive_prefix($self->_dmz_subnet_net)
-        if !$cprefix || lc($cprefix) eq 'auto';
-    my $p24 = $cprefix ? NetMgr::Vlan::prefix_ipv4_24($cprefix) : undef;
-    my @my_ipv4 = $p24 ? grep { index($_, $p24) == 0 } local_addrs('v4') : ();
+    my ($p24)   = $gw_ipv4 =~ /^(\d+\.\d+\.\d+\.)\d+$/;
+    unless ($p24) {
+        $self->_log("ipv6_vlan '$name' (relay): gateway '$gw_ipv4' is not a dotted IPv4; skipping");
+        return;
+    }
+    my @my_ipv4 = grep { index($_, $p24) == 0 } local_addrs('v4');
     unless (@my_ipv4) {
-        $self->_log("ipv6_vlan '$name' (relay): no DMZ IPv4 to derive a global address; skipping");
+        $self->_log("ipv6_vlan '$name' (relay): no IPv4 on the gateway's segment ($p24"."0/24); skipping");
         return;
     }
     # Interface to ride: the control VLAN if attached, else the DMZ LAN interface
