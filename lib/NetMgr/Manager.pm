@@ -459,21 +459,9 @@ sub _attach_relay_network {
         $self->_log("ipv6_vlan '$name' (relay): needs prefix (routed /64) + gateway (uplink DMZ IPv4); skipping");
         return;
     }
-    # Ride the control VLAN (network_management).
-    my $nets   = $self->_ipv6_vlan_networks;
-    my $nm     = $nets->{network_management} || {};
-    my $parent = NetMgr::Vlan::parent_for_subnet();
-    my $vlan_if = ($parent && defined $nm->{id} && $nm->{id} =~ /^\d+$/)
-                ? "$parent.$nm->{id}" : undef;
-    # Ride the control VLAN if it's attached; otherwise the parent LAN interface
-    # — the uplink (gateway3) is reachable there too (same .15 segment).
-    my $ctrl_if = ($vlan_if && `ip -o link show $vlan_if 2>/dev/null`)
-                ? $vlan_if : $parent;
-    unless ($ctrl_if) {
-        $self->_log("ipv6_vlan '$name' (relay): no interface to ride (no control VLAN, no LAN parent); skipping");
-        return;
-    }
-    # This node's DMZ IPv4(s) — dmz /24 recovered from the control prefix.
+    # The dmz /24 (from the control prefix) is the LAN segment the uplink is on.
+    my $nets    = $self->_ipv6_vlan_networks;
+    my $nm      = $nets->{network_management} || {};
     my $cprefix = $nm->{prefix};
     $cprefix = NetMgr::Vlan::derive_prefix($self->_dmz_subnet_net)
         if !$cprefix || lc($cprefix) eq 'auto';
@@ -481,6 +469,17 @@ sub _attach_relay_network {
     my @my_ipv4 = $p24 ? grep { index($_, $p24) == 0 } local_addrs('v4') : ();
     unless (@my_ipv4) {
         $self->_log("ipv6_vlan '$name' (relay): no DMZ IPv4 to derive a global address; skipping");
+        return;
+    }
+    # Interface to ride: the control VLAN if attached, else the DMZ LAN interface
+    # (the one carrying the dmz /24 — where the uplink is reachable). A gateway has
+    # several 192.168.* interfaces, so match the dmz /24 specifically.
+    my $parent  = NetMgr::Vlan::parent_for_subnet(qr/^\Q$p24\E/);
+    my $vlan_if = ($parent && defined $nm->{id} && $nm->{id} =~ /^\d+$/)
+                ? "$parent.$nm->{id}" : undef;
+    my $ctrl_if = ($vlan_if && `ip -o link show $vlan_if 2>/dev/null`) ? $vlan_if : $parent;
+    unless ($ctrl_if) {
+        $self->_log("ipv6_vlan '$name' (relay): no interface to ride; skipping");
         return;
     }
     # Self-assign global addresses from the routed prefix on the control VLAN.
