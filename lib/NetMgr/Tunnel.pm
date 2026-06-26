@@ -82,12 +82,19 @@ sub up {
         $log->("he_net: created $name 6in4 (remote=$server local=$local_v4)");
     }
     $run->('ip', 'link', 'set', $name, 'up');
+    # Enable IPv6 on the tunnel iface — a v6-disabled interface rejects
+    # `ip -6 addr add` with EPERM even as root. Write /proc directly.
+    my $dis = "/proc/sys/net/ipv6/conf/$name/disable_ipv6";
+    if (-w $dis && open(my $dfh, '>', $dis)) { print $dfh "0\n"; close $dfh; }
     my $have = `ip -6 -o addr show dev $name 2>/dev/null`;
     if (index($have, $local_v6) < 0) {
-        $run->('ip', 'addr', 'add', "$local_v6/$plen", 'dev', $name);
+        $run->('ip', 'addr', 'add', "$local_v6/$plen", 'dev', $name)
+            or return (undef, "ip addr add $local_v6/$plen dev $name failed "
+                            . "(RTNETLINK denied? daemon needs CAP_NET_ADMIN)");
         $log->("he_net: $name addr $local_v6/$plen");
     }
-    $run->('ip', 'route', 'replace', '::/0', 'dev', $name);   # default v6 via tunnel
+    $run->('ip', 'route', 'replace', '::/0', 'dev', $name)    # default v6 via tunnel
+        or return (undef, "ip route replace ::/0 dev $name failed (no CAP_NET_ADMIN?)");
     $run->('sysctl', '-qw', 'net.ipv6.conf.all.forwarding=1') if $fwd;
     $log->("he_net: $name up — local6=$local_v6 via $server"
          . ($fwd ? " (forwarding on)" : ""));

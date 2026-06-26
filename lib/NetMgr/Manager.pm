@@ -499,6 +499,11 @@ sub _attach_relay_network {
     }
     # Self-assign global addresses from the routed prefix on the control VLAN.
     my $is_gw = grep { $_ eq $gw_ipv4 } @my_ipv4;
+    # Enable IPv6 on the interface first — a v6-disabled iface (disable_ipv6=1,
+    # common on gateways that default IPv6 off per-port) makes `ip -6 addr add`
+    # fail with EPERM ("Permission denied") even as root. Write /proc directly so
+    # dotted VLAN ifnames don't trip the sysctl key parser.
+    _enable_ipv6_iface($ctrl_if);
     my $have  = `ip -6 -o addr show dev $ctrl_if 2>/dev/null`;
     for my $ip (@my_ipv4) {
         my $addr = NetMgr::Vlan::ipv4_addr($ip, $prefix) or next;
@@ -534,6 +539,19 @@ sub _attach_relay_network {
             $self->_log("ipv6_vlan '$name' (relay): ::/0 via $gw_addr dev $ctrl_if");
         }
     }
+}
+
+# Enable IPv6 on a single interface (disable_ipv6=0) by writing /proc directly.
+# A v6-disabled interface rejects `ip -6 addr add` with EPERM even for root, so
+# managed IPv6 (the relay address, the he6in4 tunnel address) must clear this
+# first. Surgical — only the named interface's own knob, never conf/all (writing
+# 'all' would propagate to every interface). No-op if already enabled / unwritable.
+sub _enable_ipv6_iface {
+    my ($iface) = @_;
+    return unless defined $iface && length $iface;
+    my $p = "/proc/sys/net/ipv6/conf/$iface/disable_ipv6";
+    return unless -w $p;
+    if (open my $fh, '>', $p) { print $fh "0\n"; close $fh; }
 }
 
 # Periodic ipv6_vlan keep-up: re-establish any managed IPv6 network that should
@@ -2492,6 +2510,8 @@ echo "=== sit tunnels (he6in4) ==="
 ip -d link show type sit 2>/dev/null | grep -E ":|link/sit"
 echo "=== forwarding ==="
 sysctl net.ipv6.conf.all.forwarding 2>/dev/null
+echo "=== disable_ipv6 per iface (1 = v6 off; ip -6 addr add -> EPERM even as root) ==="
+grep -H . /proc/sys/net/ipv6/conf/*/disable_ipv6 2>/dev/null | sed 's|/proc/sys/net/ipv6/conf/||; s|/disable_ipv6:|: |'
 echo "=== v6 neighbors ==="
 ip -6 neigh show 2>/dev/null | grep -vi fe80 | head -10
 SH
