@@ -2517,6 +2517,20 @@ ip -6 neigh show 2>/dev/null | grep -vi fe80 | head -10
 SH
     ifaces => 'ip -br addr show 2>/dev/null',
     routes => 'echo "== v4 =="; ip -4 route show 2>/dev/null; echo "== v6 =="; ip -6 route show 2>/dev/null',
+    # IPv6 reachability FROM this node — forwarding, the v6 firewall (a FORWARD
+    # DROP silently eats relayed traffic), and ping to public v6. Run on the
+    # uplink (gateway3) to test its own tunnel; on a relay client to test the
+    # whole path. ~6s (pings).
+    'ipv6-ping' => <<'SH',
+echo "=== forwarding (all/default) ==="
+sysctl net.ipv6.conf.all.forwarding net.ipv6.conf.default.forwarding 2>/dev/null
+echo "=== ip6tables policy + FORWARD chain ==="
+ip6tables -S 2>/dev/null | grep -E "^-P|FORWARD" | head -20 || echo "(no ip6tables / not permitted)"
+echo "=== ping6 Cloudflare 2606:4700:4700::1111 ==="
+ping6 -c2 -W2 2606:4700:4700::1111 2>&1 | tail -3
+echo "=== ping6 Google 2001:4860:4860::8888 ==="
+ping6 -c2 -W2 2001:4860:4860::8888 2>&1 | tail -3
+SH
 );
 
 # Coderef POLLs that need access to the daemon object (for in-memory
