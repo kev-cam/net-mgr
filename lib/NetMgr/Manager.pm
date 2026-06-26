@@ -502,9 +502,27 @@ sub _attach_relay_network {
     my $have  = `ip -6 -o addr show dev $ctrl_if 2>/dev/null`;
     for my $ip (@my_ipv4) {
         my $addr = NetMgr::Vlan::ipv4_addr($ip, $prefix) or next;
-        if (index($have, $addr) < 0) {
-            system('ip', '-6', 'addr', 'add', "$addr/64", 'dev', $ctrl_if, 'nodad');
+        next if index($have, $addr) >= 0;
+        # Add the global address, checking the result — a silent system() here
+        # logged "global $addr" even when the add failed (e.g. an iproute2 that
+        # rejects 'nodad'), which read as success while nothing landed. Retry
+        # without 'nodad' if the flag is what it choked on.
+        my $out = `ip -6 addr add $addr/64 dev $ctrl_if nodad 2>&1`;
+        if ($? && $out =~ /nodad|invalid|Error:/i) {
+            $out = `ip -6 addr add $addr/64 dev $ctrl_if 2>&1`;
+        }
+        chomp $out;
+        if ($?) {
+            $self->_log("ipv6_vlan '$name' (relay): FAILED to add $addr on $ctrl_if: $out");
+            next;
+        }
+        # Read back — distinguishes a clean add from one that vanished moments
+        # later (something else flushing the interface).
+        my $back = `ip -6 -o addr show dev $ctrl_if 2>/dev/null`;
+        if (index($back, $addr) >= 0) {
             $self->_log("ipv6_vlan '$name' (relay): $ctrl_if global $addr");
+        } else {
+            $self->_log("ipv6_vlan '$name' (relay): added $addr on $ctrl_if but it VANISHED (flushed by something else?)");
         }
     }
     # Default route via the uplink, unless we ARE the uplink (he_net set ::/0).
