@@ -6,7 +6,7 @@ package NetMgr::Addr;
 use strict;
 use warnings;
 use Exporter 'import';
-use Socket qw(inet_pton AF_INET6);
+use Socket qw(inet_pton AF_INET AF_INET6);
 
 our @EXPORT_OK = qw(split_hostport join_hostport local_addrs addr_in_prefix);
 
@@ -53,12 +53,16 @@ sub local_addrs {
     return @ips;
 }
 
-# True if IPv6 $addr is inside CIDR $prefix (e.g. "fd12:3456:789a:1::/64").
+# True if $addr is inside CIDR $prefix. Family-agnostic: handles both IPv6
+# ("fd12:3456:789a:1::/64") and IPv4 ("192.168.15.0/24"). The family is taken
+# from $addr; a bare address (no /len) matches as a host route.
 sub addr_in_prefix {
     my ($addr, $cidr) = @_;
-    my ($net, $len) = $cidr =~ m{^(.+)/(\d+)$} ? ($1, $2) : ($cidr, 128);
-    my $a = inet_pton(AF_INET6, $addr) or return 0;
-    my $n = inet_pton(AF_INET6, $net)  or return 0;
+    my $v6 = (index($addr, ':') >= 0);
+    my $fam = $v6 ? AF_INET6 : AF_INET;
+    my ($net, $len) = $cidr =~ m{^(.+)/(\d+)$} ? ($1, $2) : ($cidr, $v6 ? 128 : 32);
+    my $a = inet_pton($fam, $addr) or return 0;
+    my $n = inet_pton($fam, $net)  or return 0;
     my $bytes = int($len / 8);
     return 0 if $bytes && substr($a, 0, $bytes) ne substr($n, 0, $bytes);
     my $bits = $len % 8;

@@ -22,12 +22,19 @@ use Carp qw(croak);
 
 my %DEFAULTS = (
     manager => {
-        # 'auto' = bind to every 192.168.*.* address on this host, plus
-        # 127.0.0.1, all on the default port. Override with a comma-
-        # separated list of host[:port] entries (e.g. on a firewall:
-        # listen = 192.168.15.1:7531). 0.0.0.0:PORT also still works
-        # for the legacy "bind everywhere" behaviour.
-        listen        => 'auto',
+        # 'all' (default) = bind every LAN-facing address on this host — any
+        # interface, present or future (a periodic + SIGHUP rescan tracks WiFi/USB
+        # coming and going). Private/ULA only, so the control port is NOT exposed
+        # on a public WAN by default. Carve out interfaces/IPs/CIDRs with
+        # listen_exclude below; list a public address explicitly to bind it.
+        # 'auto' = the older, narrower form (192.168.* + control_prefix). Or give a
+        # comma-separated host[:port] list (e.g. listen = 192.168.15.1:7531);
+        # 0.0.0.0:PORT still does a single wildcard bind.
+        listen        => 'all',
+        # Interfaces / IPs / CIDRs to NOT listen on under 'all' (space/comma list).
+        # e.g. listen_exclude = enx00e04c680cbe          # a WAN NIC by name
+        #      listen_exclude = 24.6.36.0/22, lxcbr0     # a WAN subnet + a bridge
+        listen_exclude => '',
         log           => '/var/log/net-mgr.log',
         # Flip interfaces.online back to 0 when last_seen is older than
         # this many seconds. Combined with the periodic scan-ap /
@@ -176,7 +183,7 @@ my %DURATION_KEYS = (
     dns        => { ttl => 1 },
     scheduling => { 'scan-ap' => 1, presence => 1, discover => 1,
                     'find-peers' => 1, 'import-leases' => 1, 'push-dnsmasq' => 1,
-                    ipv6_vlan => 1 },
+                    ipv6_vlan => 1, netif => 1 },
     ddns       => { interval => 1 },
 );
 
@@ -309,11 +316,11 @@ sub _deep_copy {
 # Keep in sync with the grep:
 #   grep -rE '\$cfg->\{|config\}\{' lib bin sbin
 my %ACTIVE = (
-    manager    => [qw(listen log offline_after event_retention_days repo update_script deploy_script)],
+    manager    => [qw(listen listen_exclude log offline_after event_retention_days repo update_script deploy_script)],
     mysql      => [qw(db defaults section)],
     scanner    => [qw(presence_interval
                        dnsmasq_event_port dnsmasq_event_check_interval)],
-    scheduling => [qw(scan-ap presence discover find-peers import-leases push-dnsmasq ipv6_vlan)],
+    scheduling => [qw(scan-ap presence discover find-peers import-leases push-dnsmasq ipv6_vlan netif)],
     paths      => '*',
     dns        => '*',
     bindings   => '*',                        # parsed for future use

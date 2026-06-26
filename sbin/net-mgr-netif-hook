@@ -1,0 +1,22 @@
+#!/bin/sh
+# net-mgr-netif-hook — tell net-mgr to rescan interfaces after a link change.
+#
+# net-mgr re-evaluates a `listen = all`/`auto` spec on SIGHUP (and, as a
+# fallback, every [scheduling] netif seconds — default 30). Wire this into your
+# distro's link-change dispatcher so WiFi/USB up/down triggers an INSTANT rebind
+# instead of waiting for the periodic sweep:
+#
+#   NetworkManager:
+#     ln -s /usr/local/sbin/net-mgr-netif-hook /etc/NetworkManager/dispatcher.d/50-net-mgr
+#   ifupdown:
+#     ln -s /usr/local/sbin/net-mgr-netif-hook /etc/network/if-up.d/net-mgr
+#     ln -s /usr/local/sbin/net-mgr-netif-hook /etc/network/if-down.d/net-mgr
+#   systemd-networkd:
+#     no dispatcher dir — rely on the periodic netif rescan, or drive this from a
+#     networkd-dispatcher hook if you run that.
+#
+# Dispatchers pass args/env (interface, up|down); we ignore them and just nudge
+# the daemon — the rescan figures out what actually changed. Idempotent + quiet.
+systemctl kill -s HUP net-mgr.service 2>/dev/null \
+  || pkill -HUP -f '/usr/local/sbin/net-mgr' 2>/dev/null \
+  || true

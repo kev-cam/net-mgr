@@ -16,7 +16,7 @@ use warnings;
 use Carp qw(croak);
 use IO::Socket::INET;
 use IO::Socket::IP;     # IPv6-capable listener (control plane); INET kept for dnsmasq event listeners
-use NetMgr::Addr qw(split_hostport join_hostport local_addrs);
+use NetMgr::Addr qw(split_hostport join_hostport local_addrs addr_in_prefix);
 use NetMgr::Vlan ();
 use NetMgr::Tunnel ();
 use NetMgr::Ddns ();
@@ -289,8 +289,9 @@ sub start_listener {
     # sets control_prefix as a side effect, so its address exists before the v6
     # 'auto' enumeration below picks it up.
     $self->_attach_ipv6_vlans;
-    my $spec = $self->{config}{manager}{listen} || 'auto';
-    my @binds = _resolve_listen_spec($spec, $self->{config}{cluster}{control_prefix});
+    my $spec = $self->{config}{manager}{listen} || 'all';
+    my @binds = _resolve_listen_spec($spec, $self->{config}{cluster}{control_prefix},
+                                     $self->{config}{manager}{listen_exclude});
     croak "no listen addresses resolved from '$spec'" unless @binds;
 
     $self->{select} = IO::Select->new;
@@ -318,6 +319,58 @@ sub start_listener {
     croak "no listeners could be bound from '$spec'" unless %{ $self->{listeners} };
     $self->_start_mesh;
     return [ map { $_->{sock} } values %{ $self->{listeners} } ];
+}
+
+# Re-evaluate an 'all'/'auto' listen spec against the CURRENT interfaces and
+# adjust the bound listeners — bind addresses that appeared (WiFi associated, a
+# USB NIC was plugged in) and drop ones whose interface went away. This is what
+# keeps a daemon that started before its WiFi was up from staying stuck on
+# loopback. Runs from the periodic 'netif' trigger and on SIGHUP (so an
+# if-up/down or NetworkManager-dispatcher hook can poke it for an instant
+# update). Additive against the LIVE IO::Select — never resets it, so client and
+# mesh fds are untouched. A no-op for an explicit address list (static by intent).
+sub _recheck_listeners {
+    my ($self) = @_;
+    my $spec = $self->{config}{manager}{listen} || 'all';
+    return unless grep { lc($_) eq 'all' || lc($_) eq 'auto' }
+                  map { s/^\s+|\s+$//gr } split /,/, $spec;
+    my @want = _resolve_listen_spec($spec, $self->{config}{cluster}{control_prefix},
+                                    $self->{config}{manager}{listen_exclude});
+    my %want = map { ("$_->{host}|$_->{port}" => $_) } @want;
+    my %have;
+    for my $fd (keys %{ $self->{listeners} }) {
+        my $l = $self->{listeners}{$fd};
+        $have{"$l->{host}|$l->{port}"} = $fd;
+    }
+    # Bind newly-appeared addresses.
+    for my $key (sort keys %want) {
+        next if $have{$key};
+        my $b = $want{$key};
+        my $is_v6 = ($b->{host} // '') =~ /:/;
+        my $sock = IO::Socket::IP->new(
+            LocalAddr => $b->{host}, LocalPort => $b->{port},
+            Listen    => 16, ReuseAddr => 1, Proto => 'tcp',
+            ($is_v6 ? (V6Only => 1) : ()),
+        );
+        if (!$sock) { $self->_log("WARN: rebind $b->{host}:$b->{port} failed: $!"); next; }
+        my $fd = fileno($sock);
+        $self->{listeners}{$fd} = { sock => $sock, host => $b->{host}, port => $b->{port} };
+        $self->{select}->add($sock);
+        $self->_log("listening on $b->{host}:$b->{port} (interface appeared)");
+    }
+    # Drop listeners whose address vanished — but never loopback or a wildcard
+    # bind, which don't ride a transient interface.
+    for my $key (sort keys %have) {
+        next if $want{$key};
+        my ($host) = split /\|/, $key, 2;
+        next if $host eq '127.0.0.1' || $host eq '0.0.0.0'
+             || $host eq '::'        || $host eq '::1';
+        my $fd = $have{$key};
+        my $l  = delete $self->{listeners}{$fd};
+        $self->{select}->remove($l->{sock});
+        eval { $l->{sock}->close };
+        $self->_log("stopped listening on $host:$l->{port} (interface gone)");
+    }
 }
 
 # Attach this node to the "network_management" control VLAN: create the 802.1Q
@@ -682,16 +735,23 @@ sub _auto_spec_desc {
 # 'a, b, …'     → ditto, port 7531 implicit
 # 'host'        → single entry, port 7531
 sub _resolve_listen_spec {
-    my ($spec, $control_prefix) = @_;
+    my ($spec, $control_prefix, $exclude) = @_;
     my $default_port = 7531;
     my @out;
     my %seen;   # "host|port" — '|' not ':', since v6 hosts contain ':'
     for my $tok (grep { length } map { s/^\s+|\s+$//gr } split /,/, $spec) {
-        if (lc $tok eq 'auto') {
-            my @autos = _local_192_168_ips();
-            # Control-plane IPv6: only addresses inside [cluster] control_prefix
-            # (so 'auto' doesn't bind every global v6 the node happens to have).
-            push @autos, local_addrs('v6', $control_prefix) if $control_prefix;
+        if (lc $tok eq 'all' || lc $tok eq 'auto') {
+            # 'all' (the default): bind every LAN-facing address on the host —
+            # any interface, present or future (a periodic rescan tracks WiFi/USB
+            # coming and going). Private/ULA only, so the control port is never
+            # exposed on a public WAN by default; carve out interfaces/IPs/CIDRs
+            # with [manager] listen_exclude, or list a public address explicitly.
+            # 'auto' is the older, narrower alias (192.168.* + control_prefix).
+            my @autos = lc $tok eq 'all'
+                ? _all_listen_ips($exclude, $control_prefix)
+                : _local_192_168_ips();
+            push @autos, local_addrs('v6', $control_prefix)
+                if lc $tok eq 'auto' && $control_prefix;
             for my $ip (@autos) {
                 next if $seen{"$ip|$default_port"}++;
                 push @out, { host => $ip, port => $default_port };
@@ -707,6 +767,60 @@ sub _resolve_listen_spec {
         push @out, { host => $host, port => $port };
     }
     return @out;
+}
+
+# Enumerate every LAN-facing unicast address on the host for `listen = all`:
+# all interfaces, both families, MINUS loopback, link-local, public addresses
+# (so we never bind the control port on a WAN), and anything matched by
+# listen_exclude (interface names, bare IPs, or CIDRs). Addresses inside the
+# control_prefix are always kept even if they fall outside the private ranges.
+sub _all_listen_ips {
+    my ($exclude, $control_prefix) = @_;
+    my @ex = _parse_listen_exclusions($exclude);
+    my @ips;
+    for my $fam ('-4', '-6') {
+        for my $line (`ip -br $fam addr show 2>/dev/null`) {
+            chomp $line;
+            my ($iface, undef, @addrs) = split ' ', $line;
+            next unless defined $iface && $iface ne 'lo';
+            next if grep { ($_->{iface} // '') eq $iface } @ex;
+            for my $a (@addrs) {
+                $a =~ s|/.*||;
+                next if $a =~ /^fe80:/i || $a =~ /^169\.254\./;   # link-local
+                next if $a =~ /^127\./  || $a eq '::1';           # loopback
+                next unless _is_private_addr($a)
+                         || ($control_prefix && addr_in_prefix($a, $control_prefix));
+                next if grep {
+                       ($_->{ip}   && $_->{ip} eq $a)
+                    || ($_->{cidr} && addr_in_prefix($a, $_->{cidr}))
+                } @ex;
+                push @ips, $a;
+            }
+        }
+    }
+    return @ips;
+}
+
+# A private/ULA address (the only ones `all` binds without an explicit listing).
+sub _is_private_addr {
+    my ($a) = @_;
+    return 1 if $a =~ /^10\./ || $a =~ /^192\.168\./
+             || $a =~ /^172\.(1[6-9]|2\d|3[01])\./;          # RFC1918 v4
+    return 1 if $a =~ /^f[cd][0-9a-f][0-9a-f]:/i;            # fc00::/7 ULA
+    return 0;
+}
+
+# Parse listen_exclude into { iface | ip | cidr } tokens. A token with '/' is a
+# CIDR; a bare IPv4/IPv6 literal is an address; anything else is an interface.
+sub _parse_listen_exclusions {
+    my ($spec) = @_;
+    my @ex;
+    for my $tok (grep { length } map { s/^\s+|\s+$//gr } split /[,\s]+/, ($spec // '')) {
+        if    ($tok =~ m{/})                       { push @ex, { cidr  => $tok } }
+        elsif ($tok =~ /^[\d.]+$/ || $tok =~ /:/)  { push @ex, { ip    => $tok } }
+        else                                       { push @ex, { iface => $tok } }
+    }
+    return @ex;
 }
 
 # Pick the address forked producers should connect to. They run on this
@@ -754,6 +868,10 @@ sub run {
     local $SIG{INT}  = sub { $self->stop };
     local $SIG{TERM} = sub { $self->stop };
     local $SIG{PIPE} = 'IGNORE';
+    # SIGHUP = "rescan interfaces now" — an if-up/down or NetworkManager-dispatcher
+    # hook sends it when a link changes. Just set a flag; the rebind happens in the
+    # loop below (binding sockets inside a signal handler isn't safe).
+    local $SIG{HUP}  = sub { $self->{rescan_requested} = 1 };
 
     while (!$self->{stop}) {
         my @ready = $self->{select}->can_read(1.0);
@@ -773,6 +891,10 @@ sub run {
             && time >= $self->{next_auto_discover}) {
             $self->_auto_discover;
             $self->{next_auto_discover} = time + 300;
+        }
+        if ($self->{rescan_requested}) {
+            delete $self->{rescan_requested};
+            $self->_recheck_listeners;
         }
         $self->_reap_triggers              if %{ $self->{triggers} };
         $self->_check_periodic_triggers;
@@ -2156,8 +2278,16 @@ sub _check_periodic_triggers {
     my $now   = time();
     $self->{periodic_last} //= {};
 
-    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq ddns ipv6_vlan)) {
+    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq ddns ipv6_vlan netif)) {
         my $interval = $sched->{$name} // 0;
+        # netif: track interface changes (WiFi/USB up/down) and rebind the
+        # 'all'/'auto' listeners. Auto-enable at 30s for those specs (an explicit
+        # address list is static, so it stays off). SIGHUP gives an instant nudge.
+        if ($name eq 'netif' && !$interval) {
+            my $spec = $self->{config}{manager}{listen} || 'all';
+            $interval = 30 if grep { lc($_) eq 'all' || lc($_) eq 'auto' }
+                              map { s/^\s+|\s+$//gr } split /,/, $spec;
+        }
         # ipv6_vlan keep-up: re-establish a managed IPv6 net that's down. Auto-
         # enable at 60s when there's one to keep up (the control VLAN has an id,
         # or an he6in4 network is mode=on).
@@ -2211,6 +2341,7 @@ sub _fire_periodic {
     if ($name eq 'push-dnsmasq') { $self->_sync_dnsmasq; return }
     if ($name eq 'ddns')         { $self->_check_ddns;   return }
     if ($name eq 'ipv6_vlan')    { $self->_check_ipv6_vlans; return }
+    if ($name eq 'netif')        { $self->_recheck_listeners; return }
     my ($bin, @args);
     if ($name eq 'scan-ap') {
         my @ips = $self->_known_ap_ips;
