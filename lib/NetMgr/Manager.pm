@@ -2694,6 +2694,11 @@ ip -6 neigh show 2>/dev/null | grep -vi fe80 | head -10
 SH
     ifaces => 'ip -br addr show 2>/dev/null',
     routes => 'echo "== v4 =="; ip -4 route show 2>/dev/null; echo "== v6 =="; ip -6 route show 2>/dev/null',
+    # The active /etc/net-mgr/config. Plain text, no creds (creds live in
+    # /etc/net-mgr/secrets/ and /etc/net-mgr/root.conf — neither is exposed by
+    # any probe). Lets an operator audit a remote node's config without ssh,
+    # and pairs with `net-cluster put` (round-trip: poll, edit, put).
+    config => 'cat /etc/net-mgr/config 2>/dev/null',
     # IPv6 reachability FROM this node — forwarding, the v6 firewall (a FORWARD
     # DROP silently eats relayed traffic), and ping to public v6. Run on the
     # uplink (gateway3) to test its own tunnel; on a relay client to test the
