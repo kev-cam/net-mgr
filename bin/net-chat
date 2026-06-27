@@ -1350,10 +1350,10 @@ sub _auth_failure_dialog {
 
     $dlg->Label(-text => "Could not connect to $target.",
                 -justify => 'left', -anchor => 'w')
-        ->pack(-fill => 'x', -padx => 12, -pady => (8, 2));
+        ->pack(-fill => 'x', -padx => 12, -pady => [8, 2]);
     $dlg->Label(-text => "Reason: $err",
                 -justify => 'left', -anchor => 'w', -wraplength => 480)
-        ->pack(-fill => 'x', -padx => 12, -pady => (0, 8));
+        ->pack(-fill => 'x', -padx => 12, -pady => [0, 8]);
 
     my %vals = (
         key_file => ($key_file // NetMgr::Client::_default_key_file() // ''),
@@ -1369,7 +1369,7 @@ sub _auth_failure_dialog {
         my $f = $dlg->getOpenFile(-title => 'Select SSH private key',
                                   -initialdir => "$ENV{HOME}/.ssh");
         $vals{key_file} = $f if defined $f && length $f;
-    })->pack(-side => 'left', -padx => (4, 0));
+    })->pack(-side => 'left', -padx => [4, 0]);
 
     my $kid_frame = $dlg->Frame->pack(-fill => 'x', -padx => 12, -pady => 2);
     $kid_frame->Label(-text => 'Key ID:', -width => 12, -anchor => 'w')
@@ -1380,7 +1380,7 @@ sub _auth_failure_dialog {
     $dlg->Label(-text => "(Key ID is the principal name in the remote's allowed_signers — "
                        . "usually user\@host of the key's comment.)",
                 -justify => 'left', -wraplength => 480, -anchor => 'w')
-        ->pack(-fill => 'x', -padx => 12, -pady => (4, 0));
+        ->pack(-fill => 'x', -padx => 12, -pady => [4, 0]);
 
     my $result;
     my $btns = $dlg->Frame->pack(-fill => 'x', -padx => 12, -pady => 10);
