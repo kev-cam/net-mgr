@@ -3676,11 +3676,17 @@ sub _obs_mesh_tunnel {
     die "mesh_tunnel: owner_node required\n" unless defined $owner && length $owner;
     die "mesh_tunnel: tunnel_kind required\n" unless defined $tkind && length $tkind;
     if ($action eq 'delete') {
+        my $was = $self->{db}->get_mesh_tunnel($owner, $tkind);
         $self->{db}->delete_mesh_tunnel($owner, $tkind);
+        $self->_emit_change(table => 'mesh_tunnels', op => 'delete', row => $was)
+            if $was;
         $self->_log("mesh_tunnel: delete owner=$owner kind=$tkind");
         return ({ type => 'mesh_tunnel_delete', owner_node => $owner, kind => $tkind });
     }
-    my $row = $self->{db}->upsert_mesh_tunnel(
+    # _upsert wraps upsert_mesh_tunnel and emits a 'mesh_tunnels' change event
+    # so any subscriber (the followers' net-mgr-relay processes) receives the
+    # new/updated row in their snapshot+stream session.
+    my $r = $self->_upsert('mesh_tunnels', 'upsert_mesh_tunnel',
         owner_node    => $owner,
         kind          => $tkind,
         provider_id   => $kv->{provider_id},
@@ -3689,6 +3695,7 @@ sub _obs_mesh_tunnel {
         routed_prefix => $kv->{routed_prefix},
         notes         => $kv->{notes},
     );
+    my $row = $r->{now} || {};
     $self->_log("mesh_tunnel: set owner=$owner kind=$tkind"
               . ($kv->{provider_id}    ? " provider_id=$kv->{provider_id}"      : "")
               . ($kv->{server_v4}      ? " server_v4=$kv->{server_v4}"          : "")

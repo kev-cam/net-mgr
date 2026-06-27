@@ -1460,11 +1460,13 @@ SQL
 
 # mesh_tunnels: tunnel/uplink topology, cluster-replicated. Fields can be NULL
 # (e.g. provider_id only meaningful for he6in4). owner_node + kind = PK. The
-# upsert pattern matches isp_secrets above.
+# upsert returns { op, now } so Manager::_upsert can fan out a change event to
+# subscribers (replication path).
 sub upsert_mesh_tunnel {
     my ($self, %f) = @_;
     croak "owner_node required" unless defined $f{owner_node} && length $f{owner_node};
     croak "kind required"       unless defined $f{kind}       && length $f{kind};
+    my $was = $self->get_mesh_tunnel($f{owner_node}, $f{kind});
     $self->{dbh}->do(<<'SQL', undef,
         INSERT INTO mesh_tunnels
             (owner_node, kind, provider_id, server_v4,
@@ -1481,7 +1483,8 @@ SQL
         @f{qw(owner_node kind provider_id server_v4
               tunnel_prefix routed_prefix notes replicated_from)}
     );
-    return $self->get_mesh_tunnel($f{owner_node}, $f{kind});
+    return { op  => ($was ? 'update' : 'insert'),
+             now => $self->get_mesh_tunnel($f{owner_node}, $f{kind}) };
 }
 
 # Look up the row for one (owner_node, kind). Returns hashref or undef.
