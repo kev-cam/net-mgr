@@ -3670,30 +3670,32 @@ sub _obs_mesh_tunnel {
     }
     my $action = $kv->{action} // 'set';
     my $owner  = $kv->{owner_node};
-    my $kind   = $kv->{kind};
+    # Row column is called 'kind', but the OBSERVE dispatch key is ALSO 'kind' —
+    # so the row kind arrives as 'tunnel_kind' here to avoid collision.
+    my $tkind  = $kv->{tunnel_kind} // $kv->{row_kind};
     die "mesh_tunnel: owner_node required\n" unless defined $owner && length $owner;
-    die "mesh_tunnel: kind required\n"       unless defined $kind  && length $kind;
+    die "mesh_tunnel: tunnel_kind required\n" unless defined $tkind && length $tkind;
     if ($action eq 'delete') {
-        $self->{db}->delete_mesh_tunnel($owner, $kind);
-        $self->_log("mesh_tunnel: delete owner=$owner kind=$kind");
-        return ({ type => 'mesh_tunnel_delete', owner_node => $owner, kind => $kind });
+        $self->{db}->delete_mesh_tunnel($owner, $tkind);
+        $self->_log("mesh_tunnel: delete owner=$owner kind=$tkind");
+        return ({ type => 'mesh_tunnel_delete', owner_node => $owner, kind => $tkind });
     }
     my $row = $self->{db}->upsert_mesh_tunnel(
         owner_node    => $owner,
-        kind          => $kind,
+        kind          => $tkind,
         provider_id   => $kv->{provider_id},
         server_v4     => $kv->{server_v4},
         tunnel_prefix => $kv->{tunnel_prefix},
         routed_prefix => $kv->{routed_prefix},
         notes         => $kv->{notes},
     );
-    $self->_log("mesh_tunnel: set owner=$owner kind=$kind"
+    $self->_log("mesh_tunnel: set owner=$owner kind=$tkind"
               . ($kv->{provider_id}    ? " provider_id=$kv->{provider_id}"      : "")
               . ($kv->{server_v4}      ? " server_v4=$kv->{server_v4}"          : "")
               . ($kv->{tunnel_prefix}  ? " tunnel_prefix=$kv->{tunnel_prefix}"  : "")
               . ($kv->{routed_prefix}  ? " routed_prefix=$kv->{routed_prefix}"  : ""));
     return ({ type => 'mesh_tunnel_set',
-              owner_node => $owner, kind => $kind,
+              owner_node => $owner, kind => $tkind,
               map { $_ => $row->{$_} }
                   qw(provider_id server_v4 tunnel_prefix routed_prefix) });
 }

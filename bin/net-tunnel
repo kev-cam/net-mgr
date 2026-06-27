@@ -99,8 +99,9 @@ sub cmd_show {
 sub cmd_set {
     my $owner = $opt{owner} or do { warn "set: --owner=NAME required\n"; usage(2) };
     my $kind  = $opt{kind}  // 'he6in4';
+    # tunnel_kind, not kind — the OBSERVE dispatch key is also 'kind'.
     my @kv = (kind => 'mesh_tunnel', action => 'set',
-              owner_node => $owner, kind => $kind);
+              owner_node => $owner, tunnel_kind => $kind);
     for my $pair (
         [provider_id    => $opt{'provider-id'}],
         [server_v4      => $opt{'server-v4'}],
@@ -123,7 +124,7 @@ sub cmd_delete {
         or do { warn "delete: need OWNER\n"; usage(2) };
     my $kind = $opt{kind} // 'he6in4';
     my $r = $cli->observe(kind => 'mesh_tunnel', action => 'delete',
-                          owner_node => $owner, kind => $kind);
+                          owner_node => $owner, tunnel_kind => $kind);
     my $c = eval { parse_line($r) };
     die "delete: bad reply '$r'\n" unless $c;
     die "delete: $c->{msg}\n" if $c->{verb} eq 'ERR';
