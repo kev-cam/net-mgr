@@ -298,10 +298,36 @@ sub auth {
     binmode $tn; print $tn $nonce; $tn->flush;
     my $ts = File::Temp->new(SUFFIX => '.sig');
     binmode $ts;
-    my $rc = system("ssh-keygen -q -Y sign -n net-mgr -f " . _shq($key_file)
-                  . " < " . _shq($tn->filename)
-                  . " > " . _shq($ts->filename) . " 2>/dev/null");
-    croak "auth: ssh-keygen sign rc=" . ($rc >> 8) if $rc != 0;
+    # ssh-keygen will block on /dev/tty for a passphrase if the key is
+    # encrypted, which hangs the GUI forever (no event loop runs during the
+    # system() call). Detach the controlling tty via `setsid sh -c` so /dev/tty
+    # isn't usable, and cap the whole thing with `timeout` as a backstop. When
+    # either tool is absent we fall back to the bare command (old behaviour) —
+    # the dialog still gets a clearer error if it does hang and the user kills
+    # it, vs. an unrecoverable hang.
+    my $base = "ssh-keygen -q -Y sign -n net-mgr -f " . _shq($key_file)
+             . " < " . _shq($tn->filename)
+             . " > " . _shq($ts->filename) . " 2>/dev/null";
+    my $has_timeout = -x '/usr/bin/timeout' || -x '/bin/timeout';
+    my $has_setsid  = -x '/usr/bin/setsid'  || -x '/bin/setsid';
+    my $cmd = ($has_timeout || $has_setsid)
+        ? join(' ', ($has_timeout ? ('timeout', '8') : ()),
+                    ($has_setsid  ? ('setsid')      : ()),
+                    'sh', '-c', _shq($base))
+        : $base;
+    my $rc   = system($cmd);
+    my $exit = $rc >> 8;
+    if ($rc != 0) {
+        if ($exit == 124) {
+            croak "auth: ssh-keygen sign timed out (8s). Is the key "
+                . "'$key_file' passphrase-protected? "
+                . "Either remove the passphrase (ssh-keygen -p -f $key_file) "
+                . "or load it into ssh-agent (ssh-add $key_file) before "
+                . "starting net-chat.";
+        }
+        croak "auth: ssh-keygen sign rc=$exit (key '$key_file' — may need "
+            . "an unencrypted key or ssh-agent: see ssh-add / ssh-keygen -p)";
+    }
     open my $sf, '<', $ts->filename or croak "auth: open sig: $!";
     my $sig;
     { local $/; $sig = <$sf>; }
