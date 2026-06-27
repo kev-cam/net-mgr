@@ -552,19 +552,24 @@ sub cmd_gui {
     require Tk;   # loaded on demand; fully-qualified below so non-gui use
                   # of net-chat never needs Perl/Tk installed.
 
+    # Build MainWindow FIRST so a connect/auth failure can pop a dialog instead
+    # of dying. Without this, an AUTH failure (no key, key not in remote's
+    # allowed_signers, etc.) crashed the whole GUI; now we offer to retry with
+    # a different key, continue read-only, or cancel.
+    my $mw = Tk::MainWindow->new;
+    $mw->title('net-chat');
+    $mw->geometry('660x480');
+    my ($stream, $ctrl) = _gui_connect_with_dialog($mw);
+    return unless $stream && $ctrl;   # user cancelled — MainWindow destroyed
+
+    # Recompute auth state AFTER the dialog — the user may have flipped to
+    # --no-auth, picked a different key file, etc.
     my ($host) = NetMgr::Client::split_hostport($listen); $host //= '';
     my $is_loopback = $host =~ /^(?:127\.\d+\.\d+\.\d+|::1|localhost)$/;
     my $authed = $force_auth || (!$is_loopback && !$no_auth);
     $authed = 0 if $no_auth;
     # Our chat identity, for filtering request pop-ups to sessions we own.
     my $me = $authed ? ($key_id // NetMgr::Client::_default_key_id()) : $as;
-
-    my $stream = connect_client();   # subscriptions; drained via fileevent
-    my $ctrl   = connect_client();   # blocking request/reply ops
-
-    my $mw = Tk::MainWindow->new;
-    $mw->title('net-chat');
-    $mw->geometry('660x480');
 
     # Shared named fonts so A+/A- scale the WHOLE UI (buttons, labels, dropdown,
     # entry) not just the message pane. optionAdd (high priority) makes every
@@ -1286,6 +1291,119 @@ sub cmd_gui {
 }
 
 # ---- helpers ---------------------------------------------------------
+
+# Try to connect; if AUTH fails, pop a Tk dialog and let the user pick a
+# different key, continue read-only, or cancel. Returns (stream, ctrl) on
+# success or () if the user cancelled (MainWindow destroyed). Loops until one
+# of those terminal outcomes — connect+auth retries with whatever the user just
+# changed ($key_file/$key_id/$no_auth/$force_auth).
+sub _gui_connect_with_dialog {
+    my ($mw) = @_;
+    while (1) {
+        my ($stream, $ctrl);
+        my $err = '';
+        eval {
+            $stream = connect_client();
+            $ctrl   = connect_client();
+        };
+        $err = $@ if $@;
+        return ($stream, $ctrl) unless $err;
+
+        chomp $err;
+        my $choice = _auth_failure_dialog($mw, $listen, $err);
+        if ($choice eq 'cancel') {
+            $mw->destroy;
+            return ();
+        }
+        elsif ($choice eq 'no_auth') {
+            $no_auth = 1; $force_auth = 0;
+            # next loop will retry without AUTH
+        }
+        elsif (ref $choice eq 'HASH') {
+            $key_file   = $choice->{key_file} if defined $choice->{key_file}
+                                              && length $choice->{key_file};
+            $key_id     = $choice->{key_id}   if defined $choice->{key_id}
+                                              && length $choice->{key_id};
+            $no_auth    = 0;          # we're retrying WITH auth
+            $force_auth = 1;          # ...even if listen looks loopback-ish
+        }
+        else {
+            # unknown — bail rather than spin
+            $mw->destroy; return ();
+        }
+    }
+}
+
+# A blocking Tk dialog explaining the auth failure and offering the user three
+# choices: retry with a different SSH key / key_id; continue read-only (no
+# auth); or cancel (close the GUI). Returns:
+#   'cancel'                    — user closed/canceled
+#   'no_auth'                   — read-only
+#   { key_file=>..., key_id=>...} — retry with these
+# The current key_file/key_id are pre-filled. The text shows the daemon's exact
+# error so the user can tell "key not registered there" from "wrong key file".
+sub _auth_failure_dialog {
+    my ($mw, $target, $err) = @_;
+    require Tk;
+    my $dlg = $mw->Toplevel(-title => 'authentication required');
+    $dlg->transient($mw);
+
+    $dlg->Label(-text => "Could not connect to $target.",
+                -justify => 'left', -anchor => 'w')
+        ->pack(-fill => 'x', -padx => 12, -pady => (8, 2));
+    $dlg->Label(-text => "Reason: $err",
+                -justify => 'left', -anchor => 'w', -wraplength => 480)
+        ->pack(-fill => 'x', -padx => 12, -pady => (0, 8));
+
+    my %vals = (
+        key_file => ($key_file // NetMgr::Client::_default_key_file() // ''),
+        key_id   => ($key_id   // NetMgr::Client::_default_key_id()   // ''),
+    );
+
+    my $kf_frame = $dlg->Frame->pack(-fill => 'x', -padx => 12, -pady => 2);
+    $kf_frame->Label(-text => 'SSH key file:', -width => 12, -anchor => 'w')
+             ->pack(-side => 'left');
+    $kf_frame->Entry(-textvariable => \$vals{key_file}, -width => 40)
+             ->pack(-side => 'left', -fill => 'x', -expand => 1);
+    $kf_frame->Button(-text => 'Browse…', -command => sub {
+        my $f = $dlg->getOpenFile(-title => 'Select SSH private key',
+                                  -initialdir => "$ENV{HOME}/.ssh");
+        $vals{key_file} = $f if defined $f && length $f;
+    })->pack(-side => 'left', -padx => (4, 0));
+
+    my $kid_frame = $dlg->Frame->pack(-fill => 'x', -padx => 12, -pady => 2);
+    $kid_frame->Label(-text => 'Key ID:', -width => 12, -anchor => 'w')
+              ->pack(-side => 'left');
+    $kid_frame->Entry(-textvariable => \$vals{key_id}, -width => 40)
+              ->pack(-side => 'left', -fill => 'x', -expand => 1);
+
+    $dlg->Label(-text => "(Key ID is the principal name in the remote's allowed_signers — "
+                       . "usually user\@host of the key's comment.)",
+                -justify => 'left', -wraplength => 480, -anchor => 'w')
+        ->pack(-fill => 'x', -padx => 12, -pady => (4, 0));
+
+    my $result;
+    my $btns = $dlg->Frame->pack(-fill => 'x', -padx => 12, -pady => 10);
+    $btns->Button(-text => 'Retry with these', -command => sub {
+        $result = { key_file => $vals{key_file}, key_id => $vals{key_id} };
+        $dlg->destroy;
+    })->pack(-side => 'left', -padx => 2);
+    $btns->Button(-text => 'Continue without auth (read-only)', -command => sub {
+        $result = 'no_auth';
+        $dlg->destroy;
+    })->pack(-side => 'left', -padx => 2);
+    $btns->Button(-text => 'Cancel', -command => sub {
+        $result = 'cancel';
+        $dlg->destroy;
+    })->pack(-side => 'right', -padx => 2);
+    # ESC / window-close = cancel.
+    $dlg->protocol('WM_DELETE_WINDOW', sub { $result = 'cancel'; $dlg->destroy });
+    $dlg->bind('<Escape>' => sub { $result = 'cancel'; $dlg->destroy });
+
+    $dlg->grab;
+    $mw->waitWindow($dlg);
+    return $result // 'cancel';
+}
 
 sub need_name {
     my ($n) = @_;
