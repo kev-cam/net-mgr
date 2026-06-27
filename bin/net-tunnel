@@ -43,7 +43,11 @@ my $listen = $opt{listen} // do {
     my $pick = $opt{server} // $srvs->{default};
     $pick && $srvs->{$pick} ? $srvs->{$pick} : '127.0.0.1:7531';
 };
-$opt{auth} //= ($cmd ne 'list' && $cmd ne 'show');   # writes auth by default
+# Writes need auth — except on loopback, which the daemon exempts. Detect
+# the loopback case and skip the AUTH dance (it would just fail on a node
+# whose own /etc/net-mgr/allowed_signers doesn't list this user).
+my $is_loopback = $listen =~ m{^(127\.|::1$|localhost(?:[:/]|\z))};
+$opt{auth} //= ($cmd ne 'list' && $cmd ne 'show' && !$is_loopback);
 
 my $cli = NetMgr::Client->new(listen => $listen, timeout => 5);
 $cli->hello(consumer => "net-tunnel.$$");

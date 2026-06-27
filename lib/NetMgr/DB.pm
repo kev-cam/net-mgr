@@ -2350,6 +2350,7 @@ sub query_table {
         audit_annotations wifi_scan_results wifi_radio_state
         chat_sessions chat_members chat_messages chat_presence
         host_keys dhcp_ranges dhcp_reservations
+        mesh_tunnels
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};
