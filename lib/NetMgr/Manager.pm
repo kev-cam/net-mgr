@@ -491,20 +491,66 @@ sub _he_net_startup_net {
         ext_if => ($e->{ext_if} || undef),
         log => sub { $self->_log($_[0]) },
     );
-    $self->_log("ipv6_vlan '$name': startup bring-up failed: $err") if $err;
+    if ($err) {
+        $self->_log("ipv6_vlan '$name': startup bring-up failed: $err");
+        return;
+    }
+    # Push the current WAN IPv4 to HE so the tunnel keeps routing across Comcast
+    # WAN rotations (HE only routes the client IPv4 it has on record). Idempotent
+    # — HE returns 'nochg' when the registration is already correct, so it's safe
+    # to fire on every bring-up. No-op unless tunnel_id + update_secret are set.
+    $self->_he_update_endpoint($name, $e);
+}
+
+# Push gateway3's current WAN IPv4 to HE for one [ipv6_vlan he6in4] entry. Reads
+# the per-tunnel update key from /etc/net-mgr/secrets/<update_secret> via
+# NetMgr::Secret (never logs the credential). Called from _he_net_startup_net (on
+# every tunnel bring-up — idempotent self-heal) and from _check_ddns (on a real
+# WAN-IP change — fast convergence). Quiet no-op when tunnel_id/update_secret
+# aren't configured.
+sub _he_update_endpoint {
+    my ($self, $name, $e) = @_;
+    return unless defined $e->{tunnel_id}    && length $e->{tunnel_id};
+    return unless defined $e->{update_secret} && length $e->{update_secret};
+    require NetMgr::HE;
+    my ($ok, $msg) = NetMgr::HE::update_endpoint(
+        tunnel_id   => $e->{tunnel_id},
+        secret_name => $e->{update_secret},
+        # No `ip` — let HE detect the source IP. When THIS node IS the gateway,
+        # the source IP HE sees is the current WAN, which is exactly what we want.
+        log         => sub { $self->_log("ipv6_vlan '$name': " . $_[0]) },
+    );
+    return $ok;
+}
+
+# All [ipv6_vlan he6in4] entries with HE update configured. Used by _check_ddns
+# so a single WAN-IP change refreshes every tunnel on this node (a future
+# multi-tunnel setup — Comcast primary + T-Mobile fallback — fires both).
+sub _he_update_endpoints {
+    my ($self) = @_;
+    my $nets = $self->{config}{ipv6_vlan} || {};
+    for my $name (sort keys %$nets) {
+        my $e = $nets->{$name};
+        next unless ref $e eq 'HASH';
+        next unless lc($e->{type} // 'he6in4') eq 'he6in4';
+        next unless $e->{tunnel_id} && $e->{update_secret};
+        $self->_he_update_endpoint($name, $e);
+    }
 }
 
 # Periodic DDNS check: if the WAN IP changed, run the /etc/net-mgr/ddns hooks
-# (NetMgr::Ddns). Fired by _check_periodic_triggers at the [ddns] interval.
+# (NetMgr::Ddns) AND push the new IP to HE for every he6in4 with tunnel_id set.
+# Fired by _check_periodic_triggers at the [ddns] interval.
 sub _check_ddns {
     my ($self) = @_;
     my $dc = $self->{config}{ddns} || {};
-    NetMgr::Ddns::check(
+    my ($changed) = NetMgr::Ddns::check(
         dir       => $dc->{dir}       || '/etc/net-mgr/ddns',
         statefile => $dc->{statefile} || '/var/lib/net-mgr/wan-ip',
         ext_if    => ($dc->{ext_if} || undef),
         log       => sub { $self->_log($_[0]) },
     );
+    $self->_he_update_endpoints if $changed;
 }
 
 # Attach a type=relay IPv6 network: relay the he_net uplink to this node over the
@@ -3543,6 +3589,26 @@ sub _obs_he_net {
     return ();
 }
 
+# OBSERVE kind=he_update — push the current WAN IPv4 to HE on demand (over the
+# mesh). Same auth gate as he_net (may_internet), and the same secret-store path
+# — useful to force a refresh after fixing a stale registration, or as the manual
+# poke when [ddns] isn't watching the WAN interface. Without name=NAME refreshes
+# every configured he6in4; with name=NAME refreshes just that one.
+sub _obs_he_update {
+    my ($self, $cli, $kv) = @_;
+    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_internet})) {
+        die "he_update: not authorized (add the key to /etc/net-mgr/allowed_internet)\n";
+    }
+    if (my $name = $kv->{name}) {
+        my $e = ($self->{config}{ipv6_vlan} || {})->{$name}
+            or die "he_update: no [ipv6_vlan '$name']\n";
+        $self->_he_update_endpoint($name, $e);
+    } else {
+        $self->_he_update_endpoints;
+    }
+    return ();
+}
+
 # OBSERVE kind=relay action=up — set up a type=relay IPv6 network on demand (a
 # global address from the routed prefix on the control VLAN / LAN, and ::/0 via
 # the uplink unless this node IS the uplink). Params from kv: prefix (routed /64),
@@ -3606,6 +3672,7 @@ sub _handle_observe {
         elsif ($kind eq 'self_update') { @events = $self->_obs_self_update($cli, $kv) }
         elsif ($kind eq 'deploy')      { @events = $self->_obs_deploy($cli, $kv) }
         elsif ($kind eq 'he_net')      { @events = $self->_obs_he_net($cli, $kv) }
+        elsif ($kind eq 'he_update')   { @events = $self->_obs_he_update($cli, $kv) }
         elsif ($kind eq 'relay')       { @events = $self->_obs_relay($cli, $kv) }
         else {
             die "unknown observation kind '$kind'\n";

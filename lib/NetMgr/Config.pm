@@ -340,7 +340,10 @@ my %ACTIVE = (
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
     dnsmasq    => [qw(mode out_dir push_aps gateways)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
     ipv6_vlan  => [qw(type name mode server prefix local_suffix forwarding ext_if
-                      id addr attach gateway)], # managed IPv6 nets (vlan|he6in4|relay)
+                      id addr attach gateway
+                      tunnel_id update_secret)], # managed IPv6 nets (vlan|he6in4|relay);
+                                                 # tunnel_id+update_secret = HE DDNS
+                                                 # endpoint update (NetMgr::HE/Secret)
     ddns       => [qw(dir statefile interval ext_if)], # WAN-IP-change hooks (NetMgr::Ddns)
     forward    => [qw(method allow_peers)],   # net-connect FORWARD backend
     servers    => '*',                        # client server list (see servers())

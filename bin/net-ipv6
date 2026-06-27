@@ -9,6 +9,11 @@
 #   net-ipv6 start [--server IP] [--prefix CIDR] [--local-suffix N]
 #                  [--ext-if IF] [--no-forward]
 #   net-ipv6 stop
+#   net-ipv6 update                       push the current WAN IPv4 to HE's
+#                                         tunnelbroker.net (DDNS endpoint).
+#                                         Needs tunnel_id + update_secret in
+#                                         [ipv6_vlan "he_net"] (creds in
+#                                         /etc/net-mgr/secrets/<update_secret>).
 use strict;
 use warnings;
 use FindBin;
@@ -45,6 +50,16 @@ if ($cmd eq 'start') {
     print "net-ipv6: $name down\n";
 } elsif ($cmd eq 'status') {
     status($name, $prefix);
+} elsif ($cmd eq 'update') {
+    require NetMgr::HE;
+    my ($ok, $msg) = NetMgr::HE::update_endpoint(
+        tunnel_id   => $hc->{tunnel_id},
+        secret_name => $hc->{update_secret},
+        log         => sub { print "  $_[0]\n" },
+    );
+    print $ok ? "net-ipv6: HE endpoint updated ($msg)\n"
+              : "net-ipv6: HE update FAILED — $msg\n";
+    exit($ok ? 0 : 1);
 } else {
     usage();
 }
@@ -76,6 +91,7 @@ net-ipv6 — operate/debug the Hurricane Electric 6in4 uplink (he_net)
   net-ipv6 status
   net-ipv6 start [--server IP] [--prefix CIDR] [--local-suffix N] [--ext-if IF] [--no-forward]
   net-ipv6 stop
+  net-ipv6 update                       push current WAN IPv4 to HE (DDNS)
 Params default to [ipv6_vlan] in /etc/net-mgr/config.
 USAGE
     exit 1;
