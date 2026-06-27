@@ -310,12 +310,12 @@ sub auth {
              . " > " . _shq($ts->filename) . " 2>/dev/null";
     my $has_timeout = -x '/usr/bin/timeout' || -x '/bin/timeout';
     my $has_setsid  = -x '/usr/bin/setsid'  || -x '/bin/setsid';
-    my $cmd = ($has_timeout || $has_setsid)
+    my $sign_cmd = ($has_timeout || $has_setsid)
         ? join(' ', ($has_timeout ? ('timeout', '8') : ()),
                     ($has_setsid  ? ('setsid')      : ()),
                     'sh', '-c', _shq($base))
         : $base;
-    my $rc   = system($cmd);
+    my $rc   = system($sign_cmd);
     my $exit = $rc >> 8;
     if ($rc != 0) {
         if ($exit == 124) {
