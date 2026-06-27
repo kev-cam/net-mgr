@@ -3609,6 +3609,115 @@ sub _obs_he_update {
     return ();
 }
 
+# OBSERVE kind=write_config — write to a TIGHTLY BOUNDED set of net-mgr config
+# paths over the mesh. Designed for the rare case where you need to land a
+# config/secret on a node you can't ssh to (a gateway, a roaming follower).
+#
+# CONSTRAINTS — anything outside is rejected:
+#   - path is exactly one of:
+#       /etc/net-mgr/config                        (mode 644 default)
+#       /etc/net-mgr/config.d/<name>.conf          (mode 644 default)
+#       /etc/net-mgr/secrets/<name>                (mode 600 default; refuses other modes)
+#       /etc/net-mgr/allowed_<cap>                 (mode 644 default)
+#   - <name>/<cap> are [A-Za-z0-9._-]+ (no path traversal). Symlinks at the
+#     destination are refused (we won't write THROUGH a symlink as root).
+#   - content arrives base64-encoded (kv-safe across the protocol).
+#
+# AUTH — gated on may_update, same as kind=deploy/self_update (anyone you trust
+# to push code is trusted to push config; we don't widen the trust surface).
+# Loopback is exempt.
+#
+# SAFETY — atomic: writes to <path>.tmp.<pid>, fsync, rename into place. The
+# previous content is preserved at <path>.bak for manual rollback. The SECRET
+# VALUE is never logged; only path + sha1 of the new bytes + size + peer ID.
+#
+# Returns kv: path, sha1, size, mode, backup. The caller checks `sha1` against
+# the local file to confirm the bytes landed verbatim.
+sub _obs_write_config {
+    my ($self, $cli, $kv) = @_;
+    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_update})) {
+        die "write_config: not authorized (add the key to /etc/net-mgr/allowed_updaters)\n";
+    }
+    my $path = $kv->{path} // '';
+    my ($ok, $err, $default_mode) = _validate_write_config_path($path);
+    die "write_config: $err\n" unless $ok;
+    my $mode = $kv->{mode};
+    if (defined $mode && length $mode) {
+        $mode =~ /^0?[0-7]{3,4}$/ or die "write_config: bad mode '$mode'\n";
+        $mode = oct($mode);
+    } else {
+        $mode = $default_mode;
+    }
+    # Secrets are mode 600 — refuse looser modes silently widening the surface.
+    if ($path =~ m{^/etc/net-mgr/secrets/} && ($mode & 077)) {
+        die sprintf("write_config: secret '%s' refuses mode 0%o — must be 0600\n", $path, $mode);
+    }
+    my $b64 = $kv->{content_b64};
+    die "write_config: missing content_b64\n" unless defined $b64 && length $b64;
+    require MIME::Base64;
+    my $content = MIME::Base64::decode_base64($b64);
+    die "write_config: empty decoded content\n" unless length $content;
+    die "write_config: content too large (>1 MiB)\n" if length($content) > 1024*1024;
+
+    require Digest::SHA;
+    my $sha = Digest::SHA::sha1_hex($content);
+
+    # If a symlink already lives at $path, refuse — we won't follow it as root.
+    if (-l $path) { die "write_config: '$path' is a symlink (refused)\n" }
+
+    # Atomic write: tmp + fsync + rename. Keep a .bak of the previous bytes.
+    my $tmp = "$path.tmp.$$";
+    my $bak = "$path.bak";
+    require File::Path;
+    my ($dir) = $path =~ m{^(.+)/[^/]+$};
+    File::Path::make_path($dir, { mode => 0755 }) if $dir && !-d $dir;
+
+    if (-e $path && !-l $path) {
+        # best-effort backup; failure to backup is NOT fatal — but logged.
+        if (system('cp', '-a', '--', $path, $bak) != 0) {
+            $self->_log("write_config: could not back up '$path' to '$bak' (continuing)");
+        }
+    }
+    open(my $fh, '>', $tmp) or die "write_config: open $tmp: $!\n";
+    binmode($fh);
+    print $fh $content or do { close $fh; unlink $tmp; die "write_config: write $tmp: $!\n" };
+    $fh->flush;
+    # fsync — guard against power loss between rename and content hitting disk.
+    eval { require IO::Handle; $fh->sync };
+    close $fh or do { unlink $tmp; die "write_config: close $tmp: $!\n" };
+    chmod $mode, $tmp or do { unlink $tmp; die "write_config: chmod $tmp: $!\n" };
+    rename($tmp, $path) or do { unlink $tmp; die "write_config: rename $tmp -> $path: $!\n" };
+
+    my $who = $cli->{auth} ? ($cli->{auth}{key_id} // 'auth') : 'loopback';
+    $self->_log(sprintf("write_config: %s wrote %s (%d bytes, sha1=%s, mode=0%o)",
+                       $who, $path, length($content), $sha, $mode));
+    $self->_send($cli, format_ok(
+        path   => $path,
+        sha1   => $sha,
+        size   => length($content),
+        mode   => sprintf('0%o', $mode),
+        backup => (-e $bak ? $bak : ''),
+    ));
+    return ();
+}
+
+# Allow-list policy for write_config. Returns ($ok, $err, $default_mode).
+# Reject any path that doesn't match one of the four patterns above. The
+# patterns are exact strings/regexes — no globbing, no wildcards, no ../.
+sub _validate_write_config_path {
+    my ($path) = @_;
+    return (0, "missing path") unless defined $path && length $path;
+    return (0, "path must be absolute") unless $path =~ m{^/};
+    return (0, "path contains '..'")    if index($path, '/../') >= 0 || $path =~ m{/\.\.$};
+    return (0, "path contains '//'")    if index($path, '//')  >= 0;
+
+    return (1, undef, 0644) if $path eq '/etc/net-mgr/config';
+    return (1, undef, 0644) if $path =~ m{^/etc/net-mgr/config\.d/[A-Za-z0-9._-]+\.conf$};
+    return (1, undef, 0600) if $path =~ m{^/etc/net-mgr/secrets/[A-Za-z0-9._-]+$};
+    return (1, undef, 0644) if $path =~ m{^/etc/net-mgr/allowed_[a-z_]+$};
+    return (0, "path '$path' not in the write_config allow-list");
+}
+
 # OBSERVE kind=relay action=up — set up a type=relay IPv6 network on demand (a
 # global address from the routed prefix on the control VLAN / LAN, and ::/0 via
 # the uplink unless this node IS the uplink). Params from kv: prefix (routed /64),
@@ -3673,6 +3782,7 @@ sub _handle_observe {
         elsif ($kind eq 'deploy')      { @events = $self->_obs_deploy($cli, $kv) }
         elsif ($kind eq 'he_net')      { @events = $self->_obs_he_net($cli, $kv) }
         elsif ($kind eq 'he_update')   { @events = $self->_obs_he_update($cli, $kv) }
+        elsif ($kind eq 'write_config'){ @events = $self->_obs_write_config($cli, $kv) }
         elsif ($kind eq 'relay')       { @events = $self->_obs_relay($cli, $kv) }
         else {
             die "unknown observation kind '$kind'\n";

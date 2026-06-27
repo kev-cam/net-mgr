@@ -69,6 +69,8 @@ usage(2) unless defined $cmd;
 
 # `update` fans out the auth-gated self_update OBSERVE — sign by default.
 $auth = 1 if $cmd eq 'update' && !$auth;
+# `put` writes config — always auth-gated (write_config refuses unauthed peers).
+$auth = 1 if $cmd eq 'put' && !$auth;
 # `deploy` redeploys just THIS node via its own daemon. Loopback is trusted, so
 # it needs no signing — the no-fuss way to update a node when cross-node auth
 # (allowed_signers) isn't set up. Run it on each node, or let `update` fan out.
@@ -109,6 +111,7 @@ elsif ($cmd eq 'update')   { unshift @ARGV, 'kind=self_update'; $rc = cmd_observ
 elsif ($cmd eq 'deploy')   { unshift @ARGV, 'kind=self_update'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'regen')    { unshift @ARGV, 'kind=regen_dnsmasq'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'poll')     { $rc = cmd_poll($multi) }
+elsif ($cmd eq 'put')      { $rc = cmd_put($multi) }
 elsif ($cmd eq 'master')   { $rc = cmd_master($multi) }
 else { warn "net-cluster: unknown command '$cmd'\n"; usage(2) }
 
@@ -293,6 +296,49 @@ sub cmd_poll {
     return $any_err ? 1 : 0;
 }
 
+sub cmd_put {
+    my ($m) = @_;
+    my $local = shift @ARGV
+        or do { warn "put: usage: net-cluster put <LOCAL-FILE> <REMOTE-PATH> [mode=0644]\n"; return 2 };
+    my $remote = shift @ARGV
+        or do { warn "put: missing <REMOTE-PATH>\n"; return 2 };
+    my %extra = _parse_kv(@ARGV);
+    -r $local or do { warn "put: cannot read '$local'\n"; return 2 };
+    open(my $fh, '<', $local) or do { warn "put: open $local: $!\n"; return 2 };
+    binmode $fh; local $/; my $bytes = <$fh>; close $fh;
+    require MIME::Base64;
+    require Digest::SHA;
+    my $b64       = MIME::Base64::encode_base64($bytes, '');   # no newlines
+    my $local_sha = Digest::SHA::sha1_hex($bytes);
+    my %kv = (kind => 'write_config', path => $remote,
+              content_b64 => $b64, %extra);
+    # `put` is always auth-gated; force --auth on like `update` does.
+    if (!$m->{auth}) { warn "put: --auth required\n"; return 2 }
+    my $res = $m->observe_all(%kv);
+    my $any_err = 0;
+    if ($json) {
+        require JSON::PP;
+        print JSON::PP->new->canonical(1)->pretty->encode($res);
+    } else {
+        for my $p ($m->peers) {
+            my $r = $res->{ $p->{name} };
+            if (!$r) { printf "%-20s no reply\n", $p->{name}; $any_err = 1; next }
+            if ($r->{error}) {
+                printf "%-20s ERR %s\n", $p->{name}, $r->{error};
+                $any_err = 1; next;
+            }
+            my $kv = $r->{kv} || {};
+            my $verify = ($kv->{sha1} && $kv->{sha1} eq $local_sha) ? "verified" : "SHA-MISMATCH";
+            printf "%-20s OK  %s (%d bytes, mode=%s) %s\n",
+                $p->{name}, $kv->{path} // $remote,
+                $kv->{size} // length($bytes),
+                $kv->{mode} // '?', $verify;
+            $any_err = 1 if $verify ne 'verified';
+        }
+    }
+    return $any_err ? 1 : 0;
+}
+
 sub cmd_master {
     my ($m) = @_;
     my %kv = _parse_kv(@ARGV) or do { warn "master: need kind=… …\n"; return 2 };
@@ -351,6 +397,12 @@ Usage:
                                          probes: ipv6 ifaces routes netmgr-log
                                          fw_state ssh_forwards host-debug —
                                          gated by [debug] enabled+allowed_debug)
+  net-cluster put <LOCAL> <REMOTE> [mode=0644]
+                                        (write a config file on every peer over
+                                         the mesh; --auth REQUIRED; allow-list:
+                                         /etc/net-mgr/config, .../config.d/*.conf,
+                                         .../secrets/*, .../allowed_*; secrets
+                                         forced mode 0600)
   net-cluster master  kind=K k=v ...    (send only to cluster master)
   net-cluster update                    (pull+reinstall+re-exec EVERY peer;
                                          needs [manager] repo + cross-node auth)
