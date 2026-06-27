@@ -2913,7 +2913,35 @@ sub _chat_identity {
         my $as = (defined $kv && length($kv->{as} // '')) ? $kv->{as} : 'local';
         return ($as, 'human');
     }
+    # Unverified remote: an unauthed connection that supplies a self-asserted
+    # name (as=NAME). The name carries the 'unverified:' prefix so it's blatant
+    # in every UI surface — owners are explicitly accepting that the name is
+    # not cryptographically tied to a key. Used by the see-and-request flow:
+    # the user can browse open sessions and ask active members to admit them.
+    # CHAT_JOIN routes unverified principals through the request flow even for
+    # mode=open (no auto-admit); other write verbs treat them as non-members
+    # until/unless a member approves.
+    if (defined $kv && length($kv->{as} // '')) {
+        my $as = $kv->{as};
+        # Strip any leading 'unverified:' the client might have prepended, then
+        # add it ourselves — the prefix belongs to the daemon, not the client.
+        $as =~ s/^\s*unverified:\s*//i;
+        return ("unverified:$as", 'unverified') if length $as;
+    }
     return (undef, undef);
+}
+
+# Active member: principal currently present in the session (chat_presence row).
+# An active member can admit (allow/approve) other principals — that's the
+# see-and-request flow: not only the owner, but anyone currently in the chat
+# can let a requester in.
+sub _chat_is_active_member {
+    my ($self, $session, $principal) = @_;
+    return 0 unless defined $session && defined $principal;
+    my $rows = $self->{db}->dbh->selectall_arrayref(
+        "SELECT 1 FROM chat_presence WHERE session = ? AND principal = ? LIMIT 1",
+        { Slice => {} }, $session, $principal);
+    return scalar(@$rows) ? 1 : 0;
 }
 
 # Session names: a short safe token usable bare in WHERE clauses and URLs.
@@ -3113,13 +3141,17 @@ sub _chat_restore {
     $self->_log("chat resurrect $name: restored " . scalar(@$msgs) . " message(s)");
 }
 
-# May $who post to / upload to / read files of session $s? Same rule as
-# posting: open sessions are public, otherwise members only; loopback bypass.
+# May $who post to / upload to / read files of session $s? Open sessions are
+# public for AUTHED principals; unverified principals (self-asserted names with
+# no cryptographic backing) must be explicit members regardless of access_mode,
+# so an unauthed visitor can browse + request but can't speak in 'open' chats
+# until a member admits them. Loopback bypasses (local human / local agent).
 sub _chat_may_post {
     my ($self, $cli, $s, $who) = @_;
     return 1 if _peer_is_loopback($cli);
     return 0 unless defined $who;
-    return 1 if $s->{access_mode} eq 'open';
+    my $is_unverified = ($who =~ /^unverified:/);
+    return 1 if $s->{access_mode} eq 'open' && !$is_unverified;
     my $m = $self->{db}->get_chat_member($s->{name}, $who);
     return $m && $m->{state} eq 'member';
 }
@@ -3289,11 +3321,18 @@ sub _handle_chat_join {
     my $key_ok = (($kind // '') eq 'agent'
                   && $self->{db}->get_chat_authorized_key($name, $who)) ? 1 : 0;
 
-    unless ($is_member || $is_invited || $is_admin || $key_ok || $mode eq 'open') {
+    # Unverified principals (unauthed remote with as=NAME) ALWAYS go through
+    # the request flow, even on mode=open. mode=open means "any authed user may
+    # join without per-session approval" — that trust premise doesn't apply to
+    # a self-asserted name with no cryptographic backing.
+    my $unverified = (($kind // '') eq 'unverified');
+    unless ($is_member || $is_invited || $is_admin || $key_ok
+            || ($mode eq 'open' && !$unverified)) {
         # Not authorized yet. Rather than a flat reject, record a join request
-        # and notify owners (anyone subscribed WHERE state="requested" gets the
-        # approval pop-up). Approving saves the key (see _handle_chat_member_op),
-        # so the next join is automatic. Applies to both 'list' and 'request'.
+        # and notify owners + active members (anyone subscribed WHERE state=
+        # "requested" gets the approval pop-up). Approving saves the key (see
+        # _handle_chat_member_op), so the next join is automatic. Applies to
+        # 'list', 'request', and an unverified user on 'open'.
         my $m = $self->{db}->set_chat_member(
             session => $name, principal => $who, state => 'requested', added_by => $who);
         $self->_emit_change(table => 'chat_members', op => 'update', row => $m->{now})
@@ -3338,8 +3377,16 @@ sub _handle_chat_member_op {
     my $verb = "CHAT_" . uc $op;
     my $s = $self->{db}->get_chat_session($name)
         or return $self->_send($cli, format_err("$verb: no such session '".($name//'')."'"));
+    # Admin can always; an ACTIVE MEMBER (currently present in the session) may
+    # also admit/deny — that's the see-and-request feature: anyone in the chat
+    # can let an unverified user in, not just the owner. Unverified principals
+    # themselves cannot approve others (would be a self-elevation loop).
+    my $is_admin_op = $self->_chat_may_admin($cli, $s, $who);
+    my $is_active   = defined $who
+                   && ($who !~ /^unverified:/)
+                   && $self->_chat_is_active_member($name, $who);
     return $self->_send($cli, format_err("$verb: not authorized"))
-        unless $self->_chat_may_admin($cli, $s, $who);
+        unless $is_admin_op || $is_active;
     return $self->_send($cli, format_err("$verb: missing principal="))
         unless defined $principal && length $principal;
     my $state = ($op eq 'allow' || $op eq 'approve') ? 'member' : 'denied';
@@ -3405,7 +3452,11 @@ sub _obs_chat_msg {
         or die "chat_msg: no such session '$name'\n";
     die "chat_msg: session '$name' is closed\n" if $s->{status} eq 'closed';
 
-    if ($s->{access_mode} ne 'open' && !_peer_is_loopback($cli)) {
+    # Mode=open is public for AUTHED principals; unverified principals must be
+    # explicit members regardless (see _chat_may_post — same rule).
+    my $is_unverified = ($who =~ /^unverified:/);
+    if (($s->{access_mode} ne 'open' || $is_unverified)
+        && !_peer_is_loopback($cli)) {
         my $m = $self->{db}->get_chat_member($name, $who);
         die "chat_msg: not a member of '$name'\n"
             unless $m && $m->{state} eq 'member';

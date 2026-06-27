@@ -957,10 +957,25 @@ sub cmd_gui {
         my $who  = $kv->{principal} // return;
         return if $who eq $me;                       # not our own request
         return if $seen_req{"$sess/$who"}++;         # once per request
-        return unless $is_loopback || (($created_by{$sess} // '') eq $me);
+        # Pop for owners (always) and also when this user is ACTIVE IN the
+        # session (currently viewing it == joined). The daemon (since the
+        # see-and-request change) lets active members approve, not just
+        # owners, so a member viewing the chat can let an unverified user in.
+        return unless $is_loopback
+                   || (($created_by{$sess} // '') eq $me)
+                   || (defined $cur && $cur eq $sess);
+        # Make the unverified prefix visible so the approver knows what they're
+        # admitting — bake the explicit warning into the popup body.
+        my $is_unverified = ($who =~ /^unverified:/);
+        my $body = "'" . $who_label->($who) . "' requests to join '$sess'"
+                 . ($is_unverified
+                    ? "\n\nWARNING: This name is NOT cryptographically verified.\n"
+                      . "Anyone calling themselves this from the network can join\n"
+                      . "with the same name once you approve."
+                    : "");
         my $pop = $mw->Toplevel; $pop->title('join request');
-        $pop->Label(-text => "'" . $who_label->($who) . "' requests to join '$sess'",
-                    -padx => 14, -pady => 12)->pack;
+        $pop->Label(-text => $body, -padx => 14, -pady => 12,
+                    -justify => 'left')->pack;
         my $act = sub {
             my ($op) = @_;
             eval { $ctrl->chat_member($op, session => $sess, principal => $who) };
@@ -1383,9 +1398,10 @@ sub _gui_connect_with_dialog {
             $mw->destroy;
             return ();
         }
-        elsif ($choice eq 'no_auth') {
+        elsif (ref $choice eq 'HASH' && $choice->{no_auth}) {
+            # "Browse + request access" path.
             $no_auth = 1; $force_auth = 0;
-            # next loop will retry without AUTH
+            $as = $choice->{as} if defined $choice->{as} && length $choice->{as};
         }
         elsif (ref $choice eq 'HASH') {
             $key_file   = $choice->{key_file} if defined $choice->{key_file}
@@ -1426,6 +1442,9 @@ sub _auth_failure_dialog {
     my %vals = (
         key_file => ($key_file // NetMgr::Client::_default_key_file() // ''),
         key_id   => ($key_id   // NetMgr::Client::_default_key_id()   // ''),
+        # For the "browse + request access" path: a self-asserted name. Owners
+        # see it prefixed with "unverified:" so it's blatantly not cryptographic.
+        as       => ($as       // (getpwuid($<))[0] // 'guest'),
     );
 
     my $kf_frame = $dlg->Frame->pack(-fill => 'x', -padx => 12, -pady => 2);
@@ -1448,7 +1467,19 @@ sub _auth_failure_dialog {
     $dlg->Label(-text => "(Key ID is the principal name in the remote's allowed_signers — "
                        . "usually user\@host of the key's comment.)",
                 -justify => 'left', -wraplength => 480, -anchor => 'w')
-        ->pack(-fill => 'x', -padx => 12, -pady => [4, 0]);
+        ->pack(-fill => 'x', -padx => 12, -pady => [4, 8]);
+
+    # "Browse + request access" path: pick a display name; the remote sees it as
+    # "unverified:NAME" and present members can admit you.
+    my $as_frame = $dlg->Frame->pack(-fill => 'x', -padx => 12, -pady => 2);
+    $as_frame->Label(-text => 'Your name:', -width => 12, -anchor => 'w')
+             ->pack(-side => 'left');
+    $as_frame->Entry(-textvariable => \$vals{as}, -width => 40)
+             ->pack(-side => 'left', -fill => 'x', -expand => 1);
+    $dlg->Label(-text => "(Used for \"Browse + request access\" — chat owners "
+                       . "will see this as \"unverified:<name>\" and must admit you.)",
+                -justify => 'left', -wraplength => 480, -anchor => 'w')
+        ->pack(-fill => 'x', -padx => 12, -pady => [2, 0]);
 
     my $result;
     my $btns = $dlg->Frame->pack(-fill => 'x', -padx => 12, -pady => 10);
@@ -1456,8 +1487,8 @@ sub _auth_failure_dialog {
         $result = { key_file => $vals{key_file}, key_id => $vals{key_id} };
         $dlg->destroy;
     })->pack(-side => 'left', -padx => 2);
-    $btns->Button(-text => 'Continue without auth (read-only)', -command => sub {
-        $result = 'no_auth';
+    $btns->Button(-text => 'Browse + request access (no auth)', -command => sub {
+        $result = { no_auth => 1, as => $vals{as} };
         $dlg->destroy;
     })->pack(-side => 'left', -padx => 2);
     $btns->Button(-text => 'Cancel', -command => sub {
