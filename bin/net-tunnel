@@ -1,0 +1,147 @@
+#!/usr/bin/perl
+# net-tunnel — read/write the cluster-replicated mesh_tunnels table.
+#
+# The DB is the source of truth for tunnel topology in net-mgr: a node looks
+# itself up by name and learns its tunnel kind/server/prefixes. Config files are
+# only for overrides. This CLI is the typed-by-humans interface to the table.
+#
+# Usage:
+#   net-tunnel list                                List every tunnel row
+#   net-tunnel show OWNER [--kind he6in4]          One row, all columns
+#   net-tunnel set --owner=NAME --kind=KIND        Upsert a row. May set:
+#       [--provider-id=ID] [--server-v4=IP]          provider-id (HE tid),
+#       [--tunnel-prefix=CIDR]                       server_v4, tunnel-prefix
+#       [--routed-prefix=CIDR] [--notes=TEXT]        (/64 for tunnel itself),
+#                                                    routed-prefix (LAN /64),
+#                                                    notes.
+#   net-tunnel delete OWNER [--kind he6in4]        Remove the row.
+#
+# Auth: `set` and `delete` are auth-gated on may_update; the daemon refuses
+# unauthed callers (loopback is exempt — running on the master without --auth
+# works). Writes fan out cluster-wide via the existing replication path.
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use NetMgr::Client;
+use NetMgr::Config;
+use NetMgr::Protocol qw(parse_line format_kv);
+use Getopt::Long qw(GetOptions);
+
+my %opt;
+GetOptions(\%opt,
+    'listen=s', 'server=s', 'auth!', 'json', 'help',
+    'owner=s', 'kind=s', 'provider-id=s', 'server-v4=s',
+    'tunnel-prefix=s', 'routed-prefix=s', 'notes=s',
+) or usage(2);
+usage(0) if $opt{help};
+my $cmd = shift @ARGV // 'list';
+
+my $listen = $opt{listen} // do {
+    my $cfg = eval { NetMgr::Config->load } || {};
+    my $srvs = $cfg->{servers} || {};
+    my $pick = $opt{server} // $srvs->{default};
+    $pick && $srvs->{$pick} ? $srvs->{$pick} : '127.0.0.1:7531';
+};
+$opt{auth} //= ($cmd ne 'list' && $cmd ne 'show');   # writes auth by default
+
+my $cli = NetMgr::Client->new(listen => $listen, timeout => 5);
+$cli->hello(consumer => "net-tunnel.$$");
+$cli->auth if $opt{auth};
+
+if    ($cmd eq 'list')   { cmd_list() }
+elsif ($cmd eq 'show')   { cmd_show() }
+elsif ($cmd eq 'set')    { cmd_set() }
+elsif ($cmd eq 'delete') { cmd_delete() }
+else { warn "net-tunnel: unknown command '$cmd'\n"; usage(2) }
+$cli->bye;
+
+sub cmd_list {
+    my $rows = $cli->snapshot(1, 'mesh_tunnels');
+    my @rows = sort { ($a->{owner_node}||'') cmp ($b->{owner_node}||'')
+                   || ($a->{kind}||'')       cmp ($b->{kind}||'') } @$rows;
+    if ($opt{json}) {
+        require JSON::PP;
+        print JSON::PP->new->canonical(1)->pretty->encode(\@rows);
+        return;
+    }
+    if (!@rows) { print "(no rows)\n"; return }
+    printf "%-12s %-8s %-9s %-16s %-32s %-32s\n",
+        'OWNER', 'KIND', 'PROVIDER', 'SERVER', 'TUNNEL /64', 'ROUTED /64';
+    for my $r (@rows) {
+        printf "%-12s %-8s %-9s %-16s %-32s %-32s\n",
+            $r->{owner_node}    // '?',
+            $r->{kind}          // '?',
+            $r->{provider_id}   // '-',
+            $r->{server_v4}     // '-',
+            $r->{tunnel_prefix} // '-',
+            $r->{routed_prefix} // '-';
+    }
+}
+
+sub cmd_show {
+    my $owner = shift @ARGV or do { warn "show: need OWNER\n"; usage(2) };
+    my $kind  = $opt{kind} // 'he6in4';
+    my $rows  = $cli->snapshot(1, 'mesh_tunnels',
+                               where => "owner_node = '$owner' AND kind = '$kind'");
+    if (!@$rows) { print "(no row for $owner / $kind)\n"; exit 1 }
+    my $r = $rows->[0];
+    for my $k (qw(owner_node kind provider_id server_v4 tunnel_prefix
+                  routed_prefix notes last_modified replicated_from)) {
+        printf "  %-16s %s\n", "$k:", ($r->{$k} // '');
+    }
+}
+
+sub cmd_set {
+    my $owner = $opt{owner} or do { warn "set: --owner=NAME required\n"; usage(2) };
+    my $kind  = $opt{kind}  // 'he6in4';
+    my @kv = (kind => 'mesh_tunnel', action => 'set',
+              owner_node => $owner, kind => $kind);
+    for my $pair (
+        [provider_id    => $opt{'provider-id'}],
+        [server_v4      => $opt{'server-v4'}],
+        [tunnel_prefix  => $opt{'tunnel-prefix'}],
+        [routed_prefix  => $opt{'routed-prefix'}],
+        [notes          => $opt{notes}],
+    ) {
+        push @kv, $pair->[0] => $pair->[1] if defined $pair->[1] && length $pair->[1];
+    }
+    my $r = $cli->observe(@kv);
+    my $c = eval { parse_line($r) };
+    die "set: bad reply '$r'\n" unless $c;
+    die "set: $c->{msg}\n" if $c->{verb} eq 'ERR';
+    print "set $owner/$kind ok\n";
+}
+
+sub cmd_delete {
+    my $owner = shift @ARGV
+        or ($opt{owner} && do { unshift @ARGV, $opt{owner}; shift @ARGV })
+        or do { warn "delete: need OWNER\n"; usage(2) };
+    my $kind = $opt{kind} // 'he6in4';
+    my $r = $cli->observe(kind => 'mesh_tunnel', action => 'delete',
+                          owner_node => $owner, kind => $kind);
+    my $c = eval { parse_line($r) };
+    die "delete: bad reply '$r'\n" unless $c;
+    die "delete: $c->{msg}\n" if $c->{verb} eq 'ERR';
+    print "delete $owner/$kind ok\n";
+}
+
+sub usage {
+    my ($rc) = @_;
+    print STDERR <<'USAGE';
+net-tunnel — manage the cluster-replicated mesh_tunnels table.
+
+  net-tunnel list                                Every row
+  net-tunnel show OWNER [--kind=KIND]            One row
+  net-tunnel set  --owner=OWNER [--kind=KIND]    Upsert a row
+                  [--provider-id=ID] [--server-v4=IP]
+                  [--tunnel-prefix=CIDR] [--routed-prefix=CIDR]
+                  [--notes=TEXT]
+  net-tunnel delete OWNER [--kind=KIND]          Remove a row
+
+Common: --listen HOST:PORT (default 127.0.0.1:7531) | --server NAME (config)
+        --auth (forced on by set/delete) | --json (list)
+KIND defaults to he6in4.
+USAGE
+    exit($rc // 0);
+}

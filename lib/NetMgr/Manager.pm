@@ -42,6 +42,7 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
     audit_annotations wifi_scan_results wifi_radio_state
     chat_sessions chat_members chat_messages chat_presence
     host_keys dhcp_ranges dhcp_reservations
+    mesh_tunnels
 );
 
 # Tables whose contents are sensitive (credentials etc.); SUBSCRIBE
@@ -484,6 +485,11 @@ sub _attach_vlan_network {
 sub _he_net_startup_net {
     my ($self, $name, $e) = @_;
     return unless lc($e->{mode} // 'off') eq 'on';
+    # Overlay any missing config keys from mesh_tunnels (the DB is the source of
+    # truth for tunnel topology; the config file is for OVERRIDES only). So a
+    # node like gateway3 with an empty [ipv6_vlan "he_net"] block but a matching
+    # mesh_tunnels row comes up with the right server/prefix.
+    $e = $self->_merge_tunnel_from_db($name, $e);
     my (undef, $err) = NetMgr::Tunnel::up(
         name => $name, server => $e->{server}, prefix => $e->{prefix},
         local_suffix => ($e->{local_suffix} // '2'),
@@ -502,6 +508,35 @@ sub _he_net_startup_net {
     $self->_he_update_endpoint($name, $e);
 }
 
+# Overlay missing fields of an [ipv6_vlan he6in4] config entry from the
+# cluster-replicated mesh_tunnels table. Lookup by (owner_node=self_name,
+# kind='he6in4'). Config keys WIN: a value explicitly set in [ipv6_vlan "..."]
+# is never overridden by the DB. The merge is non-destructive — returns a NEW
+# hashref so the caller's config dict isn't mutated. Silent on DB error (the
+# tunnel still runs from whatever config has set; this is a fallback, not the
+# only source). See sql/schema.sql `mesh_tunnels` for the column reference.
+sub _merge_tunnel_from_db {
+    my ($self, $name, $e) = @_;
+    return $e unless $self->{db};
+    my $kind = lc($e->{type} // 'he6in4');
+    return $e unless $kind eq 'he6in4';
+    my $owner = $self->{cluster}{self_name};
+    return $e unless defined $owner && length $owner;
+    my $row = eval { $self->{db}->get_mesh_tunnel($owner, $kind) };
+    return $e if $@ || !$row;
+    # Build a fresh hash so callers' configs don't get mutated.
+    my %m = %$e;
+    # Map DB columns -> [ipv6_vlan] keys. Config wins; only fill what's empty.
+    $m{server}        //= $row->{server_v4}     if !defined $m{server}        || !length $m{server};
+    $m{prefix}        //= $row->{tunnel_prefix} if !defined $m{prefix}        || !length $m{prefix};
+    $m{tunnel_id}     //= $row->{provider_id}   if !defined $m{tunnel_id}     || !length $m{tunnel_id};
+    # The routed prefix isn't directly used by the tunnel itself, but a future
+    # relay-on-the-gateway path will want it; the column is also what relay
+    # nodes look up when their config has no prefix.
+    $m{routed_prefix} //= $row->{routed_prefix} if !defined $m{routed_prefix} || !length $m{routed_prefix};
+    return \%m;
+}
+
 # Push gateway3's current WAN IPv4 to HE for one [ipv6_vlan he6in4] entry. Reads
 # the per-tunnel update key from /etc/net-mgr/secrets/<update_secret> via
 # NetMgr::Secret (never logs the credential). Called from _he_net_startup_net (on
@@ -510,6 +545,8 @@ sub _he_net_startup_net {
 # aren't configured.
 sub _he_update_endpoint {
     my ($self, $name, $e) = @_;
+    # provider_id from mesh_tunnels fills tunnel_id when config doesn't have it.
+    $e = $self->_merge_tunnel_from_db($name, $e);
     return unless defined $e->{tunnel_id}    && length $e->{tunnel_id};
     return unless defined $e->{update_secret} && length $e->{update_secret};
     require NetMgr::HE;
@@ -3574,6 +3611,10 @@ sub _obs_he_net {
     }
     my $name = $kv->{name} // 'he_net';
     my $e = ($self->{config}{ipv6_vlan} || {})->{$name} || {};
+    # Fill anything missing from mesh_tunnels (the cluster-replicated table is
+    # the durable source of truth; config-file keys override; OBSERVE kv still
+    # overrides everything below).
+    $e = $self->_merge_tunnel_from_db($name, $e);
     my $action = $kv->{action} // 'up';
     if ($action eq 'down') {
         NetMgr::Tunnel::down(name => $name, log => sub { $self->_log($_[0]) });
@@ -3612,6 +3653,49 @@ sub _obs_he_update {
         $self->_he_update_endpoints;
     }
     return ();
+}
+
+# OBSERVE kind=mesh_tunnel — write/delete a row of the cluster-replicated
+# mesh_tunnels table (tunnel topology — server/prefixes/provider_id per owner).
+# Required: action (set|delete), owner_node, kind. For set: any of provider_id,
+# server_v4, tunnel_prefix, routed_prefix, notes (the upsert preserves columns
+# not supplied — partial updates are allowed). Auth-gated on may_update (same
+# trust as code/config writes — this IS a config write, just routed via DB
+# instead of a file). Loopback exempt. Emits a row event so replication picks
+# it up; followers get the change automatically.
+sub _obs_mesh_tunnel {
+    my ($self, $cli, $kv) = @_;
+    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_update})) {
+        die "mesh_tunnel: not authorized (add the key to /etc/net-mgr/allowed_updaters)\n";
+    }
+    my $action = $kv->{action} // 'set';
+    my $owner  = $kv->{owner_node};
+    my $kind   = $kv->{kind};
+    die "mesh_tunnel: owner_node required\n" unless defined $owner && length $owner;
+    die "mesh_tunnel: kind required\n"       unless defined $kind  && length $kind;
+    if ($action eq 'delete') {
+        $self->{db}->delete_mesh_tunnel($owner, $kind);
+        $self->_log("mesh_tunnel: delete owner=$owner kind=$kind");
+        return ({ type => 'mesh_tunnel_delete', owner_node => $owner, kind => $kind });
+    }
+    my $row = $self->{db}->upsert_mesh_tunnel(
+        owner_node    => $owner,
+        kind          => $kind,
+        provider_id   => $kv->{provider_id},
+        server_v4     => $kv->{server_v4},
+        tunnel_prefix => $kv->{tunnel_prefix},
+        routed_prefix => $kv->{routed_prefix},
+        notes         => $kv->{notes},
+    );
+    $self->_log("mesh_tunnel: set owner=$owner kind=$kind"
+              . ($kv->{provider_id}    ? " provider_id=$kv->{provider_id}"      : "")
+              . ($kv->{server_v4}      ? " server_v4=$kv->{server_v4}"          : "")
+              . ($kv->{tunnel_prefix}  ? " tunnel_prefix=$kv->{tunnel_prefix}"  : "")
+              . ($kv->{routed_prefix}  ? " routed_prefix=$kv->{routed_prefix}"  : ""));
+    return ({ type => 'mesh_tunnel_set',
+              owner_node => $owner, kind => $kind,
+              map { $_ => $row->{$_} }
+                  qw(provider_id server_v4 tunnel_prefix routed_prefix) });
 }
 
 # OBSERVE kind=write_config — write to a TIGHTLY BOUNDED set of net-mgr config
@@ -3788,6 +3872,7 @@ sub _handle_observe {
         elsif ($kind eq 'he_net')      { @events = $self->_obs_he_net($cli, $kv) }
         elsif ($kind eq 'he_update')   { @events = $self->_obs_he_update($cli, $kv) }
         elsif ($kind eq 'write_config'){ @events = $self->_obs_write_config($cli, $kv) }
+        elsif ($kind eq 'mesh_tunnel') { @events = $self->_obs_mesh_tunnel($cli, $kv) }
         elsif ($kind eq 'relay')       { @events = $self->_obs_relay($cli, $kv) }
         else {
             die "unknown observation kind '$kind'\n";

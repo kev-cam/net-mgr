@@ -651,3 +651,33 @@ CREATE TABLE IF NOT EXISTS chat_authorized_keys (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 INSERT IGNORE INTO schema_version (version) VALUES (25);
+
+-- mesh_tunnels (schema v27): tunnel/uplink metadata replicated cluster-wide.
+-- Source of truth for net-mgr's "overlay" tunnels: the row says "this kind of
+-- tunnel, terminated on this owner_node, has these endpoints/prefixes." Any
+-- node reading the table can decide what to do (a relay leaf reads the routed
+-- prefix; the owner reads the server/tunnel prefix; the cluster master fires
+-- the provider DDNS update with its local secret). A node's [ipv6_vlan] config
+-- OVERRIDES the columns when set (config files are for overrides only). See
+-- Manager::_he_net_startup_net for the consumer.
+--   kind: 'he6in4' (extensible — 'wireguard', 'gre', ... later)
+--   provider_id: provider-specific tunnel id (HE: numeric tid)
+--   server_v4: the remote endpoint we tunnel TO
+--   tunnel_prefix: /64 used FOR the tunnel itself (HE: server=::1, client=::2)
+--   routed_prefix: /64 routed via the tunnel for LAN clients (relay prefix)
+CREATE TABLE IF NOT EXISTS mesh_tunnels (
+    owner_node       VARCHAR(64)  NOT NULL,
+    kind             VARCHAR(32)  NOT NULL,
+    provider_id      VARCHAR(64)  NULL,
+    server_v4        VARCHAR(45)  NULL,
+    tunnel_prefix    VARCHAR(64)  NULL,
+    routed_prefix    VARCHAR(64)  NULL,
+    notes            VARCHAR(255) NULL,
+    last_modified    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                  ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from  VARCHAR(64)  NULL,
+    PRIMARY KEY (owner_node, kind),
+    KEY idx_mt_replicated (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO schema_version (version) VALUES (27);

@@ -28,6 +28,7 @@ my @REPLICATED = qw(
     machines hostnames interfaces addresses ports
     aps associations dhcp_leases aliases
     dhcp_ranges dhcp_reservations
+    mesh_tunnels
 );
 
 sub run {
@@ -407,6 +408,27 @@ sub _subnet_like_prefix {
     return "$a.$b.%"    if $len >= 16;
     return "$a.%"       if $len >= 8;
     return undef;       # wider than /8: too broad for a "scoped" pull
+}
+
+sub _apply_mesh_tunnels {
+    my ($db, $row, $idmap, $repl_from) = @_;
+    return unless $row->{owner_node} && $row->{kind};
+    $db->upsert_mesh_tunnel(
+        owner_node      => $row->{owner_node},
+        kind            => $row->{kind},
+        provider_id     => $row->{provider_id},
+        server_v4       => $row->{server_v4},
+        tunnel_prefix   => $row->{tunnel_prefix},
+        routed_prefix   => $row->{routed_prefix},
+        notes           => $row->{notes},
+        replicated_from => $repl_from,
+    );
+}
+
+sub _delete_mesh_tunnels {
+    my ($db, $row) = @_;
+    return unless $row->{owner_node} && $row->{kind};
+    $db->delete_mesh_tunnel($row->{owner_node}, $row->{kind});
 }
 
 1;

@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 26;
+our $SCHEMA_VERSION = 27;
 
 sub new {
     my ($class, %args) = @_;
@@ -682,6 +682,30 @@ SQL
         $self->{dbh}->do(
             "ALTER TABLE aps ADD COLUMN exclude TEXT NULL AFTER board"
         );
+        return;
+    }
+    if ($v == 27) {
+        # mesh_tunnels: tunnel/uplink metadata replicated cluster-wide. The
+        # source-of-truth for net-mgr's "overlay" tunnels — see sql/schema.sql
+        # for the column reference. A node's [ipv6_vlan] config OVERRIDES
+        # these columns when set ("config is for overrides only" — the design
+        # intent in project_net-mgr-vision).
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS mesh_tunnels (
+    owner_node       VARCHAR(64)  NOT NULL,
+    kind             VARCHAR(32)  NOT NULL,
+    provider_id      VARCHAR(64)  NULL,
+    server_v4        VARCHAR(45)  NULL,
+    tunnel_prefix    VARCHAR(64)  NULL,
+    routed_prefix    VARCHAR(64)  NULL,
+    notes            VARCHAR(255) NULL,
+    last_modified    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                  ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from  VARCHAR(64)  NULL,
+    PRIMARY KEY (owner_node, kind),
+    KEY idx_mt_replicated (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
         return;
     }
     croak "no migration for schema v$v";
@@ -1431,6 +1455,63 @@ SQL
         "SELECT * FROM isp_secrets
           WHERE gateway_machine_id = ? AND isp_name = ?",
         undef, $f{gateway_machine_id}, $f{isp_name}
+    );
+}
+
+# mesh_tunnels: tunnel/uplink topology, cluster-replicated. Fields can be NULL
+# (e.g. provider_id only meaningful for he6in4). owner_node + kind = PK. The
+# upsert pattern matches isp_secrets above.
+sub upsert_mesh_tunnel {
+    my ($self, %f) = @_;
+    croak "owner_node required" unless defined $f{owner_node} && length $f{owner_node};
+    croak "kind required"       unless defined $f{kind}       && length $f{kind};
+    $self->{dbh}->do(<<'SQL', undef,
+        INSERT INTO mesh_tunnels
+            (owner_node, kind, provider_id, server_v4,
+             tunnel_prefix, routed_prefix, notes, replicated_from)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+            provider_id     = COALESCE(VALUES(provider_id),     provider_id),
+            server_v4       = COALESCE(VALUES(server_v4),       server_v4),
+            tunnel_prefix   = COALESCE(VALUES(tunnel_prefix),   tunnel_prefix),
+            routed_prefix   = COALESCE(VALUES(routed_prefix),   routed_prefix),
+            notes           = COALESCE(VALUES(notes),           notes),
+            replicated_from = VALUES(replicated_from)
+SQL
+        @f{qw(owner_node kind provider_id server_v4
+              tunnel_prefix routed_prefix notes replicated_from)}
+    );
+    return $self->get_mesh_tunnel($f{owner_node}, $f{kind});
+}
+
+# Look up the row for one (owner_node, kind). Returns hashref or undef.
+sub get_mesh_tunnel {
+    my ($self, $owner_node, $kind) = @_;
+    return undef unless defined $owner_node && defined $kind;
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM mesh_tunnels WHERE owner_node = ? AND kind = ?",
+        undef, $owner_node, $kind
+    );
+}
+
+# List every tunnel. Optional kind filter.
+sub list_mesh_tunnels {
+    my ($self, $kind) = @_;
+    my $sql = "SELECT * FROM mesh_tunnels";
+    my @args;
+    if (defined $kind && length $kind) {
+        $sql .= " WHERE kind = ?";
+        push @args, $kind;
+    }
+    $sql .= " ORDER BY owner_node, kind";
+    return $self->{dbh}->selectall_arrayref($sql, { Slice => {} }, @args);
+}
+
+sub delete_mesh_tunnel {
+    my ($self, $owner_node, $kind) = @_;
+    return $self->{dbh}->do(
+        "DELETE FROM mesh_tunnels WHERE owner_node = ? AND kind = ?",
+        undef, $owner_node, $kind
     );
 }
 
