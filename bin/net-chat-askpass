@@ -1,0 +1,12 @@
+#!/bin/sh
+# net-chat-askpass — SSH_ASKPASS shim for net-chat's --gui mode.
+#
+# Invoked by ssh-keygen (or any OpenSSH tool) when SSH_ASKPASS points here and
+# SSH_ASKPASS_REQUIRE=force. The single argv we receive is the prompt text; we
+# hand it to net-chat's --askpass mode (a Tk popup) which prints the typed
+# passphrase to stdout and exits 0, or exits 1 on cancel. ssh-keygen reads our
+# stdout as the passphrase.
+#
+# Found via the same dir as the shim itself, so a non-/usr/local install works.
+dir=$(dirname "$0")
+exec "$dir/net-chat" --askpass -- "$@"

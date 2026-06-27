@@ -79,6 +79,7 @@ my $limit;
 my $since;
 my $show_all;
 my $gui;
+my $askpass;
 GetOptions(
     'listen=s'   => \$listen,
     'server=s'   => \$server,
@@ -93,7 +94,14 @@ GetOptions(
     'since=s'    => \$since,
     'all'        => \$show_all,
     'gui'        => \$gui,
+    'askpass'    => \$askpass,
 ) or die "bad options\n";
+
+# --askpass: invoked by ssh-keygen via SSH_ASKPASS (through the net-chat-askpass
+# shim) when the user's SSH key is passphrase-protected. The prompt arrives in
+# @ARGV; we pop a small Tk dialog and print the typed passphrase to stdout.
+# Exits 0 on OK, 1 on cancel. Done before HELLO/connect — no daemon needed.
+if ($askpass) { cmd_askpass(@ARGV); exit 0 }
 
 my $cmd = shift @ARGV;
 
@@ -551,6 +559,7 @@ sub cmd_gui {
     $session //= shift @ARGV;
     require Tk;   # loaded on demand; fully-qualified below so non-gui use
                   # of net-chat never needs Perl/Tk installed.
+    _gui_set_askpass_env();   # let ssh-keygen pop a Tk passphrase prompt
 
     # Build MainWindow FIRST so a connect/auth failure can pop a dialog instead
     # of dying. Without this, an AUTH failure (no key, key not in remote's
@@ -1291,6 +1300,65 @@ sub cmd_gui {
 }
 
 # ---- helpers ---------------------------------------------------------
+
+# Wire SSH_ASKPASS to net-chat-askpass so ssh-keygen pops a Tk passphrase
+# prompt for an encrypted SSH key instead of blocking on /dev/tty. Found via
+# the same dir as the running net-chat (FindBin), so installs to non-default
+# prefixes still work. SSH_ASKPASS_REQUIRE=force (OpenSSH >= 8.4) makes
+# ssh-keygen use the askpass even with a controlling tty; on older OpenSSH the
+# setsid wrapper in NetMgr::Client::auth is the fallback. Doesn't OVERRIDE a
+# user-set SSH_ASKPASS (their custom helper wins).
+sub _gui_set_askpass_env {
+    require FindBin;
+    my $shim = "$FindBin::Bin/net-chat-askpass";
+    return unless -x $shim;
+    $ENV{SSH_ASKPASS}         //= $shim;
+    $ENV{SSH_ASKPASS_REQUIRE} //= 'force';
+    # DISPLAY must be set for Tk to find the X server. Inherit if present;
+    # otherwise the askpass child can't open a window and ssh-keygen falls back
+    # to the (setsid'd) tty path. We don't try to invent one.
+}
+
+# net-chat --askpass MODE: stand-alone Tk passphrase prompt, invoked by
+# ssh-keygen via the SSH_ASKPASS shim. The single argv is the prompt text
+# ssh-keygen wants displayed (e.g. "Enter passphrase for key '/home/.../id_rsa':").
+# Prints the typed passphrase to stdout on OK; exits 1 on cancel.
+sub cmd_askpass {
+    my @prompt_words = @_;
+    my $prompt = join(' ', @prompt_words);
+    $prompt = 'Enter passphrase:' unless length $prompt;
+    require Tk;
+    my $mw = Tk::MainWindow->new;
+    $mw->withdraw;          # don't show the root MainWindow
+    my $dlg = $mw->Toplevel(-title => 'SSH passphrase');
+    $dlg->Label(-text => $prompt, -wraplength => 380,
+                -justify => 'left', -anchor => 'w')
+        ->pack(-fill => 'x', -padx => 12, -pady => [10, 6]);
+    my $val = '';
+    my $entry = $dlg->Entry(-textvariable => \$val, -show => '*', -width => 40)
+                    ->pack(-fill => 'x', -padx => 12, -pady => [0, 8]);
+    $entry->focus;
+    my $result;     # 'ok' | 'cancel'
+    my $btns = $dlg->Frame->pack(-fill => 'x', -padx => 12, -pady => [0, 10]);
+    $btns->Button(-text => 'Cancel',
+                  -command => sub { $result = 'cancel'; $dlg->destroy })
+         ->pack(-side => 'right', -padx => 2);
+    $btns->Button(-text => 'OK',
+                  -command => sub { $result = 'ok'; $dlg->destroy })
+         ->pack(-side => 'right', -padx => 2);
+    $dlg->bind('<Return>' => sub { $result = 'ok';     $dlg->destroy });
+    $dlg->bind('<Escape>' => sub { $result = 'cancel'; $dlg->destroy });
+    $dlg->protocol('WM_DELETE_WINDOW',
+                   sub { $result = 'cancel'; $dlg->destroy });
+    $dlg->grab;
+    $mw->waitWindow($dlg);
+    if (defined $result && $result eq 'ok') {
+        # Newline is required — ssh-keygen reads one line.
+        print "$val\n";
+        exit 0;
+    }
+    exit 1;
+}
 
 # Try to connect; if AUTH fails, pop a Tk dialog and let the user pick a
 # different key, continue read-only, or cancel. Returns (stream, ctrl) on
