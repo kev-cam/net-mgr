@@ -1961,6 +1961,21 @@ sub _handle_auth_response {
         if ($dok) { $ok = 1; $scope = 'debug'; }
         else      { $err = $derr // $err; }
     }
+    # Tier 6 — chat-key: keys persisted in chat_authorized_keys from prior
+    # see-and-request approvals. The DB is the source of truth here (no static
+    # /etc/net-mgr/allowed_* file), so we build a temp signers file from the
+    # rows whose pubkey is non-null and verify against it. On success the
+    # connection is scope='chat-key', flagged with the chat sessions this key
+    # is authorized for; _chat_identity then treats the connection as authed
+    # (returns the fingerprint as principal), and _handle_chat_join's
+    # chat_authorized_keys lookup auto-admits.
+    my $chat_sessions;
+    if (!$ok) {
+        my ($ckok, $ckerr, $sessions)
+            = $self->_chatkey_verify($auth->{key_id}, $auth->{nonce}, $sig);
+        if ($ckok) { $ok = 1; $scope = 'chat-key'; $chat_sessions = $sessions }
+        else       { $err = $ckerr // $err; }
+    }
     # Always invalidate the nonce — one-shot regardless of outcome.
     delete $auth->{nonce};
     if (!$ok) {
@@ -1975,10 +1990,13 @@ sub _handle_auth_response {
     my $may_debug    = $self->_is_allowed_debug($auth->{key_id});
     $cli->{auth} = { key_id => $auth->{key_id}, verified => 1, scope => $scope,
                      may_update => $may_update, may_internet => $may_internet,
-                     may_debug => $may_debug };
+                     may_debug => $may_debug,
+                     ($chat_sessions ? (chat_sessions => $chat_sessions) : ()) };
     $self->_log("auth OK $cli->{peer} key_id=$auth->{key_id} scope=$scope"
               . ($may_update ? " +update" : "") . ($may_internet ? " +internet" : "")
-              . ($may_debug ? " +debug" : ""));
+              . ($may_debug ? " +debug" : "")
+              . ($chat_sessions
+                 ? " +chats=" . join(',', sort keys %$chat_sessions) : ""));
     $self->_send($cli, format_ok(key_id => $auth->{key_id}, scope => $scope));
 }
 
@@ -2026,6 +2044,42 @@ sub _is_allowed_internet {
 # True if $key_id is named in /etc/net-mgr/allowed_debug — the allowlist of keys
 # permitted to run POLL probes over the mesh when [debug] enabled is on and the
 # allowlist exists (an empty/absent allowlist leaves POLL open, per _handle_poll).
+# Chat-key auth (Tier 6): a key persisted via the see-and-request approval
+# path can re-authenticate without being in any of the static allowed_*
+# files. We pull every chat_authorized_keys row with a stored pubkey,
+# write them to a temp allowed_signers file (one line per session-key pair),
+# then call NetMgr::Auth::verify with a state pointing at it. Returns
+# ($ok, $err, \%sessions) where %sessions maps session name -> 1 for every
+# row whose pubkey matched $key_id (the rows the user is authorized for).
+sub _chatkey_verify {
+    my ($self, $key_id, $nonce, $sig) = @_;
+    return (0, 'no key_id', undef)
+        unless defined $key_id && length $key_id;
+    my $matches = $self->{db}->list_chat_authorized_pubkeys($key_id);
+    return (0, 'no chat-key match', undef) unless $matches && @$matches;
+    my @matches = @$matches;
+    require File::Temp;
+    my $tmp = File::Temp->new(TEMPLATE => 'netmgr-chatkey-XXXXXX',
+                              TMPDIR => 1, UNLINK => 1);
+    binmode $tmp;
+    # allowed_signers format: "<principals> <pubkey>". We use the fingerprint
+    # itself as the principal so ssh-keygen -Y verify -I $key_id matches it.
+    for my $r (@matches) {
+        my $pk = $r->{pubkey} // ''; next unless length $pk;
+        # pubkey may include a comment we don't need — just key_type + blob.
+        print $tmp "$key_id $pk\n";
+    }
+    $tmp->flush;
+    my $state = NetMgr::Auth::new_state(
+        signers_path    => $tmp->filename,
+        authorized_keys => undef,
+    );
+    my ($ok, $err) = NetMgr::Auth::verify($state, $key_id, $nonce, $sig);
+    return ($ok, $err, undef) unless $ok;
+    my %sessions = map { $_->{session} => 1 } @matches;
+    return (1, undef, \%sessions);
+}
+
 sub _is_allowed_debug {
     my ($self, $key_id) = @_;
     return 0 unless defined $key_id && length $key_id;
@@ -2931,6 +2985,50 @@ sub _chat_identity {
     return (undef, undef);
 }
 
+# Sanity-normalise an OpenSSH-format public key arriving in a kv field. Strips
+# stray whitespace, collapses internal runs to single spaces, refuses anything
+# that doesn't look like a real pubkey ("ssh-*", "ecdsa-*", "sk-*", followed by
+# a base64 blob). 4 KiB length cap. Returns undef on rejection so callers can
+# treat that as "no pubkey supplied" (the request still goes through, just
+# without durable-key auth on approval).
+sub _normalize_pubkey {
+    my ($v) = @_;
+    return undef unless defined $v && length $v;
+    return undef if length($v) > 4096;
+    $v =~ s/\A\s+|\s+\z//g;
+    $v =~ s/\s+/ /g;
+    return undef unless $v =~ m{\A(?:ssh-(?:rsa|dss|ed25519|ed25519-sk)
+                                       |ecdsa-sha2-[A-Za-z0-9-]+
+                                       |sk-(?:ssh-ed25519|ecdsa-sha2-[A-Za-z0-9-]+))
+                                 \s+[A-Za-z0-9+/=]{40,}
+                                 (?:\s+\S.*)?\z}x;
+    return $v;
+}
+
+# Compute the SHA256 fingerprint + key_type of an OpenSSH-format public key by
+# shelling out to ssh-keygen -lf. Returns (key_id, key_type) — "SHA256:...",
+# "ed25519"/"rsa"/etc — or (undef, undef) on failure. Used when persisting an
+# unverified user's pubkey to chat_authorized_keys on approval; the resulting
+# key_id is what the future AUTH dance will present as its principal.
+sub _pubkey_fingerprint {
+    my ($pubkey) = @_;
+    return (undef, undef) unless defined $pubkey && length $pubkey;
+    require File::Temp;
+    my $tmp = File::Temp->new(TEMPLATE => 'netmgr-pk-XXXXXX',
+                              TMPDIR => 1, SUFFIX => '.pub', UNLINK => 1);
+    binmode $tmp;
+    print $tmp $pubkey;
+    $tmp->flush;
+    # `ssh-keygen -l -E sha256 -f <file>` ⇒ "256 SHA256:... user@host (ED25519)"
+    my $out = `ssh-keygen -l -E sha256 -f '@{[ $tmp->filename ]}' 2>/dev/null`;
+    return (undef, undef) unless defined $out && $out =~ /SHA256:/;
+    chomp $out;
+    my ($fp)  = $out =~ /(SHA256:\S+)/;
+    my ($typ) = $out =~ /\(([A-Za-z0-9_-]+)\)\s*\z/;
+    return (undef, undef) unless defined $fp && length $fp;
+    return ($fp, lc($typ // ''));
+}
+
 # Active member: principal currently present in the session (chat_presence row).
 # An active member can admit (allow/approve) other principals — that's the
 # see-and-request flow: not only the owner, but anyone currently in the chat
@@ -3333,11 +3431,23 @@ sub _handle_chat_join {
         # "requested" gets the approval pop-up). Approving saves the key (see
         # _handle_chat_member_op), so the next join is automatic. Applies to
         # 'list', 'request', and an unverified user on 'open'.
+        #
+        # An optional pubkey kv lets the requester include their SSH public key
+        # ("ssh-ed25519 AAAA... [comment]"). On approval that pubkey moves into
+        # chat_authorized_keys; the user's next connect can AUTH with the
+        # matching private key (chat-key fallthrough, NetMgr::Auth) and is
+        # auto-admitted without a second ask. Only accepted for unverified
+        # joins (an already-authed user is already known by their key).
+        my $req_pubkey = ($unverified && defined $kv->{pubkey}
+                                      && length $kv->{pubkey})
+                         ? _normalize_pubkey($kv->{pubkey}) : undef;
         my $m = $self->{db}->set_chat_member(
-            session => $name, principal => $who, state => 'requested', added_by => $who);
+            session => $name, principal => $who, state => 'requested',
+            added_by => $who, request_pubkey => $req_pubkey);
         $self->_emit_change(table => 'chat_members', op => 'update', row => $m->{now})
             if $m->{now};
-        $self->_log("chat join-request $name by $who");
+        $self->_log("chat join-request $name by $who"
+                  . ($req_pubkey ? " [+pubkey for durable auth]" : ""));
         return $self->_send($cli, format_ok(session => $name, state => 'requested'));
     }
 
@@ -3412,6 +3522,38 @@ sub _handle_chat_member_op {
             $self->_emit_change(table => 'chat_authorized_keys', op => 'delete', row => $had)
                 if $had;
         }
+    }
+
+    # Durable chat-key auth: an UNVERIFIED requester who included their SSH
+    # pubkey at request time gets that key persisted to chat_authorized_keys on
+    # approval. The fingerprint becomes the durable key_id; the future AUTH
+    # chat-key fallthrough (NetMgr::Auth) will recognise the key and auto-admit.
+    # Reject/deny clears the pending pubkey so it isn't preserved across a
+    # rejected request.
+    if ($principal =~ /^unverified:/) {
+        my $row = $self->{db}->get_chat_member($name, $principal);
+        my $pk  = $row ? $row->{request_pubkey} : undef;
+        if ($state eq 'member' && defined $pk && length $pk) {
+            my ($fp, $ktyp2) = _pubkey_fingerprint($pk);
+            if (defined $fp) {
+                # Strip "unverified:" for the label so it reads cleanly in the
+                # owner's key list ("Alice" rather than "unverified:Alice").
+                (my $lbl = $principal) =~ s/^unverified://;
+                my $k = $self->{db}->add_chat_authorized_key(
+                    session => $name, key_id => $fp,
+                    key_type => $ktyp2, label => $lbl,
+                    added_by => $who, pubkey => $pk);
+                $self->_emit_change(table => 'chat_authorized_keys',
+                                    op => 'update', row => $k) if $k;
+                $self->_log("chat $op $name: bound pubkey $fp to '$lbl'");
+            } else {
+                $self->_log("chat $op $name: pubkey on '$principal' "
+                          . "didn't parse — skipped durable-key persist");
+            }
+        }
+        # Clear the pending pubkey regardless of outcome (it's done its job, or
+        # the request was denied and shouldn't linger).
+        $self->{db}->clear_chat_member_request_pubkey($name, $principal);
     }
     $self->_log("chat $op $name principal=$principal by ".($who//'?'));
     $self->_send($cli, format_ok(session => $name, principal => $principal, state => $state));

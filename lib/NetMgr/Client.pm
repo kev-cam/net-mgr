@@ -31,8 +31,13 @@ sub new {
     ) or croak "connect " . join_hostport($host, $port) . ": $!";
     # `as` is a loopback-only self-declared identity stamped onto chat
     # control verbs / posts (the daemon ignores it once AUTH'd).
+    # `as_pubkey` is the OpenSSH-format public key auto-attached to chat_join
+    # for the see-and-request flow — the daemon stores it on the requested
+    # member row, and an active member's approval moves it to the chat's
+    # durable authorized-key list (chat-key auth on the next connect).
     return bless { sock => $sock, buf => '', listen => join_hostport($host, $port),
-                   as => $args{as}, timeout => $timeout }, $class;
+                   as => $args{as}, as_pubkey => $args{as_pubkey},
+                   timeout => $timeout }, $class;
 }
 
 sub send_line {
@@ -430,7 +435,16 @@ sub chat_delete {
 sub chat_join {
     my ($self, %a) = @_;
     croak "chat_join needs session" unless defined $a{session};
-    return $self->_chat_cmd('CHAT_JOIN', session => $a{session});
+    # An optional pubkey lets an unverified ('as'-named, unauthed) user supply
+    # their SSH public key with the join request. On approval the daemon binds
+    # the key to the chat's authorized list and a future AUTH from the matching
+    # private key auto-admits (chat-key fallthrough — no second ask). Accepts
+    # either an explicit pubkey opt or $self->{as_pubkey} stashed at new() time
+    # by the GUI's see-and-request flow.
+    my $pk = $a{pubkey} // $self->{as_pubkey};
+    my @kv = (session => $a{session});
+    push @kv, pubkey => $pk if defined $pk && length $pk;
+    return $self->_chat_cmd('CHAT_JOIN', @kv);
 }
 
 sub chat_leave {

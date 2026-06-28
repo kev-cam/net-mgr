@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 27;
+our $SCHEMA_VERSION = 28;
 
 sub new {
     my ($class, %args) = @_;
@@ -681,6 +681,17 @@ SQL
         # rescans (upsert_ap) leave it untouched. See sql/schema.sql.
         $self->{dbh}->do(
             "ALTER TABLE aps ADD COLUMN exclude TEXT NULL AFTER board"
+        );
+        return;
+    }
+    if ($v == 28) {
+        # Durable chat-key auth: persist the requester's SSH pubkey through the
+        # see-and-request approval flow. See sql/schema.sql for the rationale.
+        $self->{dbh}->do(
+            "ALTER TABLE chat_members ADD COLUMN request_pubkey TEXT NULL"
+        );
+        $self->{dbh}->do(
+            "ALTER TABLE chat_authorized_keys ADD COLUMN pubkey TEXT NULL"
         );
         return;
     }
@@ -2037,18 +2048,35 @@ sub set_chat_member {
     my $state = $f{state} // 'member';
     my $req_at  = $state eq 'requested' ? 'CURRENT_TIMESTAMP' : 'NULL';
     my $join_at = $state eq 'member'    ? 'CURRENT_TIMESTAMP' : 'NULL';
+    # request_pubkey carries the SSH pubkey supplied with an unverified join
+    # request; the request handler stashes it here, the approval handler
+    # transfers it to chat_authorized_keys and CLEARs this column (so the
+    # ephemeral key sits on the requested row only as long as it's pending).
     $self->{dbh}->do(
         "INSERT INTO chat_members
-            (session, principal, role, state, added_by, requested_at, joined_at)
-         VALUES (?, ?, ?, ?, ?, $req_at, $join_at)
+            (session, principal, role, state, added_by, requested_at, joined_at,
+             request_pubkey)
+         VALUES (?, ?, ?, ?, ?, $req_at, $join_at, ?)
          ON DUPLICATE KEY UPDATE
-            role         = VALUES(role),
-            state        = VALUES(state),
-            added_by     = VALUES(added_by),
-            requested_at = COALESCE(VALUES(requested_at), requested_at),
-            joined_at    = COALESCE(VALUES(joined_at),    joined_at)",
-        undef, $f{session}, $f{principal}, $role, $state, $f{added_by});
+            role           = VALUES(role),
+            state          = VALUES(state),
+            added_by       = VALUES(added_by),
+            requested_at   = COALESCE(VALUES(requested_at), requested_at),
+            joined_at      = COALESCE(VALUES(joined_at),    joined_at),
+            request_pubkey = COALESCE(VALUES(request_pubkey), request_pubkey)",
+        undef, $f{session}, $f{principal}, $role, $state, $f{added_by},
+        $f{request_pubkey});
     return { op => 'update', now => $self->get_chat_member($f{session}, $f{principal}) };
+}
+
+# Clear request_pubkey on a chat_members row (called after the pubkey has been
+# moved to chat_authorized_keys at approval time).
+sub clear_chat_member_request_pubkey {
+    my ($self, $session, $principal) = @_;
+    $self->{dbh}->do(
+        "UPDATE chat_members SET request_pubkey = NULL
+          WHERE session = ? AND principal = ?",
+        undef, $session, $principal);
 }
 
 # ---- per-chat authorized SSH keys (schema v25) ------------------------
@@ -2066,17 +2094,46 @@ sub add_chat_authorized_key {
     my ($self, %f) = @_;
     croak "session + key_id required"
         unless defined $f{session} && defined $f{key_id};
+    # pubkey is the OpenSSH-format public key ("ssh-ed25519 AAAA..." [ comment]),
+    # exactly the line ssh-keygen -Y verify reads from an allowed_signers file.
+    # When supplied, the chat-key AUTH fallthrough (NetMgr::Auth's signers list)
+    # can recognise the key on a future connect without it being in any of the
+    # /etc/net-mgr/allowed_* files.
     $self->{dbh}->do(
         "INSERT INTO chat_authorized_keys
-            (session, key_id, key_type, label, added_by)
-         VALUES (?, ?, ?, ?, ?)
+            (session, key_id, key_type, label, added_by, pubkey)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
             key_type = VALUES(key_type),
             label    = VALUES(label),
-            added_by = VALUES(added_by)",
+            added_by = VALUES(added_by),
+            pubkey   = COALESCE(VALUES(pubkey), pubkey)",
         undef, $f{session}, $f{key_id}, ($f{key_type} // ''),
-        ($f{label} // ''), $f{added_by});
+        ($f{label} // ''), $f{added_by}, $f{pubkey});
     return $self->get_chat_authorized_key($f{session}, $f{key_id});
+}
+
+# Every chat_authorized_keys row that includes a pubkey — for the chat-key
+# AUTH fallthrough. Optional $key_id arg narrows to just the rows for that
+# fingerprint, which is what the AUTH handler always wants. Each return
+# entry has session, key_id, key_type, pubkey, label.
+sub list_chat_authorized_pubkeys {
+    my ($self, $key_id) = @_;
+    if (defined $key_id && length $key_id) {
+        return $self->{dbh}->selectall_arrayref(
+            "SELECT session, key_id, key_type, pubkey, label
+               FROM chat_authorized_keys
+              WHERE pubkey IS NOT NULL AND pubkey <> ''
+                AND key_id = ?",
+            { Slice => {} }, $key_id
+        );
+    }
+    return $self->{dbh}->selectall_arrayref(
+        "SELECT session, key_id, key_type, pubkey, label
+           FROM chat_authorized_keys
+          WHERE pubkey IS NOT NULL AND pubkey <> ''",
+        { Slice => {} }
+    );
 }
 
 sub remove_chat_authorized_key {

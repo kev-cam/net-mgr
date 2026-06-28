@@ -164,8 +164,30 @@ exit 0;
 
 sub connect_client {
     my %opt = @_;          # want_auth => bool override
+    # In see-and-request mode (no-auth + as=NAME), attach the user's public key
+    # to chat_join so an approval persists the key on the chat — the next
+    # connect AUTHs normally (chat-key fallthrough) and auto-admits, no second
+    # ask. We try .pub next to the configured/default key_file and skip
+    # silently if it isn't readable (request still works, just without durable
+    # key persistence).
+    my $as_pubkey;
+    if ($no_auth && defined $as && length $as) {
+        my $kf = $key_file // NetMgr::Client::_default_key_file();
+        if (defined $kf && length $kf) {
+            my $pub = "$kf.pub";
+            if (-r $pub) {
+                if (open my $fh, '<', $pub) {
+                    local $/;
+                    $as_pubkey = <$fh>;
+                    close $fh;
+                }
+            }
+        }
+    }
     my $cli = eval { NetMgr::Client->new(listen => $listen, timeout => 10,
-                                         as => $as) }
+                                         as => $as,
+                                         (defined $as_pubkey
+                                          ? (as_pubkey => $as_pubkey) : ())) }
         or die "net-chat: cannot reach daemon at $listen: $@";
 
     my ($host) = NetMgr::Client::split_hostport($listen); $host //= '';

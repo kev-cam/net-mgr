@@ -681,3 +681,19 @@ CREATE TABLE IF NOT EXISTS mesh_tunnels (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 INSERT IGNORE INTO schema_version (version) VALUES (27);
+
+-- Schema v28: durable chat-key auth for unverified-then-approved users.
+-- The unverified see-and-request flow now persists the requester's SSH public
+-- key when they send one with the join request; on approval the pubkey moves
+-- to chat_authorized_keys keyed by its fingerprint. A future AUTH from that
+-- key (Tier 6 chat-key in NetMgr::Auth) recognises it via chat_authorized_keys
+-- and the user re-joins the chats they were approved for, no second ask.
+--   chat_members.request_pubkey: pubkey supplied with a join request, NULL when
+--     the request was nameless. Cleared on approve/reject (moves to authd_keys).
+--   chat_authorized_keys.pubkey: the OpenSSH-format public key
+--     ("ssh-ed25519 AAAA... comment"), the line ssh-keygen -Y verify reads.
+--     Existing rows have NULL (no chat-key auth possible until refreshed).
+ALTER TABLE chat_members         ADD COLUMN request_pubkey TEXT NULL;
+ALTER TABLE chat_authorized_keys ADD COLUMN pubkey         TEXT NULL;
+
+INSERT IGNORE INTO schema_version (version) VALUES (28);
