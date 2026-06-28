@@ -91,7 +91,7 @@ sub cmd_show {
     if (!@$rows) { print "(no row for $owner / $kind)\n"; exit 1 }
     my $r = $rows->[0];
     for my $k (qw(owner_node kind provider_id server_v4 tunnel_prefix
-                  routed_prefix notes last_modified replicated_from)) {
+                  routed_prefix secret_name notes last_modified replicated_from)) {
         printf "  %-16s %s\n", "$k:", ($r->{$k} // '');
     }
 }
