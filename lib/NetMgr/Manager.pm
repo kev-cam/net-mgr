@@ -2907,6 +2907,16 @@ my %POLL_METHODS = (
         return "== tail -120 $log ==\n" . `tail -n 120 "$log" 2>/dev/null` if -r $log;
         return "(no journald entries for $unit and no readable $log)\n";
     },
+    # Tail of net-mgr-relay.service — separate unit, separate journal. Needed
+    # to diagnose replication problems (relay can't reach master, is subscribed
+    # to too few tables, is connecting but the snapshot fails, etc.) on a node
+    # where ssh isn't an option.
+    'relay-log' => sub {
+        my $unit = 'net-mgr-relay';
+        my $j = `journalctl -u "$unit.service" -n 120 --no-pager 2>/dev/null`;
+        return "== journalctl $unit -n 120 ==\n$j" if $j =~ /\S/;
+        return "(no journald entries for $unit)\n";
+    },
 );
 
 sub _handle_poll {
