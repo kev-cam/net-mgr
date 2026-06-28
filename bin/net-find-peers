@@ -78,7 +78,10 @@ my $db;
 unless ($print_only) {
     my $cfg = NetMgr::Config->load(
         $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
-    my $mycnf = (-r "$ENV{HOME}/.my.cnf") ? "$ENV{HOME}/.my.cnf"
+    # The broker daemon forks us without HOME set; guard $ENV{HOME} so the
+    # "Use of uninitialized value" warning doesn't clutter every run.
+    my $home = $ENV{HOME} // '';
+    my $mycnf = (length $home && -r "$home/.my.cnf") ? "$home/.my.cnf"
               : NetMgr::Config->mysql_defaults_file($cfg);
     $db = NetMgr::DB->new(
         defaults_file => $mycnf,
@@ -88,11 +91,25 @@ unless ($print_only) {
     $db->connect;
 }
 
-# Pull existing peers so we can announce *new* ones in --quiet mode.
+# Pull existing peers so we can announce *new* ones in --quiet mode. Stale rows
+# (last_seen older than $stale_age) DON'T count as "known" for the bootstrap
+# gate below — a follower whose cluster info aged out (idle / down for a while)
+# needs the /24 sweep again or it stays orphaned forever.
+my $stale_age = 3600;        # seconds
+my $now_epoch = time();
 my %known;
+my $fresh_known = 0;
 if ($db) {
+    require Time::Piece;
     for my $row (@{ $db->query_table('peers') }) {
         $known{"$row->{host}:$row->{port}"} = 1;
+        # last_seen is "YYYY-MM-DD HH:MM:SS" in local time (MySQL DATETIME).
+        my $age;
+        eval {
+            my $tp = Time::Piece->strptime($row->{last_seen}, '%Y-%m-%d %H:%M:%S');
+            $age = $now_epoch - $tp->epoch;
+        };
+        $fresh_known++ if defined $age && $age < $stale_age;
     }
 }
 
@@ -103,11 +120,13 @@ if ($db) {
 # host's own IPv4 /24s directly for port-7531 responders. That's enough to find
 # the master; once it's in the peers table this guard switches the sweep back
 # off and the cheap address-based scan takes over.
-if ($bootstrap && ($print_only || !%known)) {
+if ($bootstrap && ($print_only || !$fresh_known)) {
     my %have = map { $_ => 1 } @ips;
     my @boot = grep { !$have{$_} && !$self_listeners{$_} } _local_subnet_hosts();
     if (@boot) {
-        warn scalar(@boot), " bootstrap IPs from local /24(s)\n" unless $quiet;
+        warn scalar(@boot), " bootstrap IPs from local /24(s)"
+           . (%known && !$fresh_known ? " (peers stale — re-sweeping)" : "")
+           . "\n" unless $quiet;
         push @ips, @boot;
         @ips = sort { _ipkey($a) cmp _ipkey($b) } @ips;
     }
