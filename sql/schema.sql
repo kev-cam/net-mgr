@@ -697,3 +697,12 @@ ALTER TABLE chat_members         ADD COLUMN request_pubkey TEXT NULL;
 ALTER TABLE chat_authorized_keys ADD COLUMN pubkey         TEXT NULL;
 
 INSERT IGNORE INTO schema_version (version) VALUES (28);
+
+-- Schema v29: mesh_tunnels.secret_name — the per-tunnel pointer to the
+-- credential needed for provider-side updates (HE tunnelbroker DDNS). Lives in
+-- the row so the cluster master can resolve the secret on behalf of any node
+-- without anyone else holding it. See project_net-mgr-vision: "Secrets live on
+-- the cluster master."
+ALTER TABLE mesh_tunnels ADD COLUMN secret_name VARCHAR(64) NULL;
+
+INSERT IGNORE INTO schema_version (version) VALUES (29);

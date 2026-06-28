@@ -535,6 +535,10 @@ sub _merge_tunnel_from_db {
     # relay-on-the-gateway path will want it; the column is also what relay
     # nodes look up when their config has no prefix.
     $m{routed_prefix} //= $row->{routed_prefix} if !defined $m{routed_prefix} || !length $m{routed_prefix};
+    # secret_name on the row → update_secret in the [ipv6_vlan] shape consumed
+    # by _he_update_endpoint. The actual SECRET file is read locally on the
+    # node that has it (the cluster master); other nodes route through master.
+    $m{update_secret} //= $row->{secret_name}   if !defined $m{update_secret} || !length $m{update_secret};
     return \%m;
 }
 
@@ -546,19 +550,84 @@ sub _merge_tunnel_from_db {
 # aren't configured.
 sub _he_update_endpoint {
     my ($self, $name, $e) = @_;
-    # provider_id from mesh_tunnels fills tunnel_id when config doesn't have it.
+    # provider_id + secret_name from mesh_tunnels fill the gaps; config wins.
     $e = $self->_merge_tunnel_from_db($name, $e);
-    return unless defined $e->{tunnel_id}    && length $e->{tunnel_id};
-    return unless defined $e->{update_secret} && length $e->{update_secret};
+    return unless defined $e->{tunnel_id} && length $e->{tunnel_id};
+    my $secret_name = $e->{update_secret};
     require NetMgr::HE;
-    my ($ok, $msg) = NetMgr::HE::update_endpoint(
-        tunnel_id   => $e->{tunnel_id},
-        secret_name => $e->{update_secret},
-        # No `ip` — let HE detect the source IP. When THIS node IS the gateway,
-        # the source IP HE sees is the current WAN, which is exactly what we want.
-        log         => sub { $self->_log("ipv6_vlan '$name': " . $_[0]) },
-    );
-    return $ok;
+    require NetMgr::Secret;
+    # Fast path: this node holds the secret — fire the curl directly. Two ways
+    # to "hold": secret_name is set AND the file is readable, OR HE auto-detect
+    # works because THIS node IS the tunnel endpoint (source IP = WAN).
+    if (defined $secret_name && length $secret_name) {
+        my ($val, $err) = NetMgr::Secret::get($secret_name);
+        if (defined $val) {
+            my ($ok, $msg) = NetMgr::HE::update_endpoint(
+                tunnel_id   => $e->{tunnel_id},
+                secret_name => $secret_name,
+                ip          => $e->{myip},        # optional override
+                log         => sub { $self->_log("ipv6_vlan '$name': " . $_[0]) },
+            );
+            return $ok;
+        }
+        # Secret not local — fall through to master routing.
+    }
+    # Slow path: forward to the cluster master (who holds the secret). The
+    # master looks up mesh_tunnels for owner_node=<this node> and reads its
+    # local secret. We pass myip explicitly so HE registers OUR WAN, not the
+    # master's. No-op silently if there's no master, no route to it, or this
+    # IS the master (in which case the secret should be local — log so the
+    # operator can diagnose).
+    my $self_name = $self->{cluster}{self_name};
+    my $master    = ($self->{cluster_runtime} || {})->{master_member};
+    if (!defined $master || !length $master) {
+        $self->_log("ipv6_vlan '$name': no secret locally and no master known — skipping");
+        return 0;
+    }
+    if ($master eq $self_name) {
+        $self->_log("ipv6_vlan '$name': I am master but secret '"
+                  . ($secret_name // '?')
+                  . "' is unreadable on me — place it in /etc/net-mgr/secrets/");
+        return 0;
+    }
+    my $addr = $self->{mesh} ? $self->{mesh}->address_for($master) : '';
+    if (!$addr) {
+        $self->_log("ipv6_vlan '$name': no address for master '$master' — skipping HE update");
+        return 0;
+    }
+    # Look up our current WAN so the master can pass it as myip=.
+    my (undef, $wan_v4) = NetMgr::Tunnel::external_ipv4($e->{ext_if});
+    my %kv = (kind => 'he_update', target => $self_name, name => $name);
+    $kv{myip} = $wan_v4 if defined $wan_v4 && length $wan_v4;
+    my $rc = $self->_forward_observe_to_master($addr, %kv);
+    if ($rc) {
+        $self->_log("ipv6_vlan '$name': HE update forwarded to master '$master' (myip="
+                  . ($wan_v4 // '?') . ")");
+    } else {
+        $self->_log("ipv6_vlan '$name': HE update forward to master '$master' failed");
+    }
+    return $rc;
+}
+
+# Send an OBSERVE to the master and return its OK/ERR as 1/0. Auth-signed with
+# this node's mesh key (the master's may_internet allowlist must include it).
+sub _forward_observe_to_master {
+    my ($self, $master_addr, %kv) = @_;
+    require NetMgr::Client;
+    my $cli = eval { NetMgr::Client->new(listen => $master_addr, timeout => 6) };
+    return 0 if $@ || !$cli;
+    eval { $cli->hello(consumer => "he_update.$$") };
+    if ($@) { eval { $cli->bye }; return 0 }
+    eval { $cli->auth };
+    if ($@) {
+        $self->_log("forward to master: auth failed: $@");
+        eval { $cli->bye };
+        return 0;
+    }
+    my $r = eval { $cli->observe(%kv) };
+    eval { $cli->bye };
+    return 0 if $@ || !defined $r;
+    return ($r =~ /^OK\b/) ? 1 : 0;
 }
 
 # All [ipv6_vlan he6in4] entries with HE update configured. Used by _check_ddns
@@ -3839,6 +3908,27 @@ sub _obs_he_update {
     unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_internet})) {
         die "he_update: not authorized (add the key to /etc/net-mgr/allowed_internet)\n";
     }
+    # Master-routed form: target=<owner_node> means "I am that owner, you have
+    # the secret — please fire the curl on my behalf, with myip=<my WAN>".
+    # The master looks up the row for the target in mesh_tunnels, reads its
+    # local secret (named in mesh_tunnels.secret_name), and calls curl with
+    # the supplied myip so HE registers the TARGET's WAN, not the master's.
+    if (my $target = $kv->{target}) {
+        my $kind = $kv->{tunnel_kind} // 'he6in4';
+        my $row  = $self->{db}->get_mesh_tunnel($target, $kind)
+            or die "he_update: no mesh_tunnels row for owner=$target kind=$kind\n";
+        my %e = (
+            tunnel_id     => $row->{provider_id},
+            update_secret => $row->{secret_name},
+            myip          => $kv->{myip},
+        );
+        die "he_update: row for $target has no provider_id\n"
+            unless defined $e{tunnel_id} && length $e{tunnel_id};
+        die "he_update: row for $target has no secret_name\n"
+            unless defined $e{update_secret} && length $e{update_secret};
+        $self->_he_update_endpoint($kv->{name} // 'he_net', \%e);
+        return ();
+    }
     if (my $name = $kv->{name}) {
         my $e = ($self->{config}{ipv6_vlan} || {})->{$name}
             or die "he_update: no [ipv6_vlan '$name']\n";
@@ -3888,6 +3978,7 @@ sub _obs_mesh_tunnel {
         tunnel_prefix => $kv->{tunnel_prefix},
         routed_prefix => $kv->{routed_prefix},
         notes         => $kv->{notes},
+        secret_name   => $kv->{secret_name},
     );
     my $row = $r->{now} || {};
     $self->_log("mesh_tunnel: set owner=$owner kind=$tkind"

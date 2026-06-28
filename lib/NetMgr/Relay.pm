@@ -421,6 +421,7 @@ sub _apply_mesh_tunnels {
         tunnel_prefix   => $row->{tunnel_prefix},
         routed_prefix   => $row->{routed_prefix},
         notes           => $row->{notes},
+        secret_name     => $row->{secret_name},
         replicated_from => $repl_from,
     );
 }

@@ -329,7 +329,9 @@ install: .version
 	        systemctl restart "$$u" \
 	          || printf '  *** restart %s failed; check: systemctl status %s\n' "$$u" "$$u"; \
 	      elif systemctl is-enabled --quiet "$$u" 2>/dev/null; then \
-	        printf '  %-25s enabled but stopped — start with: systemctl start %s\n' "$$u" "$$u"; \
+	        printf '  %-25s enabled but stopped — starting\n' "$$u"; \
+	        systemctl start "$$u" \
+	          || printf '  *** start %s failed; check: systemctl status %s\n' "$$u" "$$u"; \
 	      else \
 	        printf '  %-25s not enabled  — enable with: systemctl enable --now %s\n' "$$u" "$$u"; \
 	      fi; \

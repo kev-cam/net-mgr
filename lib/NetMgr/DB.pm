@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 28;
+our $SCHEMA_VERSION = 29;
 
 sub new {
     my ($class, %args) = @_;
@@ -692,6 +692,14 @@ SQL
         );
         $self->{dbh}->do(
             "ALTER TABLE chat_authorized_keys ADD COLUMN pubkey TEXT NULL"
+        );
+        return;
+    }
+    if ($v == 29) {
+        # mesh_tunnels.secret_name: per-tunnel pointer to the credential needed
+        # for provider DDNS (HE tunnelbroker). See sql/schema.sql.
+        $self->{dbh}->do(
+            "ALTER TABLE mesh_tunnels ADD COLUMN secret_name VARCHAR(64) NULL"
         );
         return;
     }
@@ -1481,18 +1489,20 @@ sub upsert_mesh_tunnel {
     $self->{dbh}->do(<<'SQL', undef,
         INSERT INTO mesh_tunnels
             (owner_node, kind, provider_id, server_v4,
-             tunnel_prefix, routed_prefix, notes, replicated_from)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             tunnel_prefix, routed_prefix, notes, secret_name,
+             replicated_from)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON DUPLICATE KEY UPDATE
             provider_id     = COALESCE(VALUES(provider_id),     provider_id),
             server_v4       = COALESCE(VALUES(server_v4),       server_v4),
             tunnel_prefix   = COALESCE(VALUES(tunnel_prefix),   tunnel_prefix),
             routed_prefix   = COALESCE(VALUES(routed_prefix),   routed_prefix),
             notes           = COALESCE(VALUES(notes),           notes),
+            secret_name     = COALESCE(VALUES(secret_name),     secret_name),
             replicated_from = VALUES(replicated_from)
 SQL
         @f{qw(owner_node kind provider_id server_v4
-              tunnel_prefix routed_prefix notes replicated_from)}
+              tunnel_prefix routed_prefix notes secret_name replicated_from)}
     );
     return { op  => ($was ? 'update' : 'insert'),
              now => $self->get_mesh_tunnel($f{owner_node}, $f{kind}) };

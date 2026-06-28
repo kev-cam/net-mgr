@@ -32,7 +32,7 @@ my %opt;
 GetOptions(\%opt,
     'listen=s', 'server=s', 'auth!', 'json', 'help',
     'owner=s', 'kind=s', 'provider-id=s', 'server-v4=s',
-    'tunnel-prefix=s', 'routed-prefix=s', 'notes=s',
+    'tunnel-prefix=s', 'routed-prefix=s', 'notes=s', 'secret-name=s',
 ) or usage(2);
 usage(0) if $opt{help};
 my $cmd = shift @ARGV // 'list';
@@ -108,6 +108,7 @@ sub cmd_set {
         [tunnel_prefix  => $opt{'tunnel-prefix'}],
         [routed_prefix  => $opt{'routed-prefix'}],
         [notes          => $opt{notes}],
+        [secret_name    => $opt{'secret-name'}],
     ) {
         push @kv, $pair->[0] => $pair->[1] if defined $pair->[1] && length $pair->[1];
     }
@@ -141,7 +142,10 @@ net-tunnel — manage the cluster-replicated mesh_tunnels table.
   net-tunnel set  --owner=OWNER [--kind=KIND]    Upsert a row
                   [--provider-id=ID] [--server-v4=IP]
                   [--tunnel-prefix=CIDR] [--routed-prefix=CIDR]
-                  [--notes=TEXT]
+                  [--notes=TEXT] [--secret-name=NAME]
+                  (--secret-name points at /etc/net-mgr/secrets/<NAME>
+                   on whichever node holds the credential — typically
+                   the cluster master)
   net-tunnel delete OWNER [--kind=KIND]          Remove a row
 
 Common: --listen HOST:PORT (default 127.0.0.1:7531) | --server NAME (config)
