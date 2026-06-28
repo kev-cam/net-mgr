@@ -858,7 +858,7 @@ sub _auto_discover {
     my $cs = $self->{cluster} or return;
     my $spec = $cs->{auto_spec} or return;
     return unless $self->{mesh};
-    my $names = eval {
+    my ($names, $ip_for) = eval {
         NetMgr::AutoDiscover::discover(
             db        => $self->{db},
             spec      => $spec,
@@ -871,7 +871,11 @@ sub _auto_discover {
         $self->_log("auto-discover failed: $e");
         return;
     }
-    $self->{mesh}->set_members($names || []);
+    # Pass the name -> address map so the mesh can dial by IP — DNS for the
+    # cluster name is unreliable (gateway3 has no PTR for nas3, only for
+    # gateway2). The address map comes from peers.host on the same row whose
+    # cluster_member named the peer.
+    $self->{mesh}->set_members($names || [], $ip_for || {});
 }
 
 sub _auto_spec_desc {

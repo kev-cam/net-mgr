@@ -243,12 +243,14 @@ sub address_for {
 # on the next tick); names not in the list are dropped + their
 # sockets closed. self_name is never added or removed.
 sub set_members {
-    my ($self, $members) = @_;
+    my ($self, $members, $address_for) = @_;
+    $address_for //= {};
     my %wanted = map { $_ => 1 } @$members;
     delete $wanted{ $self->{self_name} };
 
     for my $name (@$members) {
         next if $name eq $self->{self_name};
+        my $addr = $address_for->{$name};   # "ip:port", optional
         if (my $p = $self->{peers}{$name}) {
             # Already in our peer table — but maybe as an UNCONFIGURED entry
             # created by mesh.record() from an inbound HEARTBEAT before
@@ -262,6 +264,17 @@ sub set_members {
                 $p->{backoff}  = $self->{backoff_min};
                 $self->{log}->("mesh: promoted peer $name (was unconfigured)");
             }
+            # Refresh the dial target on every roster update — IPs can rotate.
+            # Also kick a peer that's been stuck "down" so the new address gets
+            # tried right away.
+            if (defined $addr && length $addr) {
+                my $changed = !defined $p->{dial_addr} || $p->{dial_addr} ne $addr;
+                $p->{dial_addr} = $addr;
+                if ($changed && ($p->{conn_state} // '') ne 'up') {
+                    $p->{next_try} = 0;
+                    $p->{backoff}  = $self->{backoff_min};
+                }
+            }
             next;
         }
         $self->{peers}{$name} = {
@@ -273,8 +286,10 @@ sub set_members {
             last_hb_tx => 0,
             last_hb_rx => 0,
             remote     => {},
+            (defined $addr ? (dial_addr => $addr) : ()),
         };
-        $self->{log}->("mesh: added peer $name (auto-discovered)");
+        $self->{log}->("mesh: added peer $name (auto-discovered"
+                     . (defined $addr ? " at $addr" : "") . ")");
     }
     for my $name (sort keys %{ $self->{peers} }) {
         next if $wanted{$name};
@@ -313,12 +328,16 @@ sub shutdown {
 
 sub _try_connect {
     my ($self, $name, $p, $now) = @_;
-    # Bypass for self-loops or member names we can't resolve.
+    # Dial target: prefer the explicit address stashed by auto-discover (an
+    # "ip:port" string from the peers table), so we don't depend on DNS
+    # resolving a cluster name like 'nas3'. Fall back to the name itself when
+    # no address is known (legacy path; works when /etc/hosts or PTR is set up).
     # A member spec is a host/name, or a bracketed v6 ([fd…]) optionally with a
     # port. split_hostport keeps a v6 literal intact; a bare name resolves over
-    # v4+v6 via IO::Socket::IP (so an AAAA on the control VLAN is used).
-    my ($ph, $pp) = split_hostport($name);
-    $ph = $name unless defined $ph && length $ph;
+    # v4+v6 via IO::Socket::IP.
+    my $target = $p->{dial_addr} // $name;
+    my ($ph, $pp) = split_hostport($target);
+    $ph = $target unless defined $ph && length $ph;
     my $sock = IO::Socket::IP->new(
         PeerHost => $ph,
         PeerPort => ($pp // $self->{port}),

@@ -78,9 +78,12 @@ sub discover {
 
     # 3. CIDR filter + name resolution. Pick the peer's stored cluster_member
     # first (cheap + reliable), fall back to the machines/hostnames join,
-    # finally PTR.
+    # finally PTR. Also stash IP -> name so the mesh can dial by ADDRESS even
+    # when DNS for the cluster name is unconfigured (gateway3 has no PTR for
+    # nas3, but does know its IP from the peers row).
     my @names;
     my %seen;
+    my %ip_for;
     for my $r (@$peer_rows) {
         my $ip = $r->{host};
         next unless _looks_like_v4($ip);
@@ -92,11 +95,12 @@ sub discover {
         next if defined $self_name && $name eq $self_name;
         next if $seen{$name}++;
         push @names, $name;
+        $ip_for{$name} //= "$ip:" . ($r->{port} // $port);
     }
     $log->("auto-discover: " . _spec_desc($spec)
          . " → " . scalar(@names) . " peer(s): "
          . (@names ? join(',', @names) : '-'));
-    return \@names;
+    return wantarray ? (\@names, \%ip_for) : \@names;
 }
 
 sub _spec_desc {
