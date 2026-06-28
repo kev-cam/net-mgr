@@ -68,27 +68,26 @@ sub discover {
         }
     }
 
-    # 2. Candidate peers from local peers table
+    # 2. Candidate peers from local peers table (carry cluster_member if
+    # find-peers stored one — that bypasses the machines/hostnames join + PTR
+    # fallback, which often fail on a fresh follower whose DB is empty).
     my $peer_rows = $db->dbh->selectall_arrayref(
-        "SELECT host, port FROM peers WHERE port = ?",
+        "SELECT host, port, cluster_member FROM peers WHERE port = ?",
         { Slice => {} }, $port,
     );
 
-    # 3. CIDR filter
-    my @ips;
+    # 3. CIDR filter + name resolution. Pick the peer's stored cluster_member
+    # first (cheap + reliable), fall back to the machines/hostnames join,
+    # finally PTR.
+    my @names;
+    my %seen;
     for my $r (@$peer_rows) {
         my $ip = $r->{host};
         next unless _looks_like_v4($ip);
         next if @cidrs && !_ip_in_any_cidr($ip, \@cidrs);
-        push @ips, $ip;
-    }
-
-    # 4. Resolve each IP → name. Prefer local hostnames table (we
-    # already trust it), fall back to PTR, skip if neither works.
-    my @names;
-    my %seen;
-    for my $ip (@ips) {
-        my $name = _name_for_ip($db, $ip);
+        my $name = (defined $r->{cluster_member} && length $r->{cluster_member})
+                   ? _first_label($r->{cluster_member})
+                   : _name_for_ip($db, $ip);
         next unless defined $name && length $name;
         next if defined $self_name && $name eq $self_name;
         next if $seen{$name}++;

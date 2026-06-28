@@ -706,3 +706,13 @@ INSERT IGNORE INTO schema_version (version) VALUES (28);
 ALTER TABLE mesh_tunnels ADD COLUMN secret_name VARCHAR(64) NULL;
 
 INSERT IGNORE INTO schema_version (version) VALUES (29);
+
+-- Schema v30: peers.cluster_member — the discovered peer's self-reported
+-- cluster name (from its STATUS reply). Lets a fresh follower run
+-- AutoDiscover without needing machines/interfaces/addresses populated
+-- first (chicken-and-egg: those tables fill via replication, but
+-- replication can't start until election finds a master). PTR fallback
+-- is fine but unreliable when reverse DNS is unconfigured.
+ALTER TABLE peers ADD COLUMN cluster_member VARCHAR(64) NULL;
+
+INSERT IGNORE INTO schema_version (version) VALUES (30);

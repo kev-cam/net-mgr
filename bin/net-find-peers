@@ -206,6 +206,12 @@ for my $ip (@ips) {
         schema_version => ($st->{schema_version} // undef),
         started_at     => $started_iso,
         rtt_ms         => $rtt,
+        # Store the peer's self-name so AutoDiscover doesn't have to JOIN to
+        # machines+interfaces+addresses (empty on a fresh follower) or fall
+        # back to PTR (often misconfigured). Critical for the chicken-and-egg:
+        # without it, gateway3 elects itself master because reverse DNS for
+        # nas3 isn't set up.
+        cluster_member => ($st->{cluster_member} // undef),
     );
 
     # If the peer reports a cluster_member name that isn't in our

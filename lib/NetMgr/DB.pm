@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 29;
+our $SCHEMA_VERSION = 30;
 
 sub new {
     my ($class, %args) = @_;
@@ -700,6 +700,14 @@ SQL
         # for provider DDNS (HE tunnelbroker). See sql/schema.sql.
         $self->{dbh}->do(
             "ALTER TABLE mesh_tunnels ADD COLUMN secret_name VARCHAR(64) NULL"
+        );
+        return;
+    }
+    if ($v == 30) {
+        # peers.cluster_member: peer's STATUS-reported cluster_member name, so
+        # AutoDiscover can resolve peers without machines table data.
+        $self->{dbh}->do(
+            "ALTER TABLE peers ADD COLUMN cluster_member VARCHAR(64) NULL"
         );
         return;
     }
@@ -1752,17 +1760,19 @@ sub upsert_peer {
     $f{last_status} //= 'reachable';
     $self->{dbh}->do(
         "INSERT INTO peers
-            (host, port, last_status, schema_version, started_at, rtt_ms, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+            (host, port, last_status, schema_version, started_at, rtt_ms, notes,
+             cluster_member)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
             last_status    = VALUES(last_status),
             schema_version = COALESCE(VALUES(schema_version), schema_version),
             started_at     = COALESCE(VALUES(started_at),     started_at),
             rtt_ms         = COALESCE(VALUES(rtt_ms),         rtt_ms),
-            notes          = COALESCE(VALUES(notes),          notes)",
+            notes          = COALESCE(VALUES(notes),          notes),
+            cluster_member = COALESCE(VALUES(cluster_member), cluster_member)",
         undef,
         $f{host}, $f{port}, $f{last_status}, $f{schema_version},
-        $f{started_at}, $f{rtt_ms}, $f{notes},
+        $f{started_at}, $f{rtt_ms}, $f{notes}, $f{cluster_member},
     );
     return $self->{dbh}->selectrow_hashref(
         "SELECT * FROM peers WHERE host = ? AND port = ?",
