@@ -49,6 +49,7 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
 # is allowed only when the calling connection has completed AUTH.
 my %SUBSCRIBABLE_AUTH = map { $_ => 1 } qw(
     isp_secrets
+    chat_authorized_keys
 );
 
 sub new {

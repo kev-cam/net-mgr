@@ -2409,6 +2409,7 @@ sub query_table {
         zone_classes interface_zones wifi_zones
         audit_annotations wifi_scan_results wifi_radio_state
         chat_sessions chat_members chat_messages chat_presence
+        chat_authorized_keys
         host_keys dhcp_ranges dhcp_reservations
         mesh_tunnels
     );
