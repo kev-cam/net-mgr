@@ -249,7 +249,21 @@ sub set_members {
 
     for my $name (@$members) {
         next if $name eq $self->{self_name};
-        next if $self->{peers}{$name};
+        if (my $p = $self->{peers}{$name}) {
+            # Already in our peer table — but maybe as an UNCONFIGURED entry
+            # created by mesh.record() from an inbound HEARTBEAT before
+            # auto-discover knew the name. Now that it's officially in the
+            # roster, promote it: clear the flag so it's visible in
+            # cluster_mesh, and re-arm next_try so the outbound dial kicks in
+            # immediately (don't sit on the backoff_max that record() set).
+            if ($p->{unconfigured}) {
+                delete $p->{unconfigured};
+                $p->{next_try} = 0;
+                $p->{backoff}  = $self->{backoff_min};
+                $self->{log}->("mesh: promoted peer $name (was unconfigured)");
+            }
+            next;
+        }
         $self->{peers}{$name} = {
             conn_state => 'down',
             sock       => undef,

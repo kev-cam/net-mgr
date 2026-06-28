@@ -2600,7 +2600,8 @@ sub _fire_periodic {
         exec $bin, @args;
         exit 127;
     }
-    $self->_log("periodic $name pid=$pid (next in $self->{config}{scheduling}{$name}s)");
+    my $next = $self->{config}{scheduling}{$name} // '?';
+    $self->_log("periodic $name pid=$pid (next in ${next}s)");
     $self->{triggers}{$pid} = {
         cli_fd     => undef,
         name       => $name,
