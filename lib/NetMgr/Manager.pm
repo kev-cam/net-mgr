@@ -1334,6 +1334,29 @@ sub _run_election {
     # single-node deploy with no cluster intent — leave role alone.
     return unless @{ $cs->{members} // [] } || $cs->{auto_spec};
 
+    # Config-driven authoritative override: `[cluster] master = NAME` skips the
+    # election entirely. If NAME is us, claim mastership; otherwise follow it.
+    # This is the escape hatch for the chicken-and-egg case (a fresh follower
+    # whose mesh HBs haven't started flowing yet would self-elect because
+    # peers can't vote). Per the design intent: config files are for
+    # OVERRIDES — election is the default; this is the override.
+    if (my $forced = $cs->{master}) {
+        my $self_name = $cs->{self_name} // '';
+        my $role = ($forced eq $self_name) ? 'master' : 'follower';
+        my $cur = $self->{cluster_runtime} // {};
+        my $cur_key = ($cur->{role} // '') . '|' . ($cur->{master_member} // '');
+        my $new_key = "$role|$forced";
+        return if $cur_key eq $new_key;
+        $self->{cluster_runtime} = {
+            role          => $role,
+            master_member => $forced,
+            since         => time(),
+            reason        => "config: master=$forced",
+        };
+        $self->_log("override: config master=$forced → role=$role");
+        return;
+    }
+
     # Decide with the configured role AS-IS. A 'follower' is NEVER an election
     # candidate: it follows the elected master, or waits headless if none is
     # reachable yet — it must not self-promote. (This used to coerce a

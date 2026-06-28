@@ -325,7 +325,7 @@ my %ACTIVE = (
     dns        => '*',
     bindings   => '*',                        # parsed for future use
     peers      => '*',                        # consumed by net-mgr-relay
-    cluster    => [qw(members role priority prefer_lan internet_facing
+    cluster    => [qw(members role master priority prefer_lan internet_facing
                        election_interval proxy_listen control_prefix
                        control_vlan_name control_vlan_id control_addr
                        control_attach)],      # cluster role / election
