@@ -1195,7 +1195,8 @@ sub cmd_gui {
     # pool and list those servers in the right pane (instead of the reservations).
     $top->Label(-text => '  ', -background => '#fff', -relief => 'solid', -borderwidth => 1)
         ->pack(-side => 'left', -padx => 2);
-    $top->Checkbutton(-text => 'DHCP assigned', -variable => \$S{range_mode},
+    my $dhcp_btn = $top->Checkbutton(-text => 'DHCP assigned',
+        -variable => \$S{range_mode},
         -command => sub {
             delete @S{qw(armed_ip armed_subnet range_start range_subnet)};
             $redraw->();
@@ -1203,6 +1204,11 @@ sub cmd_gui {
                 ? ' DHCP servers — pools coloured by AP/gateway; red = overlap (pools must be disjoint); click free START then END to add a pool; click a pool (grid) or a range (right pane) to remove'
                 : ' reservation mode');
         })->pack(-side => 'left');
+    $balloon->attach($dhcp_btn,
+        -msg => "Toggle DHCP-servers view. Pools recolour by serving "
+              . "AP/gateway, the side pane lists those servers, and clicks "
+              . "add/remove pool ranges instead of arming a reservation. "
+              . "Red = overlap (pools must be disjoint).");
     $top->Button(-text => 'About', -command => sub { $about->() })
         ->pack(-side => 'right', -padx => 4);
 
