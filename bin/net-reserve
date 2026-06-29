@@ -1133,8 +1133,11 @@ sub cmd_gui {
     $balloon->attach($go_btn,
         -msg => "Go to the typed subnet (Enter in the box also works).\n"
               . "Adds it to the picker if new.");
-    $top->Button(-text => 'Reload', -command => sub { $sync_now->() })
+    my $reload_btn = $top->Button(-text => 'Reload', -command => sub { $sync_now->() })
         ->pack(-side => 'left', -padx => 4);
+    $balloon->attach($reload_btn,
+        -msg => "Re-pull the current subnet from the daemon.\n"
+              . "The grid also self-refreshes every 5s; click to skip the wait.");
     # DHCP-servers mode toggle, with the white "assigned" swatch beside it (the
     # legend no longer repeats it): colour the grid by the AP/gateway serving each
     # pool and list those servers in the right pane (instead of the reservations).
