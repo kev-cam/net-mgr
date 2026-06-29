@@ -4146,6 +4146,21 @@ sub _validate_write_config_path {
     return (1, undef, 0644) if $path =~ m{^/etc/net-mgr/config\.d/[A-Za-z0-9._-]+\.conf$};
     return (1, undef, 0600) if $path =~ m{^/etc/net-mgr/secrets/[A-Za-z0-9._-]+$};
     return (1, undef, 0644) if $path =~ m{^/etc/net-mgr/allowed_[a-z_]+$};
+    # Per-host deploy overlay: /etc/net-mgr/deploy/<HOST>/<FILE>. The host
+    # owning this overlay tree (typically nas3) rsyncs its contents to the
+    # leaf during `make install-on`. Lets the deploy hub author config for
+    # leaves that have no repo / no write_config trust of their own.
+    # <HOST> is a hostname (alnum + dot/dash); <FILE> is one of the same
+    # things this allow-list accepts for /etc/net-mgr/ directly.
+    return (1, undef, 0644)
+        if $path =~ m{^/etc/net-mgr/deploy/[A-Za-z0-9][A-Za-z0-9.-]*/
+                       (?: config
+                         | config\.d/[A-Za-z0-9._-]+\.conf
+                         | allowed_[a-z_]+
+                       )$}x;
+    return (1, undef, 0600)
+        if $path =~ m{^/etc/net-mgr/deploy/[A-Za-z0-9][A-Za-z0-9.-]*/
+                       secrets/[A-Za-z0-9._-]+$}x;
     return (0, "path '$path' not in the write_config allow-list");
 }
 
