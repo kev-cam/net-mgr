@@ -181,6 +181,7 @@ sub _load_cluster_state {
         name             => $cluster_name,     # cluster identity; defaults to domain
         domain           => $domain,           # defaults to [dns] domain
         role             => $c->{role}        // 'follower',  # auto|master|follower|excluded; default follow
+        master           => $c->{master},     # config override: NAME == self → claim; else follow NAME
         priority         => $c->{priority}    // 100,
         prefer_lan       => exists $c->{prefer_lan} ? ($c->{prefer_lan} ? 1 : 0) : 1,
         internet_facing  => $c->{internet_facing},        # 0|1|undef (=auto)
