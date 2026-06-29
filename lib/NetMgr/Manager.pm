@@ -480,15 +480,24 @@ sub _apply_self_inventory {
     $db->upsert_hostname(machine_id => $mid, name => $host, source => 'self');
     # Authoritative dedup: the daemon naming itself is the source of truth for
     # "what machine answers to $host". Any OTHER machine_id with that same name
-    # is a stale DHCP correlation from a prior context (e.g. clevo-lx hostname
-    # accidentally bound to machine_id=75 = clevo-air) — drop it now so the
-    # GUI's name lookups stop returning multiples. We DON'T touch the other
-    # machine row itself; it may still have legitimate OTHER names.
-    my $orphans = $db->dbh->do(
-        "DELETE FROM hostnames WHERE name = ? AND machine_id <> ?",
-        undef, $host, $mid);
+    # is a stale DHCP correlation from a prior context — drop it via the
+    # delete_hostname helper that returns the deleted rows, then EMIT each
+    # delete to subscribers (Relay's _delete_hostnames applies the same delete
+    # on the follower; without this the master cleans up locally but
+    # followers keep replaying the stale row in their next snapshot).
+    my $other_mids = $db->dbh->selectall_arrayref(
+        "SELECT DISTINCT machine_id FROM hostnames
+          WHERE name = ? AND machine_id <> ?",
+        { Slice => {} }, $host, $mid);
+    my $orphans = 0;
+    for my $r (@{ $other_mids || [] }) {
+        for my $deleted ($db->delete_hostname($r->{machine_id}, $host)) {
+            $self->_emit_change(table => 'hostnames', op => 'delete', row => $deleted);
+            $orphans++;
+        }
+    }
     $self->_log("register_self: cleared $orphans stale hostname binding(s) for '$host'")
-        if $orphans && $orphans > 0;
+        if $orphans;
     my $stamp_source = "$host:self";
     for my $i (@{ $inv->{ifaces} || [] }) {
         my $mac = $i->{mac};
@@ -4540,6 +4549,28 @@ sub _associate_machine {
             "SELECT primary_name FROM machines WHERE id = ?", undef, $mid);
         $self->_upsert('machines', 'upsert_machine', id => $mid, primary_name => $name)
             unless defined $pn && length $pn;
+    }
+    # Conflict guard: if $name is the primary_name of a DIFFERENT machine,
+    # that machine is the authoritative owner of the name (clevo-lx belongs
+    # to machine_id=209, not machine_id=75). A producer reporting (mac, name)
+    # for a mac currently bound to the wrong machine is signalling either a
+    # DHCP-reuse or a stale interfaces-row binding. Rebind the interface to
+    # the rightful owner and write the hostname there — both replicates via
+    # the existing _upsert/emit path, and the stale (mid_of_mac, name) row
+    # gets explicitly DELETEd + emitted so followers drop it too.
+    my $owners = $self->{db}->find_machines_by_primary_name($name);
+    my ($name_owner_mid) = map { $_->{id} } @{ $owners || [] };
+    if (defined $name_owner_mid && $name_owner_mid != $mid) {
+        $self->_log("_associate_machine: '$name' belongs to machine_id="
+                  . "$name_owner_mid; rebinding mac $mac (was on $mid)");
+        $self->_upsert('interfaces', 'upsert_interface',
+            mac => $mac, machine_id => $name_owner_mid);
+        # Drop any hostname rows that still claim $name on the wrong machine.
+        for my $deleted ($self->{db}->delete_hostname($mid, $name)) {
+            $self->_emit_change(table => 'hostnames', op => 'delete',
+                                row => $deleted);
+        }
+        $mid = $name_owner_mid;
     }
     $self->_upsert('hostnames', 'upsert_hostname',
         machine_id => $mid, name => $name, source => $source);

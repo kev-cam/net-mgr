@@ -410,6 +410,12 @@ sub _subnet_like_prefix {
     return undef;       # wider than /8: too broad for a "scoped" pull
 }
 
+sub _delete_hostnames {
+    my ($db, $row) = @_;
+    return unless $row->{machine_id} && $row->{name};
+    $db->delete_hostname($row->{machine_id}, $row->{name});
+}
+
 sub _apply_mesh_tunnels {
     my ($db, $row, $idmap, $repl_from) = @_;
     return unless $row->{owner_node} && $row->{kind};

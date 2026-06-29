@@ -1142,6 +1142,31 @@ sub upsert_hostname {
              was => undef, now => $now };
 }
 
+# Delete one (machine_id, name) tuple (every row regardless of source); return
+# the list of rows that existed before, so callers can emit delete events.
+sub delete_hostname {
+    my ($self, $machine_id, $name) = @_;
+    return () unless defined $machine_id && defined $name;
+    my $rows = $self->{dbh}->selectall_arrayref(
+        "SELECT * FROM hostnames WHERE machine_id = ? AND name = ?",
+        { Slice => {} }, $machine_id, $name);
+    return () unless $rows && @$rows;
+    $self->{dbh}->do(
+        "DELETE FROM hostnames WHERE machine_id = ? AND name = ?",
+        undef, $machine_id, $name);
+    return @$rows;
+}
+
+# Resolve a name to the machine row(s) whose primary_name matches. Returns the
+# arrayref of full rows (usually one; multiples mean a duplicate-machines bug).
+sub find_machines_by_primary_name {
+    my ($self, $name) = @_;
+    return [] unless defined $name && length $name;
+    return $self->{dbh}->selectall_arrayref(
+        "SELECT * FROM machines WHERE primary_name = ?",
+        { Slice => {} }, $name);
+}
+
 sub upsert_port {
     my ($self, %f) = @_;
     croak "mac, port required" unless $f{mac} && defined $f{port};
