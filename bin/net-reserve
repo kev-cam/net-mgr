@@ -1188,18 +1188,29 @@ sub cmd_gui {
             if defined $S{range_start} && ($S{range_subnet} // '') ne $cidr;
         # A 'hint' IP — visual-only secondary highlight that points at a sensible
         # default cell whenever the user has no manual selection on this subnet:
-        # this machine's own IP if present, else the first 'free' IP. Kept in
-        # $S{hint_ip} (+ $S{hint_subnet} for cache invalidation); rendered by
-        # draw_cell with a distinct outline so it's obviously a SUGGESTION,
-        # not a click. Skipped in range_mode (DHCP-pool flow has its own
-        # selection semantics — range_start).
-        if ($S{range_mode}) {
+        # this machine's own IP if present, else the first 'free' IP. Rendered
+        # by draw_cell with a distinct outline so it's obviously a SUGGESTION,
+        # not a click. Suppressed when something is armed (avoids two outlines
+        # competing) or in range_mode (DHCP-pool flow has its own range_start
+        # selection). Recomputed every redraw so the hint isn't stale after
+        # someone else reserves the previously-free cell — _gui_default_pick is
+        # O(/24) classify calls + one cached `ip -br -4 addr show`, negligible
+        # compared to the 5-s gather() that already runs. Skipped when the model
+        # is empty (first tick, replication blip) — would otherwise mis-claim
+        # the router (.1) as 'first free'.
+        my $prev_hint_ip = $S{hint_ip};
+        if ($S{range_mode} || defined $S{armed_ip}) {
             delete @S{qw(hint_ip hint_subnet)};
-        } elsif (($S{hint_subnet} // '') ne $cidr) {
-            my $new_hint = _gui_default_pick($S{model}, $cidr);
-            $S{hint_ip}     = $new_hint;
+        } else {
+            my $model = $S{model};
+            my $have_state = $model && (
+                   keys(%{ $model->{resv}     // {} })
+                || keys(%{ $model->{leased}   // {} })
+                || keys(%{ $model->{observed} // {} })
+                || @{ $model->{ranges} // [] }
+            );
+            $S{hint_ip}     = $have_state ? _gui_default_pick($model, $cidr) : undef;
             $S{hint_subnet} = $cidr;
-            side_focus_ip(\%S, $new_hint) if defined $new_hint;
         }
         my $model = $S{model};
         # "DHCP servers" mode: colour each pool by its serving AP/gateway and list
@@ -1425,6 +1436,26 @@ sub cmd_gui {
                 $cidr, $overlap_n));
         } else {
             $status->configure(-text => sprintf(" %s — %s", $cidr, pool_summary($model, $cidr)));
+        }
+        # Track the side-pane focus to a CHANGED hint, but only when the hint
+        # is a real reservation (scrolling for a free cell would just yank to
+        # the nearest other row — noise). Also: only fire on CHANGE, so a
+        # subnet-revisit doesn't trample the user's manually-centred row.
+        # Deferred to here so the side text widget is already populated when
+        # side_focus_ip's _resv_index lookup runs (without this, the lookup
+        # hits an empty widget and falls through to _nearest_reserved, which
+        # happens to recover the right answer for resv-hint but only by
+        # coincidence). On undef hint (no IP picked at all) clear stale focus.
+        my $new_hint_ip = $S{hint_ip};
+        if (($prev_hint_ip // '') ne ($new_hint_ip // '')) {
+            if (defined $new_hint_ip && $S{model}{resv}{$new_hint_ip}) {
+                side_focus_ip(\%S, $new_hint_ip);
+            } elsif (!defined $new_hint_ip) {
+                delete @S{qw(focus_ip focus_exact)};
+                $resv_text->tagRemove('nrhit', '1.0', 'end');
+            }
+            # Hint defined but not a reservation: leave focus_ip alone — the
+            # trailing _focus_show restores the prior yview, no jolt.
         }
         # The wipe above cleared the highlight AND scrolled to the top. Re-centre
         # on the focused IP (also re-highlights); if it isn't in this view, just
