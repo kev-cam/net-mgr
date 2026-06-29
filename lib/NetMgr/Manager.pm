@@ -808,9 +808,16 @@ sub _forward_observe_to_master {
     if ($@) { eval { $cli->bye }; return 0 }
     eval { $cli->auth };
     if ($@) {
-        $self->_log("forward to master: auth failed: $@");
-        eval { $cli->bye };
-        return 0;
+        # Daemon process has no SSH key (running as root, no ~root/.ssh/id_*).
+        # That's fine: the master accepts mesh-member peers by IP. Fall through
+        # and let the OBSERVE go unsigned — the master's per-OBSERVE auth gate
+        # decides whether to admit it.
+        my $err = $@;
+        if ($err !~ /no key_file|no signing key/i) {
+            $self->_log("forward to master: auth failed: $err");
+            eval { $cli->bye };
+            return 0;
+        }
     }
     my $r = eval { $cli->observe(%kv) };
     eval { $cli->bye };
@@ -2379,6 +2386,23 @@ sub _peer_is_loopback {
     return $h eq '127.0.0.1' || $h eq '::1';
 }
 
+# Source IP matches a peers row we've already exchanged STATUS with
+# (cluster_member populated). Used to admit publish_self from daemons that
+# have no SSH key — same trust level as mesh participation itself.
+sub _peer_is_known_mesh_member {
+    my ($self, $cli) = @_;
+    my $sock = $cli->{sock} or return 0;
+    my $h = eval { $sock->peerhost } // '';
+    return 0 unless length $h;
+    my $db = $self->{db} or return 0;
+    my $r = eval {
+        $db->dbh->selectrow_arrayref(
+            "SELECT 1 FROM peers WHERE host = ? AND cluster_member IS NOT NULL LIMIT 1",
+            undef, $h);
+    };
+    return $r ? 1 : 0;
+}
+
 # Loopback always allowed; otherwise the peer's IPv4 must fall in one
 # of the CIDRs listed in [forward] allow_peers (comma- or whitespace-
 # separated). Parsed once and cached.
@@ -2700,7 +2724,7 @@ sub _check_periodic_triggers {
     my $now   = time();
     $self->{periodic_last} //= {};
 
-    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq ddns ipv6_vlan netif)) {
+    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq ddns ipv6_vlan netif register-self)) {
         my $interval = $sched->{$name} // 0;
         # netif: track interface changes (WiFi/USB up/down) and rebind the
         # 'all'/'auto' listeners. Auto-enable at 30s for those specs (an explicit
@@ -2710,6 +2734,11 @@ sub _check_periodic_triggers {
             $interval = 30 if grep { lc($_) eq 'all' || lc($_) eq 'auto' }
                               map { s/^\s+|\s+$//gr } split /,/, $spec;
         }
+        # register-self: refresh this node's interface inventory and forward it to
+        # the master so dedup propagates cluster-wide. Netif rescan already calls
+        # this on interface change, but on nodes with a fixed listen= (no netif)
+        # it would otherwise only run at daemon start.
+        $interval ||= 300 if $name eq 'register-self';
         # ipv6_vlan keep-up: re-establish a managed IPv6 net that's down. Auto-
         # enable at 60s when there's one to keep up (the control VLAN has an id,
         # or an he6in4 network is mode=on).
@@ -2764,6 +2793,7 @@ sub _fire_periodic {
     if ($name eq 'ddns')         { $self->_check_ddns;   return }
     if ($name eq 'ipv6_vlan')    { $self->_check_ipv6_vlans; return }
     if ($name eq 'netif')        { $self->_recheck_listeners; return }
+    if ($name eq 'register-self'){ $self->_register_self_interfaces; return }
     my ($bin, @args);
     if ($name eq 'scan-ap') {
         my @ips = $self->_known_ap_ips;
@@ -4234,13 +4264,16 @@ sub _obs_purge_stale {
 
 sub _obs_publish_self {
     my ($self, $cli, $kv) = @_;
-    # Any verified peer can publish ITS OWN inventory. Same trust as any
-    # other producer writing addresses — the source tag carries the
-    # publisher's name so reviewers can see who claimed what. Loopback
-    # exempt (local register_self uses _apply_self_inventory directly,
-    # but the OBSERVE path also has to be usable from local tools).
-    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{verified})) {
-        die "publish_self: not authorized (verified peer required)\n";
+    # Loopback always; any AUTH-verified peer; OR a known mesh member by IP.
+    # The mesh-member path is what daemons themselves use (the daemon runs as
+    # root with no SSH key, so Client::auth can't sign). Trust level matches
+    # mesh participation itself: a peer in the peers table has already been
+    # seen via HELLO/STATUS — the publish carries the publisher's name as the
+    # source tag so reviewers can still see who claimed what.
+    unless (_peer_is_loopback($cli)
+         || ($cli->{auth} && $cli->{auth}{verified})
+         || $self->_peer_is_known_mesh_member($cli)) {
+        die "publish_self: not authorized (verified peer or known mesh member required)\n";
     }
     my $b64 = $kv->{inv_b64};
     die "publish_self: missing inv_b64\n" unless defined $b64 && length $b64;
@@ -4255,7 +4288,9 @@ sub _obs_publish_self {
         unless ref($inv->{ifaces}) eq 'ARRAY';
     $self->_apply_self_inventory($inv);
     my $n = scalar @{ $inv->{ifaces} || [] };
-    my $who = ($cli->{auth} && $cli->{auth}{key_id}) // 'loopback';
+    my $who = ($cli->{auth} && $cli->{auth}{key_id})
+           // (_peer_is_loopback($cli) ? 'loopback'
+               : ('mesh@' . (eval { $cli->{sock}->peerhost } // '?')));
     $self->_log("publish_self: applied inventory for '$inv->{host}' ($n ifaces) from $who");
     return ();
 }
