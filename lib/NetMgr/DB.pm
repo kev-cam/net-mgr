@@ -2467,7 +2467,7 @@ sub purge_expired_leases {
     my ($self) = @_;
     my $n = $self->{dbh}->do(
         "DELETE FROM dhcp_leases
-          WHERE expires IS NOT NULL AND expires <> '' AND expires < NOW()"
+          WHERE expires IS NOT NULL AND expires < NOW()"
     );
     return ($n && $n > 0) ? $n + 0 : 0;
 }
@@ -2538,7 +2538,7 @@ sub count_expired_leases {
     my ($self) = @_;
     my ($n) = $self->{dbh}->selectrow_array(
         "SELECT COUNT(*) FROM dhcp_leases
-          WHERE expires IS NOT NULL AND expires <> '' AND expires < NOW()");
+          WHERE expires IS NOT NULL AND expires < NOW()");
     return $n // 0;
 }
 sub count_stale_hostnames {
