@@ -998,6 +998,50 @@ sub cmd_gui {
     # coderefs are assigned further down but only ever *called* at event time.
     my ($subnet_be, $status, $canvas, $resv_text, $redraw, $refresh_subnets,
         $sync_now);
+    # Spinner overlay used by $sync_now during slow phases (the 6-snapshot
+    # gather + relay refresh). Tk is single-threaded, so the animation can't
+    # tick during a blocking RPC; the workaround is $spinner_tick (called
+    # between phases) which pumps $mw->update and lets any pending after()
+    # callbacks fire — advancing the frame. Falls back to a single static
+    # frame when the surrounding work is too monolithic to interleave updates.
+    my @SPIN_FRAMES = ("\x{280B}", "\x{2819}", "\x{2839}", "\x{2838}",
+                       "\x{283C}", "\x{2834}", "\x{2826}", "\x{2827}",
+                       "\x{2807}", "\x{280F}");                       # ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏
+    my $spin_step = 0;
+    my $spin_after;       # active Tk after-id, or undef
+    my ($spinner_show, $spinner_hide, $spinner_tick);
+    $spinner_show = sub {
+        my ($label) = @_;
+        return unless $canvas && $canvas->Exists;
+        $canvas->delete('spinner');                 # clear any prior overlay
+        my $w = $canvas->width  || ($canvas->reqwidth  // 320);
+        my $h = $canvas->height || ($canvas->reqheight // 220);
+        my ($cx, $cy) = ($w/2, $h/2);
+        my ($bx, $by) = (52, 36);
+        $canvas->createRectangle($cx-$bx, $cy-$by, $cx+$bx, $cy+$by,
+            -fill => '#fff', -outline => '#39c', -width => 1, -tags => 'spinner');
+        $canvas->createText($cx, $cy - 8, -text => $SPIN_FRAMES[$spin_step],
+            -font => 'nrmono', -fill => '#39c', -tags => [qw(spinner spinner_g)]);
+        $canvas->createText($cx, $cy + 12, -text => ($label // 'loading'),
+            -fill => '#555', -tags => 'spinner');
+        # Schedule the next frame; only useful if the caller pumps $mw->update.
+        my $bump; $bump = sub {
+            return unless $canvas && $canvas->Exists;
+            return unless $canvas->find('withtag' => 'spinner_g');   # gone => stop
+            $spin_step = ($spin_step + 1) % scalar(@SPIN_FRAMES);
+            $canvas->itemconfigure('spinner_g', -text => $SPIN_FRAMES[$spin_step]);
+            $spin_after = $mw->after(90, $bump);
+        };
+        $spin_after = $mw->after(90, $bump);
+        $mw->update;                                # paint before caller blocks
+    };
+    $spinner_hide = sub {
+        if ($spin_after) { $mw->afterCancel($spin_after); undef $spin_after }
+        $canvas->delete('spinner') if $canvas && $canvas->Exists;
+    };
+    # Called between blocking phases to give Tk a chance to fire the after()
+    # callback and repaint. Cheap: just pumps the event queue.
+    $spinner_tick = sub { $mw->update if $mw && $mw->Exists };
 
     # About box — client build info plus live daemon STATUS (schema, role, mesh).
     my $about = sub {
@@ -1057,10 +1101,18 @@ sub cmd_gui {
     # nudge the relay's REFRESH proxy to pull this subnet from the master
     # into the local DB, then re-read. The periodic tick stays lazy.
     $sync_now = sub {
-        my $note = maybe_refresh($S{subnet});
-        $S{model} = gather($cli);
+        # Show a centered spinner overlay on the canvas while the slow phases
+        # run — maybe_refresh is a relay round-trip (can stall if the master is
+        # busy) and gather() does 6 SUBSCRIBE+snapshot RPCs back-to-back. Perl/Tk
+        # is single-threaded so $mw->update has to be called between phases for
+        # the after()-driven animation to advance frames; pump it after each
+        # blocking call. $redraw clears all canvas items including the spinner,
+        # so we don't need an explicit hide once the cells repaint.
+        $spinner_show->("loading");
+        my $note = maybe_refresh($S{subnet}); $spinner_tick->();
+        $S{model} = gather($cli);             $spinner_tick->();
         $refresh_subnets->();
-        $redraw->();
+        $redraw->();                          # also wipes the spinner
         $status->configure(-text => " $note") if $note;
         _write_last_subnet($S{subnet});   # remember it; --gui reopens here next time
     };
