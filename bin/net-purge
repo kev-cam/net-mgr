@@ -1,0 +1,121 @@
+#!/usr/bin/perl
+# net-purge — drop stale rows from the cluster DB over the mesh.
+#
+# Cleans up data that no producer is actively refreshing anymore:
+#   expired DHCP leases (expires < NOW)
+#   hostnames not seen in N days
+#   addresses not seen in N days (kept if source='manual')
+#   conflicting hostnames (same name on multiple machine_ids — keep newest)
+#
+# Default is DRY-RUN (count what would be dropped). Pass --commit to delete.
+# Auth-gated on may_update; for cluster-wide cleanup, fan out via
+#   net-cluster --auth observe kind=purge_stale tables=all days=30
+# which runs the purge on every peer's local DB (master writes replicate
+# down naturally; followers' divergent garbage is purged in-place).
+#
+# Usage:
+#   net-purge                              # dry-run, all tables, 30 days
+#   net-purge --days 7                     # dry-run, all tables, 7 days
+#   net-purge --tables hostnames,conflicts # dry-run, just those
+#   net-purge --commit                     # actually delete (30 days, all)
+#   net-purge --commit --tables conflicts  # just resolve hostname conflicts
+#   net-purge --listen HOST:PORT           # target a specific peer
+#
+# Common flags: --listen, --server, --auth (forced on for --commit), --json
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use NetMgr::Client;
+use NetMgr::Config;
+use NetMgr::Protocol qw(parse_line);
+use Getopt::Long qw(GetOptions);
+
+my %opt;
+GetOptions(\%opt,
+    'listen=s', 'server=s', 'auth!', 'json',
+    'tables=s', 'days=i', 'commit', 'help',
+) or usage(2);
+usage(0) if $opt{help};
+
+my $listen = $opt{listen} // do {
+    my $cfg = eval { NetMgr::Config->load } || {};
+    my $srvs = $cfg->{servers} || {};
+    my $pick = $opt{server} // $srvs->{default};
+    $pick && $srvs->{$pick} ? $srvs->{$pick} : '127.0.0.1:7531';
+};
+# Loopback is always exempt from auth; a remote --commit needs may_update.
+my $is_loopback = $listen =~ m{^(127\.|::1$|localhost(?:[:/]|\z))};
+$opt{auth} //= ($opt{commit} && !$is_loopback);
+
+my $cli = NetMgr::Client->new(listen => $listen, timeout => 10);
+$cli->hello(consumer => "net-purge.$$");
+$cli->auth if $opt{auth};
+
+my $tables = $opt{tables} // 'all';
+my $days   = defined $opt{days} ? $opt{days} : 30;
+my $dry    = $opt{commit} ? 0 : 1;
+
+my $r = $cli->observe(
+    kind    => 'purge_stale',
+    tables  => $tables,
+    days    => $days,
+    dry_run => $dry,
+);
+$cli->bye;
+my $cmd = parse_line($r) or die "net-purge: bad reply '$r'\n";
+die "net-purge: $cmd->{msg}\n" if $cmd->{verb} eq 'ERR';
+my $kv = $cmd->{kv} || {};
+
+if ($opt{json}) {
+    require JSON::PP;
+    print JSON::PP->new->canonical(1)->pretty->encode($kv);
+} else {
+    my $mode = $kv->{dry_run} ? 'would-drop' : 'dropped';
+    printf "%s (days=%s) on %s:\n", $mode, $kv->{days}, $listen;
+    my @keys = grep { !/^(dry_run|days)$/ } sort keys %$kv;
+    if (!@keys) { print "  (nothing matched)\n" }
+    else {
+        printf "  %-12s %s\n", $_, $kv->{$_} for @keys;
+    }
+    if ($dry) {
+        print "\n  Pass --commit to actually delete.\n"
+            . "  Fan out cluster-wide with:\n"
+            . "    net-cluster --auth observe kind=purge_stale "
+            . "tables=$tables days=$days\n";
+    }
+}
+exit 0;
+
+sub usage {
+    my ($rc) = @_;
+    print STDERR <<'USAGE';
+net-purge — drop stale rows from the cluster DB over the mesh.
+
+  net-purge                              # dry-run, all tables, 30 days
+  net-purge --days 7                     # dry-run, 7 days
+  net-purge --tables hostnames,conflicts # dry-run, subset
+  net-purge --commit                     # actually delete
+  net-purge --commit --tables conflicts  # one-shot conflict resolver
+
+Tables:
+  leases     expired DHCP leases (expires < NOW)
+  hostnames  hostname rows not seen in --days
+  addresses  address rows not seen in --days (kept if source='manual')
+  conflicts  same hostname on multiple machine_ids — keep newest last_seen
+  all        all of the above
+
+Flags:
+  --listen HOST:PORT   target daemon (default loopback)
+  --server NAME        named server from ~/.config/net-mgr/config [servers]
+  --auth               sign the OBSERVE (forced on for --commit to remote)
+  --json               machine-readable output
+  --tables LIST        comma list (default 'all')
+  --days N             age threshold for hostnames/addresses (default 30)
+  --commit             do the deletes (dry-run otherwise)
+
+Cluster-wide: net-cluster --auth observe kind=purge_stale tables=all days=30
+USAGE
+    exit($rc // 0);
+}

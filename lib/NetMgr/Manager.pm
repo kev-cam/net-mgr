@@ -4148,6 +4148,56 @@ sub _obs_he_update {
 # trust as code/config writes — this IS a config write, just routed via DB
 # instead of a file). Loopback exempt. Emits a row event so replication picks
 # it up; followers get the change automatically.
+sub _obs_purge_stale {
+    my ($self, $cli, $kv) = @_;
+    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_update})) {
+        die "purge_stale: not authorized (add the key to /etc/net-mgr/allowed_updaters)\n";
+    }
+    my $db = $self->{db} or die "purge_stale: no DB\n";
+    # tables: comma list of {hostnames,addresses,leases,conflicts}; 'all'
+    # expands to everything. days: age threshold for hostnames/addresses
+    # (default 30); dhcp_leases use the row's own expires column. dry_run=1
+    # returns counts WITHOUT deleting — net-purge uses it as the preview pass.
+    my $tables_kv = lc($kv->{tables} // 'all');
+    my %want;
+    for my $t (split /[,\s]+/, $tables_kv) {
+        next unless length $t;
+        if ($t eq 'all') {
+            $want{$_} = 1 for qw(leases hostnames addresses conflicts);
+        } else { $want{$t} = 1 }
+    }
+    my $days = $kv->{days};
+    $days = 30 unless defined $days && $days =~ /^\d+$/;
+    my $dry = $kv->{dry_run} ? 1 : 0;
+    my %got;
+    eval {
+        if ($want{leases}) {
+            $got{leases} = $dry ? $db->count_expired_leases
+                                : $db->purge_expired_leases;
+        }
+        if ($want{hostnames}) {
+            $got{hostnames} = $dry ? $db->count_stale_hostnames(days => $days)
+                                   : $db->purge_stale_hostnames(days => $days);
+        }
+        if ($want{conflicts}) {
+            $got{conflicts} = $dry ? $db->count_conflicting_hostnames
+                                   : $db->purge_conflicting_hostnames;
+        }
+        if ($want{addresses}) {
+            $got{addresses} = $dry ? $db->count_stale_addresses(days => $days)
+                                   : $db->purge_stale_addresses(days => $days);
+        }
+    };
+    if ($@) { my $e = $@; chomp $e; die "purge_stale: $e\n" }
+    $self->_log(($dry ? "purge_stale DRY-RUN" : "purge_stale")
+              . " days=$days "
+              . join(' ', map { "$_=$got{$_}" } sort keys %got));
+    $self->_send($cli, format_ok(
+        dry_run => $dry, days => $days,
+        map { ($_ => $got{$_}) } keys %got));
+    return ();
+}
+
 sub _obs_publish_self {
     my ($self, $cli, $kv) = @_;
     # Any verified peer can publish ITS OWN inventory. Same trust as any
@@ -4412,6 +4462,7 @@ sub _handle_observe {
         elsif ($kind eq 'write_config'){ @events = $self->_obs_write_config($cli, $kv) }
         elsif ($kind eq 'mesh_tunnel') { @events = $self->_obs_mesh_tunnel($cli, $kv) }
         elsif ($kind eq 'publish_self'){ @events = $self->_obs_publish_self($cli, $kv) }
+        elsif ($kind eq 'purge_stale') { @events = $self->_obs_purge_stale($cli, $kv) }
         elsif ($kind eq 'relay')       { @events = $self->_obs_relay($cli, $kv) }
         else {
             die "unknown observation kind '$kind'\n";

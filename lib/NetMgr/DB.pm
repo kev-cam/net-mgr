@@ -2461,4 +2461,114 @@ sub purge_events {
     );
 }
 
+# Drop DHCP leases past their `expires`. NULL/empty expires (static binding)
+# is kept. Returns the count of rows deleted.
+sub purge_expired_leases {
+    my ($self) = @_;
+    my $n = $self->{dbh}->do(
+        "DELETE FROM dhcp_leases
+          WHERE expires IS NOT NULL AND expires <> '' AND expires < NOW()"
+    );
+    return ($n && $n > 0) ? $n + 0 : 0;
+}
+
+# Drop hostname rows whose last_seen is older than $days. Returns the count.
+# Caller usually pairs this with purge_conflicting_hostnames so a stale row
+# that ALSO has a fresher rival on a different machine gets caught even when
+# under the age threshold.
+sub purge_stale_hostnames {
+    my ($self, %f) = @_;
+    my $days = $f{days} // 30;
+    my $n = $self->{dbh}->do(
+        "DELETE FROM hostnames WHERE last_seen < DATE_SUB(NOW(), INTERVAL ? DAY)",
+        undef, $days);
+    return ($n && $n > 0) ? $n + 0 : 0;
+}
+
+# Resolve hostname conflicts: when the SAME name is bound to multiple
+# machine_ids, keep the row with the most recent last_seen and drop the rest.
+# Exactly the clevo-lx/machine_75 situation. Returns the count of losers
+# dropped (zero when there are no conflicts).
+sub purge_conflicting_hostnames {
+    my ($self) = @_;
+    my $rows = $self->{dbh}->selectall_arrayref(
+        "SELECT name FROM hostnames
+          GROUP BY name HAVING COUNT(DISTINCT machine_id) > 1",
+        { Slice => {} });
+    return 0 unless $rows && @$rows;
+    my $dropped = 0;
+    for my $r (@$rows) {
+        my $name = $r->{name};
+        # Find the latest last_seen for this name.
+        my ($keep_mid) = $self->{dbh}->selectrow_array(
+            "SELECT machine_id FROM hostnames
+              WHERE name = ?
+              ORDER BY last_seen DESC, machine_id ASC LIMIT 1",
+            undef, $name);
+        next unless defined $keep_mid;
+        my $n = $self->{dbh}->do(
+            "DELETE FROM hostnames WHERE name = ? AND machine_id <> ?",
+            undef, $name, $keep_mid);
+        $dropped += $n if $n && $n > 0;
+    }
+    return $dropped;
+}
+
+# Drop address rows that haven't been seen in $days days. Requires BOTH
+# last_seen old AND (last_observed older or NULL) — last_observed is the
+# "live" timestamp; if a producer just touched the row by writing the same
+# data, last_seen may bump even though last_observed is months old. Sticky
+# manual rows (source='manual') are kept regardless.
+sub purge_stale_addresses {
+    my ($self, %f) = @_;
+    my $days = $f{days} // 30;
+    my $n = $self->{dbh}->do(
+        "DELETE FROM addresses
+          WHERE last_seen < DATE_SUB(NOW(), INTERVAL ? DAY)
+            AND (last_observed IS NULL
+                 OR last_observed < DATE_SUB(NOW(), INTERVAL ? DAY))
+            AND (source IS NULL OR source <> 'manual')",
+        undef, $days, $days);
+    return ($n && $n > 0) ? $n + 0 : 0;
+}
+
+# Dry-run variants: same predicates as the purge_* above, but return a count
+# without deleting. Used by net-purge to preview impact before --commit.
+sub count_expired_leases {
+    my ($self) = @_;
+    my ($n) = $self->{dbh}->selectrow_array(
+        "SELECT COUNT(*) FROM dhcp_leases
+          WHERE expires IS NOT NULL AND expires <> '' AND expires < NOW()");
+    return $n // 0;
+}
+sub count_stale_hostnames {
+    my ($self, %f) = @_;
+    my $days = $f{days} // 30;
+    my ($n) = $self->{dbh}->selectrow_array(
+        "SELECT COUNT(*) FROM hostnames
+          WHERE last_seen < DATE_SUB(NOW(), INTERVAL ? DAY)", undef, $days);
+    return $n // 0;
+}
+sub count_conflicting_hostnames {
+    my ($self) = @_;
+    my $rows = $self->{dbh}->selectall_arrayref(
+        "SELECT name, COUNT(DISTINCT machine_id) c FROM hostnames
+          GROUP BY name HAVING c > 1", { Slice => {} });
+    return 0 unless $rows && @$rows;
+    my $n = 0; $n += ($_->{c} - 1) for @$rows;       # losers per name
+    return $n;
+}
+sub count_stale_addresses {
+    my ($self, %f) = @_;
+    my $days = $f{days} // 30;
+    my ($n) = $self->{dbh}->selectrow_array(
+        "SELECT COUNT(*) FROM addresses
+          WHERE last_seen < DATE_SUB(NOW(), INTERVAL ? DAY)
+            AND (last_observed IS NULL
+                 OR last_observed < DATE_SUB(NOW(), INTERVAL ? DAY))
+            AND (source IS NULL OR source <> 'manual')",
+        undef, $days, $days);
+    return $n // 0;
+}
+
 1;
