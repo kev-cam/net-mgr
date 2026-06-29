@@ -382,6 +382,20 @@ install-on: .version
 	  --exclude='/tmp' --exclude='blib/' \
 	  -e "ssh $(SSHOPTS)" \
 	  ./ $(TARGET):$(REMOTE_TMP)/
+	@# Per-host config overlay: if /etc/net-mgr/deploy/<target>/ exists on
+	@# THIS (deploying) host, rsync its contents under /etc/net-mgr/ on
+	@# the target BEFORE the install runs. Lets the deployer (e.g. nas3)
+	@# own a leaf node's net-mgr config without giving the leaf its own
+	@# allowed_updaters/write_config trust. The overlay path is fixed —
+	@# files under /etc/net-mgr/deploy/<host>/X.conf land at /etc/net-mgr/X.conf.
+	@# Skipped silently when the overlay dir doesn't exist (normal case).
+	@overlay=/etc/net-mgr/deploy/$(TARGET); \
+	if [ -d "$$overlay" ]; then \
+	  echo "==> $(TARGET): overlay $$overlay -> /etc/net-mgr/"; \
+	  rsync -az -e "ssh $(SSHOPTS)" --rsync-path="$(SUDO) rsync" \
+	    "$$overlay/" $(TARGET):/etc/net-mgr/ \
+	    || echo "  *** overlay rsync failed (continuing)"; \
+	fi
 	@echo "==> $(TARGET): $(SUDO) make -C $(REMOTE_TMP) install $(MAKEARGS)"
 	@ssh $(RUNOPTS) $(TARGET) "$(SUDO) make -C $(REMOTE_TMP) install $(MAKEARGS)"
 	@if [ "$(KEEP)" = "1" ]; then \
