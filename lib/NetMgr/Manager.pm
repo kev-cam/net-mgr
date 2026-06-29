@@ -477,26 +477,28 @@ sub _apply_self_inventory {
         $mid = $r->{now}{id} if $r && $r->{now};
     }
     return unless $mid;
-    $db->upsert_hostname(machine_id => $mid, name => $host, source => 'self');
-    # Authoritative dedup: the daemon naming itself is the source of truth for
-    # "what machine answers to $host". Any OTHER machine_id with that same name
-    # is a stale DHCP correlation from a prior context — drop it via the
-    # delete_hostname helper that returns the deleted rows, then EMIT each
-    # delete to subscribers (Relay's _delete_hostnames applies the same delete
-    # on the follower; without this the master cleans up locally but
-    # followers keep replaying the stale row in their next snapshot).
+    # Route through _upsert so subscribers (followers' net-mgr-relay) actually
+    # receive the row via the replication stream. Without this, the row is
+    # only in the local DB and won't propagate downstream — the dedup-on-apply
+    # in Relay::_apply_hostnames never fires on the follower.
+    $self->_upsert('hostnames', 'upsert_hostname',
+        machine_id => $mid, name => $host, source => 'self');
+    # Local dedup: drop other-mid bindings for $host on THIS node. The same
+    # cleanup runs cluster-wide via Relay::_apply_hostnames when the self-row
+    # above replicates downstream, so leaves (gateways etc.) self-clean too.
+    # We don't emit per-row delete events for these — Relay translates the
+    # AUTHORITY-OF-NAME via the self-source row, not via per-row deletes
+    # (machine_id translation across nodes is unreliable for delete events).
     my $other_mids = $db->dbh->selectall_arrayref(
         "SELECT DISTINCT machine_id FROM hostnames
           WHERE name = ? AND machine_id <> ?",
         { Slice => {} }, $host, $mid);
     my $orphans = 0;
     for my $r (@{ $other_mids || [] }) {
-        for my $deleted ($db->delete_hostname($r->{machine_id}, $host)) {
-            $self->_emit_change(table => 'hostnames', op => 'delete', row => $deleted);
-            $orphans++;
-        }
+        my @gone = $db->delete_hostname($r->{machine_id}, $host);
+        $orphans += scalar @gone;
     }
-    $self->_log("register_self: cleared $orphans stale hostname binding(s) for '$host'")
+    $self->_log("register_self: cleared $orphans local stale hostname binding(s) for '$host'")
         if $orphans;
     my $stamp_source = "$host:self";
     for my $i (@{ $inv->{ifaces} || [] }) {
