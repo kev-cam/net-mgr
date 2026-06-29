@@ -483,12 +483,18 @@ sub _apply_self_inventory {
     # in Relay::_apply_hostnames never fires on the follower.
     $self->_upsert('hostnames', 'upsert_hostname',
         machine_id => $mid, name => $host, source => 'self');
-    # Local dedup: drop other-mid bindings for $host on THIS node. The same
-    # cleanup runs cluster-wide via Relay::_apply_hostnames when the self-row
-    # above replicates downstream, so leaves (gateways etc.) self-clean too.
-    # We don't emit per-row delete events for these — Relay translates the
-    # AUTHORITY-OF-NAME via the self-source row, not via per-row deletes
-    # (machine_id translation across nodes is unreliable for delete events).
+    # Local dedup: a self-registration is authoritative for this machine's
+    # name, so make it the SOLE attestation:
+    #   (1) drop other-mid bindings for $host (clevo-lx accidentally bound
+    #       to clevo-air's machine_id from a prior DHCP correlation)
+    #   (2) drop same-mid OTHER-SOURCE bindings (the dhcp source row that
+    #       just attests the same fact — redundant once self has spoken,
+    #       and the user-visible reason their GUI showed clevo-lx twice)
+    # Both cleanups also run cluster-wide via Relay::_apply_hostnames when
+    # the self-row above replicates downstream, so leaves (gateways etc.)
+    # self-clean too. We don't emit per-row delete events for these — Relay
+    # translates AUTHORITY-OF-NAME via the self-source row, not per-row
+    # deletes (machine_id translation across nodes is unreliable).
     my $other_mids = $db->dbh->selectall_arrayref(
         "SELECT DISTINCT machine_id FROM hostnames
           WHERE name = ? AND machine_id <> ?",
@@ -498,6 +504,12 @@ sub _apply_self_inventory {
         my @gone = $db->delete_hostname($r->{machine_id}, $host);
         $orphans += scalar @gone;
     }
+    my $same_mid_extra = $db->dbh->do(
+        "DELETE FROM hostnames
+          WHERE machine_id = ? AND name = ? AND source <> 'self'",
+        undef, $mid, $host);
+    $same_mid_extra = 0 unless $same_mid_extra && $same_mid_extra > 0;
+    $orphans += $same_mid_extra;
     $self->_log("register_self: cleared $orphans local stale hostname binding(s) for '$host'")
         if $orphans;
     my $stamp_source = "$host:self";

@@ -176,11 +176,14 @@ sub _apply_hostnames {
            $mid, $row->{name}, $row->{source});
     # Authoritative-name semantic: a 'self' source replicates from the master
     # downstream when a daemon registered itself; it asserts THIS machine is
-    # the one answering to $name. Drop any other-mid bindings for the same
-    # name on this follower's local DB — that's how a clevo-lx restart's
-    # dedup reaches gateway3/gateway2/zmc1 without per-leaf operator auth.
-    # Other sources (dhcp, dhcp.master, etc.) don't trigger cleanup —
-    # only producer-as-authority does.
+    # the one answering to $name. Drop both:
+    #   (1) other-mid bindings for the same name (clevo-lx accidentally on
+    #       clevo-air's mid from a prior DHCP correlation)
+    #   (2) same-mid OTHER-SOURCE bindings (the dhcp/dhcp.master attestations
+    #       become redundant once self has spoken — what makes the user's GUI
+    #       stop showing the same name twice on the same machine)
+    # Other sources (dhcp, dhcp.master, etc.) don't trigger any cleanup —
+    # only the producer-as-authority does.
     if (($row->{source} // '') eq 'self') {
         my $orphans = $db->dbh->selectall_arrayref(
             "SELECT DISTINCT machine_id FROM hostnames
@@ -189,6 +192,10 @@ sub _apply_hostnames {
         for my $r (@{ $orphans || [] }) {
             $db->delete_hostname($r->{machine_id}, $row->{name});
         }
+        $db->dbh->do(
+            "DELETE FROM hostnames
+              WHERE machine_id = ? AND name = ? AND source <> 'self'",
+            undef, $mid, $row->{name});
     }
 }
 
