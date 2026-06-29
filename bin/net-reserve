@@ -358,12 +358,21 @@ sub gather {
     # Key by IP, but when an address has several leases over time (DHCP reuse —
     # the same IP handed to different MACs) keep the one with the latest expiry,
     # i.e. the current holder. Plain last-wins would surface a months-old stale
-    # lease and hide the device that actually holds the address now.
+    # lease and hide the device that actually holds the address now. ALSO drop
+    # leases whose expires is already in the past — a DHCP-expired lease isn't
+    # 'in-use', and net-mgr-relay doesn't necessarily prune them from the table,
+    # so without this filter long-departed devices keep colouring their old
+    # cells orange. NULL/empty expires is kept (treated as a static binding).
+    # MySQL DATETIME compares lexically when stored in the same timezone.
+    require POSIX;
+    my $now_iso = POSIX::strftime('%Y-%m-%d %H:%M:%S', localtime);
     my %leased;
     for my $l (grep { $_->{ip} } @$leases) {
+        my $exp = $l->{expires} // '';
+        next if length $exp && $exp lt $now_iso;       # expired -> not in-use
         my $ip  = canon_ip($l->{ip});
         my $cur = $leased{$ip};
-        $leased{$ip} = $l if !$cur || ($l->{expires} // '') gt ($cur->{expires} // '');
+        $leased{$ip} = $l if !$cur || $exp gt ($cur->{expires} // '');
     }
     my %observed = map { canon_ip($_->{addr}) => $_ } grep { $_->{addr} } @$addrs;
 
