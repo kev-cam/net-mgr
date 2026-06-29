@@ -45,6 +45,7 @@ use warnings;
 use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling pass_through);
+use NetMgr::Addr   qw(local_addrs);
 use NetMgr::Client;
 use NetMgr::Config;
 use NetMgr::Protocol qw(parse_line format_kv);
@@ -431,6 +432,29 @@ sub classify {
     return 'in-use'   if $model->{leased}{$ip} || $model->{observed}{$ip};
     return 'assigned' if in_pool($model, $i);
     return 'free';
+}
+
+# Suggest a cell to highlight when the user lands on (or switches to) a subnet,
+# so they're not staring at a flat grid wondering where to act. Preferred
+# target: this machine's own IPv4 on $cidr (most likely thing the operator
+# wants to inspect/reserve — "where am I in this subnet?"). Falls back to the
+# first 'free' IP if we have no presence on the subnet. Returns undef when the
+# subnet has neither — leave the grid un-hinted in that case rather than
+# pointing at something arbitrary. Pure: takes the gather()'d model, no IO
+# beyond NetMgr::Addr's `ip -br -4 addr show` (already cheap and used widely).
+sub _gui_default_pick {
+    my ($model, $cidr) = @_;
+    return undef unless defined $cidr;
+    for my $ip (local_addrs('v4', $cidr)) {
+        return $ip if defined $ip && length $ip;
+    }
+    my (undef, undef, $first, $last) = cidr_parts($cidr);
+    return undef unless defined $first && defined $last;
+    for (my $i = $first; $i <= $last; $i++) {
+        my $ip = int2ip($i);
+        return $ip if classify($model, $ip) eq 'free';
+    }
+    return undef;
 }
 
 # ---- CLI: colour + rendering ----------------------------------------
@@ -1162,6 +1186,21 @@ sub cmd_gui {
             if defined $S{armed_ip} && ($S{armed_subnet} // '') ne $cidr;
         delete @S{qw(range_start range_subnet)}
             if defined $S{range_start} && ($S{range_subnet} // '') ne $cidr;
+        # A 'hint' IP — visual-only secondary highlight that points at a sensible
+        # default cell whenever the user has no manual selection on this subnet:
+        # this machine's own IP if present, else the first 'free' IP. Kept in
+        # $S{hint_ip} (+ $S{hint_subnet} for cache invalidation); rendered by
+        # draw_cell with a distinct outline so it's obviously a SUGGESTION,
+        # not a click. Skipped in range_mode (DHCP-pool flow has its own
+        # selection semantics — range_start).
+        if ($S{range_mode}) {
+            delete @S{qw(hint_ip hint_subnet)};
+        } elsif (($S{hint_subnet} // '') ne $cidr) {
+            my $new_hint = _gui_default_pick($S{model}, $cidr);
+            $S{hint_ip}     = $new_hint;
+            $S{hint_subnet} = $cidr;
+            side_focus_ip(\%S, $new_hint) if defined $new_hint;
+        }
         my $model = $S{model};
         # "DHCP servers" mode: colour each pool by its serving AP/gateway and list
         # those servers in the side pane instead of the reservations.
@@ -1195,12 +1234,20 @@ sub cmd_gui {
                 else             { $fill = '#fff'; }
             }
             # Outline the selected cell: the armed reservation, or the pool start.
+            # A 'hint' IP (this machine's own, or first free) gets a distinct
+            # blue outline so it's clearly a SUGGESTION the user can ignore —
+            # only drawn when nothing is armed on this subnet.
             my $sel = $S{range_mode}
                     ? (defined $S{range_start} && $ip eq $S{range_start})
                     : (defined $S{armed_ip}    && $ip eq $S{armed_ip});
+            my $hint = !$sel
+                    && !defined $S{armed_ip}
+                    && defined $S{hint_ip}
+                    && $ip eq $S{hint_ip};
+            my $outline = $sel ? '#000' : ($hint ? '#39c' : '#999');
+            my $width   = ($sel || $hint) ? 2 : 1;
             my $r = $canvas->createRectangle($x, $y, $x + $cw - 2, $y + $ch - 2,
-                -fill => $fill, -outline => ($sel ? '#000' : '#999'),
-                -width => ($sel ? 2 : 1));
+                -fill => $fill, -outline => $outline, -width => $width);
             my $t = $canvas->createText($x + ($cw - 2) / 2, $y + ($ch - 2) / 2,
                 -text => ($i & 0xFF), -font => 'nrmono');
             for my $item ($r, $t) {
