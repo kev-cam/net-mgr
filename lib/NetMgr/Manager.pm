@@ -392,29 +392,28 @@ sub _recheck_listeners {
 # last_seen. WiFi interfaces are tagged kind=wifi via /sys/class/net/<n>/wireless.
 sub _register_self_interfaces {
     my ($self) = @_;
-    my $db = $self->{db} or return;
+    my $inv = $self->_collect_self_inventory or return;
+    $self->_apply_self_inventory($inv);
+    # Replication only flows master → followers, so a follower's "self" rows
+    # would otherwise stay local — invisible to anyone viewing this host's
+    # subnets from another node. Forward to the master so it upserts the same
+    # rows and replication carries them back out to the whole cluster.
+    $self->_publish_self_to_master($inv);
+}
+
+# Snapshot the host's interface inventory — `ip -o link show` for (iface, mac)
+# and `ip -br -4 addr show` for the v4 addresses each iface carries. Returns a
+# hashref { host, ifaces => [{ name, mac, kind, online, addrs => [v4...] }] }
+# or undef when the hostname is empty. Pure (one fork+exec per `ip` call).
+sub _collect_self_inventory {
+    my ($self) = @_;
     require Sys::Hostname;
     my $host = Sys::Hostname::hostname();
     $host =~ s/\..*$//;
-    return unless length $host;
-
-    # One machine row per host, keyed by primary_name (matches the historical
-    # convention; the user manages the -lx / -air / -vm naming themselves via
-    # /etc/hostname).
-    my ($mid) = $db->dbh->selectrow_array(
-        "SELECT id FROM machines WHERE primary_name = ?", undef, $host);
-    if ($mid) {
-        $db->upsert_machine(id => $mid, primary_name => $host, online => 1);
-    } else {
-        my $r = $db->upsert_machine(primary_name => $host, online => 1);
-        $mid = $r->{now}{id} if $r && $r->{now};
-    }
-    return unless $mid;
-    $db->upsert_hostname(machine_id => $mid, name => $host, source => 'self');
-
-    # Build iface -> mac from `ip -o link show`. Strips the @parent suffix VLANs
-    # add ("enp19s0.10@enp19s0"), since the MAC and the address rows we care
-    # about live on the same key regardless of the VLAN sub-iface.
+    return undef unless length $host;
+    # iface -> mac. Strip @parent suffix VLANs add ("enp19s0.10@enp19s0"); the
+    # MAC and v4 address rows we care about live on the same key regardless of
+    # the VLAN sub-iface.
     my %iface_mac;
     if (open my $lh, '-|', 'ip', '-o', 'link', 'show') {
         while (<$lh>) {
@@ -428,7 +427,6 @@ sub _register_self_interfaces {
         }
         close $lh;
     }
-    # And iface -> [v4 addrs] from `ip -br -4 addr show`.
     my (%iface_addrs, %iface_state);
     if (open my $ah, '-|', 'ip', '-br', '-4', 'addr', 'show') {
         while (<$ah>) {
@@ -445,22 +443,54 @@ sub _register_self_interfaces {
         }
         close $ah;
     }
-    # Publish each interface (every non-lo iface with a MAC, whether or not
-    # it has v4 addrs right now — the interface row is still useful) + each
-    # of its v4 addresses.
-    my $stamp_source = "$host:self";
+    my @ifaces;
     for my $name (sort keys %iface_mac) {
-        my $mac  = $iface_mac{$name};
-        my $kind = (-d "/sys/class/net/$name/wireless") ? 'wifi' : 'ethernet';
-        my $up   = ($iface_state{$name} // '') eq 'UP' ? 1 : 0;
+        push @ifaces, {
+            name   => $name,
+            mac    => $iface_mac{$name},
+            kind   => ((-d "/sys/class/net/$name/wireless") ? 'wifi' : 'ethernet'),
+            online => (($iface_state{$name} // '') eq 'UP' ? 1 : 0),
+            addrs  => $iface_addrs{$name} // [],
+        };
+    }
+    return { host => $host, ifaces => \@ifaces };
+}
+
+# Write the inventory to the local DB: machines + hostnames + interfaces +
+# addresses, each upsert wrapped in eval (so a single bad row doesn't poison
+# the rest). Called locally on every node, AND on the master when a follower
+# OBSERVE-publishes its inventory (so the data lands in the master's DB and
+# replicates back out cluster-wide).
+sub _apply_self_inventory {
+    my ($self, $inv) = @_;
+    my $db = $self->{db} or return;
+    my $host = $inv->{host};
+    return unless defined $host && length $host;
+    # One machine row per host, keyed by primary_name (matches the historical
+    # convention; the user manages -lx / -air / -vm via /etc/hostname).
+    my ($mid) = $db->dbh->selectrow_array(
+        "SELECT id FROM machines WHERE primary_name = ?", undef, $host);
+    if ($mid) {
+        $db->upsert_machine(id => $mid, primary_name => $host, online => 1);
+    } else {
+        my $r = $db->upsert_machine(primary_name => $host, online => 1);
+        $mid = $r->{now}{id} if $r && $r->{now};
+    }
+    return unless $mid;
+    $db->upsert_hostname(machine_id => $mid, name => $host, source => 'self');
+    my $stamp_source = "$host:self";
+    for my $i (@{ $inv->{ifaces} || [] }) {
+        my $mac = $i->{mac};
+        next unless defined $mac && length $mac;
         eval {
             $db->upsert_interface(
                 mac => $mac, machine_id => $mid,
-                kind => $kind, online => $up, live => 1,
+                kind => ($i->{kind} // 'ethernet'),
+                online => ($i->{online} ? 1 : 0), live => 1,
             );
         };
-        $self->_log("register_self: upsert_interface $name/$mac failed: $@") if $@;
-        for my $addr (@{ $iface_addrs{$name} // [] }) {
+        $self->_log("register_self: upsert_interface $i->{name}/$mac failed: $@") if $@;
+        for my $addr (@{ $i->{addrs} || [] }) {
             eval {
                 $db->upsert_address(
                     mac => $mac, family => 'v4', addr => $addr,
@@ -470,6 +500,33 @@ sub _register_self_interfaces {
             $self->_log("register_self: upsert_address $mac $addr failed: $@") if $@;
         }
     }
+}
+
+# Forward our inventory to the cluster master so it can write the same rows
+# and replication propagates them cluster-wide. No-op when we ARE the master
+# (rows are already local and will replicate), or when we have no master
+# (single-node deploy / mid-election). Best-effort: a failure just means the
+# row is local-only until the next retry (Manager retries on every netif
+# rescan / startup).
+sub _publish_self_to_master {
+    my ($self, $inv) = @_;
+    my $cs = $self->{cluster} || {};
+    my $self_name = $cs->{self_name} // '';
+    my $cr = $self->{cluster_runtime} || {};
+    my $master = $cr->{master_member};
+    return if !defined $master || !length $master;
+    return if $master eq $self_name;            # we ARE master — already local
+    my $addr = $self->{mesh} ? $self->{mesh}->address_for($master) : '';
+    return unless $addr;
+    require MIME::Base64;
+    require JSON::PP;
+    my $payload = eval { JSON::PP->new->canonical(1)->encode($inv) };
+    return if $@ || !defined $payload;
+    my $b64 = MIME::Base64::encode_base64($payload, '');
+    my $ok = $self->_forward_observe_to_master($addr,
+        kind => 'publish_self', inv_b64 => $b64);
+    $self->_log("publish_self: forwarded inventory to master '$master' ("
+              . scalar(@{ $inv->{ifaces} || [] }) . " ifaces) " . ($ok ? "OK" : "FAILED"));
 }
 
 # Attach this node to the "network_management" control VLAN: create the 802.1Q
@@ -4091,6 +4148,34 @@ sub _obs_he_update {
 # trust as code/config writes — this IS a config write, just routed via DB
 # instead of a file). Loopback exempt. Emits a row event so replication picks
 # it up; followers get the change automatically.
+sub _obs_publish_self {
+    my ($self, $cli, $kv) = @_;
+    # Any verified peer can publish ITS OWN inventory. Same trust as any
+    # other producer writing addresses — the source tag carries the
+    # publisher's name so reviewers can see who claimed what. Loopback
+    # exempt (local register_self uses _apply_self_inventory directly,
+    # but the OBSERVE path also has to be usable from local tools).
+    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{verified})) {
+        die "publish_self: not authorized (verified peer required)\n";
+    }
+    my $b64 = $kv->{inv_b64};
+    die "publish_self: missing inv_b64\n" unless defined $b64 && length $b64;
+    require MIME::Base64;
+    require JSON::PP;
+    my $json = MIME::Base64::decode_base64($b64);
+    my $inv  = eval { JSON::PP->new->decode($json) };
+    die "publish_self: bad inventory blob: $@\n" if $@ || ref($inv) ne 'HASH';
+    die "publish_self: missing host\n"
+        unless defined $inv->{host} && length $inv->{host};
+    die "publish_self: missing ifaces\n"
+        unless ref($inv->{ifaces}) eq 'ARRAY';
+    $self->_apply_self_inventory($inv);
+    my $n = scalar @{ $inv->{ifaces} || [] };
+    my $who = ($cli->{auth} && $cli->{auth}{key_id}) // 'loopback';
+    $self->_log("publish_self: applied inventory for '$inv->{host}' ($n ifaces) from $who");
+    return ();
+}
+
 sub _obs_mesh_tunnel {
     my ($self, $cli, $kv) = @_;
     unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_update})) {
@@ -4326,6 +4411,7 @@ sub _handle_observe {
         elsif ($kind eq 'he_update')   { @events = $self->_obs_he_update($cli, $kv) }
         elsif ($kind eq 'write_config'){ @events = $self->_obs_write_config($cli, $kv) }
         elsif ($kind eq 'mesh_tunnel') { @events = $self->_obs_mesh_tunnel($cli, $kv) }
+        elsif ($kind eq 'publish_self'){ @events = $self->_obs_publish_self($cli, $kv) }
         elsif ($kind eq 'relay')       { @events = $self->_obs_relay($cli, $kv) }
         else {
             die "unknown observation kind '$kind'\n";
