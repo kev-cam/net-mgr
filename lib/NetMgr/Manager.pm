@@ -513,6 +513,7 @@ sub _apply_self_inventory {
     $self->_log("register_self: cleared $orphans local stale hostname binding(s) for '$host'")
         if $orphans;
     my $stamp_source = "$host:self";
+    my $addr_orphans = 0;
     for my $i (@{ $inv->{ifaces} || [] }) {
         my $mac = $i->{mac};
         next unless defined $mac && length $mac;
@@ -524,6 +525,7 @@ sub _apply_self_inventory {
             );
         };
         $self->_log("register_self: upsert_interface $i->{name}/$mac failed: $@") if $@;
+        my @live_addrs;
         for my $addr (@{ $i->{addrs} || [] }) {
             eval {
                 $db->upsert_address(
@@ -531,9 +533,35 @@ sub _apply_self_inventory {
                     source => $stamp_source, live => 1,
                 );
             };
-            $self->_log("register_self: upsert_address $mac $addr failed: $@") if $@;
+            if ($@) {
+                $self->_log("register_self: upsert_address $mac $addr failed: $@");
+            } else {
+                push @live_addrs, $addr;
+            }
         }
+        # Self-wins for addresses: this MAC's current v4 addresses are the
+        # ground truth. Retire observation-sourced rows (arp/nmap/DHCP) for
+        # the same MAC that name a DIFFERENT addr — they're describing IPs
+        # this NIC no longer holds. Preserves :self, :net-reserve, audit:*,
+        # and unrecognized sources. Mirror-cleanup runs on every follower
+        # via Relay::_apply_addresses when the self row above replicates.
+        my $placeholders = @live_addrs ? join(',', ('?') x @live_addrs) : '';
+        my $exclude_sql  = @live_addrs ? "AND addr NOT IN ($placeholders)" : '';
+        my $n = eval {
+            $db->dbh->do(
+                "DELETE FROM addresses
+                  WHERE mac = ? AND family = 'v4' $exclude_sql
+                    AND ( source LIKE '%:arp'
+                       OR source LIKE '%:nmap'
+                       OR source LIKE '%:DHCP'
+                       OR source LIKE '%:dhcp'
+                       OR source LIKE '%:dhcp.master' )",
+                undef, lc($mac), @live_addrs);
+        };
+        $addr_orphans += $n if $n && $n > 0;
     }
+    $self->_log("register_self: retired $addr_orphans local stale address row(s) for '$host'")
+        if $addr_orphans;
 }
 
 # Forward our inventory to the cluster master so it can write the same rows

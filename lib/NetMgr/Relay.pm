@@ -231,6 +231,21 @@ sub _apply_addresses {
     _stamp($db, 'addresses', $repl_from,
            'mac = ? AND family = ? AND addr = ?',
            lc $row->{mac}, $row->{family}, $row->{addr});
+    # Self-wins: when an authoritative <host>:self row arrives, retire local
+    # observation-sourced rows for the SAME (mac, family) that name a
+    # different addr — they're describing IPs this NIC no longer holds.
+    # Producer-side does the same locally; this is the cluster-wide mirror.
+    if (($row->{source} // '') =~ /:self\z/) {
+        $db->dbh->do(
+            "DELETE FROM addresses
+              WHERE mac = ? AND family = ? AND addr <> ?
+                AND ( source LIKE '%:arp'
+                   OR source LIKE '%:nmap'
+                   OR source LIKE '%:DHCP'
+                   OR source LIKE '%:dhcp'
+                   OR source LIKE '%:dhcp.master' )",
+            undef, lc $row->{mac}, $row->{family}, $row->{addr});
+    }
 }
 
 sub _apply_ports {

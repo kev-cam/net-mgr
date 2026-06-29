@@ -374,7 +374,26 @@ sub gather {
         my $cur = $leased{$ip};
         $leased{$ip} = $l if !$cur || $exp gt ($cur->{expires} // '');
     }
-    my %observed = map { canon_ip($_->{addr}) => $_ } grep { $_->{addr} } @$addrs;
+    # Recency guard: an `addresses` row whose last_observed is older than this
+    # cutoff is treated as stale and dropped from the in-use view. The daemon's
+    # self-wins / purge_stale machinery should retire these eventually, but the
+    # GUI shouldn't render a ghost IP just because some long-gone observation
+    # row is still in the table. Authoritative sources (':self', ':net-reserve',
+    # 'manual', 'audit:*') are kept regardless of age. Cutoff: 48h.
+    my $stale_iso = POSIX::strftime('%Y-%m-%d %H:%M:%S',
+                                    localtime(time() - 48*3600));
+    my %observed;
+    for my $a (grep { $_->{addr} } @$addrs) {
+        my $src = $a->{source} // '';
+        my $authoritative = $src =~ /:(?:self|net-reserve|manual)\z/
+                         || $src =~ /^audit:/
+                         || $src eq 'manual';
+        unless ($authoritative) {
+            my $obs = $a->{last_observed} // $a->{last_seen} // '';
+            next if length $obs && $obs lt $stale_iso;
+        }
+        $observed{ canon_ip($a->{addr}) } = $a;
+    }
 
     my %name_of_mid = map { ($_->{id} => $_->{primary_name}) }
                       grep { defined $_->{primary_name} && length $_->{primary_name} } @$machines;
