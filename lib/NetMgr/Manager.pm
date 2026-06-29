@@ -478,6 +478,17 @@ sub _apply_self_inventory {
     }
     return unless $mid;
     $db->upsert_hostname(machine_id => $mid, name => $host, source => 'self');
+    # Authoritative dedup: the daemon naming itself is the source of truth for
+    # "what machine answers to $host". Any OTHER machine_id with that same name
+    # is a stale DHCP correlation from a prior context (e.g. clevo-lx hostname
+    # accidentally bound to machine_id=75 = clevo-air) — drop it now so the
+    # GUI's name lookups stop returning multiples. We DON'T touch the other
+    # machine row itself; it may still have legitimate OTHER names.
+    my $orphans = $db->dbh->do(
+        "DELETE FROM hostnames WHERE name = ? AND machine_id <> ?",
+        undef, $host, $mid);
+    $self->_log("register_self: cleared $orphans stale hostname binding(s) for '$host'")
+        if $orphans && $orphans > 0;
     my $stamp_source = "$host:self";
     for my $i (@{ $inv->{ifaces} || [] }) {
         my $mac = $i->{mac};
