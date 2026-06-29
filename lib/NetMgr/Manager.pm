@@ -374,6 +374,102 @@ sub _recheck_listeners {
         eval { $l->{sock}->close };
         $self->_log("stopped listening on $host:$l->{port} (interface gone)");
     }
+    # The set of local interfaces just changed (or might have). Re-publish our
+    # interface inventory to the cluster DB so other nodes see our current
+    # addresses immediately — without this a WiFi association / USB-NIC plug
+    # waits for the next 5-min find-peers sweep to surface us, and the GUI
+    # shows our IPs as 'free' until then.
+    $self->_register_self_interfaces;
+}
+
+# Publish THIS host's machine row + every non-loopback interface (mac, kind,
+# and v4 addresses) into the cluster DB. Cluster replication then makes the
+# rows visible everywhere — without this, an interface we just brought up is
+# unknown to the mesh until another producer (net-discover, ARP, dnsmasq lease)
+# happens to notice us. Called on startup (sbin/net-mgr's register_self
+# delegates here) and on every netif rescan (_recheck_listeners, above).
+# Idempotent: every upsert is keyed by mac / (mac,addr) so re-runs just bump
+# last_seen. WiFi interfaces are tagged kind=wifi via /sys/class/net/<n>/wireless.
+sub _register_self_interfaces {
+    my ($self) = @_;
+    my $db = $self->{db} or return;
+    require Sys::Hostname;
+    my $host = Sys::Hostname::hostname();
+    $host =~ s/\..*$//;
+    return unless length $host;
+
+    # One machine row per host, keyed by primary_name (matches the historical
+    # convention; the user manages the -lx / -air / -vm naming themselves via
+    # /etc/hostname).
+    my ($mid) = $db->dbh->selectrow_array(
+        "SELECT id FROM machines WHERE primary_name = ?", undef, $host);
+    if ($mid) {
+        $db->upsert_machine(id => $mid, primary_name => $host, online => 1);
+    } else {
+        my $r = $db->upsert_machine(primary_name => $host, online => 1);
+        $mid = $r->{now}{id} if $r && $r->{now};
+    }
+    return unless $mid;
+    $db->upsert_hostname(machine_id => $mid, name => $host, source => 'self');
+
+    # Build iface -> mac from `ip -o link show`. Strips the @parent suffix VLANs
+    # add ("enp19s0.10@enp19s0"), since the MAC and the address rows we care
+    # about live on the same key regardless of the VLAN sub-iface.
+    my %iface_mac;
+    if (open my $lh, '-|', 'ip', '-o', 'link', 'show') {
+        while (<$lh>) {
+            next unless /^\d+:\s+(\S+?):\s+/;
+            my $name = $1;
+            $name =~ s/\@.*//;
+            next if $name eq 'lo';
+            if (m{link/ether\s+([0-9a-f:]+)}i) {
+                $iface_mac{$name} = lc $1;
+            }
+        }
+        close $lh;
+    }
+    # And iface -> [v4 addrs] from `ip -br -4 addr show`.
+    my (%iface_addrs, %iface_state);
+    if (open my $ah, '-|', 'ip', '-br', '-4', 'addr', 'show') {
+        while (<$ah>) {
+            chomp;
+            my ($iface, $state, @addrs) = split ' ';
+            next unless $iface && $iface ne 'lo';
+            $iface =~ s/\@.*//;
+            $iface_state{$iface} = $state;
+            for my $a (@addrs) {
+                $a =~ s|/.*||;
+                next if $a =~ /^127\./ || $a =~ /^169\.254\./;
+                push @{ $iface_addrs{$iface} }, $a;
+            }
+        }
+        close $ah;
+    }
+    # Publish each interface (every non-lo iface with a MAC, whether or not
+    # it has v4 addrs right now — the interface row is still useful) + each
+    # of its v4 addresses.
+    my $stamp_source = "$host:self";
+    for my $name (sort keys %iface_mac) {
+        my $mac  = $iface_mac{$name};
+        my $kind = (-d "/sys/class/net/$name/wireless") ? 'wifi' : 'ethernet';
+        my $up   = ($iface_state{$name} // '') eq 'UP' ? 1 : 0;
+        eval {
+            $db->upsert_interface(
+                mac => $mac, machine_id => $mid,
+                kind => $kind, online => $up, live => 1,
+            );
+        };
+        $self->_log("register_self: upsert_interface $name/$mac failed: $@") if $@;
+        for my $addr (@{ $iface_addrs{$name} // [] }) {
+            eval {
+                $db->upsert_address(
+                    mac => $mac, family => 'v4', addr => $addr,
+                    source => $stamp_source, live => 1,
+                );
+            };
+            $self->_log("register_self: upsert_address $mac $addr failed: $@") if $@;
+        }
+    }
 }
 
 # Attach this node to the "network_management" control VLAN: create the 802.1Q
