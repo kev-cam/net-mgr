@@ -742,9 +742,34 @@ sub cmd_tty {
                     print $chat_prompt; return;
                 }
                 eval { $c->chat_post(session => $name, body => $text) };
-                if ($@) {
-                    my $e = $@; $e =~ s/\s+\z//;
-                    $emit->("-- post failed: $e");
+                my $err = $@;
+                if ($err) {
+                    # Same join-request fallback as the GUI: server says
+                    # "not a member" / "not authorized to post" → silently
+                    # queue a chat_join (request) and surface "waiting for
+                    # an owner" rather than the raw AUTH error. An owner
+                    # on another box approves; the user's pubkey gets
+                    # persisted so subsequent posts work.
+                    if ($err =~ /chat_msg: not a member of|not authorized to post/i) {
+                        my $jr = eval { $c->chat_join(session => $name) };
+                        my $state = ($jr && ref $jr eq 'HASH') ? ($jr->{state} // '') : '';
+                        if ($@) {
+                            chomp(my $je = $@);
+                            $emit->("-- post needs membership; join failed: $je");
+                        } elsif ($state eq 'requested') {
+                            $emit->("-- join request sent for '$name' "
+                                  . "— waiting for an owner to approve");
+                        } elsif ($state eq 'member') {
+                            eval { $c->chat_post(session => $name, body => $text) };
+                            $emit->("-- post failed after join: $@") if $@;
+                        } else {
+                            chomp(my $e = $err);
+                            $emit->("-- post failed: $e");
+                        }
+                    } else {
+                        my $e = $err; $e =~ s/\s+\z//;
+                        $emit->("-- post failed: $e");
+                    }
                 }
                 print $chat_prompt;
             } else {                                  # cmd mode
@@ -1706,7 +1731,56 @@ sub cmd_gui {
         unless (defined $cur) { $set_status->('pick a chat first'); return }
         eval { $ctrl->chat_post(session => $cur, body => $body,
                                 ($is_loopback ? (as => $as) : ())) };
-        $set_status->("post failed: $@") if $@;
+        my $err = $@;
+        if (!$err) {
+            $entry->delete(0, 'end');
+            return;
+        }
+        # Membership gating: unauth user posting to a non-loopback session
+        # gets "not a member of '<X>'" or "not authorized to post". Don't
+        # surface that as a raw error or pop a local AUTH dialog — the
+        # right flow is to QUEUE a join request (server-side already
+        # supports it; see chat_join's see-and-request mode). The user
+        # then sees "waiting" while an owner on ANOTHER machine sees the
+        # request and approves; the user's pubkey gets persisted into the
+        # chat's allow-list so subsequent posts work without re-asking.
+        if ($err =~ /chat_msg: not a member of|not authorized to post/i) {
+            my $jr = eval { $ctrl->chat_join(session => $cur) };
+            my $jerr = $@;
+            my $state = ($jr && ref $jr eq 'HASH') ? ($jr->{state} // '') : '';
+            if ($jerr) {
+                # join itself failed (e.g. session in list-only mode and we
+                # have no key to attach) — fall back to the raw error so
+                # the user knows it's not a transient hiccup.
+                chomp $jerr;
+                $set_status->("post needs membership; join failed: $jerr");
+            } elsif ($state eq 'requested') {
+                $set_status->("post needs membership — join request "
+                            . "sent for '$cur'; waiting for an owner "
+                            . "to approve. Type stays in the box.");
+                # Keep the entry text so the user can retry once admitted
+                # — no $entry->delete here.
+                return;
+            } elsif ($state eq 'member') {
+                # Already a member somehow (race? loopback elevation?).
+                # Retry the post once.
+                eval { $ctrl->chat_post(session => $cur, body => $body,
+                                        ($is_loopback ? (as => $as) : ())) };
+                if ($@) {
+                    chomp(my $e2 = $@);
+                    $set_status->("post failed after join: $e2");
+                } else {
+                    $entry->delete(0, 'end');
+                }
+                return;
+            } else {
+                chomp(my $e = $err);
+                $set_status->("post failed: $e (join state='$state')");
+            }
+            return;
+        }
+        chomp $err;
+        $set_status->("post failed: $err");
         $entry->delete(0, 'end');
     };
 
