@@ -427,7 +427,7 @@ sub _collect_self_inventory {
         }
         close $lh;
     }
-    my (%iface_addrs, %iface_state);
+    my (%iface_addrs, %iface_addrs6, %iface_state);
     if (open my $ah, '-|', 'ip', '-br', '-4', 'addr', 'show') {
         while (<$ah>) {
             chomp;
@@ -443,14 +443,34 @@ sub _collect_self_inventory {
         }
         close $ah;
     }
+    # Same enumeration for v6: skip link-local (fe80::/10) and loopback (::1).
+    # ULA (fd00::/8) is included — control-VLAN addresses live there. State is
+    # taken from the v4 pass when available; iface-only-on-v6 keeps that pass's
+    # state.
+    if (open my $ah6, '-|', 'ip', '-br', '-6', 'addr', 'show') {
+        while (<$ah6>) {
+            chomp;
+            my ($iface, $state, @addrs) = split ' ';
+            next unless $iface && $iface ne 'lo';
+            $iface =~ s/\@.*//;
+            $iface_state{$iface} //= $state;
+            for my $a (@addrs) {
+                $a =~ s|/.*||;
+                next if $a =~ /^fe80:/i || $a eq '::1';
+                push @{ $iface_addrs6{$iface} }, $a;
+            }
+        }
+        close $ah6;
+    }
     my @ifaces;
     for my $name (sort keys %iface_mac) {
         push @ifaces, {
-            name   => $name,
-            mac    => $iface_mac{$name},
-            kind   => ((-d "/sys/class/net/$name/wireless") ? 'wifi' : 'ethernet'),
-            online => (($iface_state{$name} // '') eq 'UP' ? 1 : 0),
-            addrs  => $iface_addrs{$name} // [],
+            name      => $name,
+            mac       => $iface_mac{$name},
+            kind      => ((-d "/sys/class/net/$name/wireless") ? 'wifi' : 'ethernet'),
+            online    => (($iface_state{$name} // '') eq 'UP' ? 1 : 0),
+            addrs     => $iface_addrs{$name}  // [],   # v4 (back-compat field)
+            addrs_v6  => $iface_addrs6{$name} // [],   # v6 (new in this rev)
         };
     }
     return { host => $host, ifaces => \@ifaces };
@@ -537,6 +557,22 @@ sub _apply_self_inventory {
                 $self->_log("register_self: upsert_address $mac $addr failed: $@");
             } else {
                 push @live_addrs, $addr;
+            }
+        }
+        # Same for v6 (publish_self started carrying addrs_v6 in this rev; older
+        # producers omit the key, which leaves the loop empty — safe).
+        my @live_addrs6;
+        for my $addr (@{ $i->{addrs_v6} || [] }) {
+            eval {
+                $db->upsert_address(
+                    mac => $mac, family => 'v6', addr => $addr,
+                    source => $stamp_source, live => 1,
+                );
+            };
+            if ($@) {
+                $self->_log("register_self: upsert_address $mac $addr (v6) failed: $@");
+            } else {
+                push @live_addrs6, $addr;
             }
         }
         # Self-wins for addresses: this MAC's current v4 addresses are the

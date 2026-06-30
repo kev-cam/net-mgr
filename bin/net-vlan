@@ -1,0 +1,271 @@
+#!/usr/bin/perl
+# net-vlan — list IPv6 VLAN definitions and their members.
+#
+# VLAN definitions come from [ipv6_vlan "<name>"] sections in
+# /etc/net-mgr/config; membership is read from the `addresses` table over
+# the mesh (rows arrive via every node's publish_self, so a single query
+# against any daemon's local DB sees every cluster member).
+#
+# Usage:
+#   net-vlan list                          # every configured VLAN + prefix
+#   net-vlan members <name>                # members of named VLAN
+#   net-vlan members 2001:470:1f05:1f9::/64  # or by raw prefix
+#   net-vlan members <name|prefix> --live  # ad-hoc per-peer kernel probe
+#
+# Common flags: --listen, --server, --json, --auth (snapshot is read-only;
+# auth is optional and only needed if the daemon is locked down).
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use NetMgr::Client;
+use NetMgr::Config;
+use NetMgr::Protocol qw(parse_line);
+use Getopt::Long qw(GetOptions);
+
+my %opt;
+GetOptions(\%opt,
+    'listen=s', 'server=s', 'auth!', 'json', 'live', 'help',
+) or usage(2);
+usage(0) if $opt{help};
+
+my $cmd = shift @ARGV // 'list';
+my $arg = shift @ARGV;
+
+my $listen = $opt{listen} // do {
+    my $cfg = eval { NetMgr::Config->load } || {};
+    my $srvs = $cfg->{servers} || {};
+    my $pick = $opt{server} // $srvs->{default};
+    $pick && $srvs->{$pick} ? $srvs->{$pick} : '127.0.0.1:7531';
+};
+
+if ($cmd eq 'list') {
+    cmd_list();
+}
+elsif ($cmd eq 'members') {
+    die "members: need <name|prefix>\n" unless defined $arg && length $arg;
+    cmd_members($arg);
+}
+else {
+    usage(2);
+}
+exit 0;
+
+# ---- commands -------------------------------------------------------
+
+sub cmd_list {
+    my $vlans = load_local_vlans();
+    if ($opt{json}) {
+        require JSON::PP;
+        print JSON::PP->new->canonical(1)->pretty->encode($vlans);
+        return;
+    }
+    if (!keys %$vlans) {
+        print "(no [ipv6_vlan] sections in this node's /etc/net-mgr/config)\n";
+        return;
+    }
+    printf "%-22s %-10s %-32s %s\n", 'NAME', 'TYPE', 'PREFIX', 'EXTRA';
+    for my $name (sort keys %$vlans) {
+        my $v = $vlans->{$name};
+        my @extra;
+        push @extra, "id=$v->{id}"        if defined $v->{id};
+        push @extra, "gw=$v->{gateway}"   if defined $v->{gateway};
+        push @extra, "mode=$v->{mode}"    if defined $v->{mode};
+        push @extra, "server=$v->{server}" if defined $v->{server};
+        printf "%-22s %-10s %-32s %s\n",
+            $name, ($v->{type} // '?'),
+            ($v->{prefix} // '-'), join(' ', @extra);
+    }
+}
+
+sub cmd_members {
+    my ($arg) = @_;
+    my $prefix = resolve_prefix($arg);
+    my ($net, $len) = $prefix =~ m{^(.+)/(\d+)\z}
+        or die "members: bad prefix '$prefix' (need ::/len)\n";
+    if ($opt{live}) {
+        return cmd_members_live($prefix);
+    }
+    my $cli = NetMgr::Client->new(listen => $listen, timeout => 10);
+    $cli->hello(consumer => "net-vlan.$$");
+    $cli->auth if $opt{auth};
+    my $like = like_pattern_for($net);
+    my $rows = $cli->snapshot(1, 'addresses',
+        where => "family='v6' AND addr LIKE '$like'");
+    my $ifaces   = $cli->snapshot(2, 'interfaces');
+    my $machines = $cli->snapshot(3, 'machines');
+    $cli->bye;
+
+    my %mac_mid = map { lc($_->{mac}) => $_->{machine_id} }
+                  grep { $_->{mac} && $_->{machine_id} } @$ifaces;
+    my %mid_name = map { $_->{id} => $_->{primary_name} }
+                   grep { defined $_->{primary_name} } @$machines;
+
+    my @members;
+    for my $r (@$rows) {
+        my $name = $mid_name{ $mac_mid{ lc($r->{mac} // '') } // '' };
+        push @members, {
+            addr          => $r->{addr},
+            mac           => $r->{mac},
+            name          => $name,
+            source        => $r->{source},
+            last_observed => $r->{last_observed},
+        };
+    }
+    @members = sort { ($a->{name} // '~') cmp ($b->{name} // '~')
+                   || $a->{addr} cmp $b->{addr} } @members;
+    emit_members(\@members, $prefix, "DB at $listen");
+}
+
+sub cmd_members_live {
+    my ($prefix) = @_;
+    # Walk cluster peers (best signal we have without a real mesh-roster RPC)
+    # plus loopback. Each peer gets a poll ipv6; we grep for matches.
+    my $cli = NetMgr::Client->new(listen => $listen, timeout => 6);
+    $cli->hello(consumer => "net-vlan.$$");
+    my $peers = $cli->snapshot(1, 'peers');
+    $cli->bye;
+
+    my @targets;
+    push @targets, { name => 'self', addr => $listen };
+    for my $p (@$peers) {
+        next unless $p->{host};
+        my $addr = $p->{host};
+        $addr .= ':' . ($p->{port} // 7531) unless $addr =~ /:/;
+        push @targets, {
+            name => ($p->{cluster_member} // $p->{primary_name} // $p->{host}),
+            addr => $addr,
+        };
+    }
+    my ($net, $len) = $prefix =~ m{^(.+)/(\d+)\z};
+    my $rx = like_pattern_for($net);
+    $rx =~ s/\%/.*/g;
+    my $regex = qr/^($rx)[a-f0-9:]*(?:\/\d+)?\z/;
+
+    my %seen_target;
+    @targets = grep { my $k = $_->{addr}; !$seen_target{$k}++ } @targets;
+    my %seen_addr;   # (addr|name|iface) — same kernel addr seen twice via two peers
+    my @members;
+    for my $t (@targets) {
+        my $out = eval {
+            my $c = NetMgr::Client->new(listen => $t->{addr}, timeout => 4);
+            $c->hello(consumer => "net-vlan.$$");
+            my $r = $c->poll('ipv6');
+            $c->bye;
+            $r;
+        };
+        next unless defined $out;
+        for my $line (split /\n/, $out) {
+            # ip -br -6 output: 'iface STATE addr1/len addr2/len ...'
+            next if $line =~ /^===/;
+            my @toks = split ' ', $line;
+            next unless @toks >= 3;
+            my ($iface, $state, @addrs) = @toks;
+            for my $a (@addrs) {
+                next unless $a =~ m{^([0-9a-f:]+)/\d+\z}i;
+                my $addr = $1;
+                next unless $addr =~ /^$rx/i;
+                my $key = lc("$addr|$t->{name}|$iface");
+                next if $seen_addr{$key}++;
+                push @members, {
+                    addr => $addr, name => $t->{name},
+                    iface => $iface, source => 'live',
+                };
+            }
+        }
+    }
+    @members = sort { $a->{name} cmp $b->{name} || $a->{addr} cmp $b->{addr} } @members;
+    emit_members(\@members, $prefix, "live poll across peers");
+}
+
+sub emit_members {
+    my ($members, $prefix, $source_label) = @_;
+    if ($opt{json}) {
+        require JSON::PP;
+        print JSON::PP->new->canonical(1)->pretty->encode($members);
+        return;
+    }
+    if (!@$members) {
+        print "(no members found in $prefix via $source_label)\n";
+        print "  hint: --live falls back to per-peer kernel probes if the DB is empty.\n"
+            unless $opt{live};
+        return;
+    }
+    printf "# %s — %s\n", $prefix, $source_label;
+    printf "%-44s %-18s %s\n", 'ADDR', 'NAME', 'MAC/IFACE';
+    for my $m (@$members) {
+        printf "%-44s %-18s %s\n",
+            $m->{addr},
+            ($m->{name} // '(unknown)'),
+            ($m->{mac} // $m->{iface} // '');
+    }
+}
+
+# ---- helpers --------------------------------------------------------
+
+sub load_local_vlans {
+    my $cfg = eval { NetMgr::Config->load } || {};
+    my $v = $cfg->{ipv6_vlan} || {};
+    # Sections look like $cfg->{ipv6_vlan}{$name} = { type, prefix, ... }
+    my %out;
+    for my $name (keys %$v) {
+        my $e = $v->{$name};
+        next unless ref $e eq 'HASH';
+        $out{$name} = { %$e };
+    }
+    return \%out;
+}
+
+sub resolve_prefix {
+    my ($arg) = @_;
+    # If it already looks like a v6 CIDR, take it verbatim
+    return $arg if $arg =~ /:/ && $arg =~ m{/\d+\z};
+    my $vlans = load_local_vlans();
+    my $v = $vlans->{$arg}
+        or die "members: no [ipv6_vlan \"$arg\"] in this node's config "
+             . "(use a literal prefix, e.g. 2001:470:1f05:1f9::/64)\n";
+    my $p = $v->{prefix}
+        or die "members: [ipv6_vlan \"$arg\"] has no 'prefix' set "
+             . "(stub config? edit /etc/net-mgr/config)\n";
+    return $p;
+}
+
+# Turn a v6 network string into a SQL LIKE pattern that matches addresses
+# in that prefix. Addresses store the canonical compressed form, so
+# truncating at '::' and appending '%' catches everything in the /64.
+# Caller is responsible for ensuring $net came from a CIDR /64 — for
+# longer prefixes the match will be over-broad but still useful.
+sub like_pattern_for {
+    my ($net) = @_;
+    # Drop trailing '::' if any so '2001:470:1f05:1f9::' becomes
+    # '2001:470:1f05:1f9:', which matches '...:c0a8:f9c' etc.
+    $net =~ s/::\z/:/;
+    $net =~ s/:\z//;  # if no trailing ::, still trim a stray ':'
+    # SQL LIKE special chars in v6 addrs? '%' and '_' don't occur in IPv6.
+    return "$net:%";
+}
+
+sub usage {
+    my ($rc) = @_;
+    print STDERR <<'USAGE';
+net-vlan — list IPv6 VLAN definitions and their members.
+
+  net-vlan list                          # configured VLANs
+  net-vlan members <name>                # members of named VLAN
+  net-vlan members <prefix>              # members of an explicit /64
+  net-vlan members <name|prefix> --live  # per-peer kernel probe fallback
+
+VLAN definitions come from [ipv6_vlan "<name>"] sections in
+/etc/net-mgr/config on the node where you run this.
+Membership comes from the `addresses` table over the mesh (via --listen).
+
+Flags:
+  --listen HOST:PORT   target daemon for the DB query (default 127.0.0.1:7531)
+  --server NAME        named server from [servers] in ~/.config/net-mgr/config
+  --auth               sign the SUBSCRIBE (optional; snapshots are read-only)
+  --live               skip the DB; probe each peer's kernel via poll ipv6
+  --json               machine-readable output
+USAGE
+    exit($rc // 0);
+}
