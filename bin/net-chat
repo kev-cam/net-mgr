@@ -378,7 +378,11 @@ sub cmd_requests {
         where => "session = '$name' AND state = 'requested'");
     unless (@$rows) { print "no pending requests for '$name'\n"; return }
     print "pending requests for '$name':\n";
-    print "  $_->{principal}\n" for @$rows;
+    for my $r (@$rows) {
+        my $from = $r->{requested_from};
+        printf "  %-40s%s\n", $r->{principal},
+            (defined $from && length $from ? "   from $from" : '');
+    }
 }
 
 # net-chat --tty [session]: dumb-terminal chat client. Plain stdin + stdout,
@@ -1491,7 +1495,10 @@ sub cmd_gui {
         # Make the unverified prefix visible so the approver knows what they're
         # admitting — bake the explicit warning into the popup body.
         my $is_unverified = ($who =~ /^unverified:/);
+        my $from = $kv->{requested_from};
         my $body = "'" . $who_label->($who) . "' requests to join '$sess'"
+                 . (defined $from && length $from
+                    ? "\nfrom $from" : '')
                  . ($is_unverified
                     ? "\n\nWARNING: This name is NOT cryptographically verified.\n"
                       . "Anyone calling themselves this from the network can join\n"

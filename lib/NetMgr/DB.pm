@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 30;
+our $SCHEMA_VERSION = 31;
 
 sub new {
     my ($class, %args) = @_;
@@ -708,6 +708,16 @@ SQL
         # AutoDiscover can resolve peers without machines table data.
         $self->{dbh}->do(
             "ALTER TABLE peers ADD COLUMN cluster_member VARCHAR(64) NULL"
+        );
+        return;
+    }
+    if ($v == 31) {
+        # chat_members.requested_from: peer IP/host the join request came in
+        # on, so an approver can see WHERE the request originated, not just
+        # WHO claimed to send it. Especially useful for unverified joins
+        # (the principal is a self-asserted name; the source addr is real).
+        $self->{dbh}->do(
+            "ALTER TABLE chat_members ADD COLUMN requested_from VARCHAR(64) NULL"
         );
         return;
     }
@@ -2100,17 +2110,18 @@ sub set_chat_member {
     $self->{dbh}->do(
         "INSERT INTO chat_members
             (session, principal, role, state, added_by, requested_at, joined_at,
-             request_pubkey)
-         VALUES (?, ?, ?, ?, ?, $req_at, $join_at, ?)
+             request_pubkey, requested_from)
+         VALUES (?, ?, ?, ?, ?, $req_at, $join_at, ?, ?)
          ON DUPLICATE KEY UPDATE
             role           = VALUES(role),
             state          = VALUES(state),
             added_by       = VALUES(added_by),
             requested_at   = COALESCE(VALUES(requested_at), requested_at),
             joined_at      = COALESCE(VALUES(joined_at),    joined_at),
-            request_pubkey = COALESCE(VALUES(request_pubkey), request_pubkey)",
+            request_pubkey = COALESCE(VALUES(request_pubkey), request_pubkey),
+            requested_from = COALESCE(VALUES(requested_from), requested_from)",
         undef, $f{session}, $f{principal}, $role, $state, $f{added_by},
-        $f{request_pubkey});
+        $f{request_pubkey}, $f{requested_from});
     return { op => 'update', now => $self->get_chat_member($f{session}, $f{principal}) };
 }
 

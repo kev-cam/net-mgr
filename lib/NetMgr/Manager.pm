@@ -3840,13 +3840,25 @@ sub _handle_chat_join {
         my $req_pubkey = ($unverified && defined $kv->{pubkey}
                                       && length $kv->{pubkey})
                          ? _normalize_pubkey($kv->{pubkey}) : undef;
+        # Capture the peer address the request came in on, so the approver
+        # sees WHERE it originated regardless of the (potentially self-
+        # asserted) principal. Skipped for loopback — IP isn't informative.
+        my $req_from;
+        if ($cli->{sock} && !_peer_is_loopback($cli)) {
+            $req_from = eval { $cli->{sock}->peerhost } // '';
+            my $pp = eval { $cli->{sock}->peerport };
+            $req_from .= ":$pp" if defined $pp && length $req_from;
+            $req_from = undef unless length $req_from;
+        }
         my $m = $self->{db}->set_chat_member(
             session => $name, principal => $who, state => 'requested',
-            added_by => $who, request_pubkey => $req_pubkey);
+            added_by => $who, request_pubkey => $req_pubkey,
+            requested_from => $req_from);
         $self->_emit_change(table => 'chat_members', op => 'update', row => $m->{now})
             if $m->{now};
         $self->_log("chat join-request $name by $who"
-                  . ($req_pubkey ? " [+pubkey for durable auth]" : ""));
+                  . ($req_from   ? " from $req_from"                  : '')
+                  . ($req_pubkey ? " [+pubkey for durable auth]"      : ''));
         return $self->_send($cli, format_ok(session => $name, state => 'requested'));
     }
 

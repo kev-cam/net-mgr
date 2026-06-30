@@ -522,13 +522,20 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
 -- 'requested' is awaiting approval, 'invited' is pre-authorised on a
 -- 'list' session, 'denied' was rejected.
 CREATE TABLE IF NOT EXISTS chat_members (
-    session      VARCHAR(64)  NOT NULL,
-    principal    VARCHAR(128) NOT NULL,
-    role         ENUM('owner','member')                        NOT NULL DEFAULT 'member',
-    state        ENUM('member','requested','invited','denied') NOT NULL DEFAULT 'member',
-    added_by     VARCHAR(128),
-    requested_at DATETIME     NULL,
-    joined_at    DATETIME     NULL,
+    session        VARCHAR(64)  NOT NULL,
+    principal      VARCHAR(128) NOT NULL,
+    role           ENUM('owner','member')                        NOT NULL DEFAULT 'member',
+    state          ENUM('member','requested','invited','denied') NOT NULL DEFAULT 'member',
+    added_by       VARCHAR(128),
+    requested_at   DATETIME     NULL,
+    joined_at      DATETIME     NULL,
+    -- request_pubkey carries the SSH pubkey supplied with an unverified
+    -- join request; cleared on approval (key moves to chat_authorized_keys).
+    request_pubkey TEXT         NULL,
+    -- requested_from: peer IP/host the join request came in on, so an
+    -- approver sees WHERE the request originated, not just the
+    -- (potentially self-asserted) principal. Set when state=requested.
+    requested_from VARCHAR(64)  NULL,
     PRIMARY KEY (session, principal),
     KEY idx_member_state (state),
     CONSTRAINT fk_chat_members_session
