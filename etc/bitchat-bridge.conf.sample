@@ -1,0 +1,27 @@
+# net-bitchat-bridge configuration. Install to /etc/net-mgr/bitchat-bridge.conf.
+#
+# The supervisor exec's a helper that prints line-oriented JSON message
+# events on stdout. For ShilohEye/bitchat-terminal (which prints ANSI),
+# point the supervisor at net-bitchat-helper-wrap (the shim) and the
+# shim at the real bitchat binary via env_BITCHAT_BIN.
+
+[helper]
+path = /usr/local/bin/net-bitchat-helper-wrap
+args =
+# Pass the path to the real BitChat binary into the shim's env:
+env_BITCHAT_BIN = /home/dkc/src/bitchat-terminal/target/release/bitchat
+
+[session]
+# Which net-chat session BitChat messages land in. Create with:
+#   net-chat --auth admin create bitchat-bridge access=open
+name = bitchat-bridge
+
+[identity]
+# Attribution stamped on every relayed message (the `as` field).
+# Loopback connections may set `as` freely; this is what readers see
+# as the sender (the original BitChat nick is in the message body).
+as = bitchat-relay
+
+[daemon]
+# net-mgr daemon socket. Loopback = no auth required.
+listen = 127.0.0.1:7531

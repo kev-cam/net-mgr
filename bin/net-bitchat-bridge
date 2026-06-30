@@ -1,0 +1,218 @@
+#!/usr/bin/perl
+# net-bitchat-bridge — pipe-read a BitChat helper, post messages into a
+# net-chat session via OBSERVE kind=chat_msg to localhost:7531.
+#
+# Architecture:
+#   helper (Rust BitChat client over BLE)  --stdout JSON lines-->  this script
+#                                                                       |
+#                                                                       v
+#                                                       NetMgr::Client::chat_post
+#                                                       (loopback, no auth needed;
+#                                                        `as` field stamps attribution)
+#
+# Each helper stdout line is one JSON event:
+#   {"type":"msg","sender":"alice","body":"hello","ts":1709000000,"channel":"public"}
+#   {"type":"status","raw":"<any other line from the helper, ANSI-stripped>"}
+# 'msg' events become chat_post calls; 'status' lines are logged at debug.
+#
+# Tier-0 scope: one-way (BitChat -> net-chat) only. Tier-2 will add the
+# reverse direction via a SUBSCRIBE to chat_messages.
+#
+# Usage:
+#   net-bitchat-bridge --config /etc/net-mgr/bitchat-bridge.conf --foreground
+#   net-bitchat-bridge --once     # process one line then exit (for testing)
+#   net-bitchat-bridge --dry-run  # print what would be posted, don't post
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(GetOptions);
+use IPC::Open3;
+use IO::Select;
+use Symbol qw(gensym);
+use JSON::PP;
+use NetMgr::Client;
+
+my %opt;
+GetOptions(\%opt,
+    'config=s', 'foreground', 'once', 'dry-run', 'help',
+) or usage(2);
+usage(0) if $opt{help};
+
+my $cfg = read_config($opt{config} // '/etc/net-mgr/bitchat-bridge.conf');
+my $helper_path = $cfg->{helper}{path}
+    or die "config: [helper] path= required\n";
+my @helper_args = split ' ', ($cfg->{helper}{args} // '');
+my $session = $cfg->{session}{name} // 'bitchat-bridge';
+my $as      = $cfg->{identity}{as}  // 'bitchat-relay';
+my $listen  = $cfg->{daemon}{listen} // '127.0.0.1:7531';
+
+# Helper-targeted env vars (anything in [helper] starting env_ becomes $ENV{...}).
+for my $k (sort keys %{ $cfg->{helper} // {} }) {
+    next unless $k =~ /^env_(.+)$/;
+    $ENV{$1} = $cfg->{helper}{$k};
+}
+
+my $backoff = 1;
+while (1) {
+    my $exit = eval { run_once() };
+    my $err  = $@;
+    if ($err) {
+        warn "[bridge] $err";
+    } else {
+        warn "[bridge] helper exited (code=" . ($exit // '?') . ")\n";
+    }
+    last if $opt{once};
+    sleep $backoff;
+    $backoff = $backoff >= 30 ? 30 : $backoff * 2;
+    # Successful run resets backoff (we only get here if helper actually
+    # produced output for a while — a quick crash should keep backing off).
+    $backoff = 1 if defined $exit && $exit == 0;
+}
+
+# ---- supervisor inner loop ----
+
+sub run_once {
+    warn "[bridge] launching helper: $helper_path @helper_args\n";
+    my ($wh, $rh, $eh) = (undef, undef, gensym);
+    my $pid = open3($wh, $rh, $eh, $helper_path, @helper_args);
+    close $wh;   # we don't write commands to the helper
+
+    my $cli;
+    unless ($opt{'dry-run'}) {
+        $cli = NetMgr::Client->new(listen => $listen, timeout => 6);
+        $cli->hello(consumer => "bitchat-bridge.$$");
+        # loopback → no auth needed
+    }
+
+    # Drain stdout (JSON events) AND stderr (helper diagnostic logs) in
+    # parallel — without this, helper stderr blocks once its pipe fills
+    # (~64 KiB) and the helper stops emitting JSON because the runtime is
+    # stuck in write(2).
+    my $sel = IO::Select->new($rh, $eh);
+    my %buf = ($rh => '', $eh => '');
+    my $posted = 0;
+    my @done;   # fds we've seen EOF on
+
+  OUTER:
+    while (@done < 2) {
+        my @ready = $sel->can_read(1) or next;
+        for my $fh (@ready) {
+            my $chunk;
+            my $n = sysread($fh, $chunk, 4096);
+            if (!defined $n || $n == 0) {
+                push @done, $fh;
+                $sel->remove($fh);
+                next;
+            }
+            $buf{$fh} .= $chunk;
+            while ((my $idx = index($buf{$fh}, "\n")) >= 0) {
+                my $line = substr($buf{$fh}, 0, $idx, '');
+                substr($buf{$fh}, 0, 1, '');
+                chomp $line;
+                next unless length $line;
+                if ($fh == $eh) {
+                    # Helper diagnostic — surface to our own stderr.
+                    warn "[helper/err] $line\n";
+                    next;
+                }
+                # stdout path: JSON event
+                my $ev = eval { decode_json($line) };
+                if ($@ || ref($ev) ne 'HASH') {
+                    warn "[bridge] skip non-JSON: " . substr($line, 0, 200) . "\n";
+                    next;
+                }
+                my $type = $ev->{type} // '';
+                if ($type eq 'msg') {
+                    my $sender = $ev->{sender} // '?';
+                    my $body   = $ev->{body}   // '';
+                    next unless length $body;
+                    my $chan = $ev->{channel} // '';
+                    # bitchat-rust system-announcement bodies embed raw Noise
+                    # key bytes (client-side bug; should hex-encode). Strip
+                    # bytes outside printable ASCII and BMP; squash whitespace.
+                    utf8::upgrade($body);
+                    $body =~ s/[^\x20-\x7e\x{00a0}-\x{ffff}]+//g;
+                    $body =~ s/\s{2,}/ /g;
+                    $body =~ s/^\s+|\s+$//g;
+                    # Suppress "joined/left/connected/disconnected" system spam.
+                    next if $sender eq 'System'
+                         && $body =~ /\b(joined|left|connected|disconnected)\b/i;
+                    next unless length $body;
+                    my $tagged = sprintf('[%s@bitchat%s] %s',
+                        $sender,
+                        (length $chan && $chan ne 'mesh' ? "/$chan" : ''),
+                        $body);
+                    next if length($tagged) > 1024 * 1024;
+                    if ($opt{'dry-run'}) {
+                        print "DRY: chat_post session=$session as=$as body=$tagged\n";
+                    } else {
+                        eval { $cli->chat_post(session => $session, body => $tagged, as => $as) };
+                        warn "[bridge] chat_post failed: $@" if $@;
+                    }
+                    $posted++;
+                    last OUTER if $opt{once};
+                } elsif ($type eq 'status') {
+                    warn "[bridge] helper: " . ($ev->{raw} // '') . "\n";
+                } else {
+                    warn "[bridge] unknown event type='$type'\n";
+                }
+            }   # close per-line while
+        }       # close for my $fh
+    }           # close OUTER while
+
+    eval { $cli->bye } if $cli;
+    waitpid($pid, 0);
+    my $code = $? >> 8;
+    warn "[bridge] processed $posted msg(s) before helper exited\n";
+    return $code;
+}
+
+# ---- config + util ----
+
+sub read_config {
+    my ($path) = @_;
+    open my $fh, '<', $path or die "config $path: $!\n";
+    my %cfg;
+    my $section = 'default';
+    while (<$fh>) {
+        s/^\s+|\s+$//g;
+        next if !length || /^[#;]/;
+        if (/^\[(\S+)\]$/) { $section = $1; next }
+        if (/^([\w-]+)\s*=\s*(.*)$/) { $cfg{$section}{$1} = $2 }
+    }
+    close $fh;
+    return \%cfg;
+}
+
+sub usage {
+    my ($rc) = @_;
+    print STDERR <<'USAGE';
+net-bitchat-bridge — bridge a BitChat BLE helper into a net-chat session.
+
+  net-bitchat-bridge [--config FILE] [--foreground] [--once] [--dry-run]
+
+Flags:
+  --config FILE   path to ini-style config (default /etc/net-mgr/bitchat-bridge.conf)
+  --foreground    log to stderr, don't background
+  --once          read one message then exit (for smoke testing)
+  --dry-run       print what would be posted, don't actually contact the daemon
+
+Config sections (ini-style):
+  [helper]
+  path = /usr/local/bin/net-bitchat-helper-wrap
+  args =
+  env_BITCHAT_BIN = /home/dkc/src/bitchat-terminal/target/release/bitchat
+
+  [session]
+  name = bitchat-bridge
+
+  [identity]
+  as = bitchat-relay
+
+  [daemon]
+  listen = 127.0.0.1:7531
+USAGE
+    exit($rc // 0);
+}

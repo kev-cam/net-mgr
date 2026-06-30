@@ -1,0 +1,92 @@
+#!/usr/bin/perl
+# net-bitchat-helper-wrap — ANSI/TUI -> line-oriented JSON shim.
+#
+# ShilohEye/bitchat-terminal prints human-readable ANSI to stdout. The
+# net-bitchat-bridge supervisor expects line-oriented JSON. This shim
+# sits between them: exec the real bitchat binary, strip ANSI, regex-
+# match the message lines, emit one JSON event per line. Unrecognized
+# lines pass through as {"type":"status","raw":...} so the supervisor
+# can log them for debugging.
+#
+# Replace this with a native-JSON fork of bitchat-terminal in tier 1+.
+#
+# Env:
+#   BITCHAT_BIN   path to the real bitchat binary (default: ./target/release/bitchat)
+# Args:
+#   anything passed here is forwarded to the bitchat binary.
+
+use strict;
+use warnings;
+use IPC::Open3;
+use Symbol qw(gensym);
+use JSON::PP;
+
+$| = 1;   # autoflush so the supervisor sees events promptly
+
+my $bin = $ENV{BITCHAT_BIN}
+       // (-x "$ENV{HOME}/src/bitchat-terminal/target/release/bitchat"
+              ? "$ENV{HOME}/src/bitchat-terminal/target/release/bitchat"
+              : '/usr/local/bin/bitchat');
+-x $bin or die "shim: '$bin' is not executable; set BITCHAT_BIN\n";
+
+# Close stdin to the child (bitchat reads commands from a tty interactively;
+# without a tty it shouldn't try to read, but be explicit). Capture stdout
+# and stderr separately so we can split message events (stdout) from logs
+# (stderr).
+my $err = gensym;
+my $pid = open3('<&STDIN', \*HOUT, $err, $bin, @ARGV);
+
+my $strip_ansi = sub {
+    my ($s) = @_;
+    $s =~ s/\e\[[0-9;]*[A-Za-z]//g;   # CSI escapes
+    $s =~ s/\e\][^\a]*\a//g;           # OSC escapes ending in BEL
+    $s =~ s/[\x00-\x08\x0b-\x1f\x7f]//g;
+    return $s;
+};
+
+# Exact formats produced by terminal_ux.rs::format_message_display, after
+# ANSI stripping:
+#   Public:        [HH:MM] <sender> body
+#   Channel (rx):  [HH:MM|chan] <sender @ chan> body
+#   DM received:   [HH:MM|DM] <sender → you> body
+#   DM sent:       [HH:MM|DM] <you → recipient> body    (suppressed: my echo)
+# Anything else passes through as a status event for diagnostic logging.
+my $emit_msg = sub {
+    my ($sender, $body, $channel, $is_dm) = @_;
+    print encode_json({
+        type    => 'msg',
+        sender  => $sender,
+        body    => $body,
+        ts      => time(),
+        channel => ($channel // 'public'),
+        ($is_dm ? (is_dm => JSON::PP::true) : ()),
+    }), "\n";
+};
+
+while (defined(my $raw = <HOUT>)) {
+    chomp $raw;
+    my $line = $strip_ansi->($raw);
+    next unless length $line;
+    if ($line =~ /^\[(\d{1,2}:\d{2})\|DM\]\s+<\s*you\s*→/) {
+        # Echo of a DM I sent — don't relay back to chat.
+        next;
+    }
+    elsif ($line =~ /^\[\d{1,2}:\d{2}\|DM\]\s+<([^→>]+?)\s*→\s*you>\s+(.+)$/) {
+        # DM received
+        $emit_msg->($1, $2, 'dm', 1);
+    }
+    elsif ($line =~ /^\[\d{1,2}:\d{2}\|([^\]]+)\]\s+<([^@>]+?)\s*\@\s*[^>]+>\s+(.+)$/) {
+        # Channel message: [HH:MM|chan] <sender @ chan> body
+        $emit_msg->($2, $3, $1);
+    }
+    elsif ($line =~ /^\[\d{1,2}:\d{2}\]\s+<([^>]+)>\s+(.+)$/) {
+        # Public message
+        $emit_msg->($1, $2);
+    }
+    else {
+        print encode_json({ type => 'status', raw => $line }), "\n";
+    }
+}
+
+waitpid $pid, 0;
+exit($? >> 8);
