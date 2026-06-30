@@ -1414,6 +1414,24 @@ sub _gui_connect_with_dialog {
         $err = $@ if $@;
         return ($stream, $ctrl) unless $err;
 
+        # Transparent anonymous fallback: AUTH failed (key not in remote's
+        # allowed_chat, etc.) but the daemon's open-mode sessions allow
+        # anonymous BROWSE — only writes get gated. Try once with want_auth=>0
+        # before bothering the user with the dialog. If anon also fails (e.g.
+        # network unreachable), fall through to the dialog as before.
+        if (!$no_auth && $err =~ /AUTH failed/i) {
+            my ($s2, $c2);
+            eval {
+                $s2 = connect_client(want_auth => 0);
+                $c2 = connect_client(want_auth => 0);
+            };
+            if (!$@ && $s2 && $c2) {
+                $no_auth = 1;          # remember for downstream connect_client calls
+                $force_auth = 0;
+                return ($s2, $c2);
+            }
+        }
+
         chomp $err;
         my $choice = _auth_failure_dialog($mw, $listen, $err);
         if ($choice eq 'cancel') {
