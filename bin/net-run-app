@@ -662,6 +662,10 @@ sub _record_host_key_bg {
     open STDIN,  '<', '/dev/null';
     open STDOUT, '>', '/dev/null';
     open STDERR, '>', '/dev/null';
-    exec('net-lookup', @NM_LOOKUP_OPTS, '--record-key', '--keyname', $name, $ip);
-    POSIX::_exit(0);                          # exec failed
+    # `or` makes the fallback explicit so Perl doesn't warn "Statement
+    # unlikely to be reached" — exec replaces the process on success; on
+    # failure we still want a clean _exit (we are a detached grandchild,
+    # not the user's foreground process, so dying or warning is wrong).
+    exec('net-lookup', @NM_LOOKUP_OPTS, '--record-key', '--keyname', $name, $ip)
+        or POSIX::_exit(0);
 }
