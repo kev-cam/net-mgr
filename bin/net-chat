@@ -1080,22 +1080,130 @@ sub cmd_gui {
     return unless $stream && $ctrl;   # user cancelled — MainWindow destroyed
 
     # Non-blocking notice: tell the user they're anonymous so they aren't
-    # surprised when posts get refused. Bottom-of-window status line, NOT
-    # a modal dialog — the user requested the GUI come up regardless.
+    # surprised when posts get refused. Replaces the old info messageBox
+    # — that one couldn't offer to sign in. This dialog has the same SSH
+    # key picker as the auth-failure dialog so the user can upgrade right
+    # here without restarting net-chat. Non-modal: -transient but not
+    # -grab, so the GUI underneath stays usable.
     if ($anon_at_startup && $no_auth) {
         $mw->after(200, sub {
-            $mw->messageBox(
-                -type    => 'OK',
-                -icon    => 'info',
-                -title   => 'net-chat: anonymous browse',
-                -message => "Browsing $listen as anonymous "
-                          . "(no AUTH key sent).\n\n"
-                          . "You can read open sessions and pick the "
-                          . "bitchat-bridge channel from the dropdown. "
-                          . "Posting requires AUTH — relaunch with --auth "
-                          . "or set a key matching the daemon's "
-                          . "allowed_chat.",
+            require Tk::BrowseEntry;
+            require Tk::Balloon;
+            my $dlg = $mw->Toplevel(-title => 'net-chat: anonymous browse');
+            $dlg->transient($mw);
+            $dlg->Label(-text =>
+                "Browsing $listen as anonymous (no AUTH key sent).\n\n"
+              . "You can read open sessions. Posting requires a key in the "
+              . "daemon's allowed_chat — sign in below or stay anonymous.",
+                -justify => 'left', -wraplength => 480)
+                ->pack(-fill => 'x', -padx => 12, -pady => [10, 6]);
+
+            my @keys = _discover_ssh_keys();
+            my %v = (
+                key_file => ($key_file // NetMgr::Client::_default_key_file()
+                                       // ($keys[0] // '')),
+                key_id   => ($key_id   // NetMgr::Client::_default_key_id() // ''),
             );
+            if (!defined $key_id && @keys && $v{key_file} eq $keys[0]) {
+                my $c = _ssh_key_comment($keys[0]);
+                $v{key_id} = $c if defined $c && length $c;
+            }
+
+            my $kf_frame = $dlg->Frame->pack(-fill => 'x', -padx => 12, -pady => 2);
+            $kf_frame->Label(-text => 'SSH key file:', -width => 12, -anchor => 'w')
+                     ->pack(-side => 'left');
+            my $kf_combo = $kf_frame->BrowseEntry(-variable => \$v{key_file},
+                -width => 36, -listwidth => 60,
+                -browsecmd => sub {
+                    my $c = _ssh_key_comment($v{key_file});
+                    $v{key_id} = $c if defined $c && length $c;
+                });
+            $kf_combo->insert('end', $_) for @keys;
+            $kf_combo->pack(-side => 'left', -fill => 'x', -expand => 1);
+            $kf_frame->Button(-text => 'Browse…', -command => sub {
+                my $f = $dlg->getOpenFile(-title => 'Select SSH private key',
+                                          -initialdir => "$ENV{HOME}/.ssh");
+                if (defined $f && length $f) {
+                    $v{key_file} = $f;
+                    my $c = _ssh_key_comment($f);
+                    $v{key_id} = $c if defined $c && length $c;
+                }
+            })->pack(-side => 'left', -padx => [4, 0]);
+
+            my $kid_frame = $dlg->Frame->pack(-fill => 'x', -padx => 12, -pady => 2);
+            $kid_frame->Label(-text => 'Key ID:', -width => 12, -anchor => 'w')
+                      ->pack(-side => 'left');
+            $kid_frame->Entry(-textvariable => \$v{key_id}, -width => 36)
+                      ->pack(-side => 'left', -fill => 'x', -expand => 1);
+
+            # Try to AUTH-promote the existing $ctrl connection with the
+            # chosen creds. Stream stays anonymous (read-only subscriptions
+            # don't need auth). On failure, restore anonymous mode and tell
+            # the user — better UX than a hard error popup.
+            my $signin = sub {
+                my ($persist) = @_;
+                # Persist to ~/.config/net-mgr/config first when "Always" is
+                # picked so a sign-in failure mid-process doesn't lose the
+                # operator's intent (next launch retries with the same key).
+                if ($persist) {
+                    eval {
+                        NetMgr::Config->save_user_value('net-chat',
+                            'key_file', $v{key_file}) if length $v{key_file};
+                        NetMgr::Config->save_user_value('net-chat',
+                            'key_id',   $v{key_id})   if length $v{key_id};
+                    };
+                }
+                $key_file   = $v{key_file};
+                $key_id     = $v{key_id};
+                $no_auth    = 0;
+                $force_auth = 1;
+                # Rebuild only $ctrl — that's the post/join connection.
+                eval { $ctrl->bye } if $ctrl;
+                my $new_ctrl = eval { connect_client() };
+                if ($@ || !$new_ctrl) {
+                    my $e = $@ || 'no connection'; chomp $e;
+                    $set_status->("sign-in failed: $e (still anonymous)");
+                    $no_auth    = 1;
+                    $force_auth = 0;
+                    # Reopen an anonymous $ctrl so post-tries still work.
+                    $ctrl = eval { connect_client(want_auth => 0) };
+                } else {
+                    $ctrl = $new_ctrl;
+                    $set_status->("signed in as "
+                                . ($v{key_id} // '(unset)')
+                                . ($persist ? ' (saved to config)'
+                                            : ' (this session only)'));
+                }
+                $dlg->destroy;
+            };
+
+            my $btns = $dlg->Frame->pack(-fill => 'x', -padx => 12, -pady => 10);
+            my $stay_btn = $btns->Button(-text => 'Stay anonymous',
+                -command => sub { $dlg->destroy });
+            $stay_btn->pack(-side => 'right', -padx => 2);
+            my $once_btn = $btns->Button(-text => 'Sign in (this session)',
+                -command => sub { $signin->(0) });
+            $once_btn->pack(-side => 'left', -padx => 2);
+            my $always_btn = $btns->Button(-text => 'Sign in always',
+                -command => sub { $signin->(1) });
+            $always_btn->pack(-side => 'left', -padx => 2);
+
+            my $bln = $dlg->Balloon(-state => 'balloon', -initwait => 600);
+            $bln->attach($kf_combo,
+                -msg => "Pick a private key from ~/.ssh/. The matching .pub "
+                      . "file's comment auto-fills Key ID.");
+            $bln->attach($once_btn,
+                -msg => "Apply these creds to this net-chat process only. "
+                      . "Next launch goes back to anonymous unless you "
+                      . "pass --auth.");
+            $bln->attach($always_btn,
+                -msg => "Apply these creds AND save them to "
+                      . "~/.config/net-mgr/config [net-chat] so future "
+                      . "launches default to them.");
+            $bln->attach($stay_btn,
+                -msg => "Browse anonymously. Posts will trigger the "
+                      . "join-request flow (server queues the request "
+                      . "for an owner to approve).");
         });
     }
 
