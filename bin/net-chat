@@ -585,13 +585,47 @@ sub cmd_gui {
 
     # Build MainWindow FIRST so a connect/auth failure can pop a dialog instead
     # of dying. Without this, an AUTH failure (no key, key not in remote's
-    # allowed_signers, etc.) crashed the whole GUI; now we offer to retry with
-    # a different key, continue read-only, or cancel.
+    # allowed_signers, etc.) crashed the whole GUI.
     my $mw = Tk::MainWindow->new;
     $mw->title('net-chat');
     $mw->geometry('660x480');
+
+    # Default the GUI to ANONYMOUS browse mode for remote daemons. Open
+    # sessions allow anonymous SUBSCRIBE/snapshot, and that covers reading
+    # + picking a session, which is what users open the GUI for first.
+    # Auth gets attempted only when the user explicitly tries to post or
+    # do an owner-only op. Skipping auth on startup avoids both the
+    # ssh-askpass popup AND the auth-failure dialog for the common case
+    # of "I just want to look at this open session". Loopback connections
+    # are still auth-exempt server-side, so this also covers --listen
+    # 127.0.0.1:7531 without any change. --auth (force_auth) still wins.
+    my $anon_at_startup = 0;
+    if (!$force_auth && !$no_auth) {
+        $no_auth = 1;
+        $anon_at_startup = 1;
+    }
     my ($stream, $ctrl) = _gui_connect_with_dialog($mw);
     return unless $stream && $ctrl;   # user cancelled — MainWindow destroyed
+
+    # Non-blocking notice: tell the user they're anonymous so they aren't
+    # surprised when posts get refused. Bottom-of-window status line, NOT
+    # a modal dialog — the user requested the GUI come up regardless.
+    if ($anon_at_startup && $no_auth) {
+        $mw->after(200, sub {
+            $mw->messageBox(
+                -type    => 'OK',
+                -icon    => 'info',
+                -title   => 'net-chat: anonymous browse',
+                -message => "Browsing $listen as anonymous "
+                          . "(no AUTH key sent).\n\n"
+                          . "You can read open sessions and pick the "
+                          . "bitchat-bridge channel from the dropdown. "
+                          . "Posting requires AUTH — relaunch with --auth "
+                          . "or set a key matching the daemon's "
+                          . "allowed_chat.",
+            );
+        });
+    }
 
     # Recompute auth state AFTER the dialog — the user may have flipped to
     # --no-auth, picked a different key file, etc.
