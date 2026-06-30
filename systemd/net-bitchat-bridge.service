@@ -1,0 +1,32 @@
+[Unit]
+Description=net-bitchat-bridge — bridge BitChat BLE mesh into net-chat
+Documentation=https://github.com/kev-cam/net-mgr
+After=network-online.target net-mgr.service bluetooth.service
+Wants=net-mgr.service
+PartOf=net-mgr.service
+
+[Service]
+Type=simple
+# Preflight gates on:
+#   1. /etc/net-mgr/config  [bitchat_bridge] mode = off  (operator kill switch)
+#   2. no Bluetooth controller visible under /sys/class/bluetooth
+#   3. no bitchat-jsonl helper findable (the upstream Rust binary is
+#      built separately — not shipped by net-mgr)
+# Non-zero ExecCondition exits as "condition not met": systemd records the
+# skip with a reason, does NOT count it as a failure, and does NOT trigger
+# Restart=. That is what makes default-on installs safe on hosts that lack
+# BT or never built the upstream helper.
+ExecCondition=/usr/local/bin/net-bitchat-bridge --preflight
+ExecStart=/usr/local/bin/net-bitchat-bridge --foreground
+# on-failure (NOT always): a clean exit from the supervisor — which is
+# what preflight returns on skip even in the in-process path, as belt-and-
+# braces for older systemd that ignores ExecCondition — must not crash-
+# loop. Real BLE/helper crashes still come back, slowly.
+Restart=on-failure
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=net-bitchat-bridge
+
+[Install]
+WantedBy=multi-user.target

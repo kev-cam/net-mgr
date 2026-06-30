@@ -1,9 +1,17 @@
-# net-bitchat-bridge configuration. Install to /etc/net-mgr/bitchat-bridge.conf.
+# net-bitchat-bridge — per-feature config (OPTIONAL).
 #
-# The supervisor exec's a helper that prints line-oriented JSON message
-# events on stdout. For ShilohEye/bitchat-terminal (which prints ANSI),
-# point the supervisor at net-bitchat-helper-wrap (the shim) and the
-# shim at the real bitchat binary via env_BITCHAT_BIN.
+# The MAIN /etc/net-mgr/config [bitchat_bridge] section is the single
+# source of truth for mode/helper_path/session_name. This file is an
+# OPTIONAL overlay for helper env vars and extra args — most installs
+# don't need it. The supervisor reads main config first, then overlays
+# values from here when present.
+#
+# Use this file when:
+#   - you point at a TUI-style helper that needs the ANSI→JSON shim,
+#     and the shim needs env_BITCHAT_BIN pointing at the real binary
+#   - you need to pass extra args to the helper at launch
+#
+# Otherwise leave it alone — defaults from main config are enough.
 
 [helper]
 path = /usr/local/bin/net-bitchat-helper-wrap

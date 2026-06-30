@@ -33,25 +33,89 @@ use IO::Select;
 use Symbol qw(gensym);
 use JSON::PP;
 use NetMgr::Client;
+use NetMgr::Config;
 
 my %opt;
 GetOptions(\%opt,
-    'config=s', 'foreground', 'once', 'dry-run', 'help',
+    'config=s', 'foreground', 'once', 'dry-run', 'preflight', 'help',
 ) or usage(2);
 usage(0) if $opt{help};
 
-my $cfg = read_config($opt{config} // '/etc/net-mgr/bitchat-bridge.conf');
-my $helper_path = $cfg->{helper}{path}
-    or die "config: [helper] path= required\n";
-my @helper_args = split ' ', ($cfg->{helper}{args} // '');
-my $session = $cfg->{session}{name} // 'bitchat-bridge';
-my $as      = $cfg->{identity}{as}  // 'bitchat-relay';
-my $listen  = $cfg->{daemon}{listen} // '127.0.0.1:7531';
+# Two-stage config:
+#   /etc/net-mgr/config  [bitchat_bridge]   — single source of truth for
+#     the run/skip decision and the simple knobs (mode, helper_path,
+#     session_name, adapter_index). Defaults from NetMgr::Config %DEFAULTS.
+#   /etc/net-mgr/bitchat-bridge.conf        — optional overlay for helper
+#     env vars / args; only present when the operator needs to tune.
+my $main_cfg     = NetMgr::Config->load;
+my $bridge_cfg   = $main_cfg->{bitchat_bridge} || {};
+my $per_feat_cfg = read_per_feature_config(
+    $opt{config} // '/etc/net-mgr/bitchat-bridge.conf');
 
-# Helper-targeted env vars (anything in [helper] starting env_ becomes $ENV{...}).
-for my $k (sort keys %{ $cfg->{helper} // {} }) {
+my $mode    = lc($bridge_cfg->{mode} // 'on');
+my $session = $per_feat_cfg->{session}{name}
+           // $bridge_cfg->{session_name}
+           // 'bitchat-bridge';
+my $as      = $per_feat_cfg->{identity}{as}  // 'bitchat-relay';
+my $listen  = $per_feat_cfg->{daemon}{listen} // '127.0.0.1:7531';
+
+# Helper-targeted env vars from the optional per-feature file
+# (anything in [helper] starting env_ becomes $ENV{...}).
+for my $k (sort keys %{ $per_feat_cfg->{helper} // {} }) {
     next unless $k =~ /^env_(.+)$/;
-    $ENV{$1} = $cfg->{helper}{$k};
+    $ENV{$1} = $per_feat_cfg->{helper}{$k};
+}
+my @helper_args = split ' ', ($per_feat_cfg->{helper}{args} // '');
+
+# Helper path resolution. The per-feature file's [helper] path= wins if
+# present (back-compat with existing configs). Otherwise the main config's
+# [bitchat_bridge] helper_path applies; 'auto' searches PATH for
+# bitchat-jsonl (the upstream native-JSON helper) falling back to the
+# in-tree ANSI shim if the user pointed at a terminal-style binary via
+# env_BITCHAT_BIN.
+my $helper_path = $per_feat_cfg->{helper}{path}
+               // $bridge_cfg->{helper_path}
+               // 'auto';
+if (lc($helper_path) eq 'auto') {
+    $helper_path = _which('bitchat-jsonl');
+}
+
+# Preflight: gate the launch on (1) config mode, (2) BT controller, (3)
+# helper findable. Returns 0 to proceed, non-zero to skip cleanly with a
+# logged reason. systemd's ExecCondition treats non-zero here as "condition
+# not met" — no failure, no Restart=. We also call this at main-loop
+# startup as defense-in-depth for operators running by hand without
+# ExecCondition.
+sub preflight {
+    if ($mode eq 'off') {
+        warn "[bridge/preflight] skip: [bitchat_bridge] mode = off in /etc/net-mgr/config\n";
+        return 1;
+    }
+    if (!_bt_controller_present()) {
+        warn "[bridge/preflight] skip: no Bluetooth controller "
+           . "(/sys/class/bluetooth is empty)\n";
+        return 1;
+    }
+    if (!defined $helper_path || !length $helper_path || !-x $helper_path) {
+        my $h = $helper_path // '(unset)';
+        warn "[bridge/preflight] skip: bitchat-jsonl helper not found "
+           . "('$h' is not executable). Build it from "
+           . "https://github.com/joshbtn/bitchat-rust + the in-tree "
+           . "src/bin/bitchat-jsonl.rs and install to /usr/local/bin, "
+           . "or set [bitchat_bridge] helper_path = /full/path in "
+           . "/etc/net-mgr/config.\n";
+        return 1;
+    }
+    return 0;
+}
+
+if ($opt{preflight}) {
+    exit preflight();
+}
+if (preflight()) {
+    # belt-and-braces for older systemd / hand-runs: even with Restart=on-failure
+    # systemd might wrap us, but we exit 0 to avoid being counted as a crash.
+    exit 0;
 }
 
 my $backoff = 1;
@@ -171,9 +235,13 @@ sub run_once {
 
 # ---- config + util ----
 
-sub read_config {
+# Per-feature config file (optional overlay — main config is authoritative).
+# Returns an empty hashref when the file doesn't exist, so a default install
+# without /etc/net-mgr/bitchat-bridge.conf still proceeds.
+sub read_per_feature_config {
     my ($path) = @_;
-    open my $fh, '<', $path or die "config $path: $!\n";
+    return {} unless -r $path;
+    open my $fh, '<', $path or return {};
     my %cfg;
     my $section = 'default';
     while (<$fh>) {
@@ -184,6 +252,34 @@ sub read_config {
     }
     close $fh;
     return \%cfg;
+}
+
+# Tiny `which` — avoids a File::Which dependency. Returns the absolute path
+# to $name in $ENV{PATH} or undef. /usr/local/bin is searched first so a
+# package-installed helper wins over anything in $HOME.
+sub _which {
+    my ($name) = @_;
+    return undef unless defined $name && length $name && $name !~ m{/};
+    my @dirs = split /:/, ($ENV{PATH} // '');
+    unshift @dirs, '/usr/local/bin' unless grep { $_ eq '/usr/local/bin' } @dirs;
+    for my $d (@dirs) {
+        my $p = "$d/$name";
+        return $p if -x $p;
+    }
+    return undef;
+}
+
+# True if at least one BLE controller is exposed by the kernel. We look at
+# /sys/class/bluetooth (the canonical, no-tool, no-privilege check) rather
+# than hciconfig (which may not be installed). Note this only confirms a
+# kernel device exists — BlueZ may still reject operations later if rfkill
+# blocks it, but those failures surface in the helper logs.
+sub _bt_controller_present {
+    my $dir = '/sys/class/bluetooth';
+    opendir my $dh, $dir or return 0;
+    my @ents = grep { /^hci\d/ } readdir $dh;
+    closedir $dh;
+    return scalar @ents;
 }
 
 sub usage {

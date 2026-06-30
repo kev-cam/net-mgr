@@ -23,7 +23,7 @@ CGIDIR     ?= /usr/lib/cgi-bin
 APACHE_CONF_DIR ?= $(SYSCONFDIR)/apache2/conf-available
 DESTDIR    ?=
 
-BINS  = net-alias net-chat net-chat-askpass net-poll-ap net-audit net-audit-aps net-cluster net-cluster-gui net-config-gui net-connect net-ddns net-diag net-discover net-find-lost net-find-peers net-find-rogue-dhcp net-fw net-gen-apache-conf net-gen-dnsmasq net-import-dhcp net-import-dnsmasq net-import-ssh-forwards net-fix net-ipv6 net-isp net-link-stats net-lookup net-name net-peer net-ping net-purge net-vlan net-kill-rogue-dhcp net-reserve net-roam net-router net-run-app net-scan net-report net-set net-show net-tp-scan net-tunnel net-uplink-probe net-var net-watch net-wifi-survey net-zones
+BINS  = net-alias net-bitchat-bridge net-bitchat-helper-wrap net-chat net-chat-askpass net-poll-ap net-audit net-audit-aps net-cluster net-cluster-gui net-config-gui net-connect net-ddns net-diag net-discover net-find-lost net-find-peers net-find-rogue-dhcp net-fw net-gen-apache-conf net-gen-dnsmasq net-import-dhcp net-import-dnsmasq net-import-ssh-forwards net-fix net-ipv6 net-isp net-link-stats net-lookup net-name net-peer net-ping net-purge net-vlan net-kill-rogue-dhcp net-reserve net-roam net-router net-run-app net-scan net-report net-set net-show net-tp-scan net-tunnel net-uplink-probe net-var net-watch net-wifi-survey net-zones
 
 # Symlinks installed pointing at net-run-app — each link picks its
 # behavior from basename($0) so adding a new wrapper is a one-line
@@ -33,7 +33,7 @@ SBINS = net-mgr net-mgr-setup net-dns net-mgr-relay net-mgr-self-update net-mgr-
 # Recovery scripts live off PATH so net-find-lost can enumerate them
 # without polluting BINDIR. Each script must support --describe.
 RECOVERYS = net-recover-tlsg2424
-UNITS = net-mgr.service net-dns.service net-mgr-relay.service
+UNITS = net-mgr.service net-dns.service net-mgr-relay.service net-bitchat-bridge.service
 MAN1S = net-alias.1 net-chat.1 net-connect.1 net-diag.1 net-discover.1 net-fix.1 \
         net-gen-dnsmasq.1 net-import-dhcp.1 net-import-dnsmasq.1 \
         net-import-ssh-forwards.1 net-name.1 net-ping.1 \
@@ -287,6 +287,12 @@ install: .version
 	else \
 	  echo "  skip $(DESTDIR)$(SYSCONFDIR)/net-mgr/config (already exists)"; \
 	fi
+	@if [ -f etc/bitchat-bridge.conf.sample ] \
+	     && [ ! -f $(DESTDIR)$(SYSCONFDIR)/net-mgr/bitchat-bridge.conf ]; then \
+	  echo "  etc/bitchat-bridge.conf.sample → $(DESTDIR)$(SYSCONFDIR)/net-mgr/bitchat-bridge.conf"; \
+	  $(INSTALL) -m 644 etc/bitchat-bridge.conf.sample \
+	             $(DESTDIR)$(SYSCONFDIR)/net-mgr/bitchat-bridge.conf; \
+	fi
 	@CFG=$(DESTDIR)$(SYSCONFDIR)/net-mgr/config; \
 	  perl -Ilib -MNetMgr::Config -e 'my @d = NetMgr::Config::dead_keys($$ARGV[0]); exit unless @d; print STDERR "\nWARN: $$ARGV[0] has keys no longer read by the daemon:\n"; print STDERR "  $$_\n" for @d; print STDERR "(harmless, but you can delete them.)\n"' "$$CFG"
 	@echo
@@ -332,6 +338,10 @@ install: .version
 	        printf '  %-25s enabled but stopped — starting\n' "$$u"; \
 	        systemctl start "$$u" \
 	          || printf '  *** start %s failed; check: systemctl status %s\n' "$$u" "$$u"; \
+	      elif [ "$$u" = "net-bitchat-bridge.service" ]; then \
+	        printf '  %-25s default-on — enabling + starting\n' "$$u"; \
+	        systemctl enable --now "$$u" \
+	          || printf '  *** enable %s failed; ExecCondition will skip cleanly if BT/helper absent\n' "$$u"; \
 	      else \
 	        printf '  %-25s not enabled  — enable with: systemctl enable --now %s\n' "$$u" "$$u"; \
 	      fi; \

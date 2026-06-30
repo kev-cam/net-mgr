@@ -62,6 +62,32 @@ archive_dir = /var/lib/net-mgr/chat
 # to $TERMINAL, else x-terminal-emulator / xterm / gnome-terminal. Needs tmux.
 # terminal = xterm
 
+# BitChat-to-net-chat BLE bridge (bin/net-bitchat-bridge). The systemd unit
+# is installed ENABLED on every host by default; whether it actually starts
+# is decided at preflight time by:
+#   1. mode below (off = skip — the operator kill switch)
+#   2. presence of any Bluetooth controller (/sys/class/bluetooth/hci*)
+#   3. whether the bitchat-jsonl helper can be located on PATH
+# Failing any of those three exits cleanly via systemd ExecCondition with a
+# logged reason — no crash-loop on hosts that lack BT or never built the
+# upstream helper. The helper binary lives in joshbtn/bitchat-rust + this
+# repo's src/bin/bitchat-jsonl.rs and is NOT shipped by net-mgr.
+#
+# Per-helper tuning (env vars passed to the BitChat binary, extra args, the
+# optional ANSI→JSON shim path) lives in /etc/net-mgr/bitchat-bridge.conf.
+# This section is the single source of truth for the run/skip decision.
+[bitchat_bridge]
+# on | off. Default on. Set off to keep the bridge from starting on this
+# host even when a helper and adapter are present.
+# mode          = on
+# auto = search PATH for `bitchat-jsonl`. Otherwise an absolute path.
+# helper_path   = auto
+# net-chat session BitChat traffic is posted into. Create once with:
+#   net-chat open bitchat-bridge --mode open
+# session_name  = bitchat-bridge
+# Which hci<N> BLE adapter to bind. 0 = hci0.
+# adapter_index = 0
+
 # Fleet deploy. `make deploy` reads this and runs the remote install
 # (rsync + remote `make install`, i.e. install-on) on each host. Only the
 # build host needs this section; the daemon never reads it. sudo/ssh_opts

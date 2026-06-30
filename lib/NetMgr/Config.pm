@@ -105,6 +105,17 @@ my %DEFAULTS = (
         push_aps => 0,
         gateways => '',    # space/comma list of DHCP gateways for net-import-dnsmasq --auto
     },
+    # BitChat-to-net-chat BLE bridge (bin/net-bitchat-bridge). Default on:
+    # the systemd unit is installed enabled, but the supervisor's preflight
+    # skips cleanly when no Bluetooth controller is present, no bitchat-jsonl
+    # helper is on PATH, or mode = off here. helper_path=auto = let the
+    # supervisor find the helper on PATH; otherwise an absolute path.
+    bitchat_bridge => {
+        mode          => 'on',
+        helper_path   => 'auto',
+        session_name  => 'bitchat-bridge',
+        adapter_index => 0,
+    },
     # Control-VLAN attachment. By default every node joins the "network_management"
     # control VLAN (net-mgr creates the 802.1Q sub-interface and addresses it) so
     # the cluster control plane rides a dedicated IPv6 segment. control_attach=off
@@ -339,6 +350,7 @@ my %ACTIVE = (
     uplinks    => '*',                        # consumed by net-uplink-probe
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
     dnsmasq    => [qw(mode out_dir push_aps gateways)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
+    bitchat_bridge => [qw(mode helper_path session_name adapter_index)], # BLE bridge (bin/net-bitchat-bridge)
     ipv6_vlan  => [qw(type name mode server prefix local_suffix forwarding ext_if
                       id addr attach gateway
                       tunnel_id update_secret)], # managed IPv6 nets (vlan|he6in4|relay);
