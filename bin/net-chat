@@ -79,6 +79,7 @@ my $limit;
 my $since;
 my $show_all;
 my $gui;
+my $tty;
 my $askpass;
 GetOptions(
     'listen=s'   => \$listen,
@@ -94,6 +95,7 @@ GetOptions(
     'since=s'    => \$since,
     'all'        => \$show_all,
     'gui'        => \$gui,
+    'tty'        => \$tty,
     'askpass'    => \$askpass,
 ) or die "bad options\n";
 
@@ -125,6 +127,7 @@ $as //= $ENV{NET_CHAT_AS} // $ENV{USER} // 'local';
 # --gui launches the Tk front-end; the leftover arg (if any) is the session
 # to open initially. No subcommand is required in this mode.
 if ($gui) { cmd_gui($cmd); exit 0; }
+if ($tty) { cmd_tty($cmd); exit 0; }
 usage() unless defined $cmd;
 
 # ---- dispatch --------------------------------------------------------
@@ -372,6 +375,173 @@ sub cmd_requests {
     print "  $_->{principal}\n" for @$rows;
 }
 
+# net-chat --tty [session]: dumb-terminal chat client. Plain stdin + stdout,
+# no curses, no ANSI, no termios — works under script(1), on serial consoles,
+# in a container without X. IO::Select multiplexes stdin (user typing) with
+# the SUBSCRIBE stream (incoming messages). Like --gui, we default to
+# anonymous browse and lazily AUTH on first post / join.
+sub cmd_tty {
+    my ($name) = @_;
+    require IO::Select;
+
+    # Session picker (only when none passed) — mirrors --gui's
+    # anonymous-browse default. Pick by number or by literal name.
+    unless (defined $name && length $name) {
+        my $cli = connect_client(want_auth => 0);
+        my $rows = $cli->snapshot(1, 'chat_sessions',
+            where => "status = 'open'") || [];
+        eval { $cli->bye };
+        unless (@$rows) {
+            die "net-chat: no open sessions on $listen "
+              . "(try 'net-chat ls --all' or 'net-chat --tty NAME')\n";
+        }
+        @$rows = sort { lc($a->{name}) cmp lc($b->{name}) } @$rows;
+        print "Open chat sessions on $listen:\n";
+        my $i = 0;
+        for my $s (@$rows) {
+            printf "  %2d. %-20s  %s\n", ++$i, $s->{name}, $s->{topic} // '';
+        }
+        local $| = 1;
+        print "Pick a session (number or name, blank to quit): ";
+        my $ans = <STDIN>;
+        defined $ans or exit 0;
+        $ans =~ s/^\s+|\s+$//g;
+        exit 0 unless length $ans;
+        $name = ($ans =~ /^\d+$/ && $ans >= 1 && $ans <= @$rows)
+              ? $rows->[$ans - 1]{name} : $ans;
+    }
+    $name = need_name($name);
+
+    # Two connections: $stream carries SUBSCRIBE (always anonymous —
+    # snapshot+stream of an open session needs no auth); $ctrl is lazy and
+    # AUTH-promotes on first chat_post / chat_join.
+    my $stream = connect_client(want_auth => 0);
+    my $ctrl;
+    my $get_ctrl = sub {
+        return $ctrl if $ctrl;
+        $ctrl = eval { connect_client() };
+        return $ctrl;
+    };
+
+    if (my $c = $get_ctrl->()) {
+        my $r = eval { $c->chat_join(session => $name) };
+        if ($@) {
+            my $e = $@; $e =~ s/\s+\z//;
+            print "-- join: $e (you can still watch) --\n";
+        } elsif (($r->{state} // '') eq 'requested') {
+            print "-- join request sent — waiting for an owner --\n";
+        }
+    }
+
+    my $prompt = "[$name]> ";
+    my $shutdown = sub {
+        eval { $ctrl->chat_leave(session => $name) } if $ctrl;
+        eval { $ctrl->bye }   if $ctrl;
+        eval { $stream->bye } if $stream;
+        print "\n";
+        exit 0;
+    };
+    $SIG{INT} = $SIG{TERM} = $shutdown;
+
+    $stream->send_line("SUBSCRIBE sub=1 mode=snapshot+stream"
+                     . " FROM chat_messages WHERE session = '$name'");
+
+    my $sel = IO::Select->new($stream->{sock}, \*STDIN);
+    $| = 1;
+    print $prompt;
+    my $live = 0;
+    $stream->{buf} //= '';
+
+    # Drain the SUBSCRIBE stream — called when select says the socket is
+    # readable. sysread once, then peel as many complete lines as the
+    # buffer holds before yielding back to select.
+    my $drain_stream = sub {
+        my $sock = $stream->{sock};
+        my $buf;
+        my $n = sysread($sock, $buf, 4096);
+        unless (defined $n && $n > 0) {
+            print "\n-- daemon hung up --\n";
+            $shutdown->();
+        }
+        $stream->{buf} .= $buf;
+        while ($stream->{buf} =~ s/^([^\n]*)\n//) {
+            my $c = parse_line($1) or next;
+            if ($c->{verb} eq 'ROW'
+                && ($c->{kv}{table} // '') eq 'chat_messages') {
+                print "\n";
+                print_msg($c->{kv});
+                print $prompt;
+            } elsif ($c->{verb} eq 'EOS') {
+                unless ($live++) {
+                    print "\n-- live: type to send, /quit to leave,"
+                        . " /help for commands --\n";
+                    print $prompt;
+                }
+            } elsif ($c->{verb} eq 'ERR') {
+                print "\n-- stream error: ", ($c->{kv}{msg} // '?'), " --\n";
+                $shutdown->();
+            }
+        }
+    };
+
+    my $handle_stdin = sub {
+        my $line = <STDIN>;
+        unless (defined $line) { $shutdown->() }   # Ctrl-D
+        chomp $line;
+        my $text = $line; $text =~ s/^\s+|\s+$//g;
+        if (!length $text) { print $prompt; return }
+
+        if ($text =~ m{^/(?:quit|exit|q)\b}i) { $shutdown->() }
+        if ($text =~ m{^/help\b}i) {
+            print "  /quit /exit /q   leave the chat\n",
+                  "  /who             show who's in this session\n",
+                  "  /help            this help\n",
+                  "  (anything else)  post as a message\n",
+                  $prompt;
+            return;
+        }
+        if ($text =~ m{^/who\b}i) {
+            my $c = connect_client(want_auth => 0);
+            my $rows = eval {
+                $c->snapshot(1, 'chat_presence',
+                    where => "session = '$name'");
+            } || [];
+            eval { $c->bye };
+            my @who = sort map { $_->{principal} } @$rows;
+            print "  here: ", (@who ? join(', ', @who) : '(empty)'), "\n",
+                  $prompt;
+            return;
+        }
+        if ($text =~ m{^/}) {
+            print "-- unknown command '$text' — /help for the list --\n",
+                  $prompt;
+            return;
+        }
+
+        my $c = $get_ctrl->();
+        unless ($c) {
+            print "-- can't post: $@ --\n", $prompt;
+            return;
+        }
+        eval { $c->chat_post(session => $name, body => $text) };
+        if ($@) {
+            my $e = $@; $e =~ s/\s+\z//;
+            print "-- post failed: $e --\n", $prompt;
+        }
+        # No local echo: the SUBSCRIBE stream will return our own row,
+        # print_msg renders it with the server-stamped timestamp + verified
+        # name — that's the visible "post succeeded" cue, plus dedup-free.
+    };
+
+    while (1) {
+        my @ready = $sel->can_read or next;
+        for my $fh (@ready) {
+            if ($fh == $stream->{sock}) { $drain_stream->() }
+            else                         { $handle_stdin->() }
+        }
+    }
+}
+
 sub cmd_members {
     my $name = need_name(shift @ARGV);
     my $cli = connect_client(want_auth => 0);
@@ -579,8 +749,24 @@ sub _daemon_ip_names {
 sub cmd_gui {
     my ($session) = @_;
     $session //= shift @ARGV;
-    require Tk;   # loaded on demand; fully-qualified below so non-gui use
-                  # of net-chat never needs Perl/Tk installed.
+    # Dumb-terminal fallback: when there's no DISPLAY and stdin/stdout are
+    # both ttys, drop through to cmd_tty so `net-chat --gui` Just Works
+    # over ssh, serial consoles, or in a container without X. Same idea
+    # for the case where Perl/Tk isn't installed at all.
+    my $no_display = !defined $ENV{DISPLAY} || $ENV{DISPLAY} eq '';
+    if ($no_display && -t STDIN && -t STDOUT) {
+        warn "net-chat: no DISPLAY — falling back to --tty mode\n";
+        return cmd_tty($session);
+    }
+    unless (eval { require Tk; 1 }) {
+        my $err = $@ || 'Tk load failed';
+        chomp $err;
+        if (-t STDIN && -t STDOUT) {
+            warn "net-chat: Perl/Tk not available ($err) — falling back to --tty mode\n";
+            return cmd_tty($session);
+        }
+        die "net-chat: Perl/Tk not installed and no tty for --tty fallback: $err\n";
+    }
     _gui_set_askpass_env();   # let ssh-keygen pop a Tk passphrase prompt
 
     # Build MainWindow FIRST so a connect/auth failure can pop a dialog instead
