@@ -1908,14 +1908,164 @@ sub cmd_gui {
     # Buttons are children of $mw so we can re-pack them with -in => $top
     # (wide) or -in => $top2 (narrow) without re-parenting.
     my $top2 = $mw->Frame;   # not packed yet
+    # Members management dialog — opens a non-modal Toplevel listing the
+    # current session's chat_members rows with per-row actions
+    # (approve/reject for requested, remove for member, re-allow for
+    # denied), plus an "Add by Key ID" entry at the bottom. Refresh on
+    # each action so the list stays current without manual reopen.
+    my $members_popup = sub {
+        unless (defined $cur && length $cur) {
+            $set_status->('pick a chat first to manage members');
+            return;
+        }
+        my $dlg = $mw->Toplevel(-title => "Members of $cur");
+        $dlg->transient($mw);
+        $dlg->Label(-text => "Session: $cur",
+                    -font => 'sans-serif 11 bold', -anchor => 'w')
+            ->pack(-fill => 'x', -padx => 10, -pady => [10, 2]);
+        my $info = $created_by{$cur} ? "owner: $created_by{$cur}" : '';
+        $dlg->Label(-text => $info, -anchor => 'w', -foreground => '#666')
+            ->pack(-fill => 'x', -padx => 10, -pady => [0, 6]) if length $info;
+
+        my $list_frame = $dlg->Frame(-relief => 'sunken', -borderwidth => 1);
+        $list_frame->pack(-fill => 'both', -expand => 1, -padx => 10, -pady => 4);
+
+        my $populate;
+        $populate = sub {
+            # Tear down + rebuild — simpler than per-row diffing for a
+            # member count that's never going to be large.
+            $_->destroy for $list_frame->children;
+            my $c = connect_client(want_auth => 0);
+            my $rows = eval {
+                $c->snapshot(1, 'chat_members', where => "session = '$cur'");
+            } || [];
+            eval { $c->bye };
+
+            my $hdr = $list_frame->Frame->pack(-fill => 'x', -padx => 4, -pady => 2);
+            $hdr->Label(-text => 'principal', -width => 26,
+                        -font => 'sans-serif 9 bold', -anchor => 'w')
+                ->pack(-side => 'left');
+            $hdr->Label(-text => 'role', -width => 8,
+                        -font => 'sans-serif 9 bold', -anchor => 'w')
+                ->pack(-side => 'left');
+            $hdr->Label(-text => 'state', -width => 10,
+                        -font => 'sans-serif 9 bold', -anchor => 'w')
+                ->pack(-side => 'left');
+            $hdr->Label(-text => 'from', -width => 20,
+                        -font => 'sans-serif 9 bold', -anchor => 'w')
+                ->pack(-side => 'left');
+            $hdr->Label(-text => 'actions',
+                        -font => 'sans-serif 9 bold', -anchor => 'w')
+                ->pack(-side => 'left');
+
+            unless (@$rows) {
+                $list_frame->Label(-text => '(no members yet)',
+                                   -foreground => '#888')
+                    ->pack(-padx => 10, -pady => 8);
+                return;
+            }
+
+            # Sort: requested first (action-needed), then members, then
+            # invited / denied. Within each group: alphabetical principal.
+            my %prio = (requested => 0, invited => 1, member => 2, denied => 3);
+            for my $m (sort {
+                ($prio{$a->{state} // ''} // 9) <=>
+                ($prio{$b->{state} // ''} // 9)
+                || ($a->{principal} // '') cmp ($b->{principal} // '')
+            } @$rows) {
+                my $rf = $list_frame->Frame->pack(-fill => 'x',
+                                                  -padx => 4, -pady => 1);
+                $rf->Label(-text => $m->{principal}    // '?',
+                           -width => 26, -anchor => 'w')->pack(-side => 'left');
+                $rf->Label(-text => $m->{role}         // '?',
+                           -width => 8,  -anchor => 'w')->pack(-side => 'left');
+                $rf->Label(-text => $m->{state}        // '?',
+                           -width => 10, -anchor => 'w')->pack(-side => 'left');
+                $rf->Label(-text => $m->{requested_from} // '',
+                           -width => 20, -anchor => 'w')->pack(-side => 'left');
+                # State-specific actions. All four ops go through the
+                # same $ctrl, which may need to be AUTH'd — server-side
+                # only owners + members-of-the-session can run these.
+                my $state = $m->{state} // '';
+                my $princ = $m->{principal};
+                my $act = sub {
+                    my ($op) = @_;
+                    eval { $ctrl->chat_member($op, session => $cur,
+                                              principal => $princ) };
+                    if ($@) {
+                        my $e = $@; chomp $e;
+                        $set_status->("$op $princ failed: $e");
+                    } else {
+                        $set_status->("$op $princ → $cur");
+                    }
+                    $populate->();
+                };
+                if ($state eq 'requested') {
+                    $rf->Button(-text => 'Approve',
+                                -command => sub { $act->('approve') })
+                        ->pack(-side => 'left', -padx => 2);
+                    $rf->Button(-text => 'Reject',
+                                -command => sub { $act->('reject') })
+                        ->pack(-side => 'left', -padx => 2);
+                } elsif ($state eq 'member') {
+                    $rf->Button(-text => 'Remove',
+                                -command => sub { $act->('deny') })
+                        ->pack(-side => 'left', -padx => 2);
+                } elsif ($state eq 'denied') {
+                    $rf->Button(-text => 'Re-allow',
+                                -command => sub { $act->('allow') })
+                        ->pack(-side => 'left', -padx => 2);
+                } elsif ($state eq 'invited') {
+                    $rf->Button(-text => 'Cancel',
+                                -command => sub { $act->('deny') })
+                        ->pack(-side => 'left', -padx => 2);
+                }
+            }
+        };
+        $populate->();
+
+        # Add a new member by Key ID (= principal in remote allowed_signers).
+        # Uses CHAT_ALLOW which puts them straight on the allow-list as a
+        # member without requiring a join request.
+        my $add_frame = $dlg->Frame->pack(-fill => 'x', -padx => 10, -pady => 4);
+        $add_frame->Label(-text => 'Add by Key ID:', -anchor => 'w')
+                  ->pack(-side => 'left');
+        my $new_p = '';
+        $add_frame->Entry(-textvariable => \$new_p, -width => 30)
+                  ->pack(-side => 'left', -padx => 4, -fill => 'x',
+                         -expand => 1);
+        $add_frame->Button(-text => 'Add', -command => sub {
+            my $p = $new_p; $p =~ s/^\s+|\s+$//g;
+            return unless length $p;
+            eval { $ctrl->chat_member('allow', session => $cur,
+                                      principal => $p) };
+            if ($@) {
+                my $e = $@; chomp $e;
+                $set_status->("add $p failed: $e");
+            } else {
+                $set_status->("added $p to $cur");
+                $new_p = '';
+                $populate->();
+            }
+        })->pack(-side => 'left', -padx => 2);
+
+        my $btns = $dlg->Frame->pack(-fill => 'x', -padx => 10, -pady => 8);
+        $btns->Button(-text => 'Refresh', -command => $populate)
+             ->pack(-side => 'left', -padx => 2);
+        $btns->Button(-text => 'Close', -command => sub { $dlg->destroy })
+             ->pack(-side => 'right', -padx => 2);
+    };
+
     my $refresh_btn = $mw->Button(-text => 'Refresh', -command => $refresh);
     my $history_btn = $mw->Button(-text => 'History', -command => $load_history);
     my $term_btn    = $mw->Button(-text => 'terminal', -command => $launch_term);
+    my $members_btn = $mw->Button(-text => 'Members',  -command => $members_popup);
     my $aplus_btn   = $mw->Button(-text => 'A+', -width => 2,
         -command => sub { $fontsize++ if $fontsize < 32; $set_font->() });
     my $aminus_btn  = $mw->Button(-text => 'A-', -width => 2,
         -command => sub { $fontsize-- if $fontsize > 6; $set_font->() });
-    my @action_btns = ($refresh_btn, $history_btn, $term_btn, $aplus_btn, $aminus_btn);
+    my @action_btns = ($refresh_btn, $history_btn, $term_btn, $members_btn,
+                       $aplus_btn, $aminus_btn);
     # Initial pack: side-by-side in $top (wide). Reflow on <Configure>.
     $_->pack(-in => $top, -side => 'right') for @action_btns;
 
@@ -2082,6 +2232,17 @@ sub cmd_gui {
               . "Picks via a file dialog; posts a system message "
               . "with a link. Right-click an upload line in the "
               . "pane to download.");
+    # Top-bar action tooltips — same shared Balloon.
+    $balloon->attach($members_btn,
+        -msg => "Open the members dialog for this chat. Shows everyone "
+              . "in the roster (members, pending requests, denied) with "
+              . "approve / reject / remove / re-allow buttons. Also lets "
+              . "you add by Key ID. Server-side member ops require AUTH; "
+              . "anonymous browse can view but not change.");
+    $balloon->attach($refresh_btn,
+        -msg => "Reload chat / session list from the daemon.");
+    $balloon->attach($history_btn,
+        -msg => "Load one older message into the pane (per click).");
 
     # live reader: drain all complete lines without blocking the event loop
     $mw->fileevent($stream->{sock}, 'readable', sub {
