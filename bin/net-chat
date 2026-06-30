@@ -81,6 +81,12 @@ my $show_all;
 my $gui;
 my $tty;
 my $askpass;
+
+# Termios restore callback set by cmd_tty when it enters raw mode. Lifted to
+# a package var (our + top-level END) so the END block doesn't capture a
+# lexical from inside cmd_tty (Perl warns "will not stay shared" otherwise).
+our $TTY_TERM_RESTORER;
+END { $TTY_TERM_RESTORER->() if $TTY_TERM_RESTORER }
 GetOptions(
     'listen=s'   => \$listen,
     'server=s'   => \$server,
@@ -383,6 +389,7 @@ sub cmd_requests {
 sub cmd_tty {
     my ($name) = @_;
     require IO::Select;
+    require POSIX;
 
     # Session picker (only when none passed) — mirrors --gui's
     # anonymous-browse default. Pick by number or by literal name.
@@ -433,111 +440,344 @@ sub cmd_tty {
         }
     }
 
-    my $prompt = "[$name]> ";
+    # === raw mode for ESC detection ===
+    # We need single-byte stdin reads to catch ESC (0x1b). Save the
+    # original termios so we can restore on ANY exit path — END block,
+    # signal handlers, daemon hangup, die. STDIN may not be a tty (piped
+    # input for testing): degrade gracefully to no-raw in that case.
+    my $is_tty = -t STDIN;
+    my ($orig_term, $orig_lflag, $orig_iflag);
+    if ($is_tty) {
+        $orig_term  = POSIX::Termios->new;
+        $orig_term->getattr(fileno(STDIN));
+        $orig_lflag = $orig_term->getlflag;
+        $orig_iflag = $orig_term->getiflag;
+        my $t = POSIX::Termios->new;
+        $t->getattr(fileno(STDIN));
+        $t->setlflag($orig_lflag & ~(POSIX::ICANON() | POSIX::ECHO()));
+        $t->setiflag($orig_iflag & ~(POSIX::IXON()   | POSIX::ICRNL()));
+        $t->setcc(POSIX::VMIN(),  1);
+        $t->setcc(POSIX::VTIME(), 0);
+        $t->setattr(fileno(STDIN), POSIX::TCSANOW());
+    }
+    # Restore termios on any exit path including unanticipated die. We use
+    # a PACKAGE variable + a top-level END block (defined elsewhere) so
+    # the END closure doesn't grab a `my` variable each call (Perl warns:
+    # "will not stay shared"). Signal handlers below also call this
+    # directly for immediate cleanup, so cursor + echo come back without
+    # waiting for Perl's END phase.
+    our $TTY_TERM_RESTORER;
+    my $raw_restored = 0;
+    my $restore_term = sub {
+        return if $raw_restored;
+        $raw_restored = 1;
+        return unless $is_tty && $orig_term;
+        $orig_term->setattr(fileno(STDIN), POSIX::TCSANOW());
+    };
+    $TTY_TERM_RESTORER = $restore_term;
+
+    # === input state machine ===
+    # mode='chat'  → keystrokes accumulate into $buf, Enter posts as msg
+    # mode='cmd'   → keystrokes accumulate into $buf, Enter executes :cmd
+    # ESC toggles. Backspace edits. Ctrl-C exits. Ctrl-D exits if buf empty.
+    my $mode = 'chat';
+    my $buf  = '';
+    my $chat_prompt = "[$name]> ";
+    my $cmd_prompt  = ':';
+    my $prompt_for = sub { $mode eq 'cmd' ? $cmd_prompt : $chat_prompt };
+
     my $shutdown = sub {
+        $restore_term->();
         eval { $ctrl->chat_leave(session => $name) } if $ctrl;
         eval { $ctrl->bye }   if $ctrl;
         eval { $stream->bye } if $stream;
         print "\n";
         exit 0;
     };
-    $SIG{INT} = $SIG{TERM} = $shutdown;
+    $SIG{INT} = $SIG{TERM} = $SIG{HUP} = $shutdown;
 
     $stream->send_line("SUBSCRIBE sub=1 mode=snapshot+stream"
                      . " FROM chat_messages WHERE session = '$name'");
 
     my $sel = IO::Select->new($stream->{sock}, \*STDIN);
     $| = 1;
-    print $prompt;
     my $live = 0;
     $stream->{buf} //= '';
+    print $chat_prompt;
 
-    # Drain the SUBSCRIBE stream — called when select says the socket is
-    # readable. sysread once, then peel as many complete lines as the
-    # buffer holds before yielding back to select.
+    # Reprint the current prompt + in-progress buffer after we interrupt
+    # the terminal with an out-of-band line (incoming chat, command
+    # output). \r moves to col 0, \e[K clears to EOL.
+    my $redraw = sub {
+        print "\r\e[K", $prompt_for->(), $buf;
+    };
+    # Emit text (with trailing newline) without disrupting the user's
+    # in-progress input line. \r\e[K erases the prompt + buf, prints the
+    # text, then we redraw so the cursor lands back after $buf.
+    my $emit = sub {
+        my ($s) = @_;
+        chomp(my $clean = $s);
+        print "\r\e[K", $clean, "\n";
+        $redraw->();
+    };
+
+    # === ESC-mode command dispatch ===
+    my $cmd_help = sub {
+        $emit->(join "\n",
+            "  ESC commands (press ESC to enter, ESC to cancel, Enter to run):",
+            "    peers              list net-mgr cluster peers",
+            "    status             daemon role / master / mesh / quorum",
+            "    sessions           list chat sessions",
+            "    switch <name>      switch to a different chat session",
+            "    who                roster of this session",
+            "    bitchat            recent bridge events",
+            "    join <tier>        tier = mesh (works); neighborhood/block/city (n/i)",
+            "    quit / q / exit    leave chat",
+            "    help / ?           this help",
+        );
+    };
+
+    my $cmd_peers = sub {
+        my $c = connect_client(want_auth => 0);
+        my $rows = eval {
+            $c->snapshot(1, 'peers');
+        } || [];
+        eval { $c->bye };
+        unless (@$rows) { $emit->("  (no peers known)"); return }
+        my @lines = ("  peers known to daemon:");
+        for my $p (sort { ($a->{name}//'') cmp ($b->{name}//'') } @$rows) {
+            push @lines, sprintf("    %-18s %s:%s   %s",
+                ($p->{name} // $p->{cluster_member} // '?'),
+                ($p->{host} // '?'),
+                ($p->{port} // '7531'),
+                ($p->{last_status} // ''));
+        }
+        $emit->(join "\n", @lines);
+    };
+
+    my $cmd_status = sub {
+        my $c = connect_client(want_auth => 0);
+        my $st = eval { $c->status };
+        my $err = $@;
+        eval { $c->bye };
+        if ($err || !$st) {
+            $emit->("  status: " . ($err || 'no reply'));
+            return;
+        }
+        my @lines = ("  daemon status:");
+        for my $k (sort keys %$st) {
+            push @lines, sprintf("    %-22s %s", $k, $st->{$k} // '');
+        }
+        $emit->(join "\n", @lines);
+    };
+
+    my $cmd_sessions = sub {
+        my $c = connect_client(want_auth => 0);
+        my $rows = eval { $c->snapshot(1, 'chat_sessions') } || [];
+        eval { $c->bye };
+        unless (@$rows) { $emit->("  (no sessions)"); return }
+        my @lines = ("  chat sessions:");
+        for my $s (sort { lc($a->{name}//'') cmp lc($b->{name}//'') } @$rows) {
+            my $marker = (($s->{name}//'') eq $name) ? '*' : ' ';
+            push @lines, sprintf("    %s %-20s %-8s %-8s %s", $marker,
+                $s->{name} // '?',
+                $s->{access_mode} // '?',
+                $s->{status} // '?',
+                $s->{topic} // '');
+        }
+        $emit->(join "\n", @lines);
+    };
+
+    my $cmd_switch = sub {
+        my ($new) = @_;
+        unless (defined $new && length $new) {
+            $emit->("  usage: switch <session-name>");
+            return;
+        }
+        $emit->("  switching to '$new' — restart will resubscribe.");
+        # Tear down + relaunch ourselves with the new session arg. Cleaner
+        # than rewiring SUBSCRIBE state in place.
+        $restore_term->();
+        eval { $ctrl->chat_leave(session => $name) } if $ctrl;
+        eval { $ctrl->bye }   if $ctrl;
+        eval { $stream->bye } if $stream;
+        # exec is cleaner than recursing — fresh stack, fresh signals.
+        exec { $^X } $^X, $0, '--tty', $new;
+        exit 0;
+    };
+
+    my $cmd_who = sub {
+        my $c = connect_client(want_auth => 0);
+        my $rows = eval {
+            $c->snapshot(1, 'chat_presence',
+                where => "session = '$name'");
+        } || [];
+        eval { $c->bye };
+        my @who = sort map { $_->{principal} } @$rows;
+        $emit->("  here: " . (@who ? join(', ', @who) : '(empty)'));
+    };
+
+    my $cmd_bitchat = sub {
+        my $c = connect_client(want_auth => 0);
+        my $log = eval { $c->poll('netmgr-log') } // '';
+        eval { $c->bye };
+        my @bridge = grep { /\[(?:bridge|helper)/ } split /\n/, $log;
+        @bridge = @bridge[-8..-1] if @bridge > 8;
+        unless (@bridge) {
+            $emit->("  (no [bridge] log lines in recent tail — bridge may be skipped)");
+            return;
+        }
+        $emit->(join "\n", "  recent bridge events:", map { "    $_" } @bridge);
+    };
+
+    my $cmd_join = sub {
+        my ($tier) = @_;
+        $tier = lc($tier // '');
+        if ($tier eq 'mesh' || $tier eq '') {
+            $emit->("  on Mesh: subscribed to '$name' (BLE Mesh feed from the bridge).");
+            return;
+        }
+        if ($tier =~ /^(neighborhood|block|city|building|region|province)$/) {
+            $emit->("  tier '$tier' is Nostr-only in iOS BitChat — not implemented.");
+            return;
+        }
+        $emit->("  unknown tier '$tier' — try: mesh");
+    };
+
+    my $dispatch = sub {
+        my ($line) = @_;
+        $line =~ s/^\s+|\s+$//g;
+        return unless length $line;
+        my @parts = split /\s+/, $line;
+        my $verb = lc(shift @parts);
+        my $arg  = "@parts";
+        if    ($verb =~ /^(?:quit|q|exit)$/)  { $shutdown->() }
+        elsif ($verb =~ /^(?:help|\?)$/)      { $cmd_help->() }
+        elsif ($verb eq 'peers')              { $cmd_peers->() }
+        elsif ($verb eq 'status')             { $cmd_status->() }
+        elsif ($verb eq 'sessions')           { $cmd_sessions->() }
+        elsif ($verb eq 'switch')             { $cmd_switch->(@parts) }
+        elsif ($verb eq 'who')                { $cmd_who->() }
+        elsif ($verb eq 'bitchat')            { $cmd_bitchat->() }
+        elsif ($verb eq 'join')               { $cmd_join->(@parts) }
+        else {
+            $emit->("  unknown ESC command '$verb' — try 'help'");
+        }
+    };
+
+    # === stream drain (server -> us) ===
     my $drain_stream = sub {
         my $sock = $stream->{sock};
-        my $buf;
-        my $n = sysread($sock, $buf, 4096);
+        my $chunk;
+        my $n = sysread($sock, $chunk, 4096);
         unless (defined $n && $n > 0) {
-            print "\n-- daemon hung up --\n";
+            $emit->("-- daemon hung up --");
             $shutdown->();
         }
-        $stream->{buf} .= $buf;
+        $stream->{buf} .= $chunk;
         while ($stream->{buf} =~ s/^([^\n]*)\n//) {
             my $c = parse_line($1) or next;
             if ($c->{verb} eq 'ROW'
                 && ($c->{kv}{table} // '') eq 'chat_messages') {
-                print "\n";
+                # print message without disrupting in-progress input.
+                print "\r\e[K";
                 print_msg($c->{kv});
-                print $prompt;
+                $redraw->();
             } elsif ($c->{verb} eq 'EOS') {
                 unless ($live++) {
-                    print "\n-- live: type to send, /quit to leave,"
-                        . " /help for commands --\n";
-                    print $prompt;
+                    $emit->("-- live: type to send. ESC enters command mode."
+                          . " Try `:help`. /quit also exits.");
                 }
             } elsif ($c->{verb} eq 'ERR') {
-                print "\n-- stream error: ", ($c->{kv}{msg} // '?'), " --\n";
+                $emit->("-- stream error: " . ($c->{kv}{msg} // '?'));
                 $shutdown->();
             }
         }
     };
 
-    my $handle_stdin = sub {
-        my $line = <STDIN>;
-        unless (defined $line) { $shutdown->() }   # Ctrl-D
-        chomp $line;
-        my $text = $line; $text =~ s/^\s+|\s+$//g;
-        if (!length $text) { print $prompt; return }
-
-        if ($text =~ m{^/(?:quit|exit|q)\b}i) { $shutdown->() }
-        if ($text =~ m{^/help\b}i) {
-            print "  /quit /exit /q   leave the chat\n",
-                  "  /who             show who's in this session\n",
-                  "  /help            this help\n",
-                  "  (anything else)  post as a message\n",
-                  $prompt;
+    # === stdin (one byte at a time, raw mode) ===
+    # ESC: chat→cmd (start fresh ':' line), cmd→chat (cancel ':' line)
+    # Enter: commit the buffer per mode, then return to chat
+    # Backspace/DEL: erase one char + visual erase
+    # Ctrl-C: shutdown.  Ctrl-D: shutdown when buffer empty.
+    # printable ASCII (0x20-0x7e): echo and append.
+    # other control chars: ignore.
+    my $handle_byte = sub {
+        my $byte;
+        my $n = sysread(STDIN, $byte, 1);
+        unless (defined $n && $n > 0) { $shutdown->() }
+        my $ord = ord($byte);
+        if ($ord == 0x1b) {                          # ESC
+            if ($mode eq 'chat') {
+                $mode = 'cmd';
+                $buf  = '';
+                print "\r\e[K", $cmd_prompt;
+            } else {
+                $mode = 'chat';
+                $buf  = '';
+                print "\r\e[K", $chat_prompt;
+            }
             return;
         }
-        if ($text =~ m{^/who\b}i) {
-            my $c = connect_client(want_auth => 0);
-            my $rows = eval {
-                $c->snapshot(1, 'chat_presence',
-                    where => "session = '$name'");
-            } || [];
-            eval { $c->bye };
-            my @who = sort map { $_->{principal} } @$rows;
-            print "  here: ", (@who ? join(', ', @who) : '(empty)'), "\n",
-                  $prompt;
+        if ($ord == 0x0d || $ord == 0x0a) {          # Enter
+            my $text = $buf; $buf = '';
+            print "\r\e[K\n";
+            if ($mode eq 'chat') {
+                if (!length $text) { print $chat_prompt; return }
+                # /-commands still work in chat mode for muscle memory.
+                if ($text =~ m{^/(?:quit|exit|q)\b}i) { $shutdown->() }
+                if ($text =~ m{^/help\b}i) {
+                    $cmd_help->(); print $chat_prompt; return;
+                }
+                if ($text =~ m{^/who\b}i) {
+                    $cmd_who->(); print $chat_prompt; return;
+                }
+                if ($text =~ m{^/}) {
+                    $emit->("-- unknown slash command '$text' — /help for the list");
+                    print $chat_prompt; return;
+                }
+                my $c = $get_ctrl->();
+                unless ($c) {
+                    $emit->("-- can't post: $@");
+                    print $chat_prompt; return;
+                }
+                eval { $c->chat_post(session => $name, body => $text) };
+                if ($@) {
+                    my $e = $@; $e =~ s/\s+\z//;
+                    $emit->("-- post failed: $e");
+                }
+                print $chat_prompt;
+            } else {                                  # cmd mode
+                $dispatch->($text);
+                $mode = 'chat';
+                print $chat_prompt;
+            }
             return;
         }
-        if ($text =~ m{^/}) {
-            print "-- unknown command '$text' — /help for the list --\n",
-                  $prompt;
+        if ($ord == 0x7f || $ord == 0x08) {          # Backspace / DEL
+            if (length $buf) {
+                chop $buf;
+                print "\b \b";
+            }
             return;
         }
-
-        my $c = $get_ctrl->();
-        unless ($c) {
-            print "-- can't post: $@ --\n", $prompt;
+        if ($ord == 0x03) { $shutdown->() }          # Ctrl-C
+        if ($ord == 0x04) {                          # Ctrl-D
+            $shutdown->() if length($buf) == 0;
             return;
         }
-        eval { $c->chat_post(session => $name, body => $text) };
-        if ($@) {
-            my $e = $@; $e =~ s/\s+\z//;
-            print "-- post failed: $e --\n", $prompt;
+        if ($byte =~ /[\x20-\x7e]/) {                # printable
+            $buf .= $byte;
+            print $byte;
         }
-        # No local echo: the SUBSCRIBE stream will return our own row,
-        # print_msg renders it with the server-stamped timestamp + verified
-        # name — that's the visible "post succeeded" cue, plus dedup-free.
+        # else: ignore stray control bytes (arrow keys, etc — TODO history).
     };
 
     while (1) {
         my @ready = $sel->can_read or next;
         for my $fh (@ready) {
             if ($fh == $stream->{sock}) { $drain_stream->() }
-            else                         { $handle_stdin->() }
+            else                         { $handle_byte->() }
         }
     }
 }
