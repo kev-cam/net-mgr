@@ -1313,12 +1313,26 @@ sub cmd_gui {
     };
 
     $entry->bind('<Return>', $send);
-    $bot->Button(-text => 'Send', -command => $send)->pack(-side => 'right');
+    # Lazy-load Tk::Balloon (Tk's auto-loader warns otherwise — same idiom
+    # find-xpra uses). Shared single Balloon attached to multiple buttons.
+    require Tk::Balloon;
+    my $balloon = $mw->Balloon(-state => 'balloon', -initwait => 600);
+    my $send_btn   = $bot->Button(-text => 'Send', -command => $send)
+                         ->pack(-side => 'right');
     # Upload glyph (an up-arrow). Rendered in the Courier 'ncmono' font, which
     # has Unicode coverage on this system — the default bar font does not.
     # Downloads are reached by right-clicking the upload message in the pane.
-    $bot->Button(-text => "\x{2191}", -font => 'ncmonob', -command => $upload)
-        ->pack(-side => 'right');
+    my $upload_btn = $bot->Button(-text => "\x{2191}", -font => 'ncmonob',
+                                  -command => $upload)
+                         ->pack(-side => 'right');
+    $balloon->attach($send_btn,
+        -msg => "Send the message (Enter also sends).\n"
+              . "Posting requires AUTH on closed/list-mode sessions.");
+    $balloon->attach($upload_btn,
+        -msg => "Upload a file to this chat.\n"
+              . "Picks via a file dialog; posts a system message "
+              . "with a link. Right-click an upload line in the "
+              . "pane to download.");
 
     # live reader: drain all complete lines without blocking the event loop
     $mw->fileevent($stream->{sock}, 'readable', sub {
