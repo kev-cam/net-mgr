@@ -105,6 +105,18 @@ GetOptions(
     'askpass'    => \$askpass,
 ) or die "bad options\n";
 
+# Persisted-default fallback for the "Always" choice in the auth-failure
+# dialog. CLI args win; per-user config [net-chat] key_file / key_id apply
+# only when the user didn't pass --key-file / --key-id explicitly.
+unless (defined $key_file && defined $key_id) {
+    my $ucfg = eval { NetMgr::Config->load } || {};
+    my $sect = $ucfg->{'net-chat'} || {};
+    $key_file //= $sect->{key_file} if defined $sect->{key_file}
+                                    && length $sect->{key_file};
+    $key_id   //= $sect->{key_id}   if defined $sect->{key_id}
+                                    && length $sect->{key_id};
+}
+
 # --askpass: invoked by ssh-keygen via SSH_ASKPASS (through the net-chat-askpass
 # shim) when the user's SSH key is passphrase-protected. The prompt arrives in
 # @ARGV; we pop a small Tk dialog and print the typed passphrase to stdout.
@@ -2158,9 +2170,65 @@ sub _gui_connect_with_dialog {
 #   { key_file=>..., key_id=>...} — retry with these
 # The current key_file/key_id are pre-filled. The text shows the daemon's exact
 # error so the user can tell "key not registered there" from "wrong key file".
+# Enumerate the user's likely SSH private keys for the auth dialog dropdown.
+# A "key" is a regular file under ~/.ssh/ that has a matching .pub sibling,
+# excluding obviously-not-key files (known_hosts/authorized_keys/config/etc).
+# Returns absolute paths in deterministic order (id_ed25519 first if present,
+# then id_rsa / id_ecdsa, then others sorted by name).
+sub _discover_ssh_keys {
+    my $dir = "$ENV{HOME}/.ssh";
+    return () unless -d $dir;
+    opendir(my $dh, $dir) or return ();
+    my @entries = readdir $dh;
+    closedir $dh;
+    my %pub = map { $_ => 1 } grep { /\.pub\z/ } @entries;
+    my @keys;
+    for my $f (@entries) {
+        next if $f =~ /\A\./;
+        next if $f =~ /\.pub\z/;
+        next if $f =~ /\A(known_hosts|authorized_keys|config|environment|ssh-)/;
+        next unless exists $pub{"$f.pub"};
+        my $p = "$dir/$f";
+        next unless -f $p && -r $p;
+        push @keys, $p;
+    }
+    # Prefer the conventional names first; everything else alphabetical.
+    my @preferred = qw(id_ed25519 id_rsa id_ecdsa id_dsa);
+    my %rank;
+    @rank{@preferred} = (0..$#preferred);
+    return sort {
+        ($rank{(_basename($a))} // 99) <=> ($rank{(_basename($b))} // 99)
+        || lc(_basename($a)) cmp lc(_basename($b))
+    } @keys;
+}
+
+sub _basename { my $p = shift; $p =~ s{.*/}{}; $p }
+
+# Read the comment field (the key_id principal) from a .pub file. The format
+# is `type b64data comment`, where comment is everything after the second
+# space and typically a "user@host" string the keygen tool stamped. Returns
+# undef when the .pub is missing or unparseable.
+sub _ssh_key_comment {
+    my ($priv) = @_;
+    return undef unless defined $priv && length $priv;
+    my $pub = "$priv.pub";
+    return undef unless -r $pub;
+    open my $fh, '<', $pub or return undef;
+    my $line = <$fh>;
+    close $fh;
+    return undef unless defined $line;
+    chomp $line;
+    my @parts = split /\s+/, $line, 3;
+    return undef unless @parts >= 3;
+    my $c = $parts[2];
+    $c =~ s/^\s+|\s+$//g;
+    return length $c ? $c : undef;
+}
+
 sub _auth_failure_dialog {
     my ($mw, $target, $err) = @_;
     require Tk;
+    require Tk::BrowseEntry;
     my $dlg = $mw->Toplevel(-title => 'authentication required');
     $dlg->transient($mw);
 
@@ -2171,23 +2239,49 @@ sub _auth_failure_dialog {
                 -justify => 'left', -anchor => 'w', -wraplength => 480)
         ->pack(-fill => 'x', -padx => 12, -pady => [0, 8]);
 
+    my @keys = _discover_ssh_keys();
     my %vals = (
-        key_file => ($key_file // NetMgr::Client::_default_key_file() // ''),
+        key_file => ($key_file // NetMgr::Client::_default_key_file()
+                               // ($keys[0] // '')),
         key_id   => ($key_id   // NetMgr::Client::_default_key_id()   // ''),
-        # For the "browse + request access" path: a self-asserted name. Owners
-        # see it prefixed with "unverified:" so it's blatantly not cryptographic.
+        # For the "browse + request access" path: a self-asserted name.
+        # Owners see it prefixed with "unverified:" so it's blatantly not
+        # cryptographic.
         as       => ($as       // (getpwuid($<))[0] // 'guest'),
     );
+    # If the user hasn't overridden the key_id and we just defaulted the
+    # key_file from discovery, prefer the discovered key's pubkey comment
+    # over the synthetic user@host fallback — it's the actual principal.
+    if (!defined $key_id && @keys && $vals{key_file} eq $keys[0]) {
+        my $c = _ssh_key_comment($keys[0]);
+        $vals{key_id} = $c if defined $c && length $c;
+    }
 
+    # SSH key file — dropdown of discovered keys + Browse for the unusual
+    # case (key outside ~/.ssh, freshly generated and not yet listed, ...).
     my $kf_frame = $dlg->Frame->pack(-fill => 'x', -padx => 12, -pady => 2);
     $kf_frame->Label(-text => 'SSH key file:', -width => 12, -anchor => 'w')
              ->pack(-side => 'left');
-    $kf_frame->Entry(-textvariable => \$vals{key_file}, -width => 40)
-             ->pack(-side => 'left', -fill => 'x', -expand => 1);
+    my $kf_combo;
+    $kf_combo = $kf_frame->BrowseEntry(-variable => \$vals{key_file},
+                                       -width    => 40,
+                                       -listwidth=> 60,
+                                       -browsecmd => sub {
+        # When a dropdown choice is selected, auto-populate key_id from
+        # the .pub comment so the user doesn't have to copy/paste.
+        my $c = _ssh_key_comment($vals{key_file});
+        $vals{key_id} = $c if defined $c && length $c;
+    });
+    $kf_combo->insert('end', $_) for @keys;
+    $kf_combo->pack(-side => 'left', -fill => 'x', -expand => 1);
     $kf_frame->Button(-text => 'Browse…', -command => sub {
         my $f = $dlg->getOpenFile(-title => 'Select SSH private key',
                                   -initialdir => "$ENV{HOME}/.ssh");
-        $vals{key_file} = $f if defined $f && length $f;
+        if (defined $f && length $f) {
+            $vals{key_file} = $f;
+            my $c = _ssh_key_comment($f);
+            $vals{key_id} = $c if defined $c && length $c;
+        }
     })->pack(-side => 'left', -padx => [4, 0]);
 
     my $kid_frame = $dlg->Frame->pack(-fill => 'x', -padx => 12, -pady => 2);
@@ -2197,7 +2291,8 @@ sub _auth_failure_dialog {
               ->pack(-side => 'left', -fill => 'x', -expand => 1);
 
     $dlg->Label(-text => "(Key ID is the principal name in the remote's allowed_signers — "
-                       . "usually user\@host of the key's comment.)",
+                       . "usually user\@host of the key's comment. Auto-filled "
+                       . "from the .pub when you pick a key from the dropdown.)",
                 -justify => 'left', -wraplength => 480, -anchor => 'w')
         ->pack(-fill => 'x', -padx => 12, -pady => [4, 8]);
 
@@ -2215,7 +2310,24 @@ sub _auth_failure_dialog {
 
     my $result;
     my $btns = $dlg->Frame->pack(-fill => 'x', -padx => 12, -pady => 10);
-    $btns->Button(-text => 'Retry with these', -command => sub {
+    # Two retry buttons: "Use this session" applies the chosen creds to the
+    # current process only (matches the old "Retry with these" behavior);
+    # "Always" additionally persists key_file + key_id to ~/.config/net-mgr/
+    # config [net-chat] so future net-chat runs pick them up by default.
+    # Both return the same result hash to the caller — the persistence is
+    # a side effect.
+    $btns->Button(-text => 'Use this session', -command => sub {
+        $result = { key_file => $vals{key_file}, key_id => $vals{key_id} };
+        $dlg->destroy;
+    })->pack(-side => 'left', -padx => 2);
+    $btns->Button(-text => 'Always', -command => sub {
+        eval {
+            NetMgr::Config->save_user_value('net-chat', 'key_file', $vals{key_file})
+                if length $vals{key_file};
+            NetMgr::Config->save_user_value('net-chat', 'key_id', $vals{key_id})
+                if length $vals{key_id};
+        };
+        # Silently ignore save errors — they shouldn't block the retry.
         $result = { key_file => $vals{key_file}, key_id => $vals{key_id} };
         $dlg->destroy;
     })->pack(-side => 'left', -padx => 2);
@@ -2230,6 +2342,12 @@ sub _auth_failure_dialog {
     # ESC / window-close = cancel.
     $dlg->protocol('WM_DELETE_WINDOW', sub { $result = 'cancel'; $dlg->destroy });
     $dlg->bind('<Escape>' => sub { $result = 'cancel'; $dlg->destroy });
+
+    require Tk::Balloon;
+    my $bln = $dlg->Balloon(-state => 'balloon', -initwait => 600);
+    $bln->attach($kf_combo,
+        -msg => "Pick a private key from ~/.ssh/. The matching .pub file's "
+              . "comment is auto-filled into Key ID below.");
 
     $dlg->grab;
     $mw->waitWindow($dlg);
