@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# net-mgr-bitchat-setup — install the BitChat BLE helper for the bridge.
+#
+# Builds /home/$USER/src/bitchat-rust/target/release/bitchat-jsonl, which
+# the net-bitchat-bridge supervisor (default-on after `make install`) finds
+# via its /home/*/src/bitchat-rust/... convention. After this script
+# completes, restart the bridge to pick up the helper:
+#   sudo systemctl restart net-bitchat-bridge
+#
+# Idempotent — re-running is safe. Does NOT use sudo: runs as the calling
+# user, installs Rust under ~/.cargo/, clones into ~/src/.
+#
+# What it does:
+#   1. Installs rustup + a stable Rust toolchain into ~/.cargo (user-local,
+#      no sudo, ~5 MB on disk).
+#   2. Clones github.com/joshbtn/bitchat-rust into ~/src/bitchat-rust.
+#   3. Drops the net-mgr-shipped delegate source
+#      ($SHAREDIR/bitchat-jsonl.rs) into src/bin/bitchat-jsonl.rs.
+#   4. Runs `cargo build --release --bin bitchat-jsonl`. Cold builds take
+#      3-5 min and download ~200 crates; subsequent runs are seconds.
+#
+# Why this isn't bundled in `make install`:
+#   - Building Rust as root is the wrong shape — toolchain belongs to the
+#     user that will iterate on it, and the supervisor runs as root but
+#     can read /home/dkc/... just fine.
+#   - cargo download + build is too heavyweight for unconditional install.
+#   - You may not want BitChat support on every host — let the operator
+#     decide per box.
+
+set -euo pipefail
+
+CRATE_URL="https://github.com/joshbtn/bitchat-rust.git"
+CRATE_DIR="${HOME}/src/bitchat-rust"
+JSONL_BIN="${CRATE_DIR}/target/release/bitchat-jsonl"
+
+# Locate the shipped delegate source. When run from a net-mgr checkout
+# the file is at ../contrib/bitchat-jsonl/bitchat-jsonl.rs; once installed
+# it lives in /usr/local/share/net-mgr/bitchat-jsonl.rs.
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+JSONL_SRC=""
+for cand in \
+    "${script_dir}/../contrib/bitchat-jsonl/bitchat-jsonl.rs" \
+    "/usr/local/share/net-mgr/bitchat-jsonl.rs" \
+    "$(dirname "${script_dir}")/share/net-mgr/bitchat-jsonl.rs"
+do
+  if [ -r "$cand" ]; then JSONL_SRC=$(readlink -f "$cand"); break; fi
+done
+if [ -z "$JSONL_SRC" ]; then
+  echo "error: cannot find bitchat-jsonl.rs (the delegate source)" >&2
+  echo "  searched:" >&2
+  echo "    ${script_dir}/../contrib/bitchat-jsonl/bitchat-jsonl.rs" >&2
+  echo "    /usr/local/share/net-mgr/bitchat-jsonl.rs" >&2
+  echo "Reinstall net-mgr or run from the net-mgr source checkout." >&2
+  exit 1
+fi
+
+echo "==> Rust toolchain"
+if ! command -v rustc >/dev/null 2>&1 && [ ! -x "${HOME}/.cargo/bin/rustc" ]; then
+  echo "Installing rustup user-local (no sudo)..."
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+      sh -s -- -y --default-toolchain stable --profile minimal
+else
+  echo "already installed: $(command -v rustc 2>/dev/null || echo "${HOME}/.cargo/bin/rustc")"
+fi
+. "${HOME}/.cargo/env"
+echo "    $(rustc --version)"
+
+echo
+echo "==> Source clone at ${CRATE_DIR}"
+mkdir -p "$(dirname "${CRATE_DIR}")"
+if [ ! -d "${CRATE_DIR}/.git" ]; then
+  git clone --depth 1 "${CRATE_URL}" "${CRATE_DIR}"
+else
+  echo "already cloned: $(cd "${CRATE_DIR}" && git log -1 --format=%h)"
+fi
+
+echo
+echo "==> Installing the bitchat-jsonl delegate"
+mkdir -p "${CRATE_DIR}/src/bin"
+install -m 0644 "${JSONL_SRC}" "${CRATE_DIR}/src/bin/bitchat-jsonl.rs"
+echo "    ${JSONL_SRC} → ${CRATE_DIR}/src/bin/bitchat-jsonl.rs"
+
+echo
+echo "==> Building bitchat-jsonl (release). Cold ≈ 3-5 minutes."
+cd "${CRATE_DIR}"
+cargo build --release --bin bitchat-jsonl
+
+echo
+echo "Built: ${JSONL_BIN}"
+ls -lh "${JSONL_BIN}"
+echo
+echo "The net-bitchat-bridge supervisor's auto-discovery walks"
+echo "/home/*/src/bitchat-rust/target/release/, so it will find this"
+echo "without further configuration."
+echo
+echo "To activate:"
+echo "  sudo systemctl restart net-bitchat-bridge"
+echo "  sudo journalctl -u net-bitchat-bridge -b | tail -20"
+echo
+echo "Done."

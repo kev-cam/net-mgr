@@ -23,7 +23,7 @@ CGIDIR     ?= /usr/lib/cgi-bin
 APACHE_CONF_DIR ?= $(SYSCONFDIR)/apache2/conf-available
 DESTDIR    ?=
 
-BINS  = net-alias net-bitchat-bridge net-bitchat-helper-wrap net-chat net-chat-askpass net-poll-ap net-audit net-audit-aps net-cluster net-cluster-gui net-config-gui net-connect net-ddns net-diag net-discover net-find-lost net-find-peers net-find-rogue-dhcp net-fw net-gen-apache-conf net-gen-dnsmasq net-import-dhcp net-import-dnsmasq net-import-ssh-forwards net-fix net-ipv6 net-isp net-link-stats net-lookup net-name net-peer net-ping net-purge net-vlan net-kill-rogue-dhcp net-reserve net-roam net-router net-run-app net-scan net-report net-set net-show net-tp-scan net-tunnel net-uplink-probe net-var net-watch net-wifi-survey net-zones
+BINS  = net-alias net-bitchat-bridge net-bitchat-helper-wrap net-mgr-bitchat-setup net-chat net-chat-askpass net-poll-ap net-audit net-audit-aps net-cluster net-cluster-gui net-config-gui net-connect net-ddns net-diag net-discover net-find-lost net-find-peers net-find-rogue-dhcp net-fw net-gen-apache-conf net-gen-dnsmasq net-import-dhcp net-import-dnsmasq net-import-ssh-forwards net-fix net-ipv6 net-isp net-link-stats net-lookup net-name net-peer net-ping net-purge net-vlan net-kill-rogue-dhcp net-reserve net-roam net-router net-run-app net-scan net-report net-set net-show net-tp-scan net-tunnel net-uplink-probe net-var net-watch net-wifi-survey net-zones
 
 # Symlinks installed pointing at net-run-app — each link picks its
 # behavior from basename($0) so adding a new wrapper is a one-line
@@ -251,6 +251,11 @@ install: .version
 	@$(INSTALL) -m 644 sql/schema.sql $(DESTDIR)$(SHAREDIR)/sql/schema.sql
 	@echo "  .version → $(DESTDIR)$(SHAREDIR)/version"
 	@$(INSTALL) -m 644 .version $(DESTDIR)$(SHAREDIR)/version
+	@if [ -f contrib/bitchat-jsonl/bitchat-jsonl.rs ]; then \
+	  echo "  contrib/bitchat-jsonl/bitchat-jsonl.rs → $(DESTDIR)$(SHAREDIR)/bitchat-jsonl.rs"; \
+	  $(INSTALL) -m 644 contrib/bitchat-jsonl/bitchat-jsonl.rs \
+	             $(DESTDIR)$(SHAREDIR)/bitchat-jsonl.rs; \
+	fi
 	$(INSTALL) -d $(DESTDIR)$(MANDIR)/man1
 	$(INSTALL) -d $(DESTDIR)$(MANDIR)/man7
 	@for f in $(MAN1S); do \
@@ -346,6 +351,17 @@ install: .version
 	        printf '  %-25s not enabled  — enable with: systemctl enable --now %s\n' "$$u" "$$u"; \
 	      fi; \
 	    done; \
+	  fi; \
+	  if ! command -v bitchat-jsonl >/dev/null 2>&1 && \
+	     ! ls /home/*/src/bitchat-rust/target/release/bitchat-jsonl 2>/dev/null | grep -q .; then \
+	    echo; \
+	    echo "  Note: BitChat support requires a Rust helper that net-mgr does not"; \
+	    echo "        ship pre-built. net-bitchat-bridge.service is enabled but its"; \
+	    echo "        ExecCondition will keep it skipped (see journalctl) until the"; \
+	    echo "        helper is built. To enable BitChat on this host, run AS YOUR"; \
+	    echo "        LOGIN USER (not root — toolchain installs under ~/.cargo/):"; \
+	    echo "          $(BINDIR)/net-mgr-bitchat-setup"; \
+	    echo "        Then: sudo systemctl restart net-bitchat-bridge"; \
 	  fi; \
 	else \
 	  echo; \
