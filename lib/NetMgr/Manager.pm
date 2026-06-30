@@ -4507,6 +4507,7 @@ sub _validate_write_config_path {
     return (0, "path contains '//'")    if index($path, '//')  >= 0;
 
     return (1, undef, 0644) if $path eq '/etc/net-mgr/config';
+    return (1, undef, 0644) if $path eq '/etc/net-mgr/bitchat-bridge.conf';
     return (1, undef, 0644) if $path =~ m{^/etc/net-mgr/config\.d/[A-Za-z0-9._-]+\.conf$};
     return (1, undef, 0600) if $path =~ m{^/etc/net-mgr/secrets/[A-Za-z0-9._-]+$};
     return (1, undef, 0644) if $path =~ m{^/etc/net-mgr/allowed_[a-z_]+$};

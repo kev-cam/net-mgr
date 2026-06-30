@@ -67,17 +67,19 @@ for my $k (sort keys %{ $per_feat_cfg->{helper} // {} }) {
 }
 my @helper_args = split ' ', ($per_feat_cfg->{helper}{args} // '');
 
-# Helper path resolution. The per-feature file's [helper] path= wins if
-# present (back-compat with existing configs). Otherwise the main config's
-# [bitchat_bridge] helper_path applies; 'auto' searches PATH for
-# bitchat-jsonl (the upstream native-JSON helper) falling back to the
-# in-tree ANSI shim if the user pointed at a terminal-style binary via
-# env_BITCHAT_BIN.
-my $helper_path = $per_feat_cfg->{helper}{path}
-               // $bridge_cfg->{helper_path}
-               // 'auto';
+# Helper path resolution. Main /etc/net-mgr/config [bitchat_bridge]
+# helper_path is the SOLE source of the helper binary path. The per-feature
+# file's [helper] path key is ignored on purpose: an older install may have
+# it pointing at a now-stale binary, and silent overrides were exactly the
+# foot-gun that wired the supervisor to the wrong helper after a default-on
+# install. Per-feature file is for env/args only.
+# 'auto' (default) searches PATH for bitchat-jsonl plus convention-based
+# fallbacks under /home/*/src/bitchat-rust/target/release so a developer
+# build wins without an absolute-path config edit.
+my $helper_path = $bridge_cfg->{helper_path} // 'auto';
 if (lc($helper_path) eq 'auto') {
-    $helper_path = _which('bitchat-jsonl');
+    $helper_path = _which('bitchat-jsonl')
+                // _find_in_home_clone('bitchat-rust', 'bitchat-jsonl');
 }
 
 # Preflight: gate the launch on (1) config mode, (2) BT controller, (3)
@@ -264,6 +266,29 @@ sub _which {
     unshift @dirs, '/usr/local/bin' unless grep { $_ eq '/usr/local/bin' } @dirs;
     for my $d (@dirs) {
         my $p = "$d/$name";
+        return $p if -x $p;
+    }
+    return undef;
+}
+
+# Convention-based fallback for helper discovery: when bitchat-jsonl was
+# built from source under ~/src/<crate>/target/release on a developer
+# workstation, check that path before giving up. Returns the absolute
+# path to the executable, or undef. Iterates a small set of likely homes
+# so the service running as root can find a dkc-built binary without an
+# absolute-path config edit.
+sub _find_in_home_clone {
+    my ($crate, $name) = @_;
+    my @homes;
+    push @homes, $ENV{HOME} if $ENV{HOME};
+    # When the service runs as root, $HOME is /root; the binary likely
+    # sits under a developer's home. Walk /home/* shallowly to find it.
+    if (opendir my $dh, '/home') {
+        push @homes, map { "/home/$_" } grep { !/^\./ } readdir $dh;
+        closedir $dh;
+    }
+    for my $h (@homes) {
+        my $p = "$h/src/$crate/target/release/$name";
         return $p if -x $p;
     }
     return undef;
