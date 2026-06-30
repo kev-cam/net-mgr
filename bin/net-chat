@@ -1202,7 +1202,14 @@ sub cmd_gui {
     my $om = $top->Optionmenu(-variable => \$sessvar,
                               -options => ['select', $NEWCHAT])
                  ->pack(-side => 'left');
-    my $topiclbl = $top->Label(-text => '', -anchor => 'w')
+    # Topic label shows "owner: <created_by>" when a session is selected.
+    # The string can be long (multi-owner sessions, fully-qualified key
+    # ids), and the label is squeezed between the dropdowns and the
+    # action buttons, so clip is easy. Give it -wraplength + -justify
+    # to wrap inside its allotted space; the reflow handler below sets
+    # wraplength to the actual widget width on every <Configure>.
+    my $topiclbl = $top->Label(-text => '', -anchor => 'w',
+        -justify => 'left', -wraplength => 200)
                        ->pack(-side => 'left', -fill => 'x', -expand => 1);
 
     # -- middle: message log (read-only) ---------------------------------
@@ -1750,6 +1757,21 @@ sub cmd_gui {
         my $w = $mw->width;
         return unless defined $w && $w > 1;   # initial firing has bogus width
         $status_lbl->configure(-wraplength => $w - 20) if $status_lbl;
+        # Topic label wraps within whatever horizontal space it actually
+        # got after the dropdowns/buttons claim theirs. Read the widget's
+        # rendered width directly so we wrap to the SPACE IT HAS, not the
+        # whole window. Guard against the feedback loop (configure ->
+        # repaint -> Configure event -> configure) by only changing when
+        # the delta is meaningful.
+        if ($topiclbl) {
+            my $lw = $topiclbl->width;
+            if ($lw > 30) {
+                my $cur = $topiclbl->cget(-wraplength);
+                my $new = $lw - 8;
+                $topiclbl->configure(-wraplength => $new)
+                    if abs(($cur // 0) - $new) > 4;
+            }
+        }
         my $thresh = 720;
         if ($w < $thresh && !$folded) {
             $_->packForget for @action_btns;
