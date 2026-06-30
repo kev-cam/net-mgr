@@ -1079,6 +1079,13 @@ sub cmd_gui {
     my ($stream, $ctrl) = _gui_connect_with_dialog($mw);
     return unless $stream && $ctrl;   # user cancelled — MainWindow destroyed
 
+    # Forward-declare so the anonymous popup's callback (which fires later
+    # via Tk::after) can close over the lexical. The actual `sub { ... }`
+    # assignment happens further down once $statusvar exists; by the time
+    # the after() callback fires, the main-loop has run cmd_gui through
+    # to MainLoop and the assignment has landed.
+    my $set_status;
+
     # Non-blocking notice: tell the user they're anonymous so they aren't
     # surprised when posts get refused. Replaces the old info messageBox
     # — that one couldn't offer to sign in. This dialog has the same SSH
@@ -1366,7 +1373,7 @@ sub cmd_gui {
     $bot->pack(-fill => 'x', -side => 'bottom', -padx => 4, -pady => 3);
     $txt->pack(-fill => 'both', -expand => 1, -padx => 4);
 
-    my $set_status = sub { $statusvar = $_[0] };
+    $set_status = sub { $statusvar = $_[0] };
     my $set_font = sub {
         $mw->fontConfigure('ncui',    -size => $fontsize);
         $mw->fontConfigure('ncmono',  -size => $fontsize);
