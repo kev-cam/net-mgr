@@ -1228,14 +1228,15 @@ sub cmd_gui {
         -justify => 'left', -wraplength => 200)
                        ->pack(-side => 'left', -fill => 'x', -expand => 1);
 
-    # -- middle: message log (read-only) ---------------------------------
+    # -- middle: message log (read-only).  CREATED here, PACKED below
+    # after the bottom widgets — see the geometry block at the end of
+    # this section for why ordering matters.
     my $txt = $mw->Scrolled('Text', -scrollbars => 'oe', -wrap => 'word',
                             -state => 'disabled', -height => 22,
-                            -font => 'ncmono')
-                 ->pack(-fill => 'both', -expand => 1, -padx => 4);
+                            -font => 'ncmono');
 
-    # -- bottom: input + send --------------------------------------------
-    my $bot = $mw->Frame->pack(-fill => 'x', -padx => 4, -pady => 3);
+    # -- bottom: input + send. Created (no pack) before $txt's pack.
+    my $bot = $mw->Frame;
     my $entry = $bot->Entry->pack(-side => 'left', -fill => 'x', -expand => 1);
     # Status bar wraps to the window width so long messages (join-request
     # waiting-for, owner lists, error chains) don't get clipped on narrow
@@ -1243,7 +1244,19 @@ sub cmd_gui {
     # bar grows with the toplevel.
     my $status_lbl = $mw->Label(-textvariable => \$statusvar, -anchor => 'w',
         -justify => 'left', -relief => 'sunken', -wraplength => 600);
+
+    # Pack geometry: reserve the bottom-most strips FIRST (status, then
+    # input), then let the message log expand into whatever's left. If
+    # the user shrinks the window vertically, only the message log
+    # collapses — the entry and status stay full-height.
+    #   Order matters with -side=>bottom: status packs first, so it
+    #   claims the very bottom row; the entry frame packs next, claiming
+    #   the row above status. $txt then -expand=>1 fills the middle.
+    # Without this ordering the text widget's natural -height=>22 wins
+    # the cavity allocation and the entry box gets clipped first.
     $status_lbl->pack(-fill => 'x', -side => 'bottom');
+    $bot->pack(-fill => 'x', -side => 'bottom', -padx => 4, -pady => 3);
+    $txt->pack(-fill => 'both', -expand => 1, -padx => 4);
 
     my $set_status = sub { $statusvar = $_[0] };
     my $set_font = sub {
