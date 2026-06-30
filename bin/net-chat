@@ -1514,12 +1514,37 @@ sub cmd_gui {
             $pop->destroy;
         };
         my $bf = $pop->Frame->pack(-pady => 8);
-        $bf->Button(-text => 'Approve', -command => sub { $act->('approve') })
-           ->pack(-side => 'left', -padx => 6);
-        $bf->Button(-text => 'Reject',  -command => sub { $act->('reject') })
-           ->pack(-side => 'left', -padx => 6);
-        $bf->Button(-text => 'Ignore',  -command => sub { $pop->destroy })
-           ->pack(-side => 'left', -padx => 6);
+        my $approve_btn = $bf->Button(-text => 'Approve',
+                                      -command => sub { $act->('approve') });
+        $approve_btn->pack(-side => 'left', -padx => 6);
+        my $reject_btn  = $bf->Button(-text => 'Reject',
+                                      -command => sub { $act->('reject') });
+        $reject_btn->pack(-side => 'left', -padx => 6);
+        # Ignore is process-scoped: dedup'd by %seen_req which is reset every
+        # time the GUI starts. The chat_members row stays at 'requested', so
+        # the next net-chat process's SUBSCRIBE snapshot re-delivers it and
+        # the popup re-appears. Surface that to the user in the status bar
+        # so they aren't worried about "did I just lose this request".
+        my $ignore_btn = $bf->Button(-text => 'Ignore', -command => sub {
+            $set_status->("ignored '" . $who_label->($who)
+                        . "' for '$sess' — will reappear next net-chat launch");
+            $pop->destroy;
+        });
+        $ignore_btn->pack(-side => 'left', -padx => 6);
+        require Tk::Balloon;
+        my $bln = $pop->Balloon(-state => 'balloon', -initwait => 600);
+        $bln->attach($approve_btn,
+            -msg => "Admit '$who' to '$sess'. The server records the principal "
+                  . "(and stashes the SSH pubkey if one was sent) so future "
+                  . "AUTH from the same key auto-admits.");
+        $bln->attach($reject_btn,
+            -msg => "Mark '$who' as denied for '$sess'. Future join requests "
+                  . "from this principal won't show a popup until you "
+                  . "explicitly re-allow.");
+        $bln->attach($ignore_btn,
+            -msg => "Dismiss this popup for now. The request stays pending "
+                  . "on the server and reappears the next time you launch "
+                  . "net-chat. Useful for 'I'll decide later'.");
     };
 
     # Show the last N messages of the current session (one snapshot), oldest
