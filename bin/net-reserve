@@ -408,10 +408,21 @@ sub gather {
     }
     # MAC -> where it currently is (lease/observed) and where it's reserved, so
     # the UI can flag a device that's been given a new address but hasn't moved
-    # there yet.
+    # there yet. mac_cur_ip is intentionally restricted to REAL network signals:
+    # operator/paper sources (':net-reserve', 'audit:*', 'net-import-*') get
+    # excluded — net-reserve writes ':net-reserve' rows as a side-effect of
+    # operator action on a row, and treating those as liveness would mask
+    # genuine drift (a reservation at the same IP as a stale probe trace
+    # would look 'active' instead of 'orphan_resv'). Lease rows are always
+    # treated as live — DHCP wouldn't have leased it otherwise.
     my (%mac_cur_ip, %mac_resv_ip);
     for my $ip (sort keys %leased)   { my $m=$leased{$ip}{mac};   $mac_cur_ip{lc $m} //= $ip if $m }
-    for my $ip (sort keys %observed) { my $m=$observed{$ip}{mac}; $mac_cur_ip{lc $m} //= $ip if $m }
+    for my $ip (sort keys %observed) {
+        my $row = $observed{$ip};
+        next unless _is_live_source($row->{source} // '');
+        my $m = $row->{mac};
+        $mac_cur_ip{lc $m} //= $ip if $m;
+    }
     for my $ip (keys %resv)          { my $m=$resv{$ip}{mac};     $mac_resv_ip{lc $m} //= $ip if $m }
 
     my %subnets;
@@ -453,10 +464,14 @@ sub classify {
     my $i = ip2int($ip);
     if (my $r = $model->{resv}{$ip}) {
         # reserved AND currently occupied -> 'active' (the reservation is in
-        # effect). Otherwise: if this row's MAC is currently observed/leased at
-        # a DIFFERENT ip in the model, the reservation has drifted (the device
-        # has wandered off it) -> 'orphan_resv'. Else just pending/vacant.
-        return 'active' if $model->{leased}{$ip} || $model->{observed}{$ip};
+        # effect). "Occupied" requires a LIVE source — a stale ':net-reserve'
+        # probe trace at the reserved IP must NOT mask the orphan case where
+        # the device has actually moved elsewhere. Otherwise: if this row's
+        # MAC is currently live at a DIFFERENT ip, the reservation has drifted
+        # (device has wandered off it) -> 'orphan_resv'. Else pending/vacant.
+        my $obs_live = $model->{observed}{$ip}
+                    && _is_live_source($model->{observed}{$ip}{source} // '');
+        return 'active' if $model->{leased}{$ip} || $obs_live;
         my $m   = lc($r->{mac} // '');
         my $cur = $m ? $model->{mac_cur_ip}{$m} : undef;
         return 'orphan_resv' if defined $cur && $cur ne $ip;
@@ -468,6 +483,21 @@ sub classify {
     return 'in-use'   if $model->{leased}{$ip} || $model->{observed}{$ip};
     return 'assigned' if in_pool($model, $i);
     return 'free';
+}
+
+# True if $source is a real network-observation signal (the device was
+# actually seen on the wire). False for operator/paper sources that
+# get written as a side-effect of editing rows — those would otherwise
+# masquerade as liveness and hide genuine drift.
+#   live:  ':self', ':DHCP', ':dhcp', ':dhcp.master', ':arp', ':nmap'
+#   not:   ':net-reserve', 'audit:*', 'net-import-*', 'manual', undef
+# Whitelist by suffix so a future paper source doesn't accidentally
+# pass; new live sources require a one-line addition here.
+sub _is_live_source {
+    my ($src) = @_;
+    return 0 unless defined $src && length $src;
+    return 1 if $src =~ /:(self|DHCP|dhcp|dhcp\.master|arp|nmap)\z/i;
+    return 0;
 }
 
 # Suggest a cell to highlight when the user lands on (or switches to) a subnet,
