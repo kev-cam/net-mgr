@@ -315,26 +315,26 @@ sub cmd_put {
     # `put` is always auth-gated; force --auth on like `update` does.
     if (!$m->{auth}) { warn "put: --auth required\n"; return 2 }
     my $res = $m->observe_all(%kv);
+    require NetMgr::Protocol;
     my $any_err = 0;
-    if ($json) {
-        require JSON::PP;
-        print JSON::PP->new->canonical(1)->pretty->encode($res);
-    } else {
-        for my $p ($m->peers) {
-            my $r = $res->{ $p->{name} };
-            if (!$r) { printf "%-20s no reply\n", $p->{name}; $any_err = 1; next }
-            if ($r->{error}) {
-                printf "%-20s ERR %s\n", $p->{name}, $r->{error};
-                $any_err = 1; next;
-            }
-            my $kv = $r->{kv} || {};
-            my $verify = ($kv->{sha1} && $kv->{sha1} eq $local_sha) ? "verified" : "SHA-MISMATCH";
-            printf "%-20s OK  %s (%d bytes, mode=%s) %s\n",
-                $p->{name}, $kv->{path} // $remote,
-                $kv->{size} // length($bytes),
-                $kv->{mode} // '?', $verify;
-            $any_err = 1 if $verify ne 'verified';
+    for my $p ($m->peers) {
+        my $raw = $res->{ $p->{name} };
+        if (!defined $raw || !length $raw) {
+            printf "%-20s no reply\n", $p->{name}; $any_err = 1; next;
         }
+        if ($raw =~ /^ERR /) {
+            my $msg = $raw; $msg =~ s/^ERR\s+//;
+            printf "%-20s ERR %s\n", $p->{name}, $msg;
+            $any_err = 1; next;
+        }
+        my $cmd = eval { NetMgr::Protocol::parse_line($raw) };
+        my $kv  = ($cmd && ref($cmd) eq 'HASH') ? ($cmd->{kv} || {}) : {};
+        my $verify = ($kv->{sha1} && $kv->{sha1} eq $local_sha) ? "verified" : "SHA-MISMATCH";
+        printf "%-20s OK  %s (%d bytes, mode=%s) %s\n",
+            $p->{name}, $kv->{path} // $remote,
+            $kv->{size} // length($bytes),
+            $kv->{mode} // '?', $verify;
+        $any_err = 1 if $verify ne 'verified';
     }
     return $any_err ? 1 : 0;
 }

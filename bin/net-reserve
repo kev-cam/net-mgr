@@ -1572,14 +1572,21 @@ sub cmd_gui {
         # coincidence). On undef hint (no IP picked at all) clear stale focus.
         my $new_hint_ip = $S{hint_ip};
         if (($prev_hint_ip // '') ne ($new_hint_ip // '')) {
-            if (defined $new_hint_ip && $S{model}{resv}{$new_hint_ip}) {
+            if (defined $new_hint_ip
+                && ($S{model}{resv}{$new_hint_ip} || !defined $S{focus_ip})) {
+                # Seed the side-pane highlight when the hint IS a reservation,
+                # OR when nothing is focused yet (first paint): side_focus_ip
+                # falls back to _nearest_reserved for a free hint, so launch
+                # always gets a visible nrhit row instead of silently waiting
+                # for the first cell click to seed focus_ip.
                 side_focus_ip(\%S, $new_hint_ip);
             } elsif (!defined $new_hint_ip) {
                 delete @S{qw(focus_ip focus_exact)};
                 $resv_text->tagRemove('nrhit', '1.0', 'end');
             }
-            # Hint defined but not a reservation: leave focus_ip alone — the
-            # trailing _focus_show restores the prior yview, no jolt.
+            # Hint defined, not a reservation, and focus_ip already set: leave
+            # focus_ip alone — avoids yanking a user-centred row on free-IP
+            # hint churn. The trailing _focus_show restores the prior yview.
         }
         # The wipe above cleared the highlight AND scrolled to the top. Re-centre
         # on the focused IP (also re-highlights); if it isn't in this view, just
