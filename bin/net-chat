@@ -757,8 +757,13 @@ sub cmd_tty {
                             chomp(my $je = $@);
                             $emit->("-- post needs membership; join failed: $je");
                         } elsif ($state eq 'requested') {
+                            my @owners = _gui_session_owners($name);
+                            my $me_id = ($jr && ref $jr eq 'HASH')
+                                      ? ($jr->{principal} // '') : '';
+                            my $who = @owners ? join(', ', @owners) : '(unknown)';
                             $emit->("-- join request sent for '$name' "
-                                  . "— waiting for an owner to approve");
+                                  . "as '$me_id'"
+                                  . " — waiting for: $who");
                         } elsif ($state eq 'member') {
                             eval { $c->chat_post(session => $name, body => $text) };
                             $emit->("-- post failed after join: $@") if $@;
@@ -1209,8 +1214,13 @@ sub cmd_gui {
     # -- bottom: input + send --------------------------------------------
     my $bot = $mw->Frame->pack(-fill => 'x', -padx => 4, -pady => 3);
     my $entry = $bot->Entry->pack(-side => 'left', -fill => 'x', -expand => 1);
-    $mw->Label(-textvariable => \$statusvar, -anchor => 'w', -relief => 'sunken')
-       ->pack(-fill => 'x', -side => 'bottom');
+    # Status bar wraps to the window width so long messages (join-request
+    # waiting-for, owner lists, error chains) don't get clipped on narrow
+    # windows. -wraplength is in pixels; we update it on resize so the
+    # bar grows with the toplevel.
+    my $status_lbl = $mw->Label(-textvariable => \$statusvar, -anchor => 'w',
+        -justify => 'left', -relief => 'sunken', -wraplength => 600);
+    $status_lbl->pack(-fill => 'x', -side => 'bottom');
 
     my $set_status = sub { $statusvar = $_[0] };
     my $set_font = sub {
@@ -1714,16 +1724,48 @@ sub cmd_gui {
 
     $om->configure(-command => sub {
         $sessvar eq $NEWCHAT ? $new_chat->() : $follow->($sessvar) });
-    $top->Button(-text => 'Refresh', -command => $refresh)->pack(-side => 'right');
-    $top->Button(-text => 'History', -command => $load_history)->pack(-side => 'right');
-    $top->Button(-text => 'terminal', -command => $launch_term)->pack(-side => 'right');
-    # font size controls
-    $top->Button(-text => 'A+', -width => 2,
-                 -command => sub { $fontsize++ if $fontsize < 32; $set_font->() })
-        ->pack(-side => 'right');
-    $top->Button(-text => 'A-', -width => 2,
-                 -command => sub { $fontsize-- if $fontsize > 6; $set_font->() })
-        ->pack(-side => 'right');
+    # Action buttons. Pack on the right of $top when the window is wide
+    # enough; on a narrow window, fold into a second row below $top.
+    # Buttons are children of $mw so we can re-pack them with -in => $top
+    # (wide) or -in => $top2 (narrow) without re-parenting.
+    my $top2 = $mw->Frame;   # not packed yet
+    my $refresh_btn = $mw->Button(-text => 'Refresh', -command => $refresh);
+    my $history_btn = $mw->Button(-text => 'History', -command => $load_history);
+    my $term_btn    = $mw->Button(-text => 'terminal', -command => $launch_term);
+    my $aplus_btn   = $mw->Button(-text => 'A+', -width => 2,
+        -command => sub { $fontsize++ if $fontsize < 32; $set_font->() });
+    my $aminus_btn  = $mw->Button(-text => 'A-', -width => 2,
+        -command => sub { $fontsize-- if $fontsize > 6; $set_font->() });
+    my @action_btns = ($refresh_btn, $history_btn, $term_btn, $aplus_btn, $aminus_btn);
+    # Initial pack: side-by-side in $top (wide). Reflow on <Configure>.
+    $_->pack(-in => $top, -side => 'right') for @action_btns;
+
+    # Width threshold at which the action buttons fold to row 2. Picked by
+    # measuring the bare-minimum layout (server picker + chat picker + a
+    # few topic chars) so the fold kicks in only when truly cramped. Both
+    # the topbar fold AND the status label wraplength rebind to current
+    # window width so they grow with the toplevel.
+    my $folded = 0;
+    my $reflow_topbar = sub {
+        my $w = $mw->width;
+        return unless defined $w && $w > 1;   # initial firing has bogus width
+        $status_lbl->configure(-wraplength => $w - 20) if $status_lbl;
+        my $thresh = 720;
+        if ($w < $thresh && !$folded) {
+            $_->packForget for @action_btns;
+            $top2->pack(-fill => 'x', -padx => 4, -pady => [0, 3], -after => $top);
+            for my $b (@action_btns) {
+                $b->pack(-in => $top2, -side => 'right', -padx => 2);
+            }
+            $folded = 1;
+        } elsif ($w >= $thresh && $folded) {
+            $_->packForget for @action_btns;
+            $top2->packForget;
+            $_->pack(-in => $top, -side => 'right') for @action_btns;
+            $folded = 0;
+        }
+    };
+    $mw->bind('<Configure>', $reflow_topbar);
 
     my $send = sub {
         my $body = $entry->get;
@@ -1755,9 +1797,22 @@ sub cmd_gui {
                 chomp $jerr;
                 $set_status->("post needs membership; join failed: $jerr");
             } elsif ($state eq 'requested') {
-                $set_status->("post needs membership — join request "
-                            . "sent for '$cur'; waiting for an owner "
-                            . "to approve. Type stays in the box.");
+                # Name the actual owners + the principal we were
+                # identified as, so the user knows WHO has to approve
+                # and WHAT they'll see. Owners come from chat_members
+                # (role='owner', state='member'); fall back to the
+                # session's created_by row if no chat_members owners
+                # exist (single-creator session). Identity comes from
+                # the chat_join reply ($jr->{principal}) so the user
+                # sees the exact name the owner will see.
+                my @owners = _gui_session_owners($cur);
+                my $me_id  = ($jr && ref $jr eq 'HASH')
+                           ? ($jr->{principal} // '') : '';
+                $me_id ||= ($as // '');
+                my $owner_str = @owners ? join(', ', @owners) : '(unknown)';
+                $set_status->("join request sent for '$cur' "
+                            . "as '$me_id'; waiting for: $owner_str. "
+                            . "Text stays in the box.");
                 # Keep the entry text so the user can retry once admitted
                 # — no $entry->delete here.
                 return;
@@ -1950,6 +2005,41 @@ sub cmd_askpass {
 # success or () if the user cancelled (MainWindow destroyed). Loops until one
 # of those terminal outcomes — connect+auth retries with whatever the user just
 # changed ($key_file/$key_id/$no_auth/$force_auth).
+# Approvers for a chat session: every chat_members principal with
+# role='owner' and state='member', plus the session's created_by as a
+# fallback when no chat_members owner row exists. Returns a sorted
+# unique list of principal strings (typically "user@host" key-ids).
+# Called from $send's join-request path so the UI can surface WHO can
+# approve, not just "an owner".
+sub _gui_session_owners {
+    my ($name) = @_;
+    return () unless defined $name && length $name;
+    my $c = eval { connect_client(want_auth => 0) } or return ();
+    my $mrows = eval {
+        $c->snapshot(1, 'chat_members',
+            where => "session = '$name' AND role = 'owner' AND state = 'member'");
+    } || [];
+    my %seen;
+    my @out;
+    for my $r (@$mrows) {
+        my $p = $r->{principal};
+        next unless defined $p && length $p;
+        next if $seen{$p}++;
+        push @out, $p;
+    }
+    unless (@out) {
+        my $srows = eval {
+            $c->snapshot(2, 'chat_sessions', where => "name = '$name'");
+        } || [];
+        if (@$srows) {
+            my $cb = $srows->[0]{created_by};
+            push @out, $cb if defined $cb && length $cb;
+        }
+    }
+    eval { $c->bye };
+    return sort @out;
+}
+
 sub _gui_connect_with_dialog {
     my ($mw) = @_;
     while (1) {
