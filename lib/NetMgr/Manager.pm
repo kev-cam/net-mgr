@@ -1810,6 +1810,24 @@ sub _handle_heartbeat {
             );
         };
         $self->_log("caps: set_node_capabilities($member) failed: $@") if $@;
+
+        # Also refresh our OWN row while we're at it. The master doesn't
+        # receive its own HB, so relying purely on the received-HB path
+        # would leave a hole where the master's own line never lands. Any
+        # peer's HB fires this, but the write is idempotent (ON DUPLICATE
+        # KEY UPDATE) and cheap, so no rate-limit needed. Compared to
+        # doing this on CLUSTER_ROLE=master alone, this survives the case
+        # where the daemon re-execs mid-mastership (self_update flow)
+        # without a re-election firing.
+        my $me = $self->{cluster}{self_name};
+        if (defined $me && length $me && $me ne $member) {
+            eval {
+                $self->{db}->set_node_capabilities(
+                    member       => $me,
+                    capabilities => NetMgr::Caps::as_string(),
+                );
+            };
+        }
     }
 }
 
