@@ -20,6 +20,7 @@ use NetMgr::Addr qw(split_hostport join_hostport local_addrs addr_in_prefix);
 use NetMgr::Vlan ();
 use NetMgr::Tunnel ();
 use NetMgr::Ddns ();
+use NetMgr::Caps ();
 use IO::Select;
 use Time::HiRes qw(time);
 use FindBin ();
@@ -42,7 +43,7 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
     audit_annotations wifi_scan_results wifi_radio_state
     chat_sessions chat_members chat_messages chat_presence
     host_keys dhcp_ranges dhcp_reservations
-    mesh_tunnels
+    mesh_tunnels node_capabilities
 );
 
 # Tables whose contents are sensitive (credentials etc.); SUBSCRIBE
@@ -1090,10 +1091,15 @@ sub _start_mesh {
         state_fn  => sub {
             my $cr = $self->{cluster_runtime} // {};
             return (
-                role     => ($cr->{role}     // $cs->{role}),
-                priority => $cs->{priority},
-                master   => ($cr->{master_member} // ''),
-                schema_v => (eval { $self->{db}->current_schema_version } // 0),
+                role         => ($cr->{role}     // $cs->{role}),
+                priority     => $cs->{priority},
+                master       => ($cr->{master_member} // ''),
+                schema_v     => (eval { $self->{db}->current_schema_version } // 0),
+                # Advertised capability set — comma-separated so the whole
+                # thing fits one HB kv token (Protocol::_parse_kv_only accepts
+                # any [A-Za-z_]\w*=(.*), no parser change needed). Cached
+                # after the first call so this fires at zero cost per HB.
+                capabilities => NetMgr::Caps::as_string(),
             );
         },
     );
@@ -1571,6 +1577,11 @@ sub _handle_status {
         # Self-declared (advisory; consumers may verify against
         # their own peer_caps table before trusting it).
         cluster_capabilities => join(',', @{ $cs->{capabilities} // [] }),
+        # Runtime host capabilities (BLE, IPv6 fwd, gateway, wifi_ap,
+        # cargo, ...) — comma-separated. Same set the mesh HB emits,
+        # exposed here so a caller without a HB slot (net-cluster
+        # --capable=<x>) can filter from STATUS alone. See NetMgr::Caps.
+        node_capabilities => NetMgr::Caps::as_string(),
         # Count of entries in this daemon's local /etc/net-mgr/peers
         # table — operators can spot-check that peers agree on roster
         # size and authority spread.
@@ -1781,6 +1792,25 @@ sub _handle_heartbeat {
     my $member = $kv->{member};
     return unless defined $member && length $member;
     $self->{mesh}->record($member, $kv);
+
+    # Master persists the reporter's capabilities so consumers (net-cluster
+    # --capable=X, the bitchat-bridge placement logic, etc.) can query one
+    # host instead of round-tripping every peer's STATUS. Only masters
+    # write — followers accept HBs the same way but leave the table alone,
+    # so a bounced master doesn't briefly overwrite with stale followers'
+    # views. New/unknown keys arrive with capabilities= untouched from the
+    # peer, so no filtering here (any peer can claim any capability; the
+    # trust boundary is the daemon's own probe, not us).
+    my $cr = $self->{cluster_runtime} // {};
+    if (($cr->{role} // '') eq 'master' && exists $kv->{capabilities}) {
+        eval {
+            $self->{db}->set_node_capabilities(
+                member       => $member,
+                capabilities => $kv->{capabilities},
+            );
+        };
+        $self->_log("caps: set_node_capabilities($member) failed: $@") if $@;
+    }
 }
 
 # Loopback-only control verb. net-mgr-relay calls this after its

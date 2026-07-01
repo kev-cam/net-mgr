@@ -44,7 +44,7 @@ LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Addr.pm NetMgr/Vlan.pm NetMgr/
         NetMgr/Manager.pm NetMgr/Client.pm NetMgr/Multi.pm NetMgr/Mesh.pm \
         NetMgr/Election.pm NetMgr/AutoDiscover.pm NetMgr/Resolver.pm \
         NetMgr/Relay.pm NetMgr/Vendor.pm NetMgr/Subnets.pm \
-        NetMgr/HostDebug.pm NetMgr/Auth.pm NetMgr/ChatArchive.pm \
+        NetMgr/HostDebug.pm NetMgr/Auth.pm NetMgr/ChatArchive.pm NetMgr/Caps.pm \
         NetMgr/Producer/AP.pm NetMgr/Producer/Scan.pm \
         NetMgr/Producer/DhcpMaster.pm NetMgr/Producer/Fingerprint.pm
 

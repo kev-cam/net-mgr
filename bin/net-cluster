@@ -49,6 +49,7 @@ my $ignore_opt;
 my $auth;
 my $json;
 my $quiet_diff;
+my $capable_opt;
 my $help;
 GetOptions(
     'listen=s'   => \$listen,
@@ -58,6 +59,7 @@ GetOptions(
     'where=s'    => \$where_opt,
     'ignore=s'   => \$ignore_opt,
     'auth'       => \$auth,
+    'capable=s'  => \$capable_opt,
     'json'       => \$json,
     'quiet-diff' => \$quiet_diff,
     'help|h'     => \$help,
@@ -91,6 +93,32 @@ if ($peers_opt) {
     $multi = NetMgr::Multi->discover(seed => $listen, %mk_args);
 }
 $multi->connect_all;
+
+# --capable=a,b — filter peers to those whose STATUS advertises ALL the
+# named capabilities in node_capabilities. Applied before the command
+# dispatch so `--capable=ble status/peers/update/observe/...` all just
+# work uniformly. Peers that don't answer STATUS (unreachable) drop out
+# — you can't confirm they have BLE, so they don't count as capable.
+if (defined $capable_opt && length $capable_opt) {
+    my @want = grep { length } split /[,\s]+/, $capable_opt;
+    if (@want) {
+        my $st = eval { $multi->status_all } || {};
+        my @kept;
+        for my $p ($multi->peers) {
+            my $s = $st->{ $p->{name} } || {};
+            my $caps = $s->{node_capabilities} // '';
+            my %have = map { $_ => 1 } grep { length } split /,/, $caps;
+            my $ok = 1;
+            for my $w (@want) { $ok = 0, last unless $have{$w} }
+            push @kept, $p if $ok;
+        }
+        # NetMgr::Multi exposes peers via ->peers (list) but the underlying
+        # store is $multi->{peers} — an arrayref of hashrefs. Reassign in
+        # place so every downstream method (bye_all, status_all, snapshot_all)
+        # sees the filtered set.
+        @{ $multi->{peers} } = @kept;
+    }
+}
 
 my $connected = grep { $_->{client} } $multi->peers;
 if (!$connected) {
@@ -135,8 +163,18 @@ sub cmd_peers {
 sub cmd_status {
     my ($m) = @_;
     my $st = $m->status_all;
-    printf "%-20s %-9s %-4s %-7s %-7s %-10s %s\n",
-        'PEER', 'ROLE', 'PRI', 'REACH', 'QUORUM', 'MASTER', 'MESH';
+    # Show the CAPS column only when at least one peer reports something.
+    # On older masters (no schema v32) the field is absent and printing an
+    # empty column just adds noise.
+    my $show_caps = grep { length($_->{node_capabilities} // '') }
+                    values %$st;
+    if ($show_caps) {
+        printf "%-20s %-9s %-4s %-7s %-7s %-10s %-24s %s\n",
+            'PEER', 'ROLE', 'PRI', 'REACH', 'QUORUM', 'MASTER', 'CAPS', 'MESH';
+    } else {
+        printf "%-20s %-9s %-4s %-7s %-7s %-10s %s\n",
+            'PEER', 'ROLE', 'PRI', 'REACH', 'QUORUM', 'MASTER', 'MESH';
+    }
     for my $p ($m->peers) {
         my $s = $st->{ $p->{name} };
         if (!$s) {
@@ -144,14 +182,28 @@ sub cmd_status {
                 ($p->{error} // 'no status');
             next;
         }
-        printf "%-20s %-9s %-4s %-7s %-7s %-10s %s\n",
-            $p->{name},
-            $s->{cluster_role}      // '?',
-            $s->{cluster_priority}  // '?',
-            $s->{reachable_members} // '?',
-            ($s->{quorum_ok} ? 'yes' : 'no'),
-            ($s->{cluster_master} // '-') || '-',
-            $s->{cluster_mesh}      // '';
+        if ($show_caps) {
+            my $caps = $s->{node_capabilities} // '';
+            $caps = substr($caps, 0, 21) . '...' if length($caps) > 24;
+            printf "%-20s %-9s %-4s %-7s %-7s %-10s %-24s %s\n",
+                $p->{name},
+                $s->{cluster_role}      // '?',
+                $s->{cluster_priority}  // '?',
+                $s->{reachable_members} // '?',
+                ($s->{quorum_ok} ? 'yes' : 'no'),
+                ($s->{cluster_master} // '-') || '-',
+                $caps,
+                $s->{cluster_mesh}      // '';
+        } else {
+            printf "%-20s %-9s %-4s %-7s %-7s %-10s %s\n",
+                $p->{name},
+                $s->{cluster_role}      // '?',
+                $s->{cluster_priority}  // '?',
+                $s->{reachable_members} // '?',
+                ($s->{quorum_ok} ? 'yes' : 'no'),
+                ($s->{cluster_master} // '-') || '-',
+                $s->{cluster_mesh}      // '';
+        }
         # Diagnostics under the row — only printed when present so
         # healthy clusters stay quiet. These are what you need when
         # role stays 'auto' on a peer you expect to be electable.

@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 31;
+our $SCHEMA_VERSION = 32;
 
 sub new {
     my ($class, %args) = @_;
@@ -719,6 +719,27 @@ SQL
         $self->{dbh}->do(
             "ALTER TABLE chat_members ADD COLUMN requested_from VARCHAR(64) NULL"
         );
+        return;
+    }
+    if ($v == 32) {
+        # node_capabilities: per-mesh-member snapshot of the host's runtime
+        # capabilities (BLE, IPv6 forwarding, gateway, wifi_ap, cargo, ...).
+        # Published by each daemon via HEARTBEAT and persisted by the master.
+        # Lets consumers (net-cluster --capable=ble, the bitchat-bridge site
+        # picker, etc.) route mesh work to hosts that can do it, without
+        # walking every daemon's STATUS live. Keyed by mesh member name
+        # because HEARTBEAT identifies by member (not host:port).
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS node_capabilities (
+    member          VARCHAR(64)  NOT NULL,
+    capabilities    TEXT         NOT NULL,
+    updated_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                 ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from VARCHAR(64)  NULL,
+    PRIMARY KEY (member),
+    KEY idx_nc_replicated (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
         return;
     }
     if ($v == 27) {
@@ -2477,7 +2498,7 @@ sub query_table {
         chat_sessions chat_members chat_messages chat_presence
         chat_authorized_keys
         host_keys dhcp_ranges dhcp_reservations
-        mesh_tunnels
+        mesh_tunnels node_capabilities
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};
@@ -2615,6 +2636,44 @@ sub count_stale_addresses {
             AND (source IS NULL OR source <> 'manual')",
         undef, $days, $days);
     return $n // 0;
+}
+
+# ---- node_capabilities (schema v32) ------------------------------------
+
+# Fetch the capability row for one mesh member (returns hashref or undef).
+sub get_node_capabilities {
+    my ($self, $member) = @_;
+    return unless defined $member && length $member;
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM node_capabilities WHERE member = ?", undef, $member);
+}
+
+# List all known members with their capabilities. Handy for
+# net-cluster --capable=<x> and for the STATUS-time render.
+sub list_node_capabilities {
+    my ($self) = @_;
+    return $self->{dbh}->selectall_arrayref(
+        "SELECT member, capabilities, updated_at, replicated_from
+           FROM node_capabilities
+          ORDER BY member", { Slice => {} }) || [];
+}
+
+# Upsert one member's capabilities. Writers: the master's _handle_heartbeat
+# (member=peer, replicated_from=undef) and REFRESH replication paths
+# (replicated_from=source of the copy). caps is a comma-separated string:
+#   'ble,ipv6,gateway'
+sub set_node_capabilities {
+    my ($self, %f) = @_;
+    croak "member required" unless defined $f{member} && length $f{member};
+    my $caps = $f{capabilities} // '';
+    $self->{dbh}->do(
+        "INSERT INTO node_capabilities (member, capabilities, replicated_from)
+         VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            capabilities    = VALUES(capabilities),
+            replicated_from = COALESCE(VALUES(replicated_from), replicated_from)",
+        undef, $f{member}, $caps, $f{replicated_from});
+    return { op => 'update', now => $self->get_node_capabilities($f{member}) };
 }
 
 1;
