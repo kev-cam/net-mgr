@@ -1299,16 +1299,27 @@ sub cmd_gui {
         my $kh   = _ssh_knows($host, $name, ($cfgname // ())) ? 1 : 0;
         $cand{$addr} //= { name => $name, kh => $kh };   # first (config) wins
     }
-    # Labels, disambiguating shared names by appending the host.
-    my %n_addrs;
-    push @{ $n_addrs{ $cand{$_}{name} } }, $_ for keys %cand;
+    # Amalgamate by short name: 3 addresses that all resolve to "nas3"
+    # collapse to ONE dropdown entry labelled "nas3". Pick a canonical
+    # address per name preferring, in order:
+    #   1. the currently-active $listen (so "nas3" in the picker still
+    #      maps to whichever nas3 address you happen to be on)
+    #   2. a known_hosts entry (proves you've reached it before)
+    #   3. the first alphabetical address (deterministic tiebreak)
+    # The un-chosen addresses vanish from the picker — pass --listen
+    # <addr> on the CLI if you need a specific physical interface.
+    my %by_name;
+    push @{ $by_name{ $cand{$_}{name} } }, $_ for keys %cand;
     my %label2addr;
-    for my $addr (keys %cand) {
-        my $name  = $cand{$addr}{name};
-        my $label = (@{ $n_addrs{$name} } > 1)
-                    ? "$name (" . $host_of->($addr) . ")" : $name;
-        $label2addr{$label} = $addr;
-        $cand{$addr}{label} = $label;
+    for my $name (sort keys %by_name) {
+        my @addrs = @{ $by_name{$name} };
+        my $chosen;
+        if (my ($a) = grep { $_ eq $listen } @addrs)          { $chosen = $a }
+        elsif (my ($a) = grep { $cand{$_}{kh} } sort @addrs)  { $chosen = $a }
+        else                                                  { $chosen = (sort @addrs)[0] }
+        $label2addr{$name}      = $chosen;
+        $cand{$chosen}{label}   = $name;
+        $cand{$chosen}{addrs}   = [ sort @addrs ];   # for tooltip
     }
     # known_hosts first, then by name (case-insensitive).
     my @opts = sort {
@@ -1319,7 +1330,7 @@ sub cmd_gui {
     if (@opts > 1) {
         my $srvvar = $cand{$listen}{label} // $listen;
         $top->Label(-text => 'server:')->pack(-side => 'left');
-        $top->Optionmenu(-variable => \$srvvar, -options => \@opts,
+        my $srv_om = $top->Optionmenu(-variable => \$srvvar, -options => \@opts,
             -command => sub {
                 my $addr = $label2addr{$srvvar} // $srvvar;
                 return if $addr eq $listen;
@@ -1333,7 +1344,27 @@ sub cmd_gui {
                 push @argv, '--as',       $as         if defined $as;
                 push @argv, $cur                      if defined $cur;
                 exec $^X, $0, @argv;
-            })->pack(-side => 'left');
+            });
+        $srv_om->pack(-side => 'left');
+        # Tooltip lists the collapsed addresses so the operator can see
+        # what "nas3" actually maps to under the hood — plus the active
+        # one. Cheap to lazy-load Tk::Balloon if it hasn't already been
+        # loaded for the send/upload buttons further down.
+        require Tk::Balloon;
+        my $bln = $mw->Balloon(-state => 'balloon', -initwait => 500);
+        my $tip = "Chosen for each name — addresses collapse to one entry.\n\n";
+        for my $lbl (@opts) {
+            my $addr = $label2addr{$lbl};
+            my $addrs = $cand{$addr}{addrs} || [$addr];
+            my $star  = ($addr eq $listen) ? ' *' : '';
+            $tip .= sprintf "  %s%s\n", $lbl, $star;
+            for my $a (@$addrs) {
+                my $mark = ($a eq $addr) ? '→' : ' ';
+                $tip .= sprintf "      %s %s\n", $mark, $a;
+            }
+        }
+        $tip .= "\n* = active   → = chosen for that name";
+        $bln->attach($srv_om, -msg => $tip);
         # Persist the active server as the user-config default (a config name
         # when the address has one, else the literal address).
         $top->Button(-text => 'set default', -command => sub {
