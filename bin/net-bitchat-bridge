@@ -32,6 +32,7 @@ use IPC::Open3;
 use IO::Select;
 use Symbol qw(gensym);
 use JSON::PP;
+use POSIX qw(WNOHANG);
 use NetMgr::Client;
 use NetMgr::Config;
 
@@ -130,6 +131,15 @@ while (1) {
         warn "[bridge] helper exited (code=" . ($exit // '?') . ")\n";
     }
     last if $opt{once};
+    # Belt-and-braces reap. run_once's blocking waitpid at line ~232 catches
+    # the main helper PID, but the Rust helper's bluer runtime can hand a
+    # forked-off thread (BLE central task, dbus worker) inherited pipe FDs
+    # that outlive the main process — those exit right after but never get
+    # reaped by us, showing up as <defunct> in ps. WNOHANG so this doesn't
+    # stall between crash + backoff.
+    while ((my $reaped = waitpid(-1, WNOHANG)) > 0) {
+        warn "[bridge] reaped stray child pid=$reaped exit=" . ($? >> 8) . "\n";
+    }
     sleep $backoff;
     $backoff = $backoff >= 30 ? 30 : $backoff * 2;
     # Successful run resets backoff (we only get here if helper actually
