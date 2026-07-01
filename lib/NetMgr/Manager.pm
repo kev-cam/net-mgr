@@ -1487,6 +1487,9 @@ sub _handle_line {
     elsif ($verb eq 'CHAT_DENY')      { $self->_handle_chat_member_op($cli, $cmd, 'deny') }
     elsif ($verb eq 'CHAT_APPROVE')   { $self->_handle_chat_member_op($cli, $cmd, 'approve') }
     elsif ($verb eq 'CHAT_REJECT')    { $self->_handle_chat_member_op($cli, $cmd, 'reject') }
+    elsif ($verb eq 'CHAT_PROMOTE')       { $self->_handle_chat_role_op($cli, $cmd, 'promote') }
+    elsif ($verb eq 'CHAT_DEMOTE')        { $self->_handle_chat_role_op($cli, $cmd, 'demote') }
+    elsif ($verb eq 'CHAT_MEMBER_DELETE') { $self->_handle_chat_member_delete($cli, $cmd) }
     elsif ($verb eq 'CHAT_PUT')       { $self->_handle_chat_put($cli, $cmd) }
     elsif ($verb eq 'CHAT_GET')       { $self->_handle_chat_get($cli, $cmd) }
     elsif ($verb eq 'CHAT_LS')        { $self->_handle_chat_ls($cli, $cmd) }
@@ -3889,6 +3892,99 @@ sub _handle_chat_leave {
 
 # CHAT_ALLOW / DENY / APPROVE / REJECT — owner edits to the membership
 # list. allow/approve → state 'member'; deny/reject → state 'denied'.
+# Change a member's role (promote to owner, demote back to member). Owner-
+# only: only existing owners of the session can transition roles. The
+# target must already be a state='member' row; we don't promote pending
+# requests (they should be approved first, THEN promoted). Refuses to
+# demote the last owner — session would be un-manageable.
+sub _handle_chat_role_op {
+    my ($self, $cli, $cmd, $op) = @_;
+    my $kv = $cmd->{kv} || {};
+    my ($who) = $self->_chat_identity($cli, $kv);
+    my $name = $kv->{session} // $kv->{name};
+    my $principal = $kv->{principal};
+    my $verb = "CHAT_" . uc $op;
+    my $s = $self->{db}->get_chat_session($name)
+        or return $self->_send($cli, format_err(
+            "$verb: no such session '".($name//'')."'"));
+    return $self->_send($cli, format_err("$verb: only owners may $op"))
+        unless $self->_chat_may_admin($cli, $s, $who);
+    return $self->_send($cli, format_err("$verb: missing principal="))
+        unless defined $principal && length $principal;
+    my $existing = $self->{db}->get_chat_member($name, $principal);
+    return $self->_send($cli, format_err(
+        "$verb: '$principal' is not a member of '$name'"))
+        unless $existing && ($existing->{state} // '') eq 'member';
+    my $new_role = ($op eq 'promote') ? 'owner' : 'member';
+    if (($existing->{role} // '') eq $new_role) {
+        return $self->_send($cli, format_ok(session => $name,
+            principal => $principal, role => $new_role, unchanged => 1));
+    }
+    # Demote safety: refuse to demote the last owner.
+    if ($op eq 'demote') {
+        my ($cnt) = $self->{db}->dbh->selectrow_array(
+            "SELECT COUNT(*) FROM chat_members "
+          . "WHERE session=? AND role='owner' AND state='member'",
+            undef, $name);
+        return $self->_send($cli, format_err(
+            "$verb: refuse to demote the last owner of '$name' "
+          . "(close the chat first, or promote another owner)"))
+            if $cnt <= 1;
+    }
+    my $m = $self->{db}->set_chat_member(
+        session => $name, principal => $principal,
+        role => $new_role, state => 'member', added_by => $who);
+    $self->_emit_change(table => 'chat_members', op => 'update', row => $m->{now})
+        if $m->{now};
+    $self->_log("chat $op $name/$principal by $who -> role=$new_role");
+    return $self->_send($cli, format_ok(session => $name,
+        principal => $principal, role => $new_role));
+}
+
+# Delete a chat_members row entirely (as opposed to CHAT_DENY which sets
+# state='denied' but keeps the row). Owner-only. Refuses to delete the
+# last owner. The principal can rejoin later via CHAT_JOIN; this just
+# forgets the current record + its request_pubkey/requested_from.
+sub _handle_chat_member_delete {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my ($who) = $self->_chat_identity($cli, $kv);
+    my $name = $kv->{session} // $kv->{name};
+    my $principal = $kv->{principal};
+    my $s = $self->{db}->get_chat_session($name)
+        or return $self->_send($cli, format_err(
+            "CHAT_MEMBER_DELETE: no such session '".($name//'')."'"));
+    return $self->_send($cli, format_err(
+        "CHAT_MEMBER_DELETE: only owners may delete members"))
+        unless $self->_chat_may_admin($cli, $s, $who);
+    return $self->_send($cli, format_err("CHAT_MEMBER_DELETE: missing principal="))
+        unless defined $principal && length $principal;
+    my $existing = $self->{db}->get_chat_member($name, $principal);
+    return $self->_send($cli, format_err(
+        "CHAT_MEMBER_DELETE: '$principal' is not a member of '$name'"))
+        unless $existing;
+    # Safety: don't delete the last owner (would leave the session
+    # un-manageable). Applies whether the caller IS that owner or another
+    # owner — close the chat first if you're winding it down.
+    if (($existing->{role} // '') eq 'owner'
+        && ($existing->{state} // '') eq 'member') {
+        my ($cnt) = $self->{db}->dbh->selectrow_array(
+            "SELECT COUNT(*) FROM chat_members "
+          . "WHERE session=? AND role='owner' AND state='member'",
+            undef, $name);
+        return $self->_send($cli, format_err(
+            "CHAT_MEMBER_DELETE: refuse to delete the last owner of "
+          . "'$name' (close the chat first)"))
+            if $cnt <= 1;
+    }
+    $self->{db}->delete_chat_member($name, $principal);
+    $self->_emit_change(table => 'chat_members', op => 'delete',
+        row => { session => $name, principal => $principal });
+    $self->_log("chat member-delete $name/$principal by $who");
+    return $self->_send($cli, format_ok(session => $name,
+        principal => $principal, deleted => 1));
+}
+
 sub _handle_chat_member_op {
     my ($self, $cli, $cmd, $op) = @_;
     my $kv = $cmd->{kv} || {};

@@ -456,8 +456,10 @@ sub chat_leave {
 # Membership ops: $op is one of allow|deny|approve|reject.
 sub chat_member {
     my ($self, $op, %a) = @_;
-    my %verb = (allow => 'CHAT_ALLOW', deny => 'CHAT_DENY',
-                approve => 'CHAT_APPROVE', reject => 'CHAT_REJECT');
+    my %verb = (allow   => 'CHAT_ALLOW',   deny    => 'CHAT_DENY',
+                approve => 'CHAT_APPROVE', reject  => 'CHAT_REJECT',
+                promote => 'CHAT_PROMOTE', demote  => 'CHAT_DEMOTE',
+                delete  => 'CHAT_MEMBER_DELETE');
     croak "chat_member: bad op '$op'" unless $verb{$op};
     croak "chat_member needs session + principal"
         unless defined $a{session} && defined $a{principal};

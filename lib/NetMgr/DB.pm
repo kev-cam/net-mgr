@@ -2086,6 +2086,16 @@ sub touch_chat_activity {
         undef, $name);
 }
 
+sub delete_chat_member {
+    my ($self, $session, $principal) = @_;
+    return unless defined $session && defined $principal;
+    my $n = $self->{dbh}->do(
+        "DELETE FROM chat_members WHERE session = ? AND principal = ?",
+        undef, $session, $principal);
+    return { session => $session, principal => $principal,
+             deleted => ($n && $n > 0) ? 1 : 0 };
+}
+
 sub get_chat_member {
     my ($self, $session, $principal) = @_;
     return $self->{dbh}->selectrow_hashref(
