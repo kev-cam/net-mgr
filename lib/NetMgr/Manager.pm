@@ -1863,6 +1863,22 @@ sub _handle_cluster_role {
     $self->_log("cluster_role=$role"
               . ($master ? " master=$master" : '')
               . " (set by $cli->{peer})");
+    # When we take the master role, persist our OWN capabilities row
+    # immediately: our own HB isn't received back at us, so without this
+    # the master's own line never lands in node_capabilities and callers
+    # asking "which nodes have BLE?" get the master's peers only.
+    if ($role eq 'master') {
+        my $me = $self->{cluster}{self_name};
+        if (defined $me && length $me) {
+            eval {
+                $self->{db}->set_node_capabilities(
+                    member       => $me,
+                    capabilities => NetMgr::Caps::as_string(),
+                );
+            };
+            $self->_log("caps: set_node_capabilities(self=$me) failed: $@") if $@;
+        }
+    }
     return $self->_send($cli, format_ok(
         role   => $role,
         master => ($master // ''),
