@@ -1153,6 +1153,21 @@ sub cmd_gui {
     # to MainLoop and the assignment has landed.
     my $set_status;
 
+    # Forward-declared for the server-picker Optionmenu -command below (defined
+    # further up in the layout code). The actual sub is filled in near the end
+    # of cmd_gui, after every closure it needs ($refresh, $stream_reader, etc.)
+    # has been assigned. Doing an in-place switch (rather than exec'ing net-chat
+    # into itself with a new --listen) keeps the window position, session menu
+    # scroll, message-log widget, and Tk::Balloon state intact.
+    my $switch_server;
+    # The Tk fileevent handler that drains the SUBSCRIBE stream socket. Lifted
+    # out of its original inline `$mw->fileevent(..., sub { ... })` so the
+    # in-place server-switch can cancel it on the old socket and re-bind the
+    # SAME closure on the new one. The closure captures $stream by lexical
+    # reference — reassigning $stream on switch is enough for the reader to
+    # see the new object without redefinition.
+    my $stream_reader;
+
     # Non-blocking notice: tell the user they're anonymous so they aren't
     # surprised when posts get refused. Replaces the old info messageBox
     # — that one couldn't offer to sign in. This dialog has the same SSH
@@ -1376,13 +1391,26 @@ sub cmd_gui {
             || lc($a) cmp lc($b)
     } keys %label2addr;
 
+    # $srvvar drives the picker's -variable AND is updated by $switch_server
+    # when a switch reverts to the old server (so the visible label matches
+    # reality). Declared outside the `if` so switch_server (further down) can
+    # see it even when the picker itself isn't shown.
+    my $srvvar = $cand{$listen}{label} // $listen;
     if (@opts > 1) {
-        my $srvvar = $cand{$listen}{label} // $listen;
         $top->Label(-text => 'server:')->pack(-side => 'left');
         my $srv_om = $top->Optionmenu(-variable => \$srvvar, -options => \@opts,
             -command => sub {
                 my $addr = $label2addr{$srvvar} // $srvvar;
                 return if $addr eq $listen;
+                # $switch_server is a forward-declared lexical filled in near
+                # the end of cmd_gui (after $refresh, $follow, $stream_reader
+                # exist). Guard against a picker fire during early layout: if
+                # it isn't set yet, fall back to the old exec path so the user
+                # still lands on the picked server, just via a fresh process.
+                if ($switch_server) {
+                    $switch_server->($addr);
+                    return;
+                }
                 eval { $ctrl->chat_leave(session => $cur) } if defined $cur;
                 eval { $ctrl->bye }; eval { $stream->bye };
                 my @argv = ('--gui', '--listen', $addr);
@@ -2159,6 +2187,22 @@ sub cmd_gui {
         };
         $populate->();
 
+        # Pin a min-size after the first populate so a Delete doesn't snap the
+        # dialog to a smaller natural size on the first row removal. Tk's
+        # default geometry manager auto-fits the Toplevel to the current
+        # requested size of its packed contents, and the FIRST time we destroy
+        # + rebuild $list_frame with fewer rows the outer window shrinks;
+        # subsequent deletes look stable only because the dialog is already at
+        # natural size. Deferring via `after idle` runs this AFTER the window
+        # is actually realized on screen — width()/height() before then can
+        # return 1 (unmapped default) and pin a useless minsize=1x1. Reqwidth
+        # /reqheight are the widget's computed natural size, safe regardless
+        # of mapping state.
+        $dlg->after(0, sub {
+            my ($w, $h) = ($dlg->reqwidth, $dlg->reqheight);
+            $dlg->minsize($w, $h) if $w > 20 && $h > 20;
+        });
+
         # Add a new member by Key ID (= principal in remote allowed_signers).
         # Uses CHAT_ALLOW which puts them straight on the allow-list as a
         # member without requiring a join request.
@@ -2379,8 +2423,13 @@ sub cmd_gui {
     $balloon->attach($history_btn,
         -msg => "Load one older message into the pane (per click).");
 
-    # live reader: drain all complete lines without blocking the event loop
-    $mw->fileevent($stream->{sock}, 'readable', sub {
+    # live reader: drain all complete lines without blocking the event loop.
+    # Assigned to the forward-declared $stream_reader so the server-switch
+    # path can cancel this handler on the outgoing socket and re-bind the
+    # same closure on the new one. The body reads through the $stream
+    # lexical, so a reassignment of $stream (inside $switch_server below) is
+    # picked up automatically — no need to redefine the reader.
+    $stream_reader = sub {
         my $got = 0;
         while (defined(my $line = $stream->recv_line(0))) {
             $got++;
@@ -2403,7 +2452,7 @@ sub cmd_gui {
             my $n = sysread($stream->{sock}, my $b, 4096);
             if (defined $n && $n == 0) {
                 $mw->fileevent($stream->{sock}, 'readable', '');
-                $set_status->('disconnected (daemon gone) -- restart to reconnect');
+                $set_status->('disconnected (daemon gone) -- pick a server to reconnect');
                 $cur = undef;
                 $sessvar = 'select';
                 $om->menu->delete(0, 'end');
@@ -2412,10 +2461,101 @@ sub cmd_gui {
                 $stream->{buf} .= $b;
             }
         }
-    });
+    };
+    $mw->fileevent($stream->{sock}, 'readable', $stream_reader);
     # watch join requests across all sessions (filtered to ours in the popup)
     $stream->send_line('SUBSCRIBE sub=2 mode=snapshot+stream'
                      . " FROM chat_members WHERE state = 'requested'");
+
+    # In-place server switch (used by the top-bar server picker). Tears the
+    # current $stream + $ctrl down cleanly, updates $listen, reconnects
+    # against the new address (with the same auth-failure fallback machinery
+    # the initial connect uses), re-binds the SAME stream reader on the new
+    # socket, then re-populates the session menu. Preserves the MainWindow,
+    # font size, message log widget, and Tk::Balloon state — no exec, no
+    # visible flash.
+    #
+    # If the reconnect fails or the user cancels the auth-failure dialog,
+    # we STAY on the current server (revert $listen, keep the existing
+    # $stream/$ctrl) — the alternative (destroy $mw) would be the same as
+    # a hard exit, which is worse than "the switch didn't take".
+    $switch_server = sub {
+        my ($addr) = @_;
+        return if $addr eq $listen;
+        my $old_listen  = $listen;
+        my $wanted      = $cur;   # try to re-follow this session on new server
+
+        # Announce departure to the old daemon and stop the reader firing
+        # against a socket that's about to be closed.
+        eval { $ctrl->chat_leave(session => $cur) } if defined $cur;
+        eval { $stream->send_line('UNSUB sub=1') };
+        eval { $stream->send_line('UNSUB sub=2') };
+        eval { $mw->fileevent($stream->{sock}, 'readable', '') };
+        my $old_stream = $stream;
+        my $old_ctrl   = $ctrl;
+
+        # Try new. _gui_connect_with_dialog handles the auth-failure retry
+        # loop; on_cancel here is a NO-OP so a cancelled dialog just leaves
+        # us on the old server instead of exiting the GUI.
+        $listen = $addr;
+        my $cancelled = 0;
+        my ($new_stream, $new_ctrl) = _gui_connect_with_dialog(
+            $mw, on_cancel => sub { $cancelled = 1 });
+
+        if (!$new_stream || !$new_ctrl) {
+            # Revert. The old sockets are still alive (we sent UNSUB but
+            # didn't close them), so rebind the reader against $old_stream
+            # and carry on.
+            $listen = $old_listen;
+            $stream = $old_stream;
+            $ctrl   = $old_ctrl;
+            eval { $mw->fileevent($stream->{sock}, 'readable', $stream_reader) };
+            # Re-arm the watcher subscription that we UNSUB'd above so join
+            # requests keep landing in the popup.
+            eval {
+                $stream->send_line('SUBSCRIBE sub=2 mode=snapshot+stream'
+                                 . " FROM chat_members WHERE state = 'requested'");
+                if (defined $cur) {
+                    $stream->send_line("SUBSCRIBE sub=1 mode=stream"
+                                     . " FROM chat_messages WHERE session = '$cur'");
+                }
+            };
+            # Restore the picker label so it reflects the still-live server.
+            $srvvar = $cand{$listen}{label} // $listen;
+            $set_status->($cancelled
+                          ? "stayed on $old_listen (switch cancelled)"
+                          : "switch to $addr failed - stayed on $old_listen");
+            return;
+        }
+
+        # Success — retire the old sockets and swap.
+        eval { $old_ctrl->bye };
+        eval { $old_stream->bye };
+        $stream = $new_stream;
+        $ctrl   = $new_ctrl;
+        $mw->fileevent($stream->{sock}, 'readable', $stream_reader);
+        $stream->send_line('SUBSCRIBE sub=2 mode=snapshot+stream'
+                         . " FROM chat_members WHERE state = 'requested'");
+
+        # Reset the current-session state; $refresh + optional $follow
+        # below will re-establish it against the new server.
+        $cur     = undef;
+        $sessvar = 'select';
+        $clear->();
+        $refresh->();
+
+        # Re-follow the same session on the new server if it exists there
+        # too — otherwise leave the user on the session picker. $refresh
+        # populated %status; a session that survived the switch shows up
+        # as an entry in the Optionmenu.
+        if (defined $wanted && exists $status{$wanted}) {
+            $sessvar = $wanted;
+            $follow->($wanted);
+        } else {
+            $set_status->("connected to $addr - pick a session"
+                          . (defined $wanted ? " ('$wanted' isn't on $addr)" : ""));
+        }
+    };
 
     $mw->protocol('WM_DELETE_WINDOW', sub {
         eval { $ctrl->chat_leave(session => $cur) } if defined $cur;
@@ -2531,7 +2671,11 @@ sub _gui_session_owners {
 }
 
 sub _gui_connect_with_dialog {
-    my ($mw) = @_;
+    my ($mw, %opts) = @_;
+    # on_cancel lets a mid-session caller (the server-switch path) treat a
+    # dialog cancel as "stay on the old server" instead of exiting the GUI —
+    # startup callers keep the default (destroy $mw, exit).
+    my $on_cancel = $opts{on_cancel} // sub { $mw->destroy };
     while (1) {
         my ($stream, $ctrl);
         my $err = '';
@@ -2563,7 +2707,7 @@ sub _gui_connect_with_dialog {
         chomp $err;
         my $choice = _auth_failure_dialog($mw, $listen, $err);
         if ($choice eq 'cancel') {
-            $mw->destroy;
+            $on_cancel->();
             return ();
         }
         elsif (ref $choice eq 'HASH' && $choice->{no_auth}) {
@@ -2581,7 +2725,7 @@ sub _gui_connect_with_dialog {
         }
         else {
             # unknown — bail rather than spin
-            $mw->destroy; return ();
+            $on_cancel->(); return ();
         }
     }
 }
