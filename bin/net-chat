@@ -1468,6 +1468,62 @@ sub cmd_gui {
     my $om = $top->Optionmenu(-variable => \$sessvar,
                               -options => ['select', $NEWCHAT])
                  ->pack(-side => 'left');
+
+    # BitChat scope selector: only meaningful when the current session is
+    # the bitchat-bridge (which is scoped at the BLE mesh layer). Options
+    # mirror mainline permissionlesstech/bitchat's ChannelID / GeohashChannelLevel
+    # enums: mesh (BLE broadcast, the default) + geohash-precision channels
+    # from finest (building=8 chars) to coarsest (region=2). For the geohash-
+    # scoped ones we also need a geohash string — a small Entry to its right
+    # feeds that. Value is persisted per-user in [net-chat] bitchat_scope /
+    # bitchat_geohash so the selection survives across GUI restarts.
+    my @BITCHAT_SCOPES = ('#mesh', '#building', '#block', '#neighborhood',
+                          '#city', '#province', '#region');
+    my $bitchat_lbl    = $top->Label(-text => 'scope:');
+    my $bitchat_scope  = do {
+        my $s = eval { NetMgr::Config->user_value('net-chat', 'bitchat_scope') };
+        (defined $s && grep { $_ eq $s } @BITCHAT_SCOPES) ? $s : '#mesh';
+    };
+    my $bitchat_geo    = eval { NetMgr::Config->user_value('net-chat', 'bitchat_geohash') } // '';
+    my $bitchat_om     = $top->Optionmenu(
+        -variable => \$bitchat_scope,
+        -options  => \@BITCHAT_SCOPES,
+        -command  => sub {
+            eval { NetMgr::Config->save_user_value('net-chat',
+                       'bitchat_scope', $bitchat_scope) };
+            $set_status->("scope: $bitchat_scope"
+                . ($bitchat_scope ne '#mesh' && !length($bitchat_geo)
+                   ? " (needs a geohash — type one to the right)" : ''))
+                if $set_status;
+        },
+    );
+    my $bitchat_geo_entry = $top->Entry(-textvariable => \$bitchat_geo, -width => 10);
+    # Save the geohash on FocusOut so we don't hammer the config on every keystroke.
+    $bitchat_geo_entry->bind('<FocusOut>' => sub {
+        my $v = $bitchat_geo // '';
+        $v =~ s/^\s+|\s+$//g;
+        eval { NetMgr::Config->save_user_value('net-chat', 'bitchat_geohash', $v) };
+    });
+
+    # Show/hide the scope widgets depending on whether the current chat is
+    # the bitchat bridge. Called from $follow (session-change) below.
+    my $update_bitchat_ui = sub {
+        my ($sess) = @_;
+        my $is_bridge = defined $sess
+                     && ($sess eq 'bitchat-bridge' || $sess =~ /^bitchat[-\/]/);
+        if ($is_bridge) {
+            $bitchat_lbl->pack(-side => 'left', -padx => [8, 0])
+                unless $bitchat_lbl->ismapped;
+            $bitchat_om->pack(-side => 'left')
+                unless $bitchat_om->ismapped;
+            $bitchat_geo_entry->pack(-side => 'left', -padx => [2, 0])
+                unless $bitchat_geo_entry->ismapped;
+        } else {
+            $_->packForget for grep { $_->ismapped }
+                ($bitchat_lbl, $bitchat_om, $bitchat_geo_entry);
+        }
+    };
+
     # Topic label shows "owner: <created_by>" when a session is selected.
     # The string can be long (multi-owner sessions, fully-qualified key
     # ids), and the label is squeezed between the dropdowns and the
@@ -1864,6 +1920,7 @@ sub cmd_gui {
                          . " FROM chat_messages WHERE session = '$name'");
         $seed_recent->(10);                 # last 10 lines for context
         $set_status->("following $name - History for older messages");
+        $update_bitchat_ui->($name);
         $entry->focus;
     };
 
