@@ -1352,7 +1352,13 @@ sub cmd_gui {
                             /^\d+\.\d+\.\d+\.\d+$/ || /:/ } @raw;
     my %ip2name = $need_names ? _daemon_ip_names($ctrl) : ();
 
-    my %cand;   # addr -> { name, kh }
+    # Pre-seed a "-self-" entry pinned to the local daemon's loopback. Doing
+    # it before the discovery loop below means //= there won't clobber the
+    # label — any hostname that also happens to resolve to 127.0.0.1 will
+    # still get its normal entry keyed by its LAN address, so bigsony and
+    # -self- coexist. Loopback is where the bitchat-bridge session lives,
+    # and it's also the escape hatch when a remote you're on goes down.
+    my %cand = ( '127.0.0.1:7531' => { name => '-self-', kh => 1 } );
     for my $r (@raw) {
         my ($addr, $cfgname) = @$r;
         next unless defined $addr && length $addr;
@@ -1385,11 +1391,14 @@ sub cmd_gui {
         $cand{$chosen}{label}   = $name;
         $cand{$chosen}{addrs}   = [ sort @addrs ];   # for tooltip
     }
-    # known_hosts first, then by name (case-insensitive).
+    # known_hosts first, then by name (case-insensitive). "-self-" pinned to
+    # the very top: it's the escape hatch and the local-daemon-only sessions
+    # (bitchat-bridge etc) don't show up anywhere else in the picker.
     my @opts = sort {
         $cand{$label2addr{$b}}{kh} <=> $cand{$label2addr{$a}}{kh}
             || lc($a) cmp lc($b)
     } keys %label2addr;
+    @opts = ('-self-', grep { $_ ne '-self-' } @opts);
 
     # $srvvar drives the picker's -variable AND is updated by $switch_server
     # when a switch reverts to the old server (so the visible label matches
