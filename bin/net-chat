@@ -105,6 +105,11 @@ GetOptions(
     'askpass'    => \$askpass,
 ) or die "bad options\n";
 
+# Persisted "Sign in always" indicator — declared here so it's visible
+# in cmd_gui's anon-startup branch. Set inside the config-load block
+# below when both key_file and key_id come from the USER config.
+our $auto_auth_from_config = 0;
+
 # Persisted-default fallback for the "Sign in always" choice.
 #   * CLI args win.
 #   * User config ~/.config/net-mgr/config [net-chat] overrides system.
@@ -144,9 +149,15 @@ GetOptions(
     $key_file = $cli_kf if defined $cli_kf;
     $key_id   = $cli_ki if defined $cli_ki;
     # Persisted "Sign in always" → skip the default-anonymous branch in
-    # cmd_gui so the saved keys are actually USED. --no-auth on the CLI
-    # still opts out.
-    $force_auth = 1 if $user_wants_auth && !$no_auth && !$force_auth;
+    # cmd_gui so the saved keys are actually USED. We use a SEPARATE flag
+    # instead of $force_auth because $force_auth is honoured even for
+    # loopback connections (that's what CLI --auth means: "auth me even
+    # on loopback"), and treating a persisted preference the same way
+    # would break loopback: the chat-key fallthrough would require a
+    # chat-authorized key, which won't exist for a local admin who's
+    # just talking to their own daemon.
+    $auto_auth_from_config = 1
+        if $user_wants_auth && !$no_auth && !$force_auth;
 }
 
 # --askpass: invoked by ssh-keygen via SSH_ASKPASS (through the net-chat-askpass
@@ -1121,8 +1132,14 @@ sub cmd_gui {
     # of "I just want to look at this open session". Loopback connections
     # are still auth-exempt server-side, so this also covers --listen
     # 127.0.0.1:7531 without any change. --auth (force_auth) still wins.
+    # Persisted "Sign in always" (from ~/.config/net-mgr/config's
+    # [net-chat] block) skips the anon-startup branch so the saved key
+    # actually gets used — but WITHOUT setting $force_auth, so a loopback
+    # daemon still enjoys server-side auth exemption instead of getting
+    # rejected by the chat-key fallthrough for lacking a chat-authorized
+    # key.
     my $anon_at_startup = 0;
-    if (!$force_auth && !$no_auth) {
+    if (!$force_auth && !$no_auth && !$auto_auth_from_config) {
         $no_auth = 1;
         $anon_at_startup = 1;
     }
