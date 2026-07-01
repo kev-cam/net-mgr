@@ -1314,9 +1314,9 @@ sub cmd_gui {
     for my $name (sort keys %by_name) {
         my @addrs = @{ $by_name{$name} };
         my $chosen;
-        if (my ($x) = grep { $_ eq $listen } @addrs)          { $chosen = $x }
-        elsif (my ($x) = grep { $cand{$_}{kh} } sort @addrs)  { $chosen = $x }
-        else                                                  { $chosen = (sort @addrs)[0] }
+        ($chosen) = grep { $_ eq $listen } @addrs;
+        ($chosen) = grep { $cand{$_}{kh} } sort @addrs   unless defined $chosen;
+        $chosen //= (sort @addrs)[0];
         $label2addr{$name}      = $chosen;
         $cand{$chosen}{label}   = $name;
         $cand{$chosen}{addrs}   = [ sort @addrs ];   # for tooltip
