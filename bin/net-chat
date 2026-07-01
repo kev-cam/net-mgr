@@ -105,30 +105,48 @@ GetOptions(
     'askpass'    => \$askpass,
 ) or die "bad options\n";
 
-# Persisted-default fallback for the "Always" choice in the auth-failure
-# dialog. CLI args win; per-user ~/.config/net-mgr/config [net-chat]
-# key_file / key_id apply only when the user didn't pass --key-file /
-# --key-id explicitly. NetMgr::Config->load only reads whatever single
-# path you hand it (or the system default when none), so we mimic the
-# same two-path merge the [servers] section uses: iterate [system, user],
-# user overwrites system. Then restore any CLI-supplied value on top.
+# Persisted-default fallback for the "Sign in always" choice.
+#   * CLI args win.
+#   * User config ~/.config/net-mgr/config [net-chat] overrides system.
+#   * If BOTH key_file and key_id came from the USER config (= they
+#     clicked "Sign in always" at some point), also set $force_auth so
+#     cmd_gui doesn't fall into the default-anonymous branch and skip
+#     using those keys entirely. Without this the GUI reads the config
+#     but starts anonymous anyway, which was the "not sticky" symptom.
 {
     my $cli_kf = $key_file;
     my $cli_ki = $key_id;
-    for my $path ($ENV{NET_MGR_CONF} // '/etc/net-mgr/config',
-                  NetMgr::Config->user_path)
-    {
-        next unless defined $path && -e $path && -r $path;
-        my $ucfg = eval { NetMgr::Config->load($path) } || {};
-        my $sect = $ucfg->{'net-chat'} || {};
-        $key_file = $sect->{key_file}
-            if defined $sect->{key_file} && length $sect->{key_file};
-        $key_id   = $sect->{key_id}
-            if defined $sect->{key_id}   && length $sect->{key_id};
+    # System config first (may seed defaults; usually empty).
+    my $sys_path = $ENV{NET_MGR_CONF} // '/etc/net-mgr/config';
+    if (defined $sys_path && -e $sys_path && -r $sys_path) {
+        my $sc = eval { NetMgr::Config->load($sys_path) } || {};
+        my $s = $sc->{'net-chat'} || {};
+        $key_file = $s->{key_file}
+            if defined $s->{key_file} && length $s->{key_file};
+        $key_id   = $s->{key_id}
+            if defined $s->{key_id}   && length $s->{key_id};
     }
-    # CLI still wins over any config default.
+    # User config overrides. Track whether it carried BOTH keys.
+    my $user_wants_auth = 0;
+    my $up = NetMgr::Config->user_path;
+    if (defined $up && -e $up && -r $up) {
+        my $uc = eval { NetMgr::Config->load($up) } || {};
+        my $s  = $uc->{'net-chat'} || {};
+        my $ukf = (defined $s->{key_file} && length $s->{key_file})
+                ? $s->{key_file} : undef;
+        my $uki = (defined $s->{key_id}   && length $s->{key_id})
+                ? $s->{key_id}   : undef;
+        $key_file = $ukf if defined $ukf;
+        $key_id   = $uki if defined $uki;
+        $user_wants_auth = 1 if defined $ukf && defined $uki;
+    }
+    # CLI wins over both.
     $key_file = $cli_kf if defined $cli_kf;
     $key_id   = $cli_ki if defined $cli_ki;
+    # Persisted "Sign in always" → skip the default-anonymous branch in
+    # cmd_gui so the saved keys are actually USED. --no-auth on the CLI
+    # still opts out.
+    $force_auth = 1 if $user_wants_auth && !$no_auth && !$force_auth;
 }
 
 # --askpass: invoked by ssh-keygen via SSH_ASKPASS (through the net-chat-askpass
@@ -2060,7 +2078,18 @@ sub cmd_gui {
                                               principal => $princ) };
                     if ($@) {
                         my $e = $@; chomp $e;
+                        # Errors from destructive ops (delete/promote/deny)
+                        # commonly come back as "not authorized" or
+                        # "refuse to delete the last owner" — both are
+                        # ONLY visible in the tiny status bar today. Pop
+                        # a modal so the operator actually sees why the
+                        # row didn't disappear.
                         $set_status->("$op $princ failed: $e");
+                        $dlg->messageBox(
+                            -type    => 'ok',
+                            -icon    => 'warning',
+                            -title   => "$op failed",
+                            -message => "$op '$princ' -> '$cur' failed:\n\n$e");
                     } else {
                         $set_status->("$op $princ → $cur");
                     }
@@ -2100,22 +2129,15 @@ sub cmd_gui {
                 # Delete (destructive) — available on every state. Removes
                 # the chat_members row entirely; the principal can rejoin
                 # via a fresh CHAT_JOIN. Server refuses to delete the
-                # last owner. Confirm first because it's not reversible
-                # by Re-allow (nothing left to re-allow).
+                # last owner. No confirmation prompt: the wastebasket
+                # icon is unambiguous, and the previous yesno messageBox
+                # was silently swallowing clicks on some Tk builds
+                # because the return value wasn't literally 'yes'. If
+                # you want the ROW-preserving version, use Disable.
                 $rf->Button(-text => "\x{1f5d1}",   # 🗑 wastebasket
                             -font => 'ncui',
-                            -command => sub {
-                    my $ans = $dlg->messageBox(
-                        -type    => 'yesno',
-                        -icon    => 'question',
-                        -title   => 'Delete member',
-                        -message => "Delete '$princ' from '$cur' entirely?\n\n"
-                                  . "The row is removed (not the same as "
-                                  . "Disable — that keeps a state='denied' "
-                                  . "row you can Re-allow). The principal "
-                                  . "can rejoin later via a fresh join.");
-                    $act->('delete') if defined $ans && lc($ans) eq 'yes';
-                })->pack(-side => 'left', -padx => 2);
+                            -command => sub { $act->('delete') })
+                    ->pack(-side => 'left', -padx => 2);
             }
         };
         $populate->();
