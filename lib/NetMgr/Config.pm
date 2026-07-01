@@ -457,8 +457,18 @@ sub servers {
         }
     }
     my $default;
-    $default = $srv{$default_name}
-        if defined $default_name && exists $srv{$default_name};
+    if (defined $default_name) {
+        if (exists $srv{$default_name}) {
+            # Symbolic name → look up its host:port entry.
+            $default = $srv{$default_name};
+        } elsif ($default_name =~ /[.:]/) {
+            # Raw host[:port] saved directly (the common case when the
+            # user clicked "set default" on an ad-hoc address that has
+            # no matching symbolic entry in [servers]). Use it verbatim
+            # so the choice actually persists on next launch.
+            $default = $default_name;
+        }
+    }
     return wantarray ? (\%srv, $default, $default_name) : \%srv;
 }
 
