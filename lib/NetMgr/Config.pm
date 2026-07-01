@@ -351,7 +351,7 @@ my %ACTIVE = (
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
     dnsmasq    => [qw(mode out_dir push_aps gateways)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
     bitchat_bridge => [qw(mode helper_path session_name adapter_index)], # BLE bridge (bin/net-bitchat-bridge)
-    'net-chat' => [qw(key_file key_id)], # auth-dialog "Always" persistence
+    'net-chat' => [qw(key_file key_id last_session)], # auth-dialog "Always" + last-open session
     ipv6_vlan  => [qw(type name mode server prefix local_suffix forwarding ext_if
                       id addr attach gateway
                       tunnel_id update_secret)], # managed IPv6 nets (vlan|he6in4|relay);

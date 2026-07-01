@@ -1053,6 +1053,20 @@ sub _daemon_ip_names {
 sub cmd_gui {
     my ($session) = @_;
     $session //= shift @ARGV;
+    # Fall back to the last-open session from the per-user config when the
+    # user didn't pass a session name. Same two-path merge the auth defaults
+    # use — user config overwrites system, then we keep the CLI (or the
+    # $session arg passed in from a switch-server re-exec) on top.
+    unless (defined $session && length $session) {
+        for my $path ($ENV{NET_MGR_CONF} // '/etc/net-mgr/config',
+                      NetMgr::Config->user_path)
+        {
+            next unless defined $path && -e $path && -r $path;
+            my $ucfg = eval { NetMgr::Config->load($path) } || {};
+            my $ls = $ucfg->{'net-chat'}{last_session};
+            $session = $ls if defined $ls && length $ls;
+        }
+    }
     # Dumb-terminal fallback: when there's no DISPLAY and stdin/stdout are
     # both ttys, drop through to cmd_tty so `net-chat --gui` Just Works
     # over ssh, serial consoles, or in a container without X. Same idea
@@ -1767,6 +1781,9 @@ sub cmd_gui {
         $cur = $name;
         $mw->title("net-chat - $name");
         $topiclbl->configure(-text => ($created_by{$name} ? "owner: $created_by{$name}" : ''));
+        # Remember this session as the "last open" for next launch. Silent
+        # save failure (config unwritable, etc) — the picker still works.
+        eval { NetMgr::Config->save_user_value('net-chat', 'last_session', $name) };
         eval { $ctrl->chat_join(session => $name) };   # roster + post rights
         # Stream new messages only; past messages are pulled in on demand with
         # the History button (one older line per click), so joining a busy chat
