@@ -106,15 +106,29 @@ GetOptions(
 ) or die "bad options\n";
 
 # Persisted-default fallback for the "Always" choice in the auth-failure
-# dialog. CLI args win; per-user config [net-chat] key_file / key_id apply
-# only when the user didn't pass --key-file / --key-id explicitly.
-unless (defined $key_file && defined $key_id) {
-    my $ucfg = eval { NetMgr::Config->load } || {};
-    my $sect = $ucfg->{'net-chat'} || {};
-    $key_file //= $sect->{key_file} if defined $sect->{key_file}
-                                    && length $sect->{key_file};
-    $key_id   //= $sect->{key_id}   if defined $sect->{key_id}
-                                    && length $sect->{key_id};
+# dialog. CLI args win; per-user ~/.config/net-mgr/config [net-chat]
+# key_file / key_id apply only when the user didn't pass --key-file /
+# --key-id explicitly. NetMgr::Config->load only reads whatever single
+# path you hand it (or the system default when none), so we mimic the
+# same two-path merge the [servers] section uses: iterate [system, user],
+# user overwrites system. Then restore any CLI-supplied value on top.
+{
+    my $cli_kf = $key_file;
+    my $cli_ki = $key_id;
+    for my $path ($ENV{NET_MGR_CONF} // '/etc/net-mgr/config',
+                  NetMgr::Config->user_path)
+    {
+        next unless defined $path && -e $path && -r $path;
+        my $ucfg = eval { NetMgr::Config->load($path) } || {};
+        my $sect = $ucfg->{'net-chat'} || {};
+        $key_file = $sect->{key_file}
+            if defined $sect->{key_file} && length $sect->{key_file};
+        $key_id   = $sect->{key_id}
+            if defined $sect->{key_id}   && length $sect->{key_id};
+    }
+    # CLI still wins over any config default.
+    $key_file = $cli_kf if defined $cli_kf;
+    $key_id   = $cli_ki if defined $cli_ki;
 }
 
 # --askpass: invoked by ssh-keygen via SSH_ASKPASS (through the net-chat-askpass

@@ -3977,12 +3977,38 @@ sub _handle_chat_member_delete {
           . "'$name' (close the chat first)"))
             if $cnt <= 1;
     }
+    # Wipe every trace of the principal for this session — not just the
+    # chat_members row. Otherwise a "deleted" user can rejoin instantly
+    # via the durable chat-key path, or lingers in the presence roster
+    # until their existing socket closes. Order matters: presence first
+    # (transient), then authorized_keys (durable), then the member row.
+    my $prior_key = $self->{db}->get_chat_authorized_key($name, $principal);
+    my $n_pres = eval {
+        $self->{db}->dbh->do(
+            "DELETE FROM chat_presence WHERE session = ? AND principal = ?",
+            undef, $name, $principal);
+    } // 0;
+    $self->{db}->remove_chat_authorized_key($name, $principal);
     $self->{db}->delete_chat_member($name, $principal);
+    # Emit deletes so subscribers (GUI Members dialog, other clients)
+    # see the row disappear from every relevant table.
+    if ($prior_key) {
+        $self->_emit_change(table => 'chat_authorized_keys', op => 'delete',
+            row => $prior_key);
+    }
+    if ($n_pres && $n_pres > 0) {
+        $self->_emit_change(table => 'chat_presence', op => 'delete',
+            row => { session => $name, principal => $principal });
+    }
     $self->_emit_change(table => 'chat_members', op => 'delete',
         row => { session => $name, principal => $principal });
-    $self->_log("chat member-delete $name/$principal by $who");
+    $self->_log("chat member-delete $name/$principal by $who"
+              . " [-member" . ($prior_key ? " -key" : "")
+              . ($n_pres ? " -presence" : "") . "]");
     return $self->_send($cli, format_ok(session => $name,
-        principal => $principal, deleted => 1));
+        principal => $principal, deleted => 1,
+        cleared_key      => $prior_key ? 1 : 0,
+        cleared_presence => ($n_pres ? 1 : 0)));
 }
 
 sub _handle_chat_member_op {
