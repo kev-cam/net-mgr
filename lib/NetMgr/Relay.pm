@@ -28,7 +28,7 @@ my @REPLICATED = qw(
     machines hostnames interfaces addresses ports
     aps associations dhcp_leases aliases
     dhcp_ranges dhcp_reservations
-    mesh_tunnels
+    mesh_tunnels node_capabilities
 );
 
 sub run {
