@@ -217,8 +217,9 @@ sub run_once {
         # Peer poll tick — fire only when the helper's stdin is still open
         # so we don't stall on a dead pipe during helper respawn.
         if ($wh && time - $last_peer_poll >= $PEER_POLL_S) {
-            eval { print $wh encode_json({ cmd => 'peers' }), "\n" };
-            warn "[bridge] peer poll write: $@" if $@;
+            my $ok = eval { print $wh encode_json({ cmd => 'peers' }), "\n"; 1 };
+            warn "[bridge] peer poll tick "
+               . ($ok ? "sent" : "FAILED: $@") . "\n";
             $last_peer_poll = time;
         }
         my @ready = $sel->can_read(1) or next;
