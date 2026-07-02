@@ -219,10 +219,12 @@ install: .version
 	$(INSTALL) -d $(DESTDIR)$(SHAREDIR)/sql
 	$(INSTALL) -d $(DESTDIR)$(SYSCONFDIR)/net-mgr
 	$(INSTALL) -d $(DESTDIR)$(UNITDIR)
-	@for f in $(BINS); do \
+	@VERSION="$$(cat .version)"; \
+	 for f in $(BINS); do \
 	  echo "  bin/$$f → $(DESTDIR)$(BINDIR)/$$f"; \
 	  sed -e 's|use lib .*FindBin.*|use lib "$(PERL5DIR)";|' \
 	      -e 's|"\$$FindBin::Bin/../recovery"|"$(RECOVERYDIR)"|' \
+	      -e "s|@NET_MGR_VERSION@|$$VERSION|g" \
 	      bin/$$f > $(DESTDIR)$(BINDIR)/$$f.tmp && \
 	  mv $(DESTDIR)$(BINDIR)/$$f.tmp $(DESTDIR)$(BINDIR)/$$f && \
 	  chmod 755 $(DESTDIR)$(BINDIR)/$$f; \

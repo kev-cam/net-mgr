@@ -104,7 +104,22 @@ GetOptions(
     'tty'        => \$tty,
     'bit-chat'   => \my $bitchat_mode,
     'askpass'    => \$askpass,
+    'version|V'  => \my $show_version,
 ) or die "bad options\n";
+
+# --version / -V: print the installed build stamp and exit. The
+# placeholder below (assembled at runtime so sed doesn't clobber the
+# sentinel check itself) is substituted at `make install` time with
+# the contents of .version — so a stale binary on gateway3 will print
+# an older stamp than a freshly-installed one on bigsony.
+if ($show_version) {
+    my $v = '@NET_MGR_VERSION@';
+    my $sentinel = '@' . 'NET_MGR_VERSION' . '@';
+    $v = '(uninstalled — run make install to stamp the version)'
+        if $v eq $sentinel;
+    print "net-chat $v\n";
+    exit 0;
+}
 
 # --bit-chat: shortcut for BitChat bridge access. Auto-selects the local
 # daemon's loopback listener (that's where the bitchat-bridge session
@@ -2319,12 +2334,14 @@ sub cmd_gui {
                         eval { $ctrl->chat_open(name => $dm_name,
                                                 mode => 'request',
                                                 topic => "DM: $who[0] & $who[1]") };
-                        # ignore "already open" errors — we just want the
-                        # session to EXIST here; report other errors so a
+                        # Server returns "CHAT_OPEN: session 'X' exists" for
+                        # already-open sessions — that's the happy path here,
+                        # we just want the session to EXIST. Report other
+                        # errors (e.g. bad mode, name too long) so a
                         # dead-in-the-water DM click isn't silent.
-                        if ($@ && $@ !~ /already open|already exists/i) {
+                        if ($@ && $@ !~ /\bexists\b/i) {
                             my $e = $@; chomp $e;
-                            $set_status->("DM open failed: $e");
+                            $set_status->("DM: $e");
                             return;
                         }
                         eval { $ctrl->chat_member('allow', session => $dm_name,
@@ -2333,6 +2350,7 @@ sub cmd_gui {
                         # a member; the follow below is what actually matters)
                         $refresh->();
                         $follow->($dm_name);
+                        $set_status->("DM $dm_name — " . scalar(@who) . " parties");
                         $dlg->destroy;
                     })->pack(-side => 'left', -padx => 2);
                 }
