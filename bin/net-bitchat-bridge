@@ -200,9 +200,27 @@ sub run_once {
     # the subscription happens to EOF (net-mgr daemon restart, etc.) — we
     # want to keep going as long as helper stdout+stderr are live.
     my %eof;
+    # Periodic peer poll: every $PEER_POLL_S seconds, ask the helper for its
+    # current peer list and upsert each into bitchat_peers via loopback
+    # BITCHAT_PEER_UPSERT. Feeds the net-chat GUI Members dialog when the
+    # session is bitchat-bridge.
+    my $PEER_POLL_S = 30;
+    my $last_peer_poll = time - $PEER_POLL_S + 5;   # first poll ~5s in
+    my $peer_cli;
+    unless ($opt{'dry-run'}) {
+        $peer_cli = NetMgr::Client->new(listen => $listen, timeout => 6);
+        $peer_cli->hello(consumer => "bitchat-bridge.peers.$$");
+    }
 
   OUTER:
     while (!($eof{$rh} && $eof{$eh})) {
+        # Peer poll tick — fire only when the helper's stdin is still open
+        # so we don't stall on a dead pipe during helper respawn.
+        if ($wh && time - $last_peer_poll >= $PEER_POLL_S) {
+            eval { print $wh encode_json({ cmd => 'peers' }), "\n" };
+            warn "[bridge] peer poll write: $@" if $@;
+            $last_peer_poll = time;
+        }
         my @ready = $sel->can_read(1) or next;
         for my $fh (@ready) {
             my $chunk;
@@ -294,11 +312,36 @@ sub run_once {
                 } elsif ($type eq 'status') {
                     warn "[bridge] helper: " . ($ev->{raw} // '') . "\n";
                 } elsif ($type eq 'cmd_reply') {
-                    # Reply to the {"cmd":"send"} we wrote to stdin. ok/err
-                    # visible in stderr already; nothing to post to net-chat.
-                    warn "[bridge] cmd_reply ok=" . ($ev->{ok} ? 1 : 0)
-                       . " path=" . ($ev->{path} // '')
-                       . ($ev->{err} ? " err=$ev->{err}" : '') . "\n";
+                    # cmd_reply for our {"cmd":"peers"} poll — upsert each
+                    # peer into bitchat_peers via loopback. Any other
+                    # cmd_reply (e.g. send ok/err) just gets logged.
+                    if (($ev->{cmd} // '') eq 'peers'
+                        && ref $ev->{peers} eq 'ARRAY'
+                        && $peer_cli)
+                    {
+                        my $n_up = 0;
+                        for my $p (@{ $ev->{peers} }) {
+                            next unless ref $p eq 'HASH' && $p->{peer_id};
+                            my $line = 'BITCHAT_PEER_UPSERT '
+                                     . "peer_id=$p->{peer_id}"
+                                     . (defined $p->{nickname}
+                                        ? " nickname=$p->{nickname}" : '')
+                                     . " is_connected="
+                                     . ($p->{connected} ? 1 : 0);
+                            eval { $peer_cli->send_recv($line) };
+                            warn "[bridge] peer upsert failed: $@" if $@;
+                            $n_up++ unless $@;
+                        }
+                        warn "[bridge] peer_cli upserted $n_up peer(s)\n"
+                            if $n_up;
+                        # Also sweep any peers now stale (not in this reply).
+                        # We only mark disconnected — retention is the
+                        # daemon's job via sweep_bitchat_peers.
+                    } else {
+                        warn "[bridge] cmd_reply ok=" . ($ev->{ok} ? 1 : 0)
+                           . " path=" . ($ev->{path} // '')
+                           . ($ev->{err} ? " err=$ev->{err}" : '') . "\n";
+                    }
                 } else {
                     warn "[bridge] unknown event type='$type'\n";
                 }
@@ -306,9 +349,10 @@ sub run_once {
         }       # close for my $fh
     }           # close OUTER while
 
-    eval { $cli->bye } if $cli;
-    eval { $sub->bye } if $sub;
-    eval { close $wh } if $wh;
+    eval { $cli->bye }      if $cli;
+    eval { $sub->bye }      if $sub;
+    eval { $peer_cli->bye } if $peer_cli;
+    eval { close $wh }      if $wh;
     waitpid($pid, 0);
     my $code = $? >> 8;
     warn "[bridge] processed $posted inbound BLE, forwarded $forwarded outbound to BLE, before helper exited\n";

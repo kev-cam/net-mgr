@@ -43,7 +43,7 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
     audit_annotations wifi_scan_results wifi_radio_state
     chat_sessions chat_members chat_messages chat_presence
     host_keys dhcp_ranges dhcp_reservations
-    mesh_tunnels node_capabilities
+    mesh_tunnels node_capabilities bitchat_peers
 );
 
 # Tables whose contents are sensitive (credentials etc.); SUBSCRIBE
@@ -1496,6 +1496,7 @@ sub _handle_line {
     elsif ($verb eq 'CHAT_PROMOTE')       { $self->_handle_chat_role_op($cli, $cmd, 'promote') }
     elsif ($verb eq 'CHAT_DEMOTE')        { $self->_handle_chat_role_op($cli, $cmd, 'demote') }
     elsif ($verb eq 'CHAT_MEMBER_DELETE') { $self->_handle_chat_member_delete($cli, $cmd) }
+    elsif ($verb eq 'BITCHAT_PEER_UPSERT') { $self->_handle_bitchat_peer_upsert($cli, $cmd) }
     elsif ($verb eq 'CHAT_PUT')       { $self->_handle_chat_put($cli, $cmd) }
     elsif ($verb eq 'CHAT_GET')       { $self->_handle_chat_get($cli, $cmd) }
     elsif ($verb eq 'CHAT_LS')        { $self->_handle_chat_ls($cli, $cmd) }
@@ -5746,6 +5747,51 @@ sub _socat_remove {
     kill 'KILL', $pid;
     waitpid($pid, 0);
     return 1;
+}
+
+# ---- BITCHAT_PEER_UPSERT (loopback-only) --------------------------------
+#
+# Used by net-bitchat-bridge on this host to keep bitchat_peers in sync
+# with what its Rust helper's peer_manager knows. Restricted to loopback
+# — a remote peer has no BLE view of this bridge site, and the table is
+# intentionally per-site (not cluster-replicated), so accepting a remote
+# upsert would just corrupt this site's neighbourhood picture.
+#
+# Wire format (one peer per verb, kv):
+#   BITCHAT_PEER_UPSERT peer_id=HEX16 [nickname="..."] [is_connected=0|1]
+#     [signing_pk_hex=HEX64]
+sub _handle_bitchat_peer_upsert {
+    my ($self, $cli, $cmd) = @_;
+    return $self->_send($cli, format_err(
+        "BITCHAT_PEER_UPSERT: loopback-only"))
+        unless _peer_is_loopback($cli);
+    my $kv = $cmd->{kv} || {};
+    my $peer_id = $kv->{peer_id};
+    unless (defined $peer_id && length $peer_id) {
+        return $self->_send($cli, format_err(
+            "BITCHAT_PEER_UPSERT: missing peer_id"));
+    }
+    my $signing_pk;
+    if (defined $kv->{signing_pk_hex} && length $kv->{signing_pk_hex}) {
+        my $h = $kv->{signing_pk_hex};
+        $signing_pk = pack('H*', $h) if $h =~ /^[0-9a-fA-F]{64}$/;
+    }
+    my $row = eval {
+        $self->{db}->set_bitchat_peer(
+            peer_id      => $peer_id,
+            nickname     => $kv->{nickname},
+            is_connected => ($kv->{is_connected} // 0) ? 1 : 0,
+            signing_pk   => $signing_pk,
+        );
+    };
+    if ($@) {
+        my $e = $@; chomp $e;
+        $self->_log("BITCHAT_PEER_UPSERT $peer_id: $e");
+        return $self->_send($cli, format_err("BITCHAT_PEER_UPSERT: $e"));
+    }
+    $self->_emit_change(table => 'bitchat_peers', op => 'update', row => $row)
+        if $row;
+    return $self->_send($cli, format_ok(peer_id => $peer_id));
 }
 
 1;

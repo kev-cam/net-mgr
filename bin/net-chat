@@ -2305,6 +2305,75 @@ sub cmd_gui {
                             -command => sub { $act->('delete') })
                     ->pack(-side => 'left', -padx => 2);
             }
+
+            # BitChat peer section — shown only when the current session
+            # IS the bitchat-bridge (or a bitchat/geohash subsession). Rows
+            # come from the bitchat_peers table, populated by the local
+            # net-bitchat-bridge supervisor's periodic {"cmd":"peers"} poll.
+            # These aren't chat_members — they're distinct BLE peers with
+            # no chat_authorized_keys or role — so they get a separator +
+            # a "BitChat #mesh" label and no per-row action buttons (for
+            # now). Future: promote a BitChat peer to chat_member with
+            # one click, once SSH-Ed25519 identity binding lands on both
+            # sides.
+            if (defined $cur && ($cur eq 'bitchat-bridge'
+                              || $cur =~ /^bitchat[-\/]/))
+            {
+                my $peers = eval {
+                    my $c2 = connect_client(want_auth => 0);
+                    my $r  = $c2->snapshot(4, 'bitchat_peers');
+                    eval { $c2->bye };
+                    $r;
+                } || [];
+                if (@$peers) {
+                    # Section header — a thin separator + label.
+                    $list_frame->Frame(-height => 1, -background => '#888')
+                        ->pack(-fill => 'x', -padx => 4, -pady => [10, 2]);
+                    $list_frame->Label(
+                        -text   => 'BitChat #mesh — BLE peers in range',
+                        -font   => 'sans-serif 9 bold',
+                        -anchor => 'w',
+                        -foreground => '#555',
+                    )->pack(-fill => 'x', -padx => 4);
+                    # Sort connected first, then last_seen desc, then nick.
+                    for my $p (sort {
+                        (($b->{is_connected} // 0) <=> ($a->{is_connected} // 0))
+                        || (($b->{last_seen} // '') cmp ($a->{last_seen} // ''))
+                        || (($a->{nickname} // '') cmp ($b->{nickname} // ''))
+                    } @$peers) {
+                        my $rf = $list_frame->Frame->pack(-fill => 'x',
+                                                          -padx => 4, -pady => 1);
+                        $rf->Label(-text => $p->{nickname} // '(anon)',
+                                   -width => 26, -anchor => 'w')
+                            ->pack(-side => 'left');
+                        $rf->Label(-text => $p->{peer_id} // '?',
+                                   -width => 18, -anchor => 'w',
+                                   -foreground => '#888',
+                                   -font => 'ncmono 9')
+                            ->pack(-side => 'left');
+                        $rf->Label(
+                            -text  => ($p->{is_connected} ? 'connected' : 'seen'),
+                            -width => 10, -anchor => 'w',
+                            -foreground => ($p->{is_connected} ? '#080' : '#888'),
+                        )->pack(-side => 'left');
+                        my $seen = $p->{last_seen} // '';
+                        # DB gives "YYYY-MM-DD HH:MM:SS" — show the time only
+                        # if today, else the whole thing.
+                        $seen =~ s/^\d{4}-\d\d-\d\d //
+                            if $seen =~ /^\Q@{[substr($seen,0,10)]}\E/;
+                        $rf->Label(-text => $seen, -anchor => 'w',
+                                   -foreground => '#888')
+                            ->pack(-side => 'left');
+                    }
+                } else {
+                    $list_frame->Frame(-height => 1, -background => '#888')
+                        ->pack(-fill => 'x', -padx => 4, -pady => [10, 2]);
+                    $list_frame->Label(
+                        -text => 'BitChat #mesh — no BLE peers seen yet',
+                        -foreground => '#888',
+                    )->pack(-padx => 4, -pady => 2);
+                }
+            }
         };
         $populate->();
 

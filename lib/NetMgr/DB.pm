@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 32;
+our $SCHEMA_VERSION = 33;
 
 sub new {
     my ($class, %args) = @_;
@@ -719,6 +719,29 @@ SQL
         $self->{dbh}->do(
             "ALTER TABLE chat_members ADD COLUMN requested_from VARCHAR(64) NULL"
         );
+        return;
+    }
+    if ($v == 33) {
+        # bitchat_peers: BitChat BLE mesh peers seen by the local helper on
+        # this bridge site. Populated by net-bitchat-bridge polling the
+        # Rust helper's {"cmd":"peers"} response every ~30s and posting
+        # via BITCHAT_PEERS_UPSERT. Not cluster-replicated on purpose —
+        # each bridge site sees its OWN BLE neighbourhood, and merging
+        # across sites would just add distance/RSSI ambiguity. Feeds the
+        # net-chat GUI Members dialog when the current session is
+        # bitchat-bridge, and the credential-free onramp logic when it
+        # ships.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS bitchat_peers (
+    peer_id       VARCHAR(16)  NOT NULL PRIMARY KEY,   -- SHA-256(noise_pk)[:8] hex
+    nickname      VARCHAR(64)  NULL,
+    is_connected  TINYINT(1)   NOT NULL DEFAULT 0,
+    last_seen     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                               ON UPDATE CURRENT_TIMESTAMP,
+    signing_pk    VARBINARY(32) NULL   -- Ed25519 signing pubkey from Announce TLV 0x03,
+                                       -- filled when the RX side captures it
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
         return;
     }
     if ($v == 32) {
@@ -2498,7 +2521,7 @@ sub query_table {
         chat_sessions chat_members chat_messages chat_presence
         chat_authorized_keys
         host_keys dhcp_ranges dhcp_reservations
-        mesh_tunnels node_capabilities
+        mesh_tunnels node_capabilities bitchat_peers
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};
@@ -2636,6 +2659,59 @@ sub count_stale_addresses {
             AND (source IS NULL OR source <> 'manual')",
         undef, $days, $days);
     return $n // 0;
+}
+
+# ---- bitchat_peers (schema v33) ----------------------------------------
+
+# Upsert one BitChat peer row (per-bridge-site view of the BLE mesh).
+sub set_bitchat_peer {
+    my ($self, %f) = @_;
+    croak "peer_id required" unless defined $f{peer_id} && length $f{peer_id};
+    $self->{dbh}->do(
+        "INSERT INTO bitchat_peers (peer_id, nickname, is_connected, signing_pk)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            nickname     = COALESCE(VALUES(nickname), nickname),
+            is_connected = VALUES(is_connected),
+            signing_pk   = COALESCE(VALUES(signing_pk), signing_pk)",
+        undef, $f{peer_id}, $f{nickname},
+        ($f{is_connected} ? 1 : 0), $f{signing_pk});
+    return $self->get_bitchat_peer($f{peer_id});
+}
+
+sub get_bitchat_peer {
+    my ($self, $peer_id) = @_;
+    return unless defined $peer_id && length $peer_id;
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM bitchat_peers WHERE peer_id = ?", undef, $peer_id);
+}
+
+sub list_bitchat_peers {
+    my ($self) = @_;
+    return $self->{dbh}->selectall_arrayref(
+        "SELECT * FROM bitchat_peers ORDER BY is_connected DESC, last_seen DESC",
+        { Slice => {} }) || [];
+}
+
+# Sweep peers we haven't seen for longer than $stale_secs — sets
+# is_connected=0. Optional purge (delete) beyond $purge_secs; skipped when
+# $purge_secs is undef so operators can decide the retention window.
+sub sweep_bitchat_peers {
+    my ($self, %opts) = @_;
+    my $stale = $opts{stale_secs}  // 120;    # 2 min
+    my $purge = $opts{purge_secs};              # e.g. 86400 * 7 for 7d
+    $self->{dbh}->do(
+        "UPDATE bitchat_peers SET is_connected = 0
+          WHERE is_connected = 1
+            AND last_seen < DATE_SUB(NOW(), INTERVAL ? SECOND)",
+        undef, $stale);
+    if (defined $purge && $purge > 0) {
+        $self->{dbh}->do(
+            "DELETE FROM bitchat_peers
+              WHERE last_seen < DATE_SUB(NOW(), INTERVAL ? SECOND)",
+            undef, $purge);
+    }
+    return;
 }
 
 # ---- node_capabilities (schema v32) ------------------------------------
