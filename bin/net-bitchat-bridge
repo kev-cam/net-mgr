@@ -258,10 +258,25 @@ sub run_once {
                     next unless length $row_body;
                     next if $row_sender eq $as;             # echo guard
                     next if $row_body =~ /^\[[^]]*\@bitchat/; # tag guard
-                    # Serialize and forward to helper.
+                    # DM tag: "@HEX16: text" → route as private (Noise-
+                    # encrypted) to that peer, not broadcast. The Members
+                    # dialog's DM button on a bitchat_peers row posts this
+                    # form via chat_post.
+                    my $dm_to_peer;
+                    if ($row_body =~ s/^\@([0-9a-fA-F]{16}):\s*//) {
+                        $dm_to_peer = lc $1;
+                    }
+                    # Serialize and forward to helper. With $dm_to_peer set
+                    # we include "to_peer" in the JSON so bitchat-jsonl's
+                    # cmd_reader routes via send_private_message_by_hex_id
+                    # instead of a broadcast.
                     my $out_body = $row_body;
                     utf8::upgrade($out_body);
-                    my $cmd = encode_json({ cmd => 'send', body => $out_body });
+                    my $cmd = encode_json({
+                        cmd  => 'send',
+                        body => $out_body,
+                        ($dm_to_peer ? (to_peer => $dm_to_peer) : ()),
+                    });
                     if ($opt{'dry-run'}) {
                         print "DRY: helper stdin << $cmd\n";
                     } else {

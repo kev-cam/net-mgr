@@ -2292,6 +2292,28 @@ sub cmd_gui {
                                 -command => sub { $act->('deny') })
                         ->pack(-side => 'left', -padx => 2);
                 }
+                # DM — open a private two-party session between me and this
+                # principal. Canonical naming: "dm:<a>|<b>" with the two
+                # principals sorted so both parties resolve the same
+                # session name. Uses request-mode so the DM roster is
+                # locked to the two named parties.
+                my $dm_target = $princ;
+                if (defined $dm_target && length $dm_target && $dm_target !~ /^unverified:/) {
+                    $rf->Button(-text => 'DM', -command => sub {
+                        my @who = sort ($as // 'anon', $dm_target);
+                        my $dm_name = 'dm:' . join('|', @who);
+                        eval { $ctrl->chat_open(name => $dm_name,
+                                                mode => 'request',
+                                                topic => "DM: $who[0] & $who[1]") };
+                        # ignore "already open" errors — just want it to exist
+                        eval { $ctrl->chat_member('allow', session => $dm_name,
+                                                  principal => $dm_target) };
+                        # Refresh session list, then follow.
+                        $refresh->();
+                        $follow->($dm_name);
+                        $dlg->destroy;   # close Members dialog; we've moved on
+                    })->pack(-side => 'left', -padx => 2);
+                }
                 # Delete (destructive) — available on every state. Removes
                 # the chat_members row entirely; the principal can rejoin
                 # via a fresh CHAT_JOIN. Server refuses to delete the
@@ -2364,6 +2386,53 @@ sub cmd_gui {
                         $rf->Label(-text => $seen, -anchor => 'w',
                                    -foreground => '#888')
                             ->pack(-side => 'left');
+                        # DM button — pops a small text dialog that posts a
+                        # message tagged with "@<peer_id>:" prefix. The
+                        # net-bitchat-bridge supervisor recognises that
+                        # prefix and, instead of a broadcast, writes a
+                        # {"cmd":"send","to_peer":"HEX16","body":"..."} to
+                        # the helper's stdin — Noise-encrypted private
+                        # message straight to that BitChat peer.
+                        my $peer_id = $p->{peer_id};
+                        my $peer_nick = $p->{nickname} // '(anon)';
+                        if (defined $peer_id && length $peer_id) {
+                            $rf->Button(-text => 'DM', -command => sub {
+                                my $dm = $mw->Toplevel(
+                                    -title => "DM BitChat: $peer_nick");
+                                $dm->transient($dlg);
+                                $dm->Label(
+                                    -text => "Private message to $peer_nick ($peer_id)",
+                                    -anchor => 'w')
+                                    ->pack(-fill => 'x', -padx => 10, -pady => [10,4]);
+                                my $txt = $dm->Text(-height => 5, -width => 50,
+                                                    -wrap => 'word', -font => 'ncui');
+                                $txt->pack(-fill => 'both', -expand => 1,
+                                           -padx => 10, -pady => 4);
+                                $txt->focus;
+                                my $btns = $dm->Frame->pack(-fill => 'x',
+                                                            -padx => 10, -pady => 8);
+                                $btns->Button(-text => 'Cancel',
+                                    -command => sub { $dm->destroy })
+                                    ->pack(-side => 'right', -padx => 2);
+                                $btns->Button(-text => 'Send',
+                                    -command => sub {
+                                        my $body = $txt->get('1.0', 'end');
+                                        $body =~ s/\s+$//;
+                                        return unless length $body;
+                                        my $tagged = "\@$peer_id: $body";
+                                        eval { $ctrl->chat_post(
+                                            session => 'bitchat-bridge',
+                                            body    => $tagged, as => $as) };
+                                        if ($@) {
+                                            my $e = $@; chomp $e;
+                                            $set_status->("DM to $peer_nick failed: $e");
+                                        } else {
+                                            $set_status->("DM sent to $peer_nick");
+                                        }
+                                        $dm->destroy;
+                                    })->pack(-side => 'right', -padx => 2);
+                            })->pack(-side => 'left', -padx => 4);
+                        }
                     }
                 } else {
                     $list_frame->Frame(-height => 1, -background => '#888')
