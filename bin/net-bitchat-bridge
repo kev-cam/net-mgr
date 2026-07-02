@@ -378,18 +378,20 @@ sub run_once {
                 # duplicate emissions from the same helper.
                 if ($type eq 'packet_rx') {
                     my $from_addr = $ev->{from} // '';
+                    my $len       = $ev->{len} // length($ev->{hex} // '') / 2;
                     if ($from_addr =~ /^relay:/) {
-                        next;   # injected packet echoing back — skip
+                        warn "[bridge] packet_rx skip (self-inject) from=$from_addr len=$len\n";
+                        next;
                     }
                     my $pid = $ev->{packet_id} // '';
                     if (!length $pid) {
-                        # Compute packet_id at supervisor when helper didn't
-                        # send one — SHA-256(hex) first 32 chars is stable
-                        # across sites for the same wire bytes.
                         require Digest::SHA;
                         $pid = substr(Digest::SHA::sha256_hex($ev->{hex} // ''), 0, 32);
                     }
-                    next if $relay_seen->($pid);
+                    if ($relay_seen->($pid)) {
+                        warn "[bridge] packet_rx dedup pid=$pid from=$from_addr\n";
+                        next;
+                    }
                     if ($cli) {
                         my $line = 'BITCHAT_PACKET_RELAY '
                                  . NetMgr::Protocol::format_kv(
@@ -397,8 +399,13 @@ sub run_once {
                                      hex       => ($ev->{hex} // ''),
                                      from      => $from_addr,
                                    );
-                        eval { $cli->send_recv($line) };
-                        warn "[bridge] relay fanout failed: $@" if $@;
+                        my $reply = eval { $cli->send_recv($line) };
+                        if ($@) {
+                            warn "[bridge] relay fanout failed: $@";
+                        } else {
+                            warn "[bridge] relay OUT pid=$pid from=$from_addr len=$len reply="
+                               . substr($reply // '', 0, 80) . "\n";
+                        }
                     }
                     next;
                 }
