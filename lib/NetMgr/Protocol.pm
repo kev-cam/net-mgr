@@ -140,6 +140,7 @@ sub parse_line {
     elsif ($verb eq 'CHAT_DEMOTE')        { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'CHAT_MEMBER_DELETE') { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'BITCHAT_PEER_UPSERT') { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'BITCHAT_PACKET_RELAY') { $cmd->{kv} = _parse_kv_only(\@toks) }
     # net-chat file transfer (data= is base64).
     elsif ($verb eq 'CHAT_PUT')       { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'CHAT_GET')       { $cmd->{kv} = _parse_kv_only(\@toks) }

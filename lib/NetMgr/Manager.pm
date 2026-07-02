@@ -44,6 +44,7 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
     chat_sessions chat_members chat_messages chat_presence
     host_keys dhcp_ranges dhcp_reservations
     mesh_tunnels node_capabilities bitchat_peers
+    bitchat_relay_packets
 );
 
 # Tables whose contents are sensitive (credentials etc.); SUBSCRIBE
@@ -1497,6 +1498,7 @@ sub _handle_line {
     elsif ($verb eq 'CHAT_DEMOTE')        { $self->_handle_chat_role_op($cli, $cmd, 'demote') }
     elsif ($verb eq 'CHAT_MEMBER_DELETE') { $self->_handle_chat_member_delete($cli, $cmd) }
     elsif ($verb eq 'BITCHAT_PEER_UPSERT') { $self->_handle_bitchat_peer_upsert($cli, $cmd) }
+    elsif ($verb eq 'BITCHAT_PACKET_RELAY') { $self->_handle_bitchat_packet_relay($cli, $cmd) }
     elsif ($verb eq 'CHAT_PUT')       { $self->_handle_chat_put($cli, $cmd) }
     elsif ($verb eq 'CHAT_GET')       { $self->_handle_chat_get($cli, $cmd) }
     elsif ($verb eq 'CHAT_LS')        { $self->_handle_chat_ls($cli, $cmd) }
@@ -5810,6 +5812,133 @@ sub _handle_bitchat_peer_upsert {
     $self->_emit_change(table => 'bitchat_peers', op => 'update', row => $row)
         if $row;
     return $self->_send($cli, format_ok(peer_id => $peer_id));
+}
+
+# ---- BITCHAT_PACKET_RELAY (cross-site BitChat mesh binding) --------------
+#
+# Threads a raw BitChat wire packet through the net-mgr cluster so bridge
+# sites bind their BLE meshes over IP. Two entry points:
+#
+#   From loopback with no origin: LOCAL origin — the local supervisor
+#   captured a packet on BLE and wants it re-radiated at every other
+#   BLE-capable bridge site. Fan out to every ble-capable mesh peer.
+#   Deliberately NOT delivered to local SUBSCRIBE listeners here, because
+#   the local helper already emitted this packet and would re-inject its
+#   own broadcast in a self-loop.
+#
+#   From ANY caller with origin set: REMOTE origin — a peer bridge's
+#   fan-out just landed on us. LRU-dedup (bloom-scale defense against
+#   in-flight duplicates before the helper's own bloom sees them), then
+#   _emit_change so local supervisor's SUBSCRIBE stream sees a ROW event
+#   and can call {"cmd":"inject_packet"} on its helper.
+#
+# Wire format kv:
+#   BITCHAT_PACKET_RELAY packet_id=HEX32 hex=<packet_hex_bytes>
+#     from=<label> [origin=<site_name>]
+#
+# Loop guards:
+#   - packet_id LRU (last N packet ids; skip on hit)
+#   - origin field short-circuits re-fanout at remote sites
+#   - supervisor filters helper packet_rx events whose from starts with
+#     "relay:" (see net-bitchat-bridge — those are packets we injected)
+sub _handle_bitchat_packet_relay {
+    my ($self, $cli, $cmd) = @_;
+    my $kv = $cmd->{kv} || {};
+    my $pid    = $kv->{packet_id} // '';
+    my $hex    = $kv->{hex}       // '';
+    my $origin = $kv->{origin}    // '';
+    my $from   = $kv->{from}      // '';
+    my $me     = $self->{cluster}{self_name} // '';
+
+    unless (length $pid && length $hex) {
+        return $self->_send($cli,
+            format_err('BITCHAT_PACKET_RELAY: need packet_id + hex'));
+    }
+
+    # LRU dedup — a moderately-sized ring of recent packet ids. Not
+    # security-critical, so a plain hash + insertion-order eviction
+    # is enough. Both origin (self-fanout) and remote paths share it.
+    $self->{_bitchat_relay_lru}      //= {};
+    $self->{_bitchat_relay_lru_ord}  //= [];
+    if ($self->{_bitchat_relay_lru}{$pid}++) {
+        return $self->_send($cli, format_ok(dedup => 1));
+    }
+    push @{ $self->{_bitchat_relay_lru_ord} }, $pid;
+    while (scalar(@{ $self->{_bitchat_relay_lru_ord} }) > 4096) {
+        my $old = shift @{ $self->{_bitchat_relay_lru_ord} };
+        delete $self->{_bitchat_relay_lru}{$old};
+    }
+
+    if ($origin eq '' || $origin eq $me) {
+        # LOCAL origin — supervisor asked us to broadcast this packet
+        # across the mesh. Must come from loopback (nobody else should
+        # spoof our origin). Fan out; don't deliver locally.
+        return $self->_send($cli, format_err(
+            "BITCHAT_PACKET_RELAY: local origin requires loopback"))
+            unless _peer_is_loopback($cli);
+        my $count = $self->_bitchat_relay_fanout(
+            packet_id => $pid, hex => $hex, from => $from,
+            origin    => $me);
+        return $self->_send($cli, format_ok(fanned => $count));
+    }
+
+    # REMOTE origin — hand off to local SUBSCRIBE listeners so the
+    # supervisor's stream picks it up and injects into the helper.
+    $self->_emit_change(
+        table => 'bitchat_relay_packets',
+        op    => 'insert',
+        row   => {
+            packet_id => $pid,
+            hex       => $hex,
+            origin    => $origin,
+            from_addr => $from,
+            seen_at   => time(),
+        });
+    return $self->_send($cli, format_ok(injected => 1));
+}
+
+# Fan out one packet to every mesh peer with 'ble' in their advertised
+# node_capabilities. Follows the _forward_observe_to_master pattern
+# (canonical daemon→peer push): open a NetMgr::Client, HELLO, send verb,
+# BYE, done. Sync sequential today — TODO: swap to non-blocking when
+# peer count grows beyond a handful. Skips self by member name.
+sub _bitchat_relay_fanout {
+    my ($self, %a) = @_;
+    my $me    = $self->{cluster}{self_name} // '';
+    my $rows  = eval { $self->{db}->list_node_capabilities } || [];
+    my $count = 0;
+    for my $r (@$rows) {
+        my $member = $r->{member} // '';
+        next unless length $member;
+        next if $member eq $me;
+        my %caps = map { $_ => 1 }
+                   grep { length }
+                   split /,/, ($r->{capabilities} // '');
+        next unless $caps{ble};
+        my $addr = eval { $self->{mesh}->address_for($member) }
+                || "$member:7531";
+        my $ok = eval {
+            require NetMgr::Client;
+            my $c = NetMgr::Client->new(listen => $addr, timeout => 6);
+            $c->hello(consumer => "bitchat-relay-fanout.$$");
+            eval { $c->auth };   # tolerate no-key (mirrors _forward_observe_to_master:874-886)
+            $c->send_recv('BITCHAT_PACKET_RELAY '
+                        . NetMgr::Protocol::format_kv(
+                            packet_id => $a{packet_id},
+                            hex       => $a{hex},
+                            from      => $a{from},
+                            origin    => $a{origin},
+                          ));
+            $c->bye;
+            1;
+        };
+        if ($ok) { $count++ }
+        else {
+            $self->_log("bitchat-relay fanout to $member ($addr) failed: $@")
+                if $@;
+        }
+    }
+    return $count;
 }
 
 1;

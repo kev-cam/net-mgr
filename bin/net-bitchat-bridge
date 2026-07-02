@@ -35,7 +35,7 @@ use JSON::PP;
 use POSIX qw(WNOHANG);
 use NetMgr::Client;
 use NetMgr::Config;
-use NetMgr::Protocol qw(parse_line);
+use NetMgr::Protocol qw(parse_line format_kv);
 
 my %opt;
 GetOptions(\%opt,
@@ -202,7 +202,36 @@ sub run_once {
         } else {
             warn "[bridge] SUBSCRIBE sent for session=$session\n";
         }
+        # Cross-site mesh binding (Option B step 2): stream inserts on the
+        # in-memory bitchat_relay_packets table so we get a ROW event
+        # whenever another bridge site fanned out a packet_rx to us.
+        # Origin filter keeps us from acting on our own fanout echoing back.
+        my $me = eval { NetMgr::Config->cluster->{self_name} } // 'unknown';
+        eval {
+            $sub->send_line("SUBSCRIBE sub=3 mode=stream"
+                          . " FROM bitchat_relay_packets"
+                          . " WHERE origin != '$me'");
+        };
+        warn "[bridge] SUBSCRIBE relay send failed: $@" if $@;
     }
+    my $me = eval { NetMgr::Config->cluster->{self_name} } // 'unknown';
+    # LRU dedup at the supervisor edge — both stdout packet_rx and inbound
+    # SUBSCRIBE stream share this so a packet arriving twice (once via BLE
+    # + once via IP fanout, or same fanout received twice) isn't relayed
+    # or injected twice. Bounded ring; drop oldest at 4096 entries.
+    my %relay_lru;
+    my @relay_lru_ord;
+    my $relay_seen = sub {
+        my ($pid) = @_;
+        return 1 if !defined $pid || $pid eq '';
+        return 1 if $relay_lru{$pid}++;
+        push @relay_lru_ord, $pid;
+        while (@relay_lru_ord > 4096) {
+            my $old = shift @relay_lru_ord;
+            delete $relay_lru{$old};
+        }
+        return 0;
+    };
 
     # Drain helper stdout (JSON events from BLE) AND stderr (helper diag
     # logs) AND — new for Tier-2 — the subscription stream (typed messages
@@ -270,6 +299,30 @@ sub run_once {
                     if ($@ || !$c) { warn "[bridge] sub parse: $@\n" if $@; next }
                     next unless ($c->{verb} // '') eq 'ROW';
                     my $t = $c->{kv}{table} // '';
+                    # Cross-site relay inbound (Option B): a peer bridge's
+                    # helper captured a BLE packet and fanned it out to us.
+                    # Origin filter is already server-side (WHERE origin != me);
+                    # LRU-check the packet_id here too and inject via helper stdin.
+                    if ($t eq 'bitchat_relay_packets') {
+                        my $pid    = $c->{kv}{packet_id} // '';
+                        my $hex    = $c->{kv}{hex}       // '';
+                        my $origin = $c->{kv}{origin}    // '';
+                        next unless length $pid && length $hex;
+                        next if $origin eq $me;         # belt-and-braces
+                        next if $relay_seen->($pid);
+                        my $cmd = encode_json({
+                            cmd  => 'inject_packet',
+                            hex  => $hex,
+                            from => "relay:$origin",
+                        });
+                        my $ok = eval { print $wh "$cmd\n"; 1 };
+                        if (!$ok) {
+                            warn "[bridge] inject_packet write failed: $@";
+                        } else {
+                            $forwarded++;
+                        }
+                        next;
+                    }
                     next unless $t eq 'chat_messages';
                     my $row_sender = $c->{kv}{sender} // '';
                     my $row_body   = $c->{kv}{body}   // '';
@@ -314,6 +367,42 @@ sub run_once {
                     next;
                 }
                 my $type = $ev->{type} // '';
+
+                # Cross-site relay (Option B): every raw BLE packet the
+                # helper receives is emitted as packet_rx. We forward to
+                # the loopback daemon which fans out to ble-capable mesh
+                # peers. Skip packets we injected ourselves (from starts
+                # with "relay:") — those are the local rebroadcast side
+                # of an inbound IP-forwarded packet and don't need to
+                # go around the ring again. Also LRU-guard against
+                # duplicate emissions from the same helper.
+                if ($type eq 'packet_rx') {
+                    my $from_addr = $ev->{from} // '';
+                    if ($from_addr =~ /^relay:/) {
+                        next;   # injected packet echoing back — skip
+                    }
+                    my $pid = $ev->{packet_id} // '';
+                    if (!length $pid) {
+                        # Compute packet_id at supervisor when helper didn't
+                        # send one — SHA-256(hex) first 32 chars is stable
+                        # across sites for the same wire bytes.
+                        require Digest::SHA;
+                        $pid = substr(Digest::SHA::sha256_hex($ev->{hex} // ''), 0, 32);
+                    }
+                    next if $relay_seen->($pid);
+                    if ($cli) {
+                        my $line = 'BITCHAT_PACKET_RELAY '
+                                 . NetMgr::Protocol::format_kv(
+                                     packet_id => $pid,
+                                     hex       => ($ev->{hex} // ''),
+                                     from      => $from_addr,
+                                   );
+                        eval { $cli->send_recv($line) };
+                        warn "[bridge] relay fanout failed: $@" if $@;
+                    }
+                    next;
+                }
+
                 if ($type eq 'msg') {
                     my $sender = $ev->{sender} // '?';
                     my $body   = $ev->{body}   // '';
