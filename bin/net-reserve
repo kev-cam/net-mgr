@@ -13,7 +13,10 @@
 #   net-reserve list [SUBNET]        colour-coded address map (free/reserved/pool)
 #   net-reserve free [SUBNET] [-n N] list the next free static IPs
 #   net-reserve ranges               list the dynamic DHCP pools
-#   net-reserve reserve IP MAC [--name N] [--group G] [--notes '..'] [--push]
+#   net-reserve reserve IP [MAC] [--name N] [--group G] [--notes '..'] [--push]
+#                                    edit-or-create: omit MAC to update the row
+#                                    at IP (keeps current MAC); omitted flags
+#                                    preserve current values, pass '' to clear.
 #                                    --push also surfaces just this one as a
 #                                    never-seen net-lookup name (needs --name)
 #   net-reserve release IP           remove a reservation
@@ -651,10 +654,16 @@ sub cmd_ranges {
 }
 
 sub cmd_reserve {
-    my $ip  = shift @ARGV or usage("reserve needs IP MAC");
-    my $mac = shift @ARGV or usage("reserve needs IP MAC");
+    # `reserve` is BOTH the create and the edit front door — IP is the row
+    # key. MAC is required only when there's no reservation at IP yet
+    # (create); on an edit, omit it to keep the current MAC or supply a new
+    # one to rebind. Omitted --name/--group/--notes preserve the existing
+    # row's values; pass '' to clear a field.
+    my $ip  = shift @ARGV or usage("reserve needs IP [MAC]");
     die "net-reserve: bad IP '$ip'\n"  unless defined ip2int($ip);
-    die "net-reserve: bad MAC '$mac'\n" unless $mac =~ /^[0-9a-fA-F:]{17}$/;
+    my $mac = shift @ARGV;
+    die "net-reserve: bad MAC '$mac'\n"
+        if defined $mac && $mac !~ /^[0-9a-fA-F:]{17}$/;
     my $cli = connect_client();
     # Pull this subnet's current view first, then warn (don't block) if
     # the chosen IP sits inside a dynamic pool.
@@ -664,8 +673,12 @@ sub cmd_reserve {
     warn "net-reserve: note: $ip is inside a DHCP dynamic range — "
        . "it may also be auto-leased; consider a free static instead\n"
         if $st eq 'assigned';
+    my $existing = $model->{resv}{ canon_ip($ip) };
+    die "net-reserve: no reservation at $ip yet — MAC required to create one\n"
+        if !$existing && !defined $mac;
     my $r = $cli->observe(
-        kind => 'dhcp_reservation', ip => $ip, mac => lc $mac,
+        kind => 'dhcp_reservation', ip => $ip,
+        (defined $mac       ? (mac   => lc $mac)    : ()),
         (defined $opt_name  ? (name  => $opt_name)  : ()),
         subnet_cidr => subnet_of($ip),
         (defined $opt_group ? (grp   => $opt_group) : ()),
@@ -675,16 +688,33 @@ sub cmd_reserve {
     # The daemon refuses a 2nd reservation for a MAC already reserved elsewhere;
     # `net-reserve move OLD NEW` relocates it, or --force adds it anyway.
     die "net-reserve: $r\n" if !defined $r || $r =~ /^ERR/;
-    print "reserved $ip -> $mac",
+    my $show_mac = defined $mac ? lc $mac : ($existing ? $existing->{mac} : '?');
+    print(($existing ? "updated " : "reserved "),
+          "$ip -> $show_mac",
           (defined $opt_name ? " ($opt_name)" : ''),
-          (defined $opt_group ? " [$opt_group]" : ''), "\n";
+          (defined $opt_group ? " [$opt_group]" : ''), "\n");
     # --push: also surface just this one reservation as a never-seen net-lookup
     # name (so its tile/name resolves right away), without pushing the rest.
+    # On an edit-with---push the operator may have omitted MAC — fetch it
+    # from the (now-updated) row so _push_host still has one for net-lookup.
     if ($opt_push) {
         if (defined $opt_name && length $opt_name) {
-            my $ok = _push_host($cli, ip => $ip, mac => lc $mac, name => $opt_name);
-            print "pushed $ip -> $opt_name into net-lookup (never-seen)\n"
-                if $ok && !$opt_dry;
+            my $push_mac = defined $mac ? lc $mac
+                         : ($existing ? $existing->{mac} : undef);
+            if (!defined $push_mac) {
+                my $after = gather($cli);
+                my $row   = $after->{resv}{ canon_ip($ip) };
+                $push_mac = $row->{mac} if $row;
+            }
+            if (defined $push_mac && length $push_mac) {
+                my $ok = _push_host($cli, ip => $ip, mac => $push_mac,
+                                    name => $opt_name);
+                print "pushed $ip -> $opt_name into net-lookup (never-seen)\n"
+                    if $ok && !$opt_dry;
+            } else {
+                warn "net-reserve: --push has no MAC to push (row not visible); "
+                   . "reservation made, nothing pushed\n";
+            }
         } else {
             warn "net-reserve: --push needs a --name to resolve; "
                . "reservation made, nothing pushed\n";
@@ -2232,7 +2262,12 @@ usage:
   net-reserve list [SUBNET]              colour-coded address map
   net-reserve free [SUBNET] [-n N]       next free static IPs
   net-reserve ranges                     dynamic DHCP pools
-  net-reserve reserve IP MAC [--name N] [--group G] [--notes '..'] [--push]
+  net-reserve reserve IP [MAC] [--name N] [--group G] [--notes '..'] [--push]
+                                         omit MAC to edit an existing row;
+                                         omitted flags preserve current values,
+                                         pass '' (e.g. --group '') to clear.
+                                         Edit against the cluster master (nas3)
+                                         — non-master edits revert on replication.
                                          (--push: also push just this one as a
                                          never-seen net-lookup name; needs --name)
   net-reserve release IP

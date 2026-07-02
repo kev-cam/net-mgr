@@ -4285,42 +4285,74 @@ sub _dhcp_subnet_of {
     return "$1.0/24";
 }
 
-# OBSERVE kind=dhcp_reservation ip=.. mac=.. [name=..] [subnet_cidr=..]
+# OBSERVE kind=dhcp_reservation ip=.. [mac=..] [name=..] [subnet_cidr=..]
 #   [grp=..] [notes=..] [as=NAME]
+#
+# Merge semantics: this verb is both create and edit — ip is the row key.
+#   * If no row exists at ip, mac is required (create path).
+#   * If a row exists, mac is optional (keeps current) — supply it only to
+#     rebind the reservation to a different device.
+#   * Any of name/grp/notes/subnet_cidr that is OMITTED from the OBSERVE
+#     preserves the existing value on the row. To CLEAR a field, send it
+#     explicitly as an empty string. This lets `net-reserve reserve IP
+#     --name NEW` rename without clobbering grp/notes to NULL, which the
+#     old "always pass VALUES(..)" behaviour did.
 sub _obs_dhcp_reservation {
     my ($self, $cli, $kv) = @_;
     my ($who) = $self->_chat_identity($cli, $kv);
     die "dhcp_reservation: not authorized\n" unless defined $who;
     my $ip  = $kv->{ip};
-    my $mac = $kv->{mac};
     die "dhcp_reservation: ip required\n"  unless defined $ip  && length $ip;
-    die "dhcp_reservation: mac required\n" unless defined $mac && length $mac;
     die "dhcp_reservation: bad ip '$ip'\n"
         unless $ip =~ /\A\d+\.\d+\.\d+\.\d+\z/;
-    die "dhcp_reservation: bad mac '$mac'\n"
-        unless $mac =~ /\A[0-9a-fA-F:]{17}\z/;
+    # Single fetch: reused for the duplicate-MAC guard AND the merge below,
+    # so we don't hit the DB twice on the edit path.
+    my $existing = $self->{db}->get_dhcp_reservation($ip);
+    my $mac      = $kv->{mac};
+    # mac is only required when creating a fresh row. On an edit, omitting
+    # mac keeps whatever the row already has.
+    if (defined $mac && length $mac) {
+        die "dhcp_reservation: bad mac '$mac'\n"
+            unless $mac =~ /\A[0-9a-fA-F:]{17}\z/;
+    } else {
+        die "dhcp_reservation: mac required\n" unless $existing;
+        $mac = $existing->{mac};
+    }
     # One reservation per MAC: refuse a NEW reservation for a device already
     # reserved at another address (it should be moved/released, not duplicated).
     # Updating the reservation already at this IP is fine, as is an explicit
     # force=1 (multi-homed edge cases).
-    unless ($self->{db}->get_dhcp_reservation($ip) || $kv->{force}) {
+    unless ($existing || $kv->{force}) {
         my $other = $self->{db}->dhcp_reservation_for_mac($mac);
         die "dhcp_reservation: $mac is already reserved at $other->{ip}"
           . (defined $other->{name} && length $other->{name} ? " ($other->{name})" : '')
           . " - move or release it first (or force=1)\n"
             if $other;
     }
-    # Auto-name from the MAC's correlated machine when the caller gives no name,
-    # so reservations don't sit nameless in dnsmasq/DNS.
-    my $name = $kv->{name};
-    $name = $self->{db}->name_for_mac($mac) if !defined $name || $name eq '';
+    # Merge helper: caller sent it → use their value (empty string clears);
+    # otherwise inherit the existing row's value; else undef (create fresh).
+    my $merge = sub {
+        my ($k) = @_;
+        return $kv->{$k} if exists $kv->{$k};
+        return $existing ? $existing->{$k} : undef;
+    };
+    my $name = $merge->('name');
+    # Auto-name from the MAC's correlated machine ONLY when creating a fresh
+    # row with no name supplied — so reservations don't sit nameless in
+    # dnsmasq/DNS. NEVER re-derive over an existing name: doing so on an
+    # edit would silently replace an operator-set label with whatever
+    # name_for_mac returns (often an mDNS "DESKTOP-*" string — the exact
+    # thing the operator is trying to escape when they rename).
+    if (!$existing && (!defined $name || $name eq '')) {
+        $name = $self->{db}->name_for_mac($mac);
+    }
     $self->_upsert('dhcp_reservations', 'upsert_dhcp_reservation',
         ip          => $ip,
         mac         => $mac,
         name        => $name,
-        subnet_cidr => ($kv->{subnet_cidr} // _dhcp_subnet_of($ip)),
-        grp         => $kv->{grp},
-        notes       => $kv->{notes},
+        subnet_cidr => ($merge->('subnet_cidr') // _dhcp_subnet_of($ip)),
+        grp         => $merge->('grp'),
+        notes       => $merge->('notes'),
         updated_by  => $who,
     );
     $self->_log("dhcp reservation $ip -> $mac by $who");

@@ -116,6 +116,42 @@ like(last_reply($agent), qr/^ERR.*already reserved/, 'move onto occupied IP erro
 feed($agent, "OBSERVE kind=dhcp_reservation_move ip=198.51.100.25 new_ip=198.51.100.20");
 like(last_reply($agent), qr/^OK/, 'move back ok');
 
+# ---- 3c. merge semantics (edit path) --------------------------------
+# Seed a fully-populated row, then confirm:
+#   - name-only edit (no mac, no grp, no notes)   preserves grp+notes+mac
+#   - explicit empty string on a field            clears it
+#   - create without an existing row STILL needs mac (guardrail)
+feed($agent, "OBSERVE kind=dhcp_reservation ip=198.51.100.30 "
+           . "mac=aa:bb:cc:dd:ee:30 name=orig grp=lab notes=chassis-A");
+like(last_reply($agent), qr/^OK/, 'seed row for merge tests');
+is($db->get_dhcp_reservation('198.51.100.30')->{grp},   'lab',       'grp seeded');
+is($db->get_dhcp_reservation('198.51.100.30')->{notes}, 'chassis-A', 'notes seeded');
+
+# (a) rename via omitted-mac edit: name changes, everything else survives
+feed($agent, "OBSERVE kind=dhcp_reservation ip=198.51.100.30 name=renamed");
+like(last_reply($agent), qr/^OK/, 'rename edit ok (no mac)');
+my $r30 = $db->get_dhcp_reservation('198.51.100.30');
+is($r30->{name},  'renamed',           'name updated');
+is($r30->{mac},   'aa:bb:cc:dd:ee:30', 'mac preserved on omit');
+is($r30->{grp},   'lab',               'grp preserved on omit');
+is($r30->{notes}, 'chassis-A',         'notes preserved on omit');
+
+# (b) explicit empty string clears the field; siblings still preserved
+feed($agent, "OBSERVE kind=dhcp_reservation ip=198.51.100.30 grp=");
+like(last_reply($agent), qr/^OK/, 'clear grp with empty string ok');
+$r30 = $db->get_dhcp_reservation('198.51.100.30');
+ok(!defined $r30->{grp} || $r30->{grp} eq '', 'grp cleared');
+is($r30->{name},  'renamed',   'name preserved on clear');
+is($r30->{notes}, 'chassis-A', 'notes preserved on clear');
+
+# (c) create path still requires mac — no row at this ip yet
+feed($agent, "OBSERVE kind=dhcp_reservation ip=198.51.100.31 name=nomac");
+like(last_reply($agent), qr/^ERR.*mac required/, 'create without mac rejected');
+ok(!$db->get_dhcp_reservation('198.51.100.31'), 'no row created without mac');
+
+# clean the merge-test row so the delete section is unaffected
+$db->delete_dhcp_reservation('198.51.100.30');
+
 # ---- 4. delete ------------------------------------------------------
 feed($agent, "OBSERVE kind=dhcp_reservation_delete ip=198.51.100.20");
 like(last_reply($agent), qr/^OK/, 'delete ok');
