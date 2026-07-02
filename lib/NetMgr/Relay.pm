@@ -476,4 +476,14 @@ sub _delete_mesh_tunnels {
     $db->delete_mesh_tunnel($row->{owner_node}, $row->{kind});
 }
 
+sub _apply_node_capabilities {
+    my ($db, $row, $idmap, $repl_from) = @_;
+    return unless defined $row->{member} && length $row->{member};
+    $db->set_node_capabilities(
+        member          => $row->{member},
+        capabilities    => $row->{capabilities} // '',
+        replicated_from => $repl_from,
+    );
+}
+
 1;
