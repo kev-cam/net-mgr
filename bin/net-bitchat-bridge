@@ -35,6 +35,7 @@ use JSON::PP;
 use POSIX qw(WNOHANG);
 use NetMgr::Client;
 use NetMgr::Config;
+use NetMgr::Protocol qw(parse_line);
 
 my %opt;
 GetOptions(\%opt,
@@ -153,32 +154,54 @@ sub run_once {
     warn "[bridge] launching helper: $helper_path @helper_args\n";
     my ($wh, $rh, $eh) = (undef, undef, gensym);
     my $pid = open3($wh, $rh, $eh, $helper_path, @helper_args);
-    close $wh;   # we don't write commands to the helper
+    # Keep $wh open — it's the reverse-direction channel now. Tier-2 wires
+    # net-chat's `bitchat-bridge` session to the helper's stdin JSON command
+    # protocol: SUBSCRIBE to chat_messages, and each new user-typed line
+    # becomes {"cmd":"send","body":"..."} on the helper's stdin, which
+    # broadcasts it on BLE mesh. Buffered write so a slow helper doesn't
+    # stall the supervisor.
+    $wh->autoflush(1) if $wh;
 
-    my $cli;
+    my ($cli, $sub);
     unless ($opt{'dry-run'}) {
+        # $cli — write channel: chat_post inbound BLE messages.
         $cli = NetMgr::Client->new(listen => $listen, timeout => 6);
         $cli->hello(consumer => "bitchat-bridge.$$");
-        # loopback → no auth needed
+        # $sub — read channel: SUBSCRIBE stream. Separate client so a slow
+        # chat_post never stalls the subscription (and vice versa).
+        $sub = NetMgr::Client->new(listen => $listen, timeout => 6);
+        $sub->hello(consumer => "bitchat-bridge.sub.$$");
+        # Stream-only (not snapshot): we don't want the message backlog
+        # replayed to BLE at startup, only newly-typed lines. WHERE gates
+        # to just our session so we don't get every unrelated chat's
+        # traffic in the loop.
+        $sub->send_line("SUBSCRIBE sub=1 mode=stream"
+                      . " FROM chat_messages WHERE session = '$session'");
     }
 
-    # Drain stdout (JSON events) AND stderr (helper diagnostic logs) in
-    # parallel — without this, helper stderr blocks once its pipe fills
-    # (~64 KiB) and the helper stops emitting JSON because the runtime is
-    # stuck in write(2).
+    # Drain helper stdout (JSON events from BLE) AND stderr (helper diag
+    # logs) AND — new for Tier-2 — the subscription stream (typed messages
+    # to broadcast back onto BLE). Without concurrent draining any one of
+    # them stalling would block the others (~64 KiB pipe buffer).
     my $sel = IO::Select->new($rh, $eh);
+    $sel->add($sub->{sock}) if $sub && $sub->{sock};
     my %buf = ($rh => '', $eh => '');
+    $buf{ $sub->{sock} } = '' if $sub && $sub->{sock};
     my $posted = 0;
-    my @done;   # fds we've seen EOF on
+    my $forwarded = 0;
+    # Track EOF per fd so the helper-dies test is independent of whether
+    # the subscription happens to EOF (net-mgr daemon restart, etc.) — we
+    # want to keep going as long as helper stdout+stderr are live.
+    my %eof;
 
   OUTER:
-    while (@done < 2) {
+    while (!($eof{$rh} && $eof{$eh})) {
         my @ready = $sel->can_read(1) or next;
         for my $fh (@ready) {
             my $chunk;
             my $n = sysread($fh, $chunk, 4096);
             if (!defined $n || $n == 0) {
-                push @done, $fh;
+                $eof{$fh} = 1;
                 $sel->remove($fh);
                 next;
             }
@@ -191,6 +214,40 @@ sub run_once {
                 if ($fh == $eh) {
                     # Helper diagnostic — surface to our own stderr.
                     warn "[helper/err] $line\n";
+                    next;
+                }
+                # Subscription stream: net-chat client posted a new message
+                # to bitchat-bridge session. Forward to helper stdin so it
+                # broadcasts on BLE mesh. Loop guard: skip messages our own
+                # $as posted (those came FROM BLE via chat_post; forwarding
+                # them back to BLE would echo).
+                if ($sub && $fh == $sub->{sock}) {
+                    my $c = eval { parse_line($line) };
+                    if ($@ || !$c) { warn "[bridge] sub parse: $@\n" if $@; next }
+                    next unless ($c->{verb} // '') eq 'ROW';
+                    my $t = $c->{kv}{table} // '';
+                    next unless $t eq 'chat_messages';
+                    my $row_sender = $c->{kv}{sender} // '';
+                    my $row_body   = $c->{kv}{body}   // '';
+                    next unless length $row_body;
+                    # Echo guard: skip anything we posted (either literal
+                    # $as, or the tagged form we use for BLE inbound).
+                    next if $row_sender eq $as;
+                    next if $row_body =~ /^\[[^]]*\@bitchat/;
+                    # Serialize and forward to helper.
+                    my $out_body = $row_body;
+                    utf8::upgrade($out_body);
+                    my $cmd = encode_json({ cmd => 'send', body => $out_body });
+                    if ($opt{'dry-run'}) {
+                        print "DRY: helper stdin << $cmd\n";
+                    } else {
+                        my $ok = eval { print $wh "$cmd\n"; 1 };
+                        if (!$ok) {
+                            warn "[bridge] stdin write failed: $@";
+                        } else {
+                            $forwarded++;
+                        }
+                    }
                     next;
                 }
                 # stdout path: JSON event
@@ -239,9 +296,11 @@ sub run_once {
     }           # close OUTER while
 
     eval { $cli->bye } if $cli;
+    eval { $sub->bye } if $sub;
+    eval { close $wh } if $wh;
     waitpid($pid, 0);
     my $code = $? >> 8;
-    warn "[bridge] processed $posted msg(s) before helper exited\n";
+    warn "[bridge] processed $posted inbound BLE, forwarded $forwarded outbound to BLE, before helper exited\n";
     return $code;
 }
 
