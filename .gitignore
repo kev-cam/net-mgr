@@ -4,3 +4,4 @@
 .*.swp
 /tmp/
 .version
+net-import-dnsmasq.log
