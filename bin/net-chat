@@ -2292,26 +2292,48 @@ sub cmd_gui {
                                 -command => sub { $act->('deny') })
                         ->pack(-side => 'left', -padx => 2);
                 }
-                # DM — open a private two-party session between me and this
-                # principal. Canonical naming: "dm:<a>|<b>" with the two
-                # principals sorted so both parties resolve the same
-                # session name. Uses request-mode so the DM roster is
-                # locked to the two named parties.
+                # DM — open a private two-party session between me and
+                # this principal. Session names must match
+                # [A-Za-z0-9][A-Za-z0-9._-]{0,63} (see need_name +
+                # server-side validator), so principals like "dkc@bigsony"
+                # need sanitizing: '@' and any other non-allowed char → '_'.
+                # Both endpoints compute the same canonical name because
+                # sanitize+sort are deterministic. Use request-mode so
+                # the DM roster is locked to the two named parties. Human-
+                # readable topic keeps the ORIGINAL principals visible.
                 my $dm_target = $princ;
                 if (defined $dm_target && length $dm_target && $dm_target !~ /^unverified:/) {
                     $rf->Button(-text => 'DM', -command => sub {
-                        my @who = sort ($as // 'anon', $dm_target);
-                        my $dm_name = 'dm:' . join('|', @who);
+                        my $me   = $as // $key_id // 'anon';
+                        my @who  = sort ($me, $dm_target);
+                        my $sanitize = sub {
+                            (my $s = shift) =~ s/[^A-Za-z0-9._-]/_/g; $s
+                        };
+                        # `dm-<a>__<b>` — 'dm-' prefix + __ separator both
+                        # allowed; keeps the two sanitized principals visible
+                        # in the dropdown label. Cap at 63 chars total after
+                        # the leading 'dm-' (server allows up to 64).
+                        my $dm_name = 'dm-' . join('__',
+                            $sanitize->($who[0]), $sanitize->($who[1]));
+                        $dm_name = substr($dm_name, 0, 64);
                         eval { $ctrl->chat_open(name => $dm_name,
                                                 mode => 'request',
                                                 topic => "DM: $who[0] & $who[1]") };
-                        # ignore "already open" errors — just want it to exist
+                        # ignore "already open" errors — we just want the
+                        # session to EXIST here; report other errors so a
+                        # dead-in-the-water DM click isn't silent.
+                        if ($@ && $@ !~ /already open|already exists/i) {
+                            my $e = $@; chomp $e;
+                            $set_status->("DM open failed: $e");
+                            return;
+                        }
                         eval { $ctrl->chat_member('allow', session => $dm_name,
                                                   principal => $dm_target) };
-                        # Refresh session list, then follow.
+                        # (allow-failed is non-fatal — target may already be
+                        # a member; the follow below is what actually matters)
                         $refresh->();
                         $follow->($dm_name);
-                        $dlg->destroy;   # close Members dialog; we've moved on
+                        $dlg->destroy;
                     })->pack(-side => 'left', -padx => 2);
                 }
                 # Delete (destructive) — available on every state. Removes
