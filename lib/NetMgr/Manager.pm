@@ -2856,7 +2856,7 @@ sub _check_periodic_triggers {
     my $now   = time();
     $self->{periodic_last} //= {};
 
-    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq ddns ipv6_vlan netif register-self)) {
+    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq ddns ipv6_vlan netif register-self bitchat-sweep)) {
         my $interval = $sched->{$name} // 0;
         # netif: track interface changes (WiFi/USB up/down) and rebind the
         # 'all'/'auto' listeners. Auto-enable at 30s for those specs (an explicit
@@ -2906,6 +2906,13 @@ sub _check_periodic_triggers {
         $interval ||= 30 if $name eq 'push-dnsmasq'
             && ((($self->{config}{dnsmasq}{mode} // 'off') eq 'auto')
                  || $self->{config}{dnsmasq}{push_aps});
+        # bitchat-sweep: mark stale bitchat_peers rows disconnected + purge old
+        # ones. Auto-enable at 60s ONLY when the table exists (this node ran
+        # the schema v33 migration). Prevents the accumulation of
+        # bigsony-bridge duplicates the user saw after several helper
+        # restarts each generated a fresh Noise key + fresh peer_id row.
+        $interval ||= 60 if $name eq 'bitchat-sweep'
+            && $self->{db}->current_schema_version >= 33;
         next unless $interval && $interval > 0;
         my $last = $self->{periodic_last}{$name} // 0;
         next if ($now - $last) < $interval;
@@ -2922,6 +2929,17 @@ sub _check_periodic_triggers {
 sub _fire_periodic {
     my ($self, $name) = @_;
     if ($name eq 'push-dnsmasq') { $self->_sync_dnsmasq; return }
+    if ($name eq 'bitchat-sweep') {
+        # Two-stage sweep: peers with is_connected=1 that haven't been
+        # refreshed by the supervisor's poll for 90s go to is_connected=0.
+        # Rows sitting at is_connected=0 for over 30 min get purged.
+        # Windows tuned for a 30-second supervisor poll cadence + a few
+        # missed cycles' tolerance.
+        eval { $self->{db}->sweep_bitchat_peers(
+            stale_secs => 90, purge_secs => 1800) };
+        $self->_log("bitchat-sweep failed: $@") if $@;
+        return;
+    }
     if ($name eq 'ddns')         { $self->_check_ddns;   return }
     if ($name eq 'ipv6_vlan')    { $self->_check_ipv6_vlans; return }
     if ($name eq 'netif')        { $self->_recheck_listeners; return }

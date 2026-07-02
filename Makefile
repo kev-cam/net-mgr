@@ -183,7 +183,7 @@ list:
 	  V=$$($$AS "git -C '$(CURDIR)' describe --tags --always --dirty" 2>/dev/null \
 	       || $$AS "git -C '$(CURDIR)' rev-parse --short HEAD" 2>/dev/null \
 	       || echo unknown); \
-	  D=$$($$AS "git -C '$(CURDIR)' log -1 --format=%cd --date=short" 2>/dev/null); \
+	  D=$$($$AS "git -C '$(CURDIR)' log -1 --format=%cd --date=format:%Y-%m-%d\ %H:%M" 2>/dev/null); \
 	  printf '%s%s\n' "$$V" "$${D:+ ($$D)}" > .version; \
 	  if [ "$$(id -un)" = "root" ] && [ "$$OWNER" != "root" ]; then \
 	    chown "$$OWNER" .version 2>/dev/null || true; \
