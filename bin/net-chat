@@ -102,8 +102,25 @@ GetOptions(
     'all'        => \$show_all,
     'gui'        => \$gui,
     'tty'        => \$tty,
+    'bit-chat'   => \my $bitchat_mode,
     'askpass'    => \$askpass,
 ) or die "bad options\n";
+
+# --bit-chat: shortcut for BitChat bridge access. Auto-selects the local
+# daemon's loopback listener (that's where the bitchat-bridge session
+# lives — chat_messages there aren't cluster-replicated, so it's ONLY
+# reachable via loopback on a bridge site) and defaults the initial
+# session to 'bitchat-bridge'. Compatible with --gui and --tty. When
+# combined with --tty it drops you straight into the read-and-post loop
+# on that session; --gui opens with the session pre-selected.
+my $bitchat_default_session;
+if ($bitchat_mode) {
+    $listen                  //= '127.0.0.1:7531';
+    $bitchat_default_session   = 'bitchat-bridge';
+    # Loopback needs no auth server-side; belt-and-braces skip the
+    # client-side auth attempt too so we don't pop the "which key" dialog.
+    $no_auth                 //= 1 unless $force_auth;
+}
 
 # Persisted "Sign in always" indicator — declared here so it's visible
 # in cmd_gui's anon-startup branch. Set inside the config-load block
@@ -187,8 +204,8 @@ $as //= $ENV{NET_CHAT_AS} // $ENV{USER} // 'local';
 
 # --gui launches the Tk front-end; the leftover arg (if any) is the session
 # to open initially. No subcommand is required in this mode.
-if ($gui) { cmd_gui($cmd); exit 0; }
-if ($tty) { cmd_tty($cmd); exit 0; }
+if ($gui) { cmd_gui($cmd // $bitchat_default_session); exit 0; }
+if ($tty) { cmd_tty($cmd // $bitchat_default_session); exit 0; }
 usage() unless defined $cmd;
 
 # ---- dispatch --------------------------------------------------------
@@ -2149,6 +2166,44 @@ sub cmd_gui {
             $hdr->Label(-text => 'from', -width => 20,
                         -font => 'sans-serif 9 bold', -anchor => 'w')
                 ->pack(-side => 'left');
+
+            # IP → hostname resolver with a per-populate cache. The
+            # requested_from column carries whatever peer address the
+            # daemon captured when the CHAT_JOIN arrived — usually the
+            # remote IPv4 (or v6). Show the friendly name where DNS/
+            # /etc/hosts has one; strip the port for cleaner display.
+            # Sync gethostbyaddr with a 1s alarm guards against a slow
+            # resolver blocking the whole GUI thread.
+            my %hostcache;
+            my $host_for = sub {
+                my ($from) = @_;
+                return '' unless defined $from && length $from;
+                my $host_port = $from;
+                (my $host = $host_port) =~ s/:\d+$//;
+                return $hostcache{$host} if exists $hostcache{$host};
+                # Already a name (contains letters)? just return.
+                if ($host =~ /[A-Za-z]/) { return $hostcache{$host} = $host }
+                my $name;
+                eval {
+                    require Socket;
+                    local $SIG{ALRM} = sub { die "timeout\n" };
+                    alarm 1;
+                    my $packed = Socket::inet_aton($host);
+                    if ($packed) {
+                        $name = gethostbyaddr($packed, Socket::AF_INET());
+                    }
+                    alarm 0;
+                };
+                alarm 0;
+                # Drop the trailing .grfx.com / .local / whatever so it fits
+                # in the 20-char column — the shortname is what the user
+                # recognises anyway ("gateway2" not "gateway2.grfx.com").
+                if (defined $name && length $name) {
+                    $name =~ s/\..*$//;
+                    return $hostcache{$host} = $name;
+                }
+                return $hostcache{$host} = $host;
+            };
             $hdr->Label(-text => 'actions',
                         -font => 'sans-serif 9 bold', -anchor => 'w')
                 ->pack(-side => 'left');
@@ -2176,7 +2231,7 @@ sub cmd_gui {
                            -width => 8,  -anchor => 'w')->pack(-side => 'left');
                 $rf->Label(-text => $m->{state}        // '?',
                            -width => 10, -anchor => 'w')->pack(-side => 'left');
-                $rf->Label(-text => $m->{requested_from} // '',
+                $rf->Label(-text => $host_for->($m->{requested_from}),
                            -width => 20, -anchor => 'w')->pack(-side => 'left');
                 # State-specific actions. All four ops go through the
                 # same $ctrl, which may need to be AUTH'd — server-side
