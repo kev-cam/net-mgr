@@ -1,0 +1,63 @@
+#!/bin/sh
+# net-mgr-reset-ble — reset the local Bluetooth stack and bounce net-bitchat-bridge.
+#
+# Run by the daemon (as root) on an authenticated `reset_ble` OBSERVE — see
+# NetMgr::Manager::_obs_reset_ble — or by hand. Trigger across the cluster
+# with `net-cluster reset-ble`.
+#
+# Recovery target: the "Maximum advertisements reached" wedge that leaves
+# net-bitchat-bridge in activating/auto-restart. Restarting bluez frees the
+# advertising slot; the bridge then comes up cleanly on next auto-restart.
+#
+# Steps are idempotent and safe to run when things are healthy. `set -e` is
+# NOT set — every step reports its own status and the script always exits 0
+# unless something catastrophic happens, so a caller sees the full picture
+# rather than a truncated first-failure trace.
+
+echo "net-mgr-reset-ble: $(date -Is) on $(hostname)"
+
+step() {
+    label=$1; shift
+    printf 'step: %s ... ' "$label"
+    if out=$("$@" 2>&1); then
+        echo "ok"
+        [ -n "$out" ] && echo "  $out" | sed 's/^/  /'
+    else
+        rc=$?
+        echo "FAIL rc=$rc"
+        [ -n "$out" ] && echo "$out" | sed 's/^/  /'
+    fi
+}
+
+# 1. hciconfig reset — a hard reset of hci0, if available. Some drivers get
+#    wedged in a way that a mere `systemctl restart bluetooth` doesn't clear.
+if command -v hciconfig >/dev/null 2>&1; then
+    step "hciconfig hci0 reset" hciconfig hci0 reset
+else
+    echo "step: hciconfig hci0 reset ... skip (hciconfig not installed)"
+fi
+
+# 2. Restart bluez. This is the load-bearing step for the advertising-slot
+#    exhaustion — bluez holds the slot reservations, restarting drops them.
+step "systemctl restart bluetooth" systemctl restart bluetooth
+
+# 3. Give bluez a moment to come back up. Without this, the bridge restart
+#    below can race and immediately fail its advertise() with the same error.
+sleep 2
+
+# 4. Restart net-bitchat-bridge IFF it's enabled here. Hosts without a bridge
+#    (nas3, laptops, etc.) skip cleanly instead of erroring on "no such unit".
+if systemctl is-enabled net-bitchat-bridge >/dev/null 2>&1; then
+    step "systemctl restart net-bitchat-bridge" systemctl restart net-bitchat-bridge
+    # A quick liveness check: bridge should reach `active` within ~5s if BLE is
+    # healthy. `activating` is not fatal (auto-restart kicks in) but worth
+    # surfacing so the caller can decide whether to retry.
+    sleep 3
+    state=$(systemctl is-active net-bitchat-bridge 2>&1 || true)
+    echo "  net-bitchat-bridge state: $state"
+else
+    echo "step: restart net-bitchat-bridge ... skip (unit not enabled)"
+fi
+
+echo "net-mgr-reset-ble: done"
+exit 0

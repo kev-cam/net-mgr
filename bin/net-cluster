@@ -138,6 +138,7 @@ elsif ($cmd eq 'observe')  { $rc = cmd_observe($multi) }
 elsif ($cmd eq 'update')   { unshift @ARGV, 'kind=self_update'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'deploy')   { unshift @ARGV, 'kind=self_update'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'regen')    { unshift @ARGV, 'kind=regen_dnsmasq'; $rc = cmd_observe($multi) }
+elsif ($cmd eq 'reset-ble'){ unshift @ARGV, 'kind=reset_ble'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'poll')     { $rc = cmd_poll($multi) }
 elsif ($cmd eq 'put')      { $rc = cmd_put($multi) }
 elsif ($cmd eq 'master')   { $rc = cmd_master($multi) }
@@ -460,6 +461,10 @@ Usage:
                                          needs [manager] repo + cross-node auth)
   net-cluster deploy                    (same, but just THIS node via loopback —
                                          no signing needed; run it per node)
+  net-cluster reset-ble                 (bounce bluez + net-bitchat-bridge on
+                                         every peer — recovery for BLE wedges
+                                         like "Maximum advertisements reached";
+                                         auth-gated same as update)
 
 Common flags:
   --listen HOST:PORT     local seed daemon for discovery (127.0.0.1:7531)

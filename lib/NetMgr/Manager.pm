@@ -3181,6 +3181,41 @@ sub _obs_deploy {
     return ();
 }
 
+# OBSERVE kind=reset_ble — bounce the local Bluetooth stack + net-bitchat-bridge.
+# Recovery for the "Maximum advertisements reached" wedge that leaves the bridge
+# in activating/auto-restart after bluez holds onto advertising slots across a
+# helper crash. Auth-gated same as self_update/deploy — restarting host services
+# is at least as privileged as pulling code. Runs the configured reset script in
+# a forked child; _reap_triggers logs the result (no daemon re-exec — this
+# doesn't touch the manager itself).
+sub _obs_reset_ble {
+    my ($self, $cli, $kv) = @_;
+    my ($who) = $self->_chat_identity($cli, $kv);
+    die "reset_ble: not authorized\n" unless defined $who;
+    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_update})) {
+        die "reset_ble: '$who' is not an allowed updater "
+          . "(add the key to /etc/net-mgr/allowed_updaters)\n";
+    }
+    my $script = $self->{config}{manager}{reset_ble_script}
+              // '/usr/local/sbin/net-mgr-reset-ble';
+    -x $script or die "reset_ble: script '$script' is not executable\n";
+    die "reset_ble: already in progress\n"
+        if grep { $_->{name} eq 'reset-ble' } values %{ $self->{triggers} };
+
+    my $pid = fork();
+    die "reset_ble: fork failed: $!\n" unless defined $pid;
+    if ($pid == 0) {
+        for my $c (values %{ $self->{clients}   }) { close $c->{sock} if $c->{sock} }
+        for my $l (values %{ $self->{listeners} }) { close $l->{sock} if $l->{sock} }
+        { no warnings; exec $script; }
+        POSIX::_exit(127);
+    }
+    $self->{triggers}{$pid} = { name => 'reset-ble', started_at => time(),
+                                cli_fd => undef, who => $who };
+    $self->_log("reset-ble started pid=$pid by $who (script=$script)");
+    return ();
+}
+
 # Re-exec the daemon into freshly installed code (after self_update). Relaunch
 # with the exact original argv via /proc/self/cmdline. Perl marks our sockets
 # close-on-exec, so the replacement process rebinds cleanly.
@@ -4810,6 +4845,7 @@ sub _handle_observe {
         elsif ($kind eq 'regen_dnsmasq'){ @events = $self->_obs_regen_dnsmasq($cli, $kv) }
         elsif ($kind eq 'self_update') { @events = $self->_obs_self_update($cli, $kv) }
         elsif ($kind eq 'deploy')      { @events = $self->_obs_deploy($cli, $kv) }
+        elsif ($kind eq 'reset_ble')   { @events = $self->_obs_reset_ble($cli, $kv) }
         elsif ($kind eq 'he_net')      { @events = $self->_obs_he_net($cli, $kv) }
         elsif ($kind eq 'he_update')   { @events = $self->_obs_he_update($cli, $kv) }
         elsif ($kind eq 'write_config'){ @events = $self->_obs_write_config($cli, $kv) }
