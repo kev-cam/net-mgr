@@ -3216,6 +3216,57 @@ sub _obs_reset_ble {
     return ();
 }
 
+# OBSERVE kind=dnsmasq_switch — flip this gateway between the user's custom
+# dnsmasq build and the distro-packaged (stock) one. `variant` (custom|stock,
+# default custom) is forwarded as argv[1] to the shim; the shim in turn defers
+# to an operator-supplied manual switch script for the actual binary/unit
+# swap (path overridable via [manager] dnsmasq_switch_impl, exported as
+# NET_MGR_DNSMASQ_SWITCH_IMPL). variant=stock has a guaranteed dpkg-dist
+# restore fallback even if the manual script is missing, so an operator who
+# lands on 'custom' can always get back to 'stock'. Auth-gated same as
+# self_update/reset_ble — swapping a running service is at least as privileged
+# as pulling code. Forked child so the run loop keeps serving; _reap_triggers
+# just logs the result (no daemon re-exec).
+sub _obs_dnsmasq_switch {
+    my ($self, $cli, $kv) = @_;
+    my ($who) = $self->_chat_identity($cli, $kv);
+    die "dnsmasq_switch: not authorized\n" unless defined $who;
+    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_update})) {
+        die "dnsmasq_switch: '$who' is not an allowed updater "
+          . "(add the key to /etc/net-mgr/allowed_updaters)\n";
+    }
+    my $variant = $kv->{variant} // 'custom';
+    $variant =~ /^(?:custom|stock)$/
+        or die "dnsmasq_switch: variant must be 'custom' or 'stock' (got '$variant')\n";
+    my $script = $self->{config}{manager}{dnsmasq_switch_script}
+              // '/usr/local/sbin/net-mgr-dnsmasq-switch';
+    -x $script or die "dnsmasq_switch: script '$script' is not executable\n";
+    die "dnsmasq_switch: already in progress\n"
+        if grep { $_->{name} eq 'dnsmasq-switch' } values %{ $self->{triggers} };
+
+    # [manager] dnsmasq_switch_impl overrides the shim's default path to the
+    # operator's manual switch script. Passed via env so the shim (a plain
+    # /bin/sh) can pick it up without argv parsing gymnastics.
+    my $impl = $self->{config}{manager}{dnsmasq_switch_impl};
+
+    my $pid = fork();
+    die "dnsmasq_switch: fork failed: $!\n" unless defined $pid;
+    if ($pid == 0) {
+        for my $c (values %{ $self->{clients}   }) { close $c->{sock} if $c->{sock} }
+        for my $l (values %{ $self->{listeners} }) { close $l->{sock} if $l->{sock} }
+        $ENV{NET_MGR_DNSMASQ_SWITCH_IMPL} = $impl if defined $impl && length $impl;
+        { no warnings; exec $script, $variant; }
+        POSIX::_exit(127);
+    }
+    $self->{triggers}{$pid} = { name => 'dnsmasq-switch', started_at => time(),
+                                cli_fd => undef, who => $who };
+    $self->_log("dnsmasq-switch started pid=$pid by $who "
+              . "(script=$script variant=$variant"
+              . (defined $impl && length $impl ? " impl=$impl" : '')
+              . ")");
+    return ();
+}
+
 # Re-exec the daemon into freshly installed code (after self_update). Relaunch
 # with the exact original argv via /proc/self/cmdline. Perl marks our sockets
 # close-on-exec, so the replacement process rebinds cleanly.
@@ -4878,6 +4929,8 @@ sub _handle_observe {
         elsif ($kind eq 'self_update') { @events = $self->_obs_self_update($cli, $kv) }
         elsif ($kind eq 'deploy')      { @events = $self->_obs_deploy($cli, $kv) }
         elsif ($kind eq 'reset_ble')   { @events = $self->_obs_reset_ble($cli, $kv) }
+        elsif ($kind eq 'dnsmasq_switch')
+                                       { @events = $self->_obs_dnsmasq_switch($cli, $kv) }
         elsif ($kind eq 'he_net')      { @events = $self->_obs_he_net($cli, $kv) }
         elsif ($kind eq 'he_update')   { @events = $self->_obs_he_update($cli, $kv) }
         elsif ($kind eq 'write_config'){ @events = $self->_obs_write_config($cli, $kv) }

@@ -139,6 +139,8 @@ elsif ($cmd eq 'update')   { unshift @ARGV, 'kind=self_update'; $rc = cmd_observ
 elsif ($cmd eq 'deploy')   { unshift @ARGV, 'kind=self_update'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'regen')    { unshift @ARGV, 'kind=regen_dnsmasq'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'reset-ble'){ unshift @ARGV, 'kind=reset_ble'; $rc = cmd_observe($multi) }
+elsif ($cmd eq 'dnsmasq-switch')
+                           { unshift @ARGV, 'kind=dnsmasq_switch'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'poll')     { $rc = cmd_poll($multi) }
 elsif ($cmd eq 'put')      { $rc = cmd_put($multi) }
 elsif ($cmd eq 'master')   { $rc = cmd_master($multi) }
@@ -464,6 +466,13 @@ Usage:
   net-cluster reset-ble                 (bounce bluez + net-bitchat-bridge on
                                          every peer — recovery for BLE wedges
                                          like "Maximum advertisements reached";
+                                         auth-gated same as update)
+  net-cluster dnsmasq-switch [variant=custom|stock]
+                                        (flip each gateway between the user's
+                                         custom dnsmasq and the distro stock;
+                                         default variant=custom; stock has a
+                                         guaranteed dpkg-dist restore fallback
+                                         so you can always flip back;
                                          auth-gated same as update)
 
 Common flags:

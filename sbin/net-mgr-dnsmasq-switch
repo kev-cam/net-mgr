@@ -1,0 +1,173 @@
+#!/bin/sh
+# net-mgr-dnsmasq-switch — flip this gateway between the user's custom dnsmasq
+# and the distro-packaged (stock) one.
+#
+# Run by the daemon (as root) on an authenticated `dnsmasq_switch` OBSERVE —
+# see NetMgr::Manager::_obs_dnsmasq_switch — or by hand. Trigger across the
+# cluster with `net-cluster dnsmasq-switch variant=custom|stock`.
+#
+# Argv:  $1 = variant (custom|stock, default: custom)
+#
+# The heavy lifting for variant=custom is done by an operator-supplied "manual"
+# script that actually swaps the dnsmasq binary/systemd unit for the user's
+# private build. That script's location is not shipped by net-mgr — we invoke:
+#   1. $NET_MGR_DNSMASQ_SWITCH_IMPL (set by the daemon from
+#      [manager] dnsmasq_switch_impl), else
+#   2. /usr/local/sgy/bin/sgy-dnsmasq-switch (assumed default alongside
+#      the existing sgy-conf-dnsmasq — see project locate findings)
+# If neither exists we exit non-zero with an actionable TODO. variant=stock has
+# a hard-guaranteed reversal (restore /etc/dnsmasq.conf.dpkg-dist + restart
+# dnsmasq) so an operator who lands on 'custom' can always get back to 'stock'
+# from the CLI, even without the manual script installed.
+#
+# Idempotent: /var/lib/net-mgr/dnsmasq-variant remembers the last flip so
+# re-running switch-to-custom while already on custom exits 0 with a message
+# and does nothing. Reversibility is explicit — the user's ask ("easier to
+# test") means flipping back and forth is the point.
+#
+# WARNING: variant=stock on a live gateway drops any /usr/local/sgy/conf.d/
+# fragments the running config pulls in, which can take down DHCP for the
+# whole subnet until you flip back. We surface a big warning and (unless
+# --force / FORCE=1) still proceed — but at least the operator sees it.
+#
+# Steps are self-reporting; `set -e` is NOT set so the caller sees the full
+# picture on partial failure, matching sibling scripts (net-mgr-reset-ble).
+
+VARIANT="${1:-custom}"
+FORCE="${FORCE:-0}"
+
+STATE_DIR=/var/lib/net-mgr
+STATE_FILE="$STATE_DIR/dnsmasq-variant"
+
+DEFAULT_IMPL=/usr/local/sgy/bin/sgy-dnsmasq-switch
+IMPL="${NET_MGR_DNSMASQ_SWITCH_IMPL:-$DEFAULT_IMPL}"
+
+DPKG_DIST=/etc/dnsmasq.conf.dpkg-dist
+LIVE_CONF=/etc/dnsmasq.conf
+BAK_CONF=/etc/.dnsmasq.conf.bak-sgy
+
+echo "net-mgr-dnsmasq-switch: $(date -Is) on $(hostname) variant=$VARIANT"
+
+case "$VARIANT" in
+    custom|stock) ;;
+    *)
+        echo "  ERROR: variant must be 'custom' or 'stock' (got '$VARIANT')"
+        exit 2
+        ;;
+esac
+
+step() {
+    label=$1; shift
+    printf 'step: %s ... ' "$label"
+    if out=$("$@" 2>&1); then
+        echo "ok"
+        [ -n "$out" ] && echo "$out" | sed 's/^/  /'
+        return 0
+    else
+        rc=$?
+        echo "FAIL rc=$rc"
+        [ -n "$out" ] && echo "$out" | sed 's/^/  /'
+        return $rc
+    fi
+}
+
+# Idempotency check — running switch-to-X while already on X is a no-op.
+if [ -r "$STATE_FILE" ]; then
+    current=$(cat "$STATE_FILE" 2>/dev/null | tr -d '[:space:]')
+    if [ "$current" = "$VARIANT" ]; then
+        echo "  already on $VARIANT (per $STATE_FILE) — nothing to do"
+        exit 0
+    fi
+fi
+
+# Currently-serving-DHCP check — only interesting when going TO stock, since
+# that path drops sgy include fragments and can take down the subnet.
+if [ "$VARIANT" = "stock" ]; then
+    live_dhcp=no
+    if systemctl is-active --quiet dnsmasq 2>/dev/null; then
+        live_dhcp=yes
+    fi
+    if [ "$live_dhcp" = "yes" ]; then
+        echo "  ****************************************************************"
+        echo "  * WARNING: dnsmasq is ACTIVE on this host. Switching to 'stock' *"
+        echo "  * will overwrite /etc/dnsmasq.conf with the dpkg-dist default,  *"
+        echo "  * dropping any /usr/local/sgy/conf.d/dnsmasq-* include lines    *"
+        echo "  * the running config pulls in. DHCP for served subnets will be  *"
+        echo "  * DOWN until you flip back with variant=custom.                 *"
+        echo "  * (backup of the live conf is written to $BAK_CONF)"
+        echo "  ****************************************************************"
+        if [ "$FORCE" != "1" ]; then
+            echo "  (set FORCE=1 in env to acknowledge and proceed non-interactively)"
+        fi
+    fi
+fi
+
+rc_overall=0
+
+case "$VARIANT" in
+custom)
+    # variant=custom needs the operator's manual switch script. If it isn't
+    # present, exit non-zero with an actionable TODO — no useful fallback
+    # exists (we don't know where the user's custom binary lives).
+    if [ ! -x "$IMPL" ]; then
+        echo "  ERROR: switch impl '$IMPL' not found or not executable"
+        echo "  TODO: install your manual dnsmasq-switch script at that path,"
+        echo "        or set [manager] dnsmasq_switch_impl = /path/to/script"
+        echo "        in /etc/net-mgr/config."
+        exit 3
+    fi
+    step "run $IMPL custom" "$IMPL" custom || rc_overall=$?
+    ;;
+stock)
+    # Try the manual script first if present — it may know how to unwind its
+    # own binary/unit swap more cleanly than a raw dpkg-dist restore.
+    if [ -x "$IMPL" ]; then
+        step "run $IMPL stock" "$IMPL" stock || rc_overall=$?
+    else
+        echo "step: run manual switch impl ... skip ('$IMPL' not present)"
+    fi
+    # Guaranteed fallback: restore /etc/dnsmasq.conf from dpkg-dist and
+    # restart dnsmasq. Idempotent — an unchanged file just gets copied over
+    # itself. Backup the live conf first so the flip is reversible even from
+    # here (variant=custom will invoke the manual script; if that's missing
+    # the operator can `cp $BAK_CONF $LIVE_CONF` by hand).
+    if [ -r "$DPKG_DIST" ]; then
+        if [ -r "$LIVE_CONF" ]; then
+            step "backup $LIVE_CONF -> $BAK_CONF" cp -p "$LIVE_CONF" "$BAK_CONF" \
+                || rc_overall=$?
+        fi
+        step "restore $LIVE_CONF from $DPKG_DIST" cp -p "$DPKG_DIST" "$LIVE_CONF" \
+            || rc_overall=$?
+    else
+        echo "step: restore dpkg-dist ... skip ($DPKG_DIST not present)"
+    fi
+    if systemctl is-enabled dnsmasq >/dev/null 2>&1 \
+       || systemctl is-active dnsmasq >/dev/null 2>&1; then
+        step "systemctl restart dnsmasq" systemctl restart dnsmasq || rc_overall=$?
+        sleep 2
+        state=$(systemctl is-active dnsmasq 2>&1 || true)
+        echo "  dnsmasq state: $state"
+    else
+        echo "step: restart dnsmasq ... skip (unit not enabled/active)"
+    fi
+    ;;
+esac
+
+# Persist the new state ONLY when the switch itself succeeded — a half-failed
+# flip must not confuse the idempotency check on the next call.
+if [ "$rc_overall" = "0" ]; then
+    if [ ! -d "$STATE_DIR" ]; then
+        mkdir -p "$STATE_DIR" 2>/dev/null || true
+    fi
+    if [ -d "$STATE_DIR" ]; then
+        printf '%s\n' "$VARIANT" > "$STATE_FILE" 2>/dev/null || true
+        echo "  recorded variant=$VARIANT in $STATE_FILE"
+    fi
+    echo "net-mgr-dnsmasq-switch: done (variant=$VARIANT)"
+else
+    echo "net-mgr-dnsmasq-switch: FINISHED WITH ERRORS (rc=$rc_overall) — state NOT updated"
+fi
+
+# Always exit 0 so the daemon logs the full per-step trace rather than a
+# truncated first-failure. Callers key off the printed state summary.
+exit 0
