@@ -61,6 +61,24 @@ my $session = $per_feat_cfg->{session}{name}
 my $as      = $per_feat_cfg->{identity}{as}  // 'bitchat-relay';
 my $listen  = $per_feat_cfg->{daemon}{listen} // '127.0.0.1:7531';
 
+# WiFi onramp: when configured, respond to "WiFi?" (case-insensitive) on
+# #mesh with a WIFI: URI DM back to the asker. This is the concrete
+# credential-free onramp step from project_bitchat-bridge — any nearby
+# BitChat client can request WiFi access without knowing SSID/password
+# up front. Config lives in the per-feature bitchat-bridge.conf under a
+# [wifi_response] section:
+#
+#   [wifi_response]
+#   ssid     = guest-net           # required
+#   auth     = WPA                 # WPA | WPA2 | WEP | nopass (default WPA)
+#   password = welcome123          # required unless auth=nopass
+#   hidden   = false               # optional; true for SSID-hidden networks
+#   note     = "you're on VLAN 42" # optional; appended after the URI in the DM
+#
+# If ssid isn't set, WiFi? is ignored (no accidental broadcasts of
+# credentials from a mis-configured bridge).
+my $wifi_cfg = $per_feat_cfg->{wifi_response} // {};
+
 # Helper-targeted env vars from the optional per-feature file
 # (anything in [helper] starting env_ becomes $ENV{...}).
 for my $k (sort keys %{ $per_feat_cfg->{helper} // {} }) {
@@ -299,6 +317,58 @@ sub run_once {
                 if ($type eq 'msg') {
                     my $sender = $ev->{sender} // '?';
                     my $body   = $ev->{body}   // '';
+                    my $sender_peer_id = $ev->{sender_peer_id} // '';
+
+                    # WiFi onramp: match "WiFi?" (case-insensitive, tolerant
+                    # of hyphen/space in "Wi-Fi?"). Respond with a WIFI: URI
+                    # DM straight to the asker via helper stdin (bypass
+                    # chat_post → SUBSCRIBE echo loop). Only when we have a
+                    # 16-hex peer_id AND wifi_response.ssid is configured
+                    # AND the sender isn't the bridge itself.
+                    if ($body =~ /^\s*wi[- ]?fi\??\s*$/i
+                        && $wifi_cfg->{ssid}
+                        && $sender_peer_id =~ /^[0-9a-fA-F]{16}$/
+                        && $sender ne 'System'
+                        && $sender ne $as)
+                    {
+                        my $ssid = $wifi_cfg->{ssid};
+                        my $auth = uc($wifi_cfg->{auth} // 'WPA');
+                        my $pass = $wifi_cfg->{password} // '';
+                        my $hidden = ($wifi_cfg->{hidden} // '') =~ /^(1|true|yes)$/i;
+                        # WIFI: QR-code URI — same format iOS/Android
+                        # camera and QR readers parse. Escape ";" and ","
+                        # in fields per the WiFi Alliance recommendation.
+                        my $esc = sub {
+                            my $s = shift // ''; $s =~ s/([\\;,"'])/\\$1/g; $s
+                        };
+                        my $uri = 'WIFI:S:' . $esc->($ssid)
+                                . ';T:' . $auth
+                                . ($auth eq 'NOPASS'
+                                   ? '' : ';P:' . $esc->($pass))
+                                . ($hidden ? ';H:true' : '')
+                                . ';;';
+                        my $reply = "SSID: $ssid  (paste into WiFi QR reader "
+                                  . "or use plain SSID+password)\n$uri";
+                        $reply .= "\n" . $wifi_cfg->{note}
+                            if $wifi_cfg->{note};
+                        warn "[bridge] wifi-onramp: replying to $sender_peer_id ($sender)\n";
+                        eval {
+                            print $wh encode_json({
+                                cmd     => 'send',
+                                body    => $reply,
+                                to_peer => lc $sender_peer_id,
+                            }), "\n";
+                        };
+                        warn "[bridge] wifi-onramp write failed: $@" if $@;
+                        # Also log in the net-chat session so an operator
+                        # sees the reply happened (from the bridge, not
+                        # the asker).
+                        eval { $cli->chat_post(session => $session,
+                            body => "[wifi-onramp] responded to $sender ($sender_peer_id)",
+                            as   => $as) } if $cli;
+                        next;
+                    }
+
                     next unless length $body;
                     my $chan = $ev->{channel} // '';
                     # bitchat-rust system-announcement bodies embed raw Noise
