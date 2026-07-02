@@ -175,8 +175,15 @@ sub run_once {
         # replayed to BLE at startup, only newly-typed lines. WHERE gates
         # to just our session so we don't get every unrelated chat's
         # traffic in the loop.
-        $sub->send_line("SUBSCRIBE sub=1 mode=stream"
-                      . " FROM chat_messages WHERE session = '$session'");
+        eval {
+            $sub->send_line("SUBSCRIBE sub=1 mode=stream"
+                          . " FROM chat_messages WHERE session = '$session'");
+        };
+        if ($@) {
+            warn "[bridge] SUBSCRIBE send failed: $@";
+        } else {
+            warn "[bridge] SUBSCRIBE sent for session=$session\n";
+        }
     }
 
     # Drain helper stdout (JSON events from BLE) AND stderr (helper diag
@@ -222,6 +229,7 @@ sub run_once {
                 # $as posted (those came FROM BLE via chat_post; forwarding
                 # them back to BLE would echo).
                 if ($sub && $fh == $sub->{sock}) {
+                    warn "[bridge] sub line: " . substr($line, 0, 200) . "\n";
                     my $c = eval { parse_line($line) };
                     if ($@ || !$c) { warn "[bridge] sub parse: $@\n" if $@; next }
                     next unless ($c->{verb} // '') eq 'ROW';
