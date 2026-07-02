@@ -103,6 +103,8 @@ GetOptions(
     'gui'        => \$gui,
     'tty'        => \$tty,
     'bit-chat'   => \my $bitchat_mode,
+    'test'       => \my $test_mode,
+    'test-interval=i' => \my $test_interval,
     'askpass'    => \$askpass,
     'version|V'  => \my $show_version,
 ) or die "bad options\n";
@@ -216,6 +218,16 @@ if (!defined $listen) {
     }
 }
 $as //= $ENV{NET_CHAT_AS} // $ENV{USER} // 'local';
+
+# --test: resident tester mode. Combined with --bit-chat this is the
+# gateway2/gateway3 BLE-mesh smoke tester — post a heartbeat message
+# every N seconds and log every inbound line to stderr so `journalctl`
+# (or a foregrounded terminal) shows the round-trip. No Tk required,
+# no interactive input; just posts + prints. Runs until Ctrl-C.
+if ($test_mode) {
+    cmd_test($cmd // $bitchat_default_session);
+    exit 0;
+}
 
 # --gui launches the Tk front-end; the leftover arg (if any) is the session
 # to open initially. No subcommand is required in this mode.
@@ -478,6 +490,70 @@ sub cmd_requests {
 
 # net-chat --tty [session]: dumb-terminal chat client. Plain stdin + stdout,
 # no curses, no ANSI, no termios — works under script(1), on serial consoles,
+# --test: resident tester. Post a heartbeat every N seconds AND print
+# every inbound message on the SUBSCRIBE stream to stderr with a
+# timestamp. Designed for `net-chat --test --bit-chat` on gateway2/3
+# so a BLE-only smoke test can run under systemd/journal without a
+# person driving a keyboard. Interval defaults to 60s; override with
+# --test-interval SECS. Heartbeat body embeds hostname + ISO timestamp
+# so operators grepping journals across bridges can correlate hops.
+sub cmd_test {
+    my ($name) = @_;
+    require IO::Select;
+    require Sys::Hostname;
+    unless (defined $name && length $name) {
+        die "net-chat --test: session required "
+          . "(add --bit-chat or a session name as argv)\n";
+    }
+    my $interval = $test_interval && $test_interval > 0 ? $test_interval : 60;
+    my $host     = Sys::Hostname::hostname();
+    warn "[net-chat --test] session=$name interval=${interval}s host=$host\n";
+
+    my $stream = connect_client(want_auth => 0);
+    my $ctrl   = connect_client(want_auth => 0);
+    $stream->send_line("SUBSCRIBE sub=1 mode=stream"
+                     . " FROM chat_messages WHERE session = '$name'");
+
+    my $sel = IO::Select->new($stream->{sock});
+    my $last_post = 0;
+    my $counter   = 0;
+    while (1) {
+        # Heartbeat post. Interval-timed on wall clock, so a slow SUBSCRIBE
+        # doesn't drift the cadence.
+        if (time() - $last_post >= $interval) {
+            $counter++;
+            my $iso = POSIX::strftime('%Y-%m-%dT%H:%M:%SZ', gmtime());
+            my $body = "[test $host #$counter $iso] ping";
+            eval { $ctrl->chat_post(
+                session => $name, body => $body, as => 'bitchat-tester') };
+            if ($@) {
+                my $e = $@; chomp $e;
+                warn "[net-chat --test] post failed: $e\n";
+            } else {
+                warn "[net-chat --test] posted #$counter\n";
+            }
+            $last_post = time();
+        }
+
+        # Wait up to 1s for an inbound row. Sub-second polling keeps
+        # the heartbeat deadline responsive without a heavy loop.
+        my @ready = $sel->can_read(1);
+        next unless @ready;
+        while (defined(my $line = $stream->recv_line(0))) {
+            my $c = NetMgr::Protocol::parse_line($line) or next;
+            next unless ($c->{verb} // '') eq 'ROW';
+            next unless ($c->{kv}{table} // '') eq 'chat_messages';
+            my $ts     = $c->{kv}{ts}     // '?';
+            my $sender = $c->{kv}{sender} // '?';
+            my $body   = $c->{kv}{body}   // '';
+            # Truncate long bodies so a huge inbound file transfer doesn't
+            # blow up the journal.
+            $body = substr($body, 0, 400) . '...' if length($body) > 400;
+            warn "[net-chat --test] recv $ts $sender: $body\n";
+        }
+    }
+}
+
 # in a container without X. IO::Select multiplexes stdin (user typing) with
 # the SUBSCRIBE stream (incoming messages). Like --gui, we default to
 # anonymous browse and lazily AUTH on first post / join.
