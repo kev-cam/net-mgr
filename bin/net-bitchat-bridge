@@ -231,17 +231,17 @@ sub run_once {
                 if ($sub && $fh == $sub->{sock}) {
                     warn "[bridge] sub line: " . substr($line, 0, 200) . "\n";
                     my $c = eval { parse_line($line) };
-                    if ($@ || !$c) { warn "[bridge] sub parse: $@\n" if $@; next }
-                    next unless ($c->{verb} // '') eq 'ROW';
+                    if ($@ || !$c) { warn "[bridge] sub parse err: $@\n" if $@; next }
+                    my $v = $c->{verb} // '';
+                    if ($v ne 'ROW') { warn "[bridge] sub non-ROW verb=$v\n"; next }
                     my $t = $c->{kv}{table} // '';
-                    next unless $t eq 'chat_messages';
+                    if ($t ne 'chat_messages') { warn "[bridge] sub wrong table=$t\n"; next }
                     my $row_sender = $c->{kv}{sender} // '';
                     my $row_body   = $c->{kv}{body}   // '';
-                    next unless length $row_body;
-                    # Echo guard: skip anything we posted (either literal
-                    # $as, or the tagged form we use for BLE inbound).
-                    next if $row_sender eq $as;
-                    next if $row_body =~ /^\[[^]]*\@bitchat/;
+                    if (!length $row_body) { warn "[bridge] sub empty body\n"; next }
+                    if ($row_sender eq $as) { warn "[bridge] sub echo-guard sender=$as\n"; next }
+                    if ($row_body =~ /^\[[^]]*\@bitchat/) { warn "[bridge] sub echo-guard tag\n"; next }
+                    warn "[bridge] sub FORWARDING sender=$row_sender body_len=" . length($row_body) . "\n";
                     # Serialize and forward to helper.
                     my $out_body = $row_body;
                     utf8::upgrade($out_body);
