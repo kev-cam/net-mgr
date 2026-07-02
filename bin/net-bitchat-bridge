@@ -229,19 +229,16 @@ sub run_once {
                 # $as posted (those came FROM BLE via chat_post; forwarding
                 # them back to BLE would echo).
                 if ($sub && $fh == $sub->{sock}) {
-                    warn "[bridge] sub line: " . substr($line, 0, 200) . "\n";
                     my $c = eval { parse_line($line) };
-                    if ($@ || !$c) { warn "[bridge] sub parse err: $@\n" if $@; next }
-                    my $v = $c->{verb} // '';
-                    if ($v ne 'ROW') { warn "[bridge] sub non-ROW verb=$v\n"; next }
+                    if ($@ || !$c) { warn "[bridge] sub parse: $@\n" if $@; next }
+                    next unless ($c->{verb} // '') eq 'ROW';
                     my $t = $c->{kv}{table} // '';
-                    if ($t ne 'chat_messages') { warn "[bridge] sub wrong table=$t\n"; next }
+                    next unless $t eq 'chat_messages';
                     my $row_sender = $c->{kv}{sender} // '';
                     my $row_body   = $c->{kv}{body}   // '';
-                    if (!length $row_body) { warn "[bridge] sub empty body\n"; next }
-                    if ($row_sender eq $as) { warn "[bridge] sub echo-guard sender=$as\n"; next }
-                    if ($row_body =~ /^\[[^]]*\@bitchat/) { warn "[bridge] sub echo-guard tag\n"; next }
-                    warn "[bridge] sub FORWARDING sender=$row_sender body_len=" . length($row_body) . "\n";
+                    next unless length $row_body;
+                    next if $row_sender eq $as;             # echo guard
+                    next if $row_body =~ /^\[[^]]*\@bitchat/; # tag guard
                     # Serialize and forward to helper.
                     my $out_body = $row_body;
                     utf8::upgrade($out_body);
@@ -296,6 +293,12 @@ sub run_once {
                     last OUTER if $opt{once};
                 } elsif ($type eq 'status') {
                     warn "[bridge] helper: " . ($ev->{raw} // '') . "\n";
+                } elsif ($type eq 'cmd_reply') {
+                    # Reply to the {"cmd":"send"} we wrote to stdin. ok/err
+                    # visible in stderr already; nothing to post to net-chat.
+                    warn "[bridge] cmd_reply ok=" . ($ev->{ok} ? 1 : 0)
+                       . " path=" . ($ev->{path} // '')
+                       . ($ev->{err} ? " err=$ev->{err}" : '') . "\n";
                 } else {
                     warn "[bridge] unknown event type='$type'\n";
                 }
