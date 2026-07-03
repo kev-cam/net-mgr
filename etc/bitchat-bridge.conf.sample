@@ -33,3 +33,23 @@ as = bitchat-relay
 [daemon]
 # net-mgr daemon socket. Loopback = no auth required.
 listen = 127.0.0.1:7531
+
+[bitchat_bridge]
+# First-seen greeting: when a BLE peer_id first appears (from an inbound
+# msg OR the periodic peers cmd_reply), DM this string to them ONCE per
+# daemon lifetime. Absent / empty = feature off (default).
+#
+# The canonical use is an Android/iOS WIFI: QR-code URI. Android's
+# Messages, Signal, and most modern chat apps render such a string as
+# a tap-to-join WiFi credential without the peer having to type SSID
+# or password. Format:
+#     WIFI:T:<auth>;S:<ssid>;P:<password>;;
+# where <auth> is WPA | WPA2 | WEP | nopass (drop P: for nopass).
+#
+# For the video-c bridge (SSID "video", password "InTheRoom") this is:
+#     greeting = WIFI:T:WPA;S:video;P:InTheRoom;;
+#
+# The set of already-greeted peers is in-memory only — a helper respawn
+# or daemon restart will re-greet everyone. That's acceptable for tier-0
+# because the WIFI: URI is idempotent from the user's side.
+#greeting = WIFI:T:WPA;S:video;P:InTheRoom;;
