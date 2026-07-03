@@ -1875,7 +1875,7 @@ sub _resv_index {
 sub reserve_dialog {
     my ($cli, $S, $ip, $mac, $redraw, $status) = @_;
     my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Reserve $ip",
-        -buttons => ['Probe', 'Reserve', 'Reserve+Push', 'Cancel']);
+        -buttons => ['Probe', 'Reserve', 'Reserve+Push', 'Push', 'Cancel']);
     # Default the name to what we already know the device by — its machine name,
     # or failing that the hostname it gave over DHCP — so reserving a device uses
     # its own name when none other is given (e.g. KP200 from its lease).
@@ -1993,6 +1993,24 @@ sub reserve_dialog {
         my ($pip) = ($v{ip} // '') =~ /(\d+\.\d+\.\d+\.\d+)/;
         probe_dialog($cli, $S, ($pip // $v{ip}),
             { mac => $v{mac}, name => $v{name}, grp => $v{group} });
+    }
+    # Plain Push: skip the reservation write, just re-push the current row's IP/MAC/name
+    # into net-lookup as a kind=host paper record. Handy when the reservation already
+    # exists (from a prior Reserve or from the CLI) but wasn't pushed at the time.
+    if ($ans eq 'Push') {
+        ($v{ip}) = $v{ip} =~ /(\d+\.\d+\.\d+\.\d+)/ ? ($1) : ($v{ip});
+        unless (defined ip2int($v{ip})) {
+            $status->configure(-text => " bad IP '$v{ip}' — not pushed"); return;
+        }
+        unless ($v{mac} =~ /^[0-9a-fA-F:]{17}$/) {
+            $status->configure(-text => " bad MAC '$v{mac}' — not pushed"); return;
+        }
+        my $ok = _push_host($cli, ip => $v{ip}, mac => lc $v{mac},
+                            ($v{name} ne '' ? (name => $v{name}) : ()));
+        $status->configure(-text => $ok
+            ? " pushed $v{ip} -> $v{mac}" . ($v{name} ne '' ? " ($v{name})" : '')
+            : " push $v{ip} failed");
+        return;
     }
     return unless $ans eq 'Reserve' || $ans eq 'Reserve+Push';
     ($v{ip}) = $v{ip} =~ /(\d+\.\d+\.\d+\.\d+)/ ? ($1) : ($v{ip});  # tolerate a label
