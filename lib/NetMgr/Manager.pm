@@ -4407,6 +4407,7 @@ sub _obs_dhcp_reservation {
         updated_by  => $who,
     );
     $self->_log("dhcp reservation $ip -> $mac by $who");
+    $self->_broadcast_regen_dnsmasq;
     return ();
 }
 
@@ -4421,6 +4422,7 @@ sub _obs_dhcp_reservation_delete {
     $self->_emit_change(table => 'dhcp_reservations', op => 'delete', row => $row)
         if $row;
     $self->_log("dhcp reservation delete $ip by $who") if $row;
+    $self->_broadcast_regen_dnsmasq if $row;
     return ();
 }
 
@@ -4446,6 +4448,7 @@ sub _obs_dhcp_reservation_move {
     $self->_emit_change(table => 'dhcp_reservations', op => 'insert', row => $res->{new})
         if $res->{new};
     $self->_log("dhcp reservation move $old -> $new by $who");
+    $self->_broadcast_regen_dnsmasq;
     return ();
 }
 
@@ -4508,6 +4511,69 @@ sub _obs_regen_dnsmasq {
               . ($cli->{ident} // '?') . ")");
     $self->{triggers}{$pid} = { cli_fd => undef, name => 'regen-dnsmasq', started_at => time() };
     return ();
+}
+
+# Event-driven dnsmasq refresh. Called from the dhcp_reservation OBSERVE
+# handlers so a reservation edit propagates immediately instead of waiting
+# for the receiver's 30s push-dnsmasq tick to notice the (count | MAX(updated_at))
+# signature move. Two paths:
+#   (a) Self: fire the existing _obs_regen_dnsmasq on this node (its own
+#       mode-off short-circuit + one-in-flight guard apply — safe to call
+#       unconditionally).
+#   (b) Peers: fork a child that walks list_node_capabilities, filters to
+#       members advertising the 'dnsmasq' capability, and sends
+#       OBSERVE kind=regen_dnsmasq to each via NetMgr::Client. Fork pattern
+#       mirrors _bitchat_relay_fanout / _forward_observe_to_master.
+# A 2s per-master debounce coalesces batch imports (e.g. net-import-dnsmasq
+# upserting 100 rows) to a single fan-out; receivers already coalesce via
+# the one-in-flight guard. Failure on any single peer is logged and skipped;
+# that peer's own 30s push-dnsmasq tick catches up.
+sub _broadcast_regen_dnsmasq {
+    my ($self) = @_;
+    # Always fire locally — _obs_regen_dnsmasq handles mode-off / in-flight.
+    eval { $self->_obs_regen_dnsmasq({ ident => 'self' }, {}) };
+    $self->_log("regen_dnsmasq self-fire failed: $@") if $@;
+    # Debounce network fan-out: a bulk import shouldn't do N_peers * N_rows
+    # connect/observe/bye round-trips on the main path.
+    my $now = time();
+    return if ($now - ($self->{regen_dnsmasq_bcast_at} // 0)) < 2;
+    $self->{regen_dnsmasq_bcast_at} = $now;
+    my $pid = fork();
+    return unless defined $pid;
+    if ($pid) {
+        $self->{triggers}{$pid} = { cli_fd => undef, name => 'regen-dnsmasq-fanout', started_at => $now };
+        return;
+    }
+    # child
+    for my $c (values %{ $self->{clients} }) { close $c->{sock} if $c->{sock} }
+    close $self->{listen} if $self->{listen};
+    my $me   = $self->{cluster}{self_name} // '';
+    my $rows = eval { $self->{db}->list_node_capabilities } || [];
+    for my $r (@$rows) {
+        my $member = $r->{member} // '';
+        next unless length $member;
+        next if $member eq $me;
+        my %caps = map { $_ => 1 }
+                   grep { length }
+                   split /,/, ($r->{capabilities} // '');
+        next unless $caps{dnsmasq};
+        my $addr = eval { $self->{mesh}->address_for($member) }
+                || "$member:7531";
+        my $ok = eval {
+            require NetMgr::Client;
+            my $c = NetMgr::Client->new(listen => $addr, timeout => 6);
+            $c->hello(consumer => "regen-dnsmasq-fanout.$$");
+            eval { $c->auth };   # tolerate no-key (mirrors _forward_observe_to_master)
+            $c->observe(kind => 'regen_dnsmasq');
+            $c->bye;
+            1;
+        };
+        if (!$ok) {
+            $self->_log("regen_dnsmasq fanout to $member ($addr) failed: $@")
+                if $@;
+        }
+    }
+    exit 0;
 }
 
 # kind=ap_exclude — set the per-AP host blacklist (space-separated globs of
