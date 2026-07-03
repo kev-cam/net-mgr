@@ -141,6 +141,7 @@ elsif ($cmd eq 'regen')    { unshift @ARGV, 'kind=regen_dnsmasq'; $rc = cmd_obse
 elsif ($cmd eq 'reset-ble'){ unshift @ARGV, 'kind=reset_ble'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'dnsmasq-switch')
                            { unshift @ARGV, 'kind=dnsmasq_switch'; $rc = cmd_observe($multi) }
+elsif ($cmd eq 'dhcp-cycle'){ unshift @ARGV, 'kind=dhcp_cycle'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'poll')     { $rc = cmd_poll($multi) }
 elsif ($cmd eq 'put')      { $rc = cmd_put($multi) }
 elsif ($cmd eq 'master')   { $rc = cmd_master($multi) }
@@ -473,6 +474,13 @@ Usage:
                                          default variant=custom; stock has a
                                          guaranteed dpkg-dist restore fallback
                                          so you can always flip back;
+                                         auth-gated same as update)
+  net-cluster --peers X dhcp-cycle iface=Y [count=N] [gap=SECS]
+                                        (release + reacquire the DHCP lease on
+                                         iface Y — drives an event window at
+                                         the gateway's dnsmasq; count 1..20,
+                                         gap 1..60s, settle 1..30s optional;
+                                         one in-flight cycle per iface;
                                          auth-gated same as update)
 
 Common flags:

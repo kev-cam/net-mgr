@@ -3267,6 +3267,80 @@ sub _obs_dnsmasq_switch {
     return ();
 }
 
+# OBSERVE kind=dhcp_cycle — release + reacquire a DHCP lease on the named
+# interface via /usr/local/bin/net-dhcp-cycle. Used to drive a controlled
+# DHCPREQUEST/DHCPACK window against the gateway's dnsmasq event socket so an
+# operator can verify events flow through into net-mgr's addresses /
+# dhcp_leases tables — and also for post-config-change lease refreshes. Auth-
+# gated same as self_update/reset_ble: bouncing an interface can drop live SSH
+# sessions, so it's at least as privileged as pulling code. iface is required;
+# count/gap/settle are forwarded to the script's --repeat/--gap/--settle. One
+# in-flight cycle per interface (a second request for the SAME iface is
+# refused; parallel cycles on different interfaces are fine). Forked child so
+# the run loop keeps serving; _reap_triggers just logs exit.
+sub _obs_dhcp_cycle {
+    my ($self, $cli, $kv) = @_;
+    my ($who) = $self->_chat_identity($cli, $kv);
+    die "dhcp_cycle: not authorized\n" unless defined $who;
+    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_update})) {
+        die "dhcp_cycle: '$who' is not an allowed updater "
+          . "(add the key to /etc/net-mgr/allowed_updaters)\n";
+    }
+    my $iface = $kv->{iface};
+    defined $iface && length $iface
+        or die "dhcp_cycle: iface=<name> is required\n";
+    $iface =~ /\A[A-Za-z0-9\@.+_\-]{1,32}\z/
+        or die "dhcp_cycle: implausible iface name '$iface'\n";
+
+    my %opt;
+    for my $k (qw(count gap settle)) {
+        next unless defined $kv->{$k} && length $kv->{$k};
+        $kv->{$k} =~ /\A[0-9]+\z/
+            or die "dhcp_cycle: $k must be a positive integer (got '$kv->{$k}')\n";
+        $opt{$k} = 0 + $kv->{$k};
+    }
+    if (defined $opt{count}  && ($opt{count}  < 1 || $opt{count}  > 20)) {
+        die "dhcp_cycle: count must be in 1..20 (got $opt{count})\n";
+    }
+    if (defined $opt{gap}    && ($opt{gap}    < 1 || $opt{gap}    > 60)) {
+        die "dhcp_cycle: gap must be in 1..60 seconds (got $opt{gap})\n";
+    }
+    if (defined $opt{settle} && ($opt{settle} < 1 || $opt{settle} > 30)) {
+        die "dhcp_cycle: settle must be in 1..30 seconds (got $opt{settle})\n";
+    }
+
+    my $script = $self->{config}{manager}{dhcp_cycle_script}
+              // '/usr/local/bin/net-dhcp-cycle';
+    -x $script or die "dhcp_cycle: script '$script' is not executable\n";
+    die "dhcp_cycle: already in progress for iface=$iface\n"
+        if grep { $_->{name} eq 'dhcp-cycle' && ($_->{iface} // '') eq $iface }
+               values %{ $self->{triggers} };
+
+    my @args;
+    push @args, '--repeat', $opt{count}  if defined $opt{count};
+    push @args, '--gap',    $opt{gap}    if defined $opt{gap};
+    push @args, '--settle', $opt{settle} if defined $opt{settle};
+    push @args, $iface;
+
+    my $pid = fork();
+    die "dhcp_cycle: fork failed: $!\n" unless defined $pid;
+    if ($pid == 0) {
+        for my $c (values %{ $self->{clients}   }) { close $c->{sock} if $c->{sock} }
+        for my $l (values %{ $self->{listeners} }) { close $l->{sock} if $l->{sock} }
+        { no warnings; exec $script, @args; }
+        POSIX::_exit(127);
+    }
+    $self->{triggers}{$pid} = { name => 'dhcp-cycle', started_at => time(),
+                                cli_fd => undef, who => $who, iface => $iface };
+    $self->_log("dhcp-cycle started pid=$pid by $who "
+              . "(script=$script iface=$iface"
+              . (defined $opt{count}  ? " count=$opt{count}"   : '')
+              . (defined $opt{gap}    ? " gap=$opt{gap}"       : '')
+              . (defined $opt{settle} ? " settle=$opt{settle}" : '')
+              . ")");
+    return ();
+}
+
 # Re-exec the daemon into freshly installed code (after self_update). Relaunch
 # with the exact original argv via /proc/self/cmdline. Perl marks our sockets
 # close-on-exec, so the replacement process rebinds cleanly.
@@ -4997,6 +5071,7 @@ sub _handle_observe {
         elsif ($kind eq 'reset_ble')   { @events = $self->_obs_reset_ble($cli, $kv) }
         elsif ($kind eq 'dnsmasq_switch')
                                        { @events = $self->_obs_dnsmasq_switch($cli, $kv) }
+        elsif ($kind eq 'dhcp_cycle')  { @events = $self->_obs_dhcp_cycle($cli, $kv) }
         elsif ($kind eq 'he_net')      { @events = $self->_obs_he_net($cli, $kv) }
         elsif ($kind eq 'he_update')   { @events = $self->_obs_he_update($cli, $kv) }
         elsif ($kind eq 'write_config'){ @events = $self->_obs_write_config($cli, $kv) }
