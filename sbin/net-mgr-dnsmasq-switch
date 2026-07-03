@@ -8,17 +8,28 @@
 #
 # Argv:  $1 = variant (custom|stock, default: custom)
 #
-# The heavy lifting for variant=custom is done by an operator-supplied "manual"
-# script that actually swaps the dnsmasq binary/systemd unit for the user's
-# private build. That script's location is not shipped by net-mgr — we invoke:
+# The heavy lifting for variant=custom is done by a "swap" script bundled with
+# the kev-cam dnsmasq fork at /usr/local/src/dnsmasq/swap-dnsmasq. It stops the
+# distro dnsmasq.service and launches the locally-built /usr/local/sbin/dnsmasq
+# as a transient dnsmasq-local.service, re-using the ORIGINAL argv (read from
+# /proc) — same /etc/dnsmasq.conf, same conf.d fragments, same pidfile/user.
+# We invoke:
 #   1. $NET_MGR_DNSMASQ_SWITCH_IMPL (set by the daemon from
 #      [manager] dnsmasq_switch_impl), else
-#   2. /usr/local/sgy/bin/sgy-dnsmasq-switch (assumed default alongside
-#      the existing sgy-conf-dnsmasq — see project locate findings)
-# If neither exists we exit non-zero with an actionable TODO. variant=stock has
-# a hard-guaranteed reversal (restore /etc/dnsmasq.conf.dpkg-dist + restart
-# dnsmasq) so an operator who lands on 'custom' can always get back to 'stock'
-# from the CLI, even without the manual script installed.
+#   2. /usr/local/src/dnsmasq/swap-dnsmasq (the kev-cam fork's own swap tool)
+# Argv mapping: variant=custom -> "$IMPL" local ; variant=stock -> "$IMPL" system.
+# swap-dnsmasq's own 'status' subcommand is NEVER invoked from here.
+#
+# The dnsmasq tree must be present on the target host (nas3 has it; gateway3
+# does NOT until the user rsyncs it — see prereqs in the commit message).
+#
+# If swap-dnsmasq isn't installed we exit non-zero on variant=custom with an
+# actionable TODO. variant=stock has a hard-guaranteed dpkg-dist restore
+# fallback (belt-and-suspenders — swap-dnsmasq system already reverses cleanly
+# on its own, but the fallback covers a fresh host without the dnsmasq tree AND
+# the case where swap-dnsmasq itself fails; per user, the swap scripts are
+# UNTESTED) so an operator who lands on 'custom' can always get back to
+# 'stock' from the CLI even without the swap script installed.
 #
 # Idempotent: /var/lib/net-mgr/dnsmasq-variant remembers the last flip so
 # re-running switch-to-custom while already on custom exits 0 with a message
@@ -39,7 +50,7 @@ FORCE="${FORCE:-0}"
 STATE_DIR=/var/lib/net-mgr
 STATE_FILE="$STATE_DIR/dnsmasq-variant"
 
-DEFAULT_IMPL=/usr/local/sgy/bin/sgy-dnsmasq-switch
+DEFAULT_IMPL=/usr/local/src/dnsmasq/swap-dnsmasq
 IMPL="${NET_MGR_DNSMASQ_SWITCH_IMPL:-$DEFAULT_IMPL}"
 
 DPKG_DIST=/etc/dnsmasq.conf.dpkg-dist
@@ -106,25 +117,32 @@ rc_overall=0
 
 case "$VARIANT" in
 custom)
-    # variant=custom needs the operator's manual switch script. If it isn't
-    # present, exit non-zero with an actionable TODO — no useful fallback
-    # exists (we don't know where the user's custom binary lives).
+    # variant=custom needs the swap script. If it isn't present, exit non-zero
+    # with an actionable TODO — no useful fallback exists (we don't know how
+    # to launch the user's custom binary with the right argv without it).
     if [ ! -x "$IMPL" ]; then
         echo "  ERROR: switch impl '$IMPL' not found or not executable"
-        echo "  TODO: install your manual dnsmasq-switch script at that path,"
+        echo "  TODO: rsync the dnsmasq tree from nas3 (source of truth):"
+        echo "          rsync -a --delete /usr/local/src/dnsmasq/ \\"
+        echo "                root@$(hostname):/usr/local/src/dnsmasq/"
+        echo "        then build+install the custom binary on this host:"
+        echo "          cd /usr/local/src/dnsmasq && ./remake install"
         echo "        or set [manager] dnsmasq_switch_impl = /path/to/script"
-        echo "        in /etc/net-mgr/config."
+        echo "        in /etc/net-mgr/config to point at a different swap tool."
         exit 3
     fi
-    step "run $IMPL custom" "$IMPL" custom || rc_overall=$?
+    step "run $IMPL local" "$IMPL" local || rc_overall=$?
     ;;
 stock)
-    # Try the manual script first if present — it may know how to unwind its
-    # own binary/unit swap more cleanly than a raw dpkg-dist restore.
+    # Try the swap script first if present — swap-dnsmasq system cleanly
+    # stops dnsmasq-local and starts dnsmasq.service (same /etc/dnsmasq.conf
+    # on both sides, so no config restore needed). The dpkg-dist restore
+    # below is belt-and-suspenders for a fresh host without the tree yet, or
+    # if swap-dnsmasq itself fails (UNTESTED per user).
     if [ -x "$IMPL" ]; then
-        step "run $IMPL stock" "$IMPL" stock || rc_overall=$?
+        step "run $IMPL system" "$IMPL" system || rc_overall=$?
     else
-        echo "step: run manual switch impl ... skip ('$IMPL' not present)"
+        echo "step: run swap-dnsmasq system ... skip ('$IMPL' not present)"
     fi
     # Guaranteed fallback: restore /etc/dnsmasq.conf from dpkg-dist and
     # restart dnsmasq. Idempotent — an unchanged file just gets copied over
