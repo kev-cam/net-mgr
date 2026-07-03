@@ -45,6 +45,7 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
     host_keys dhcp_ranges dhcp_reservations
     mesh_tunnels node_capabilities bitchat_peers
     bitchat_relay_packets
+    wan_services wan_service_candidates wan_service_health
 );
 
 # Tables whose contents are sensitive (credentials etc.); SUBSCRIBE

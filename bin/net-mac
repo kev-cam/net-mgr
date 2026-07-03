@@ -1,0 +1,256 @@
+#!/usr/bin/perl
+# net-mac — read-only view of the WAN-failover data model. Commit A of the
+# wan-failover series (see project design notes). Snapshots the three
+# cluster-replicated tables — wan_services, wan_service_candidates,
+# wan_service_health — over the net-mgr socket, so it runs from any host
+# without DB credentials. Print-only in commit A; the mutating verbs and the
+# manual-failover subcommands land in commit B, the master orchestrator +
+# wan-probe in commit C.
+#
+# Name: "mac" as in "master access controller" — the WAN-side counterpart
+# to net-reserve's LAN focus. The pod(1) man page is deferred to commit B.
+#
+# Usage:
+#   net-mac list [SERVICE]        one section per WAN service (or focus on
+#                                 SERVICE if given); shows the service row,
+#                                 its candidates, and per-candidate health
+#                                 rollups. Human-readable table by default;
+#                                 --json emits a plain-old-data hash.
+#
+#   --listen HOST:PORT   daemon address (overrides --server and config)
+#   --server NAME        a server from [servers] in ~/.config/net-mgr/config
+#   --json               machine-readable output
+#   --auth / --no-auth   force / suppress the SSH-key handshake
+#   --key-id ID / --key-file PATH   identity for AUTH
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling pass_through);
+use NetMgr::Client;
+use NetMgr::Config;
+
+my ($listen, $server, $force_auth, $no_auth, $key_id, $key_file, $json,
+    $describe);
+GetOptions(
+    'listen=s'   => \$listen,
+    'server=s'   => \$server,
+    'auth'       => \$force_auth,
+    'no-auth'    => \$no_auth,
+    'key-id=s'   => \$key_id,
+    'key-file=s' => \$key_file,
+    'json'       => \$json,
+    'describe'   => \$describe,
+) or die "bad options\n";
+
+if ($describe) {
+    print "name: net-mac\n";
+    print "description: read-only view of WAN services / candidates / health\n";
+    exit 0;
+}
+
+# Server resolution mirrors net-reserve: --listen wins, then --server, then
+# $NET_MGR_LISTEN, then the configured default, then loopback.
+if (!defined $listen) {
+    if (defined $server) {
+        $listen = NetMgr::Config->resolve_server($server)
+            or die "net-mac: unknown server '$server'\n";
+    } else {
+        $listen = $ENV{NET_MGR_LISTEN}
+               // NetMgr::Config->resolve_server(undef)
+               // '127.0.0.1:7531';
+    }
+}
+
+my $cmd = shift @ARGV;
+usage() unless defined $cmd;
+
+my %DISPATCH = (
+    list => \&cmd_list,
+);
+my $handler = $DISPATCH{$cmd} or usage("unknown command '$cmd'");
+$handler->();
+exit 0;
+
+# ---- connection ------------------------------------------------------
+
+sub connect_client {
+    my $cli = eval { NetMgr::Client->new(listen => $listen, timeout => 10) }
+        or die "net-mac: cannot reach daemon at $listen: $@";
+    my ($host) = NetMgr::Client::split_hostport($listen); $host //= '';
+    my $is_loopback = $host =~ /^(?:127\.\d+\.\d+\.\d+|::1|localhost)$/;
+    my $do_auth = $force_auth || (!$is_loopback && !$no_auth);
+    $do_auth = 0 if $no_auth;
+    if ($do_auth) {
+        eval {
+            $cli->auth(
+                (defined $key_id   ? (key_id   => $key_id)   : ()),
+                (defined $key_file ? (key_file => $key_file) : ()),
+            );
+        };
+        die "net-mac: AUTH failed: $@" if $@;
+    }
+    $cli->hello(consumer => "net-mac.$$");
+    return $cli;
+}
+
+# ---- list -----------------------------------------------------------
+
+sub cmd_list {
+    my $focus = shift @ARGV;
+    my $cli   = connect_client();
+
+    my $where = defined $focus ? "name = '" . _sql_esc($focus) . "'" : undef;
+    my $svc_rows = $cli->snapshot(1, 'wan_services',
+                                  (defined $where ? (where => $where) : ()));
+
+    my $cand_where = defined $focus
+        ? "service_name = '" . _sql_esc($focus) . "'" : undef;
+    my $cand_rows = $cli->snapshot(2, 'wan_service_candidates',
+                                   (defined $cand_where ? (where => $cand_where) : ()));
+
+    my $health_rows = $cli->snapshot(3, 'wan_service_health',
+                                     (defined $cand_where ? (where => $cand_where) : ()));
+    eval { $cli->bye };
+
+    # Group candidates + health by service_name.
+    my %cands;
+    push @{ $cands{ $_->{service_name} // '' } }, $_ for @$cand_rows;
+    my %health;   # svc -> member -> [health rows]
+    for my $h (@$health_rows) {
+        push @{ $health{ $h->{service_name} // '' }{ $h->{member} // '' } }, $h;
+    }
+
+    if ($json) {
+        require JSON::PP;
+        my %out;
+        for my $s (@$svc_rows) {
+            my $n = $s->{name};
+            $out{$n} = {
+                service    => $s,
+                candidates => [ map {
+                    my $c = $_;
+                    my $m = $c->{member};
+                    {
+                        %$c,
+                        health => $health{$n}{$m} || [],
+                    }
+                } @{ $cands{$n} || [] } ],
+            };
+        }
+        print JSON::PP->new->canonical(1)->pretty->encode(\%out);
+        return;
+    }
+
+    if (!@$svc_rows) {
+        if (defined $focus) {
+            print "no WAN service named '$focus' known to $listen\n";
+        } else {
+            print "no WAN services configured on $listen\n";
+            print "(commit A of wan-failover — the OBSERVE verbs that populate "
+                . "these tables land in commit B)\n";
+        }
+        return;
+    }
+
+    my $first = 1;
+    for my $s (@$svc_rows) {
+        print "\n" unless $first; $first = 0;
+        _print_service($s, $cands{ $s->{name} } || [], $health{ $s->{name} } || {});
+    }
+}
+
+sub _print_service {
+    my ($s, $cands, $health_by_member) = @_;
+    my $name  = $s->{name} // '(unnamed)';
+    my $act   = _nn($s->{active_member});
+    my $stat  = _nn($s->{last_status});
+    my $mode  = _nn($s->{orchestrator_mode});
+    my $work  = _ago($s->{last_working_at});
+    print "== $name ==\n";
+    printf "  active_member: %-24s  last_status: %-10s  mode: %s\n",
+        $act, $stat, $mode;
+    printf "  last_working:  %s\n", $work;
+    if (my $reason = $s->{last_status_reason}) {
+        printf "  reason:        %s\n", $reason;
+    }
+
+    if (!@$cands) {
+        print "  (no candidates)\n";
+        return;
+    }
+    print "  candidates:\n";
+    printf "    %-4s  %-16s  %-8s  %-17s  %-8s  %s\n",
+        'pri', 'member', 'iface', 'mac', 'apply', 'last_working';
+    for my $c (@$cands) {
+        printf "    %-4s  %-16s  %-8s  %-17s  %-8s  %s\n",
+            _nn($c->{priority}),
+            _nn($c->{member}),
+            _nn($c->{iface}),
+            _nn($c->{mac}),
+            _nn($c->{last_apply_result}),
+            _ago($c->{last_working_at});
+
+        my $rows = $health_by_member->{ $c->{member} // '' } || [];
+        next unless @$rows;
+        # per-candidate health rollup: worst-case fail streak, most-recent
+        # check, and the health-line status.
+        my $max_fail = 0;
+        my $last_check;
+        my $worst_status = 'unknown';
+        my %status_prio = (fail => 3, degraded => 2, ok => 1, unknown => 0);
+        for my $h (@$rows) {
+            my $f = $h->{consecutive_failures} // 0;
+            $max_fail = $f if $f > $max_fail;
+            my $lc = $h->{last_check};
+            $last_check = $lc if defined $lc
+                              && (!defined $last_check || $lc gt $last_check);
+            my $s2 = $h->{last_status} // 'unknown';
+            $worst_status = $s2
+                if ($status_prio{$s2} // 0) > ($status_prio{$worst_status} // 0);
+        }
+        printf "      health: streak=%d  last_check=%s  status=%s (%d target%s)\n",
+            $max_fail, _ago($last_check), $worst_status,
+            scalar(@$rows), (@$rows == 1 ? '' : 's');
+    }
+}
+
+# ---- helpers ---------------------------------------------------------
+
+sub _nn { my $v = $_[0]; return (defined $v && length $v) ? $v : '-' }
+
+# Format a DATETIME "YYYY-MM-DD HH:MM:SS" as a rough "Xs ago" / "Xm ago"
+# string, or "-" if the value is empty. Robust to a NULL row column.
+sub _ago {
+    my ($dt) = @_;
+    return '-' unless defined $dt && length $dt;
+    my ($y, $mo, $d, $h, $mi, $s) = $dt =~
+        /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/;
+    return $dt unless defined $y;
+    require Time::Local;
+    my $t = eval { Time::Local::timegm($s, $mi, $h, $d, $mo - 1, $y - 1900) };
+    return $dt unless defined $t;
+    my $age = time() - $t;
+    return "just now" if $age < 1;
+    return sprintf("%ds ago",  $age) if $age < 60;
+    return sprintf("%dm ago",  int($age / 60))   if $age < 3600;
+    return sprintf("%dh ago",  int($age / 3600)) if $age < 86400;
+    return sprintf("%dd ago",  int($age / 86400));
+}
+
+sub _sql_esc { my $v = $_[0] // ''; $v =~ s/'/''/g; $v }
+
+sub usage {
+    my ($msg) = @_;
+    print STDERR "net-mac: $msg\n\n" if $msg;
+    print STDERR <<'USAGE';
+usage:
+  net-mac list [SERVICE]                 WAN services + candidates + health
+
+  --listen H:P / --server NAME           daemon address
+  --json                                 machine-readable output
+  --auth / --no-auth / --key-id / --key-file
+USAGE
+    exit($msg ? 2 : 0);
+}

@@ -723,3 +723,87 @@ INSERT IGNORE INTO schema_version (version) VALUES (29);
 ALTER TABLE peers ADD COLUMN cluster_member VARCHAR(64) NULL;
 
 INSERT IGNORE INTO schema_version (version) VALUES (30);
+
+-- Schema v34: wan-failover data model. Three cluster-replicated tables
+-- carry the state the failover orchestrator (commit C) needs, ahead of
+-- the OBSERVE verbs (commit B) that write to them.
+--
+--   wan_services            — one named "WAN service" (e.g. 'primary').
+--                              active_member points at whichever candidate is
+--                              currently promoted; last_status is the rolling
+--                              health verdict; orchestrator_mode is 'auto' or
+--                              'manual' (pinned by an operator).
+--   wan_service_candidates  — (service_name, member) tuples: the ordered set
+--                              of members eligible to serve this service. The
+--                              orchestrator promotes the healthy candidate with
+--                              the LOWEST priority number. apply/teardown hooks
+--                              are cluster-visible so any node can see how a
+--                              given candidate is brought up on the owning host.
+--   wan_service_health      — per-(service, member, target) probe rollup.
+--                              wan-probe (commit C) writes; the master reads to
+--                              decide promotions. Not replicated back to the
+--                              origin, so each site sees the failover it drove.
+--
+-- All three carry replicated_from so cluster-master takes precedence per the
+-- v21 convention. Fresh installs get the tables here; upgrades pick them up
+-- via _apply_migration(v=34) in NetMgr::DB.
+CREATE TABLE IF NOT EXISTS wan_services (
+    name                   VARCHAR(64)  NOT NULL PRIMARY KEY,
+    active_member          VARCHAR(64)  NULL,
+    last_status            VARCHAR(16)  NOT NULL DEFAULT 'unknown',
+    last_status_reason     VARCHAR(255) NULL,
+    last_promotion_at      DATETIME     NULL,
+    last_working_at        DATETIME     NULL,
+    orchestrator_mode      VARCHAR(16)  NOT NULL DEFAULT 'auto',
+    probe_targets          VARCHAR(255) NOT NULL DEFAULT '1.1.1.1,8.8.8.8',
+    probe_interval_s       INT          NOT NULL DEFAULT 3,
+    fail_streak_threshold  INT          NOT NULL DEFAULT 3,
+    min_promotion_secs     INT          NOT NULL DEFAULT 30,
+    quarantine_secs        INT          NOT NULL DEFAULT 300,
+    antiflap_freeze_secs   INT          NOT NULL DEFAULT 120,
+    notes                  TEXT,
+    last_modified          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                        ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from        VARCHAR(64)  NULL,
+    KEY idx_ws_replicated (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS wan_service_candidates (
+    service_name        VARCHAR(64)  NOT NULL,
+    member              VARCHAR(64)  NOT NULL,
+    priority            INT          NOT NULL DEFAULT 100,
+    iface               VARCHAR(32)  NULL,
+    mac                 CHAR(17)     NULL,
+    isp_name            VARCHAR(64)  NULL,
+    apply_hook          VARCHAR(255) NULL,
+    teardown_hook       VARCHAR(255) NULL,
+    probe_when_standby  TINYINT      NOT NULL DEFAULT 1,
+    last_apply_result   VARCHAR(16)  NULL,
+    last_apply_at       DATETIME     NULL,
+    last_apply_note     VARCHAR(255) NULL,
+    last_working_at     DATETIME     NULL,
+    notes               TEXT,
+    last_modified       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                     ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from     VARCHAR(64)  NULL,
+    PRIMARY KEY (service_name, member),
+    KEY idx_wsc_svc_prio (service_name, priority),
+    KEY idx_wsc_replicated (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS wan_service_health (
+    service_name         VARCHAR(64)  NOT NULL,
+    member               VARCHAR(64)  NOT NULL,
+    target               VARCHAR(64)  NOT NULL,
+    last_check           DATETIME     NULL,
+    last_ok              DATETIME     NULL,
+    last_status          VARCHAR(16)  NOT NULL DEFAULT 'unknown',
+    last_rtt_ms          FLOAT        NULL,
+    consecutive_failures INT          NOT NULL DEFAULT 0,
+    replicated_from      VARCHAR(64)  NULL,
+    PRIMARY KEY (service_name, member, target),
+    KEY idx_wsh_svc (service_name),
+    KEY idx_wsh_replicated (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO schema_version (version) VALUES (34);

@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 33;
+our $SCHEMA_VERSION = 34;
 
 sub new {
     my ($class, %args) = @_;
@@ -785,6 +785,77 @@ CREATE TABLE IF NOT EXISTS mesh_tunnels (
     replicated_from  VARCHAR(64)  NULL,
     PRIMARY KEY (owner_node, kind),
     KEY idx_mt_replicated (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
+    if ($v == 34) {
+        # wan-failover data model (commit A of the wan-failover series):
+        # wan_services / wan_service_candidates / wan_service_health. Column
+        # docs live in sql/schema.sql. All three are cluster-replicated and
+        # carry replicated_from per the v21 convention. Fresh installs pick
+        # them up from schema.sql; older installs get them here. Re-run safe
+        # (CREATE TABLE IF NOT EXISTS).
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS wan_services (
+    name                   VARCHAR(64)  NOT NULL PRIMARY KEY,
+    active_member          VARCHAR(64)  NULL,
+    last_status            VARCHAR(16)  NOT NULL DEFAULT 'unknown',
+    last_status_reason     VARCHAR(255) NULL,
+    last_promotion_at      DATETIME     NULL,
+    last_working_at        DATETIME     NULL,
+    orchestrator_mode      VARCHAR(16)  NOT NULL DEFAULT 'auto',
+    probe_targets          VARCHAR(255) NOT NULL DEFAULT '1.1.1.1,8.8.8.8',
+    probe_interval_s       INT          NOT NULL DEFAULT 3,
+    fail_streak_threshold  INT          NOT NULL DEFAULT 3,
+    min_promotion_secs     INT          NOT NULL DEFAULT 30,
+    quarantine_secs        INT          NOT NULL DEFAULT 300,
+    antiflap_freeze_secs   INT          NOT NULL DEFAULT 120,
+    notes                  TEXT,
+    last_modified          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                        ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from        VARCHAR(64)  NULL,
+    KEY idx_ws_replicated (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS wan_service_candidates (
+    service_name        VARCHAR(64)  NOT NULL,
+    member              VARCHAR(64)  NOT NULL,
+    priority            INT          NOT NULL DEFAULT 100,
+    iface               VARCHAR(32)  NULL,
+    mac                 CHAR(17)     NULL,
+    isp_name            VARCHAR(64)  NULL,
+    apply_hook          VARCHAR(255) NULL,
+    teardown_hook       VARCHAR(255) NULL,
+    probe_when_standby  TINYINT      NOT NULL DEFAULT 1,
+    last_apply_result   VARCHAR(16)  NULL,
+    last_apply_at       DATETIME     NULL,
+    last_apply_note     VARCHAR(255) NULL,
+    last_working_at     DATETIME     NULL,
+    notes               TEXT,
+    last_modified       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                     ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from     VARCHAR(64)  NULL,
+    PRIMARY KEY (service_name, member),
+    KEY idx_wsc_svc_prio (service_name, priority),
+    KEY idx_wsc_replicated (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS wan_service_health (
+    service_name         VARCHAR(64)  NOT NULL,
+    member               VARCHAR(64)  NOT NULL,
+    target               VARCHAR(64)  NOT NULL,
+    last_check           DATETIME     NULL,
+    last_ok              DATETIME     NULL,
+    last_status          VARCHAR(16)  NOT NULL DEFAULT 'unknown',
+    last_rtt_ms          FLOAT        NULL,
+    consecutive_failures INT          NOT NULL DEFAULT 0,
+    replicated_from      VARCHAR(64)  NULL,
+    PRIMARY KEY (service_name, member, target),
+    KEY idx_wsh_svc (service_name),
+    KEY idx_wsh_replicated (replicated_from)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
         return;
@@ -2750,6 +2821,40 @@ sub set_node_capabilities {
             replicated_from = COALESCE(VALUES(replicated_from), replicated_from)",
         undef, $f{member}, $caps, $f{replicated_from});
     return { op => 'update', now => $self->get_node_capabilities($f{member}) };
+}
+
+# ---- wan_services / candidates / health (schema v34) --------------------
+#
+# Read-only helpers only in commit A of the wan-failover series — no upsert
+# side yet. The orchestrator (commit C) and the OBSERVE verbs (commit B)
+# introduce the writers; net-mac uses the list helpers straight from the
+# daemon-side snapshot in the meantime.
+
+sub list_wan_services {
+    $_[0]->{dbh}->selectall_arrayref(
+        "SELECT * FROM wan_services ORDER BY name", { Slice => {} })
+}
+
+sub list_wan_service_candidates {
+    my ($self, $svc) = @_;
+    my $sql = "SELECT * FROM wan_service_candidates";
+    my @args;
+    if (defined $svc) { $sql .= " WHERE service_name = ?"; push @args, $svc }
+    $sql .= " ORDER BY service_name, priority, member";
+    $self->{dbh}->selectall_arrayref($sql, { Slice => {} }, @args)
+}
+
+sub list_wan_service_health {
+    my ($self, $svc) = @_;
+    my $sql = "SELECT * FROM wan_service_health";
+    my @args;
+    if (defined $svc) { $sql .= " WHERE service_name = ?"; push @args, $svc }
+    $sql .= " ORDER BY service_name, member, target";
+    $self->{dbh}->selectall_arrayref($sql, { Slice => {} }, @args)
+}
+
+sub count_wan_services {
+    $_[0]->{dbh}->selectrow_array("SELECT COUNT(*) FROM wan_services") // 0
 }
 
 1;

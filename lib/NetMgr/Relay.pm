@@ -29,6 +29,7 @@ my @REPLICATED = qw(
     aps associations dhcp_leases aliases
     dhcp_ranges dhcp_reservations
     mesh_tunnels node_capabilities
+    wan_services wan_service_candidates wan_service_health
 );
 
 sub run {
@@ -484,6 +485,159 @@ sub _apply_node_capabilities {
         capabilities    => $row->{capabilities} // '',
         replicated_from => $repl_from,
     );
+}
+
+# ---- wan-failover replication (schema v34) --------------------------
+#
+# No upsert helpers on the DB yet — those arrive in commit B. Until then
+# each apply drives a straight INSERT ... ON DUPLICATE KEY UPDATE against
+# the primary key, mirroring the _apply_node_capabilities shape (idempotent,
+# non-emitting, stamps replicated_from). Columns match sql/schema.sql v34.
+
+sub _apply_wan_services {
+    my ($db, $row, $idmap, $repl_from) = @_;
+    return unless defined $row->{name} && length $row->{name};
+    $db->dbh->do(<<'SQL', undef,
+INSERT INTO wan_services
+    (name, active_member, last_status, last_status_reason,
+     last_promotion_at, last_working_at, orchestrator_mode,
+     probe_targets, probe_interval_s, fail_streak_threshold,
+     min_promotion_secs, quarantine_secs, antiflap_freeze_secs,
+     notes, replicated_from)
+VALUES (?,?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?)
+ON DUPLICATE KEY UPDATE
+    active_member         = VALUES(active_member),
+    last_status           = VALUES(last_status),
+    last_status_reason    = VALUES(last_status_reason),
+    last_promotion_at     = VALUES(last_promotion_at),
+    last_working_at       = VALUES(last_working_at),
+    orchestrator_mode     = VALUES(orchestrator_mode),
+    probe_targets         = VALUES(probe_targets),
+    probe_interval_s      = VALUES(probe_interval_s),
+    fail_streak_threshold = VALUES(fail_streak_threshold),
+    min_promotion_secs    = VALUES(min_promotion_secs),
+    quarantine_secs       = VALUES(quarantine_secs),
+    antiflap_freeze_secs  = VALUES(antiflap_freeze_secs),
+    notes                 = VALUES(notes),
+    replicated_from       = COALESCE(VALUES(replicated_from), replicated_from)
+SQL
+        $row->{name},
+        $row->{active_member},
+        ($row->{last_status} // 'unknown'),
+        $row->{last_status_reason},
+        $row->{last_promotion_at},
+        $row->{last_working_at},
+        ($row->{orchestrator_mode} // 'auto'),
+        ($row->{probe_targets} // '1.1.1.1,8.8.8.8'),
+        ($row->{probe_interval_s}      // 3),
+        ($row->{fail_streak_threshold} // 3),
+        ($row->{min_promotion_secs}    // 30),
+        ($row->{quarantine_secs}       // 300),
+        ($row->{antiflap_freeze_secs}  // 120),
+        $row->{notes},
+        $repl_from,
+    );
+}
+
+sub _delete_wan_services {
+    my ($db, $row) = @_;
+    return unless defined $row->{name} && length $row->{name};
+    $db->dbh->do("DELETE FROM wan_services WHERE name = ?", undef, $row->{name});
+}
+
+sub _apply_wan_service_candidates {
+    my ($db, $row, $idmap, $repl_from) = @_;
+    return unless defined $row->{service_name} && length $row->{service_name}
+               && defined $row->{member}       && length $row->{member};
+    $db->dbh->do(<<'SQL', undef,
+INSERT INTO wan_service_candidates
+    (service_name, member, priority, iface, mac, isp_name,
+     apply_hook, teardown_hook, probe_when_standby,
+     last_apply_result, last_apply_at, last_apply_note,
+     last_working_at, notes, replicated_from)
+VALUES (?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?)
+ON DUPLICATE KEY UPDATE
+    priority           = VALUES(priority),
+    iface              = VALUES(iface),
+    mac                = VALUES(mac),
+    isp_name           = VALUES(isp_name),
+    apply_hook         = VALUES(apply_hook),
+    teardown_hook      = VALUES(teardown_hook),
+    probe_when_standby = VALUES(probe_when_standby),
+    last_apply_result  = VALUES(last_apply_result),
+    last_apply_at      = VALUES(last_apply_at),
+    last_apply_note    = VALUES(last_apply_note),
+    last_working_at    = VALUES(last_working_at),
+    notes              = VALUES(notes),
+    replicated_from    = COALESCE(VALUES(replicated_from), replicated_from)
+SQL
+        $row->{service_name},
+        $row->{member},
+        ($row->{priority} // 100),
+        $row->{iface},
+        $row->{mac},
+        $row->{isp_name},
+        $row->{apply_hook},
+        $row->{teardown_hook},
+        (defined $row->{probe_when_standby} ? ($row->{probe_when_standby} ? 1 : 0) : 1),
+        $row->{last_apply_result},
+        $row->{last_apply_at},
+        $row->{last_apply_note},
+        $row->{last_working_at},
+        $row->{notes},
+        $repl_from,
+    );
+}
+
+sub _delete_wan_service_candidates {
+    my ($db, $row) = @_;
+    return unless defined $row->{service_name} && length $row->{service_name}
+               && defined $row->{member}       && length $row->{member};
+    $db->dbh->do(
+        "DELETE FROM wan_service_candidates WHERE service_name = ? AND member = ?",
+        undef, $row->{service_name}, $row->{member});
+}
+
+sub _apply_wan_service_health {
+    my ($db, $row, $idmap, $repl_from) = @_;
+    return unless defined $row->{service_name} && length $row->{service_name}
+               && defined $row->{member}       && length $row->{member}
+               && defined $row->{target}       && length $row->{target};
+    $db->dbh->do(<<'SQL', undef,
+INSERT INTO wan_service_health
+    (service_name, member, target,
+     last_check, last_ok, last_status, last_rtt_ms,
+     consecutive_failures, replicated_from)
+VALUES (?,?,?, ?,?,?,?, ?,?)
+ON DUPLICATE KEY UPDATE
+    last_check           = VALUES(last_check),
+    last_ok              = VALUES(last_ok),
+    last_status          = VALUES(last_status),
+    last_rtt_ms          = VALUES(last_rtt_ms),
+    consecutive_failures = VALUES(consecutive_failures),
+    replicated_from      = COALESCE(VALUES(replicated_from), replicated_from)
+SQL
+        $row->{service_name},
+        $row->{member},
+        $row->{target},
+        $row->{last_check},
+        $row->{last_ok},
+        ($row->{last_status} // 'unknown'),
+        $row->{last_rtt_ms},
+        ($row->{consecutive_failures} // 0),
+        $repl_from,
+    );
+}
+
+sub _delete_wan_service_health {
+    my ($db, $row) = @_;
+    return unless defined $row->{service_name} && length $row->{service_name}
+               && defined $row->{member}       && length $row->{member}
+               && defined $row->{target}       && length $row->{target};
+    $db->dbh->do(
+        "DELETE FROM wan_service_health
+          WHERE service_name = ? AND member = ? AND target = ?",
+        undef, $row->{service_name}, $row->{member}, $row->{target});
 }
 
 1;
