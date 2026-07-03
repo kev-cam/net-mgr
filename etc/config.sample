@@ -106,7 +106,7 @@ archive_dir = /var/lib/net-mgr/chat
 # in [scheduling] uses this).
 presence_interval = 90s
 # dnsmasq event-socket auto-discovery (Manager._check_dnsmasq_listeners):
-# dnsmasq_event_port           = 7532
+# dnsmasq_event_port           = 7533
 # dnsmasq_event_check_interval = 60
 
 [paths]

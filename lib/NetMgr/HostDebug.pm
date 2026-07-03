@@ -338,7 +338,9 @@ sub _listeners {
         138 => 'NetBIOS', 139 => 'NetBIOS', 161 => 'SNMP',
         445 => 'SMB', 547 => 'DHCPv6', 631 => 'IPP',
         2049 => 'NFS', 5353 => 'mDNS', 5355 => 'LLMNR',
-        7531 => 'net-mgr', 7532 => 'net-mgr-dnsmasq-event',
+        7531 => 'net-mgr',
+        7533 => 'net-mgr-dnsmasq-event',
+        7532 => 'net-mgr-dnsmasq-event (legacy)',
     );
     for my $line (split /\n/, $out) {
         my @f = split ' ', $line;

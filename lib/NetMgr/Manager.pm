@@ -5615,12 +5615,12 @@ use IO::Socket::INET ();
 
 # Periodic: scan the DB for hosts likely to be running dnsmasq (port
 # 53 or 67 known open) and try to connect to their event-listen port,
-# default 7532. Re-attempt every minute by default; once attached the
+# default 7533. Re-attempt every minute by default; once attached the
 # socket stays in select() forever.
 sub _check_dnsmasq_listeners {
     my ($self) = @_;
     my $cfg = $self->{config}{scanner} // {};
-    my $port  = $cfg->{dnsmasq_event_port}           // 7532;
+    my $port  = $cfg->{dnsmasq_event_port}           // 7533;
     my $every = $cfg->{dnsmasq_event_check_interval} // 60;
     my $now = time();
     $self->{periodic_last} //= {};
