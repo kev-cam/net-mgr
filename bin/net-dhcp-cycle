@@ -1,0 +1,119 @@
+#!/bin/sh
+# net-dhcp-cycle — release + reacquire DHCP leases on named interfaces.
+#
+# Used to force a controlled DHCPREQUEST/DHCPACK window against a custom
+# dnsmasq's event socket, so an operator can verify events flow into net-mgr's
+# addresses / dhcp_leases tables. Also handy for post-config-change lease
+# refreshes.
+#
+# Usage:
+#   net-dhcp-cycle [--repeat N] [--gap SECS] IFACE [IFACE ...]
+#
+# Options:
+#   --repeat N     Run the release+acquire pair N times per interface (default 1).
+#   --gap SECS     Sleep this many seconds between iterations (default 3).
+#   --settle SECS  Sleep after each acquire before reporting the IP (default 2).
+#   -h, --help     Show this.
+#
+# Safety:
+#   Cycling an interface that your current SSH session is coming in on WILL drop
+#   your connection. This script does NOT autodetect that — you name the
+#   interfaces explicitly. If in doubt, run under nohup + &, or run from a
+#   different transport (console, other interface, at(1)).
+#
+# Examples:
+#   net-dhcp-cycle wlp2s0                       # one release+acquire on wlp2s0
+#   net-dhcp-cycle --repeat 3 --gap 5 wlp2s0    # three cycles, 5s apart
+#   net-dhcp-cycle enp0s25 wlp2s0               # both interfaces, sequentially
+
+set -e
+
+repeat=1
+gap=3
+settle=2
+ifaces=
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --repeat)  repeat=$2; shift 2 ;;
+        --gap)     gap=$2; shift 2 ;;
+        --settle)  settle=$2; shift 2 ;;
+        -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --) shift; ifaces="$ifaces $*"; break ;;
+        -*) echo "net-dhcp-cycle: unknown option '$1'" >&2; exit 2 ;;
+        *)  ifaces="$ifaces $1"; shift ;;
+    esac
+done
+
+if [ -z "$ifaces" ]; then
+    echo "net-dhcp-cycle: at least one interface name required" >&2
+    echo "usage: net-dhcp-cycle [--repeat N] [--gap SECS] IFACE [IFACE ...]" >&2
+    exit 2
+fi
+
+if [ "$(id -u)" != "0" ]; then
+    echo "net-dhcp-cycle: must run as root (dhclient / dhcpcd need it)" >&2
+    exit 2
+fi
+
+# Pick a DHCP client. dhclient is present on most Debian-derived hosts; dhcpcd
+# on Arch/Alpine/Devuan-minimal. NM's nmcli is a fallback that doesn't rely on
+# either being on PATH.
+if command -v dhclient >/dev/null 2>&1; then
+    client=dhclient
+elif command -v dhcpcd >/dev/null 2>&1; then
+    client=dhcpcd
+elif command -v nmcli >/dev/null 2>&1; then
+    client=nmcli
+else
+    echo "net-dhcp-cycle: no DHCP client found (looked for dhclient, dhcpcd, nmcli)" >&2
+    exit 3
+fi
+echo "net-dhcp-cycle: using $client"
+
+do_release() {
+    _iface=$1
+    case $client in
+        dhclient) dhclient -r "$_iface" 2>&1 | sed 's/^/    /' || true ;;
+        dhcpcd)   dhcpcd  -k "$_iface" 2>&1 | sed 's/^/    /' || true ;;
+        nmcli)    nmcli dev disconnect "$_iface" 2>&1 | sed 's/^/    /' || true ;;
+    esac
+}
+
+do_acquire() {
+    _iface=$1
+    case $client in
+        dhclient) dhclient "$_iface" 2>&1 | sed 's/^/    /' ;;
+        dhcpcd)   dhcpcd  "$_iface" 2>&1 | sed 's/^/    /' ;;
+        nmcli)    nmcli dev connect "$_iface" 2>&1 | sed 's/^/    /' ;;
+    esac
+}
+
+report_ip() {
+    _iface=$1
+    ip -4 -o addr show "$_iface" 2>/dev/null \
+        | awk '{print $4}' \
+        | head -1 \
+        | sed "s|^|    ip=|"
+}
+
+for iface in $ifaces; do
+    if [ ! -e "/sys/class/net/$iface" ]; then
+        echo "== $iface (missing) =="
+        echo "    /sys/class/net/$iface does not exist — skipping"
+        continue
+    fi
+    i=1
+    while [ $i -le $repeat ]; do
+        printf '== %s (cycle %d/%d) ==\n' "$iface" "$i" "$repeat"
+        printf '  release:\n'
+        do_release "$iface"
+        sleep 1
+        printf '  acquire:\n'
+        do_acquire "$iface"
+        sleep "$settle"
+        report_ip "$iface"
+        i=$((i + 1))
+        [ $i -le $repeat ] && sleep "$gap"
+    done
+done
