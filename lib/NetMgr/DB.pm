@@ -2593,6 +2593,7 @@ sub query_table {
         chat_authorized_keys
         host_keys dhcp_ranges dhcp_reservations
         mesh_tunnels node_capabilities bitchat_peers
+        wan_services wan_service_candidates wan_service_health
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};
