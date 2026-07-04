@@ -145,3 +145,74 @@ match      = (?i)^!hello\b
 channel    = chat_post
 target     = ${session}
 body       = hi ${sender} — net-chat-autoresponder alive
+
+; --------------------------------------------------------------------------
+; Rule 4 — periodic BLE broadcast heartbeat (WIFI URI diagnostic).
+;
+; WHAT THIS DOES
+;   Every `every` seconds, chat_post into the bitchat-bridge session with
+;   a plain (no @HEX16: prefix) body. The bridge's SUBSCRIBE loop picks
+;   the row up (bin/net-bitchat-bridge:343-407), passes the sender-echo
+;   guard at :376 (our sender is 'net-chat-autoresponder' not the
+;   bridge's own 'bitchat-relay') AND the tag guard at :377 (the body
+;   does NOT start with '[X@bitchat...]'), then encodes
+;   {"cmd":"send","body":"..."} to the helper stdin with NO to_peer
+;   field — which the Rust helper fans out as a BLE MESH BROADCAST to
+;   every peer in range.
+;
+; WHY IT EXISTS (diagnostic — not a permanent production rule)
+;   The WIFI-greeting DM (rule.wifi-greeting) fires ONCE per peer per
+;   dedup window on bitchat_peers first-seen. If a peer never appears
+;   in bitchat_peers (silent decrypt failure, upsert path stuck, out
+;   of Noise handshake, etc.) the greeter never fires and that peer
+;   assumes we can't see them. A periodic BROADCAST bypasses the
+;   first-seen gate — it goes out unconditionally — so a peer who
+;   never got the DM will still see the WIFI URI on the mesh. That
+;   differentiates two failure modes cheaply:
+;     BLE reachable + greeter not firing  (broadcast arrives, DM does not)
+;     Peer not visible at all             (neither arrives)
+;
+; HOW TO DISABLE
+;   Comment the rule out (prepend ';' to each key) and restart the
+;   responder. Or drop an override into
+;   /etc/net-mgr/net-chat-autoresponder.d/*.conf with the same section
+;   header ([rule.wifi-broadcast]) and no keys — the last-write-wins
+;   merge in load_config() will strip it out on next load.
+;
+; RATE / POLITENESS
+;   60s is aggressive on purpose — it makes the diagnostic near-instant
+;   to observe from another BLE endpoint. Once the diagnostic has
+;   answered the question, BUMP TO 5m OR 15m in production. The bridge
+;   has NO outbound rate limit (see net-bitchat-bridge:392-407 — every
+;   ROW is immediately json-encoded and printed to helper stdin), so
+;   the rule's own `every=` IS the rate limit on BLE spam.
+;
+; PERIODIC-RULE GRAMMAR (in addition to channel/target/body above):
+;   trigger    — REQUIRED — 'periodic'
+;   every      — REQUIRED — DURATION (s|m|h|d|w suffix); MUST be >= 5s
+;                (parser floor — prevents typos like `every=0.5s` from
+;                collapsing to fire-every-tick).
+;   match      — MUST NOT be set (periodic has no regex — fails load).
+;   dedup_ttl  — forced to 0 internally; every interval fires
+;                unconditionally.
+;
+; Periodic-only substitution tokens (in addition to $$ for a literal
+; '$'; ${cap.*} is NOT available on periodic — no regex, no captures):
+;   ${now}       current UTC HH:MM:SS (rendered per fire)
+;   ${host}      Sys::Hostname::hostname()
+;   ${nickname}  [global].as
+;   ${sender}    [global].as (same as nickname on periodic)
+;
+; TIMER SEMANTICS
+;   Timer state is IN-MEMORY only, NOT persisted. On restart the first
+;   fire happens after `every` seconds — not immediately — so a
+;   supervisor loop that flaps the responder doesn't spam the mesh.
+;   Loop granularity is 10s (recv_line timeout), so an `every` value
+;   below 10s effectively rounds up to the next tick.
+; --------------------------------------------------------------------------
+[rule.wifi-broadcast]
+trigger    = periodic
+every      = 60s
+channel    = chat_post
+target     = bitchat-bridge
+body       = WIFI:T:WPA;S:video;P:InTheRoom;; — did you get this? reply "ok" if you did.

@@ -58,14 +58,26 @@ $ignore{ $GLOBAL->{as} } = 1 if defined $GLOBAL->{as} && length $GLOBAL->{as};
 my $SEEN = SeenFile->open($GLOBAL->{state_file}
                           // '/var/lib/net-mgr/net-chat-autoresponder.seen');
 
-my @ble_rules  = grep { $_->{trigger} eq 'bitchat_peer_first_seen' } @RULES;
-my @chat_rules = grep { $_->{trigger} eq 'chat_message' }            @RULES;
+my @ble_rules      = grep { $_->{trigger} eq 'bitchat_peer_first_seen' } @RULES;
+my @chat_rules     = grep { $_->{trigger} eq 'chat_message' }            @RULES;
+my @periodic_rules = grep { $_->{trigger} eq 'periodic' }                @RULES;
 my %chat_sessions;
 $chat_sessions{$_->{session}}++ for @chat_rules;
 
+# In-memory timer for periodic rules — deliberately NOT persisted. On
+# restart the first fire happens after 'every' seconds, not immediately,
+# so a supervisor loop that flaps the service doesn't spam the mesh.
+{
+    my $t0 = time;
+    for my $r (@periodic_rules) {
+        $r->{_next_fire} = $t0 + $r->{_every_secs};
+    }
+}
+
 warn "[autoresponder] loaded " . scalar(@RULES) . " rule(s) from $opt{config}"
-   . " ("      . scalar(@ble_rules)  . " bitchat_peer_first_seen"
-   . ", "      . scalar(@chat_rules) . " chat_message)\n";
+   . " ("      . scalar(@ble_rules)      . " bitchat_peer_first_seen"
+   . ", "      . scalar(@chat_rules)     . " chat_message"
+   . ", "      . scalar(@periodic_rules) . " periodic)\n";
 
 # ---- 2. Two connections -----------------------------------------------------
 my $R = NetMgr::Client->new(listen => $GLOBAL->{listen}, timeout => 6);
@@ -94,9 +106,15 @@ for my $s (sort keys %chat_sessions) {
 }
 
 # ---- 4. React loop (net-watch:77-92 shape) ----------------------------------
+# recv_line(10) blocks in select() for at most 10s, so the periodic-rule
+# check below runs on every tick (both idle wake-ups AND data-arrival
+# ticks). Latency for a due periodic rule is bounded by that 10s timeout.
+# If any rule's `every` is < 10s, the effective interval will be rounded
+# UP to whatever the next tick lands on — documented at the sample rule.
 while (1) {
     my $line = $R->recv_line(10);
     $SEEN->prune;
+    fire_periodic_rules(\@periodic_rules) if @periodic_rules;
     next unless defined $line;
     my $c = eval { parse_line($line) };
     if ($@) { warn "[autoresponder] parse: $@"; next }
@@ -146,6 +164,30 @@ sub on_peer_row {
         my $key = "$r->{name}\t$pid";
         next if $r->{dedup_ttl} > 0 && $SEEN->check($key, $r->{dedup_ttl});
         $SEEN->record($key) if dispatch($r, $ctx) && $r->{dedup_ttl} > 0;
+    }
+}
+
+sub fire_periodic_rules {
+    my ($rules) = @_;
+    my $now = time;
+    for my $r (@$rules) {
+        next if !defined $r->{_next_fire} || $r->{_next_fire} > $now;
+        # ${peer_id}/${session}/cap.* aren't meaningful for a wall-clock
+        # trigger; leave them empty and let subst() fall through. The
+        # ${nickname} slot carries the global 'as' (per design brief) so
+        # a broadcast rule can self-identify without re-typing the name.
+        my $ctx = {
+            peer_id  => '',
+            nickname => ($GLOBAL->{as} // ''),
+            sender   => ($GLOBAL->{as} // ''),
+            session  => '',
+        };
+        dispatch($r, $ctx);
+        # Re-anchor next fire to `now`, NOT (prev _next_fire + every).
+        # If the loop was blocked for a long time (parse hang, slow
+        # daemon, laptop suspend), we do NOT want to catch up by
+        # firing back-to-back and spamming the mesh.
+        $r->{_next_fire} = $now + $r->{_every_secs};
     }
 }
 
@@ -221,21 +263,40 @@ sub dispatch {
     }
 }
 
-# ${peer_id} ${nickname} ${sender} ${session} ${cap.NAME} — everything else
-# passes through literally. '$$' escapes a literal '$'.
+# ${peer_id} ${nickname} ${sender} ${session} ${cap.NAME} ${now} ${host} —
+# everything else passes through literally. '$$' escapes a literal '$'.
+#   ${now}   — current UTC HH:MM:SS (rendered per fire, useful for periodic).
+#   ${host}  — Sys::Hostname::hostname() (cached).
 sub subst {
     my ($s, $ctx) = @_;
     return '' unless defined $s;
     $s =~ s/\$\$/\x01/g;
     $s =~ s/
         \$\{
-          ( peer_id | nickname | sender | session
+          ( peer_id | nickname | sender | session | now | host
           | cap\.[A-Za-z_][A-Za-z0-9_]*
           )
         \}
-    / defined $ctx->{$1} ? $ctx->{$1} : '' /gex;
+    / _token_val($1, $ctx) /gex;
     $s =~ s/\x01/\$/g;
     return $s;
+}
+
+my $HOST_CACHED;
+sub _token_val {
+    my ($tok, $ctx) = @_;
+    if ($tok eq 'now') {
+        my @t = gmtime;
+        return sprintf('%02d:%02d:%02d', $t[2], $t[1], $t[0]);
+    }
+    if ($tok eq 'host') {
+        unless (defined $HOST_CACHED) {
+            require Sys::Hostname;
+            $HOST_CACHED = Sys::Hostname::hostname() // '';
+        }
+        return $HOST_CACHED;
+    }
+    return defined $ctx->{$tok} ? $ctx->{$tok} : '';
 }
 
 # ---- config -----------------------------------------------------------------
@@ -338,7 +399,8 @@ sub _compile_rule {
         or die "no trigger=";
     die "bad trigger '$trigger'"
         unless $trigger eq 'bitchat_peer_first_seen'
-            || $trigger eq 'chat_message';
+            || $trigger eq 'chat_message'
+            || $trigger eq 'periodic';
 
     my $ch = $r->{channel} or die "no channel=";
     die "bad channel '$ch'"
@@ -368,13 +430,31 @@ sub _compile_rule {
         die "chat_message session sanitize: '$sess' has forbidden chars"
             unless $sess =~ /^[A-Za-z0-9._-]{1,64}$/;
     }
+    if ($trigger eq 'periodic') {
+        # `every` REQUIRED. Enforce a 5s floor so a typo like `every=0.5s`
+        # (which _parse_duration would treat as 0 -> fire-every-tick) can't
+        # spam the mesh. No dedup, no regex, no session for periodic.
+        my $every = $r->{every};
+        die "periodic trigger needs every=" unless defined $every && length $every;
+        my $secs = _parse_duration($every);
+        die "periodic every='$every' must be >= 5s (got ${secs}s)"
+            if $secs < 5;
+        $r->{_every_secs} = $secs;
+        # `match` on a periodic rule would be silently ignored, which
+        # confuses readers of the config. Fail load instead.
+        die "periodic trigger does not accept match="
+            if defined $r->{match};
+    }
     $match = '.*' unless defined $match;
     my $re = _compile_re($match);
     $r->{_re} = $re;
 
     # Duration parse. Default 30d for BLE first-seen; 0 for chat_message.
+    # Periodic ignores dedup entirely — the `every` interval IS the
+    # rate limit; forcing dedup_ttl=0 keeps every fire unconditional
+    # even if someone copies a dedup_ttl= from a first-seen rule.
     my $default_ttl = $trigger eq 'bitchat_peer_first_seen' ? '30d' : '0';
-    my $ttl = $r->{dedup_ttl} // $default_ttl;
+    my $ttl = $trigger eq 'periodic' ? '0' : ($r->{dedup_ttl} // $default_ttl);
     $r->{dedup_ttl} = _parse_duration($ttl);
     return 1;
 }
