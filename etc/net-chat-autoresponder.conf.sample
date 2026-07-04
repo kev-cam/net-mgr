@@ -262,12 +262,6 @@ body       = hi ${sender} — net-chat-autoresponder alive
 ;   acked_ttl  — optional — SeenFile freshness window; default 1h.
 ;                Suffix s|m|h|d|w. MUST be > 0.
 ; --------------------------------------------------------------------------
-; Tip: to populate `body` from a shared-wifi entry instead of hard-coding
-; the SSID/password inline (single source of truth across bridge / picker /
-; fanout), run:
-;     net-share-wifi --uri <label>
-; and paste the resulting WIFI:...;; URI in. See net-share-wifi(1) and
-; /etc/net-mgr/shared-wifi.conf.sample.
 [rule.wifi-fanout]
 trigger    = periodic
 every      = 60s

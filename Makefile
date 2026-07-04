@@ -23,7 +23,7 @@ CGIDIR     ?= /usr/lib/cgi-bin
 APACHE_CONF_DIR ?= $(SYSCONFDIR)/apache2/conf-available
 DESTDIR    ?=
 
-BINS  = net-alias net-autoresponder-gui net-bitchat-bridge net-bitchat-helper-wrap net-mgr-bitchat-setup net-chat net-chat-askpass net-chat-autoresponder net-poll-ap net-audit net-audit-aps net-cluster net-cluster-gui net-config-gui net-connect net-ddns net-dhcp-cycle net-diag net-discover net-find-lost net-find-peers net-find-rogue-dhcp net-fw net-gen-apache-conf net-gen-dnsmasq net-import-dhcp net-import-dnsmasq net-import-ssh-forwards net-fix net-ipv6 net-isp net-link-stats net-lookup net-mac net-name net-peer net-ping net-purge net-vlan net-kill-rogue-dhcp net-reserve net-roam net-router net-run-app net-scan net-report net-set net-share-wifi net-show net-tp-scan net-tunnel net-uplink-probe net-var net-watch net-wifi-survey net-zones
+BINS  = net-alias net-autoresponder-gui net-bitchat-bridge net-bitchat-helper-wrap net-mgr-bitchat-setup net-chat net-chat-askpass net-chat-autoresponder net-poll-ap net-audit net-audit-aps net-cluster net-cluster-gui net-config-gui net-connect net-ddns net-dhcp-cycle net-diag net-discover net-find-lost net-find-peers net-find-rogue-dhcp net-fw net-gen-apache-conf net-gen-dnsmasq net-import-dhcp net-import-dnsmasq net-import-ssh-forwards net-fix net-ipv6 net-isp net-link-stats net-lookup net-mac net-name net-peer net-ping net-purge net-vlan net-kill-rogue-dhcp net-reserve net-roam net-router net-run-app net-scan net-report net-set net-show net-tp-scan net-tunnel net-uplink-probe net-var net-watch net-wifi-survey net-zones
 
 # Symlinks installed pointing at net-run-app — each link picks its
 # behavior from basename($0) so adding a new wrapper is a one-line
@@ -307,17 +307,6 @@ install: .version
 	             $(DESTDIR)$(SYSCONFDIR)/net-mgr/net-chat-autoresponder.conf; \
 	fi
 	@$(INSTALL) -d $(DESTDIR)$(SYSCONFDIR)/net-mgr/net-chat-autoresponder.d
-	@# shared-wifi: ship the .sample so first install doesn't clobber
-	@# site config. Recommended mode 0640 root:net-mgr (see the sample's
-	@# header) — we install the .sample world-readable so it stays visible
-	@# to any operator inspecting /etc/net-mgr, and net-share-wifi will
-	@# nag on STDERR if the LIVE file is 0644+password.
-	@if [ -f etc/shared-wifi.conf.sample ]; then \
-	  echo "  etc/shared-wifi.conf.sample → $(DESTDIR)$(SYSCONFDIR)/net-mgr/shared-wifi.conf.sample"; \
-	  $(INSTALL) -m 644 etc/shared-wifi.conf.sample \
-	             $(DESTDIR)$(SYSCONFDIR)/net-mgr/shared-wifi.conf.sample; \
-	fi
-	@$(INSTALL) -d $(DESTDIR)$(SYSCONFDIR)/net-mgr/shared-wifi.d
 	@CFG=$(DESTDIR)$(SYSCONFDIR)/net-mgr/config; \
 	  perl -Ilib -MNetMgr::Config -e 'my @d = NetMgr::Config::dead_keys($$ARGV[0]); exit unless @d; print STDERR "\nWARN: $$ARGV[0] has keys no longer read by the daemon:\n"; print STDERR "  $$_\n" for @d; print STDERR "(harmless, but you can delete them.)\n"' "$$CFG"
 	@echo
