@@ -225,6 +225,16 @@ sub run_once {
         } else {
             warn "[bridge] SUBSCRIBE sent for session=$session\n";
         }
+        # Ensure the session row exists. On a fresh box the bridge may
+        # subscribe long before it ever posts (no BLE traffic yet), and
+        # sibling tools that chat_post INTO this session get "no such
+        # session" until we've created it. A single startup marker is
+        # the cheapest fix — idempotent, human-readable, and doubles as
+        # a "bridge came up" beacon that other observers can consume.
+        my $marker = "[bridge] online nick="
+                   . (length($nickname) ? $nickname : "(compiled-default)");
+        eval { $cli->chat_post(session => $session, body => $marker); };
+        warn "[bridge] session marker post failed: $@" if $@;
         # Cross-site mesh binding (Option B step 2): stream inserts on the
         # in-memory bitchat_relay_packets table so we get a ROW event
         # whenever another bridge site fanned out a packet_rx to us.
