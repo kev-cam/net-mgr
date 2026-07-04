@@ -1,0 +1,1111 @@
+#!/usr/bin/perl
+# net-autoresponder-gui — Tk editor + live tester for the
+# net-chat-autoresponder ruleset. Reads the primary
+# /etc/net-mgr/net-chat-autoresponder.conf and every overlay in the
+# adjacent .d/ directory, in filename-sort order, mirroring the loader
+# in bin/net-chat-autoresponder. Each rule is tracked against the file
+# it was last defined in (last-write-wins per rule name across overlays)
+# so save-back writes to the SAME file — you don't accidentally move
+# a site-override rule out of its overlay back into the packaged
+# default.
+#
+# Rule enable/disable is persisted by prefixing every line of the rule
+# section (header + body kv) with '; '. The autoresponder's INI reader
+# treats those as comments so a disabled rule is a no-op at daemon
+# level; the GUI restores the rule by stripping that prefix. The
+# alternative (rename the [rule.NAME] header) would work too but
+# commenting keeps the rule text visible / diffable in place.
+#
+# Test pane: for the selected rule, sample recent rows from the table
+# its trigger consumes (bitchat_peers / chat_messages) via
+# NetMgr::Client->snapshot on --listen, then re-run the rule's match /
+# from / session filters against each row and show what would fire,
+# with the resolved target/body after ${...} substitution. Periodic
+# rules have no history to sample; the tester synthesises a single
+# tick context and just shows the resolved wire post.
+#
+# NOTE: net-chat-autoresponder reads its config exactly once at
+# startup. There is no SIGHUP handler and the daemon exposes no
+# `service_restart` REPAIR action today (see the actions list in
+# lib/NetMgr/Manager.pm _handle_repair). After Save the GUI shows a
+# reminder to `systemctl restart net-chat-autoresponder` — automating
+# that from here would need SSH or a new REPAIR action, neither of
+# which is worth the complexity for an occasional edit.
+#
+# Usage:
+#   net-autoresponder-gui [--listen HOST:PORT]
+#                         [--file /etc/net-mgr/net-chat-autoresponder.conf]
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use File::Copy    ();
+use File::Basename qw(basename dirname);
+use POSIX          qw(strftime);
+
+BEGIN {
+    eval { require Tk; 1 } or die <<MSG;
+net-autoresponder-gui needs perl-Tk. Install with:
+  Debian/Ubuntu:  sudo apt install perl-tk
+  RHEL/Fedora:    sudo dnf install perl-Tk
+MSG
+}
+use Tk;
+use Tk::ROText;
+use Tk::DialogBox;
+use Tk::Optionmenu;
+
+use NetMgr::Client;
+
+my $listen = $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
+my $file   = '/etc/net-mgr/net-chat-autoresponder.conf';
+my $help;
+GetOptions(
+    'listen=s' => \$listen,
+    'file=s'   => \$file,
+    'help|h'   => \$help,
+) or usage(2);
+usage(0) if $help;
+
+# --- Rule / file model ----------------------------------------------
+# %S{rules}   ordered arrayref of rule hashes; each:
+#               { name, enabled, source, kv=>{...}, start_ln, end_ln }
+#             start_ln/end_ln index into %S{files}{source} (0-based, inclusive).
+# %S{files}   { path => \@lines } — raw file contents (no trailing \n).
+# %S{order}   arrayref of overlay paths in load order (primary first).
+# %S{primary} primary config file path (destination for +New rules).
+my %S = (
+    rules   => [],
+    files   => {},
+    order   => [],
+    primary => $file,
+    sel_idx => undef,   # index into $S{rules} of the currently-edited rule
+);
+
+# --- Tk skeleton (net-cluster-gui:139-150 layout) --------------------
+my $mw = MainWindow->new(-title => "net-autoresponder-gui ($file)");
+$mw->geometry('1100x760');
+
+my $top_bar    = $mw->Frame(-relief => 'groove', -bd => 1)
+                    ->pack(-side => 'top', -fill => 'x');
+my $body_frame = $mw->Frame->pack(-side => 'top', -fill => 'both', -expand => 1);
+my $test_frame = $mw->Frame(-relief => 'sunken', -bd => 1)
+                    ->pack(-side => 'top', -fill => 'both', -expand => 1, -pady => 2);
+my $action_bar = $mw->Frame->pack(-side => 'bottom', -fill => 'x');
+my $status_lbl = $mw->Label(-anchor => 'w', -relief => 'sunken')
+                    ->pack(-side => 'bottom', -fill => 'x');
+
+# --- Top bar: daemon target + config file + Load --------------------
+$top_bar->Label(-text => 'Target daemon:')->pack(-side => 'left', -padx => 4);
+my $listen_var = $listen;
+$top_bar->Entry(-textvariable => \$listen_var, -width => 22)
+        ->pack(-side => 'left', -padx => 4);
+$top_bar->Label(-text => '   Config:')->pack(-side => 'left');
+my $file_var = $file;
+$top_bar->Entry(-textvariable => \$file_var, -width => 44)
+        ->pack(-side => 'left', -padx => 4);
+$top_bar->Button(-text => 'Load', -command => \&do_load)
+        ->pack(-side => 'left', -padx => 4);
+$top_bar->Button(-text => 'Restart hint', -command => \&show_restart_hint)
+        ->pack(-side => 'right', -padx => 4);
+
+# --- Body: LEFT rule list, RIGHT editor ------------------------------
+my $left_frame  = $body_frame->Frame(-relief => 'groove', -bd => 1)
+                             ->pack(-side => 'left', -fill => 'y', -padx => 2);
+my $right_frame = $body_frame->Frame(-relief => 'groove', -bd => 1)
+                             ->pack(-side => 'left', -fill => 'both',
+                                    -expand => 1, -padx => 2);
+
+$left_frame->Label(-text => 'Rules',
+                   -font => '{Helvetica} 9 bold')
+           ->pack(-side => 'top', -anchor => 'w', -padx => 4, -pady => 2);
+my $rules_list = $left_frame->Scrolled('Listbox',
+    -scrollbars => 'oe',
+    -width      => 32,
+    -height     => 20,
+    -font       => '{Monospace} 10',
+    -selectmode => 'browse',
+)->pack(-side => 'top', -fill => 'y', -expand => 1, -padx => 4, -pady => 2);
+$rules_list->bind('<<ListboxSelect>>', \&on_rule_pick);
+
+my $left_btns = $left_frame->Frame->pack(-side => 'top', -fill => 'x', -pady => 2);
+$left_btns->Button(-text => '+ Add',    -command => \&do_add_rule)
+          ->pack(-side => 'left',  -padx => 2);
+$left_btns->Button(-text => 'Toggle',   -command => \&do_toggle_enabled)
+          ->pack(-side => 'left',  -padx => 2);
+$left_btns->Button(-text => 'Delete',   -command => \&do_delete_rule)
+          ->pack(-side => 'left',  -padx => 2);
+
+# Right-side editor is rebuilt every time the trigger changes.
+my %E;              # widget refs + backing scalars for the editor form
+my $editor_frame;   # inner frame that we destroy/rebuild
+build_editor_shell();
+
+# --- Test pane (bottom half) ----------------------------------------
+my $test_top = $test_frame->Frame->pack(-side => 'top', -fill => 'x', -pady => 2);
+$test_top->Label(-text => 'Test pane', -font => '{Helvetica} 9 bold')
+         ->pack(-side => 'left', -padx => 4);
+$test_top->Label(-text => '   Sample size:')->pack(-side => 'left');
+my $sample_n = 50;
+$test_top->Entry(-textvariable => \$sample_n, -width => 5)
+         ->pack(-side => 'left', -padx => 2);
+$test_top->Button(-text => 'Fetch + test selected rule',
+                  -command => \&do_test)
+         ->pack(-side => 'left', -padx => 6);
+$test_top->Label(-text => '(uses editor state, not the saved rule)',
+                 -foreground => '#666')
+         ->pack(-side => 'left', -padx => 8);
+
+my $test_text = $test_frame->Scrolled('ROText',
+    -scrollbars => 'osoe',
+    -wrap       => 'none',
+    -font       => '{Monospace} 9',
+    -height     => 14,
+)->pack(-side => 'top', -fill => 'both', -expand => 1, -padx => 4, -pady => 2);
+$test_text->tagConfigure('hit',    -foreground => '#040');
+$test_text->tagConfigure('miss',   -foreground => '#888');
+$test_text->tagConfigure('bold',   -font       => '{Monospace} 9 bold');
+$test_text->tagConfigure('err',    -foreground => '#a00');
+$test_text->tagConfigure('resolved', -foreground => '#005');
+
+# --- Action bar -----------------------------------------------------
+$action_bar->Button(-text => 'Save rule',
+                    -command => \&do_save_rule)
+           ->pack(-side => 'left', -padx => 4);
+$action_bar->Button(-text => 'Reload from disk',
+                    -command => \&do_load)
+           ->pack(-side => 'left', -padx => 4);
+$action_bar->Button(-text => 'Quit', -command => sub { exit 0 })
+           ->pack(-side => 'right', -padx => 4);
+
+do_load();
+MainLoop;
+exit 0;
+
+# ====================================================================
+# Actions
+# ====================================================================
+
+sub do_load {
+    $file = $file_var;
+    $S{primary} = $file;
+    $S{files}   = {};
+    $S{order}   = [];
+    $S{rules}   = [];
+    $S{sel_idx} = undef;
+
+    my @paths = overlay_paths($file);
+    unless (@paths) {
+        set_status("No config found: $file (and no $file.d/*.conf)");
+        refresh_rules_list();
+        clear_editor();
+        return;
+    }
+    my %by_name;
+    my @name_order;
+    for my $p (@paths) {
+        my @lines = slurp_lines($p);
+        $S{files}{$p} = \@lines;
+        push @{$S{order}}, $p;
+        parse_rules_from($p, \@lines, \%by_name, \@name_order);
+    }
+    $S{rules} = [ map { $by_name{$_} } @name_order ];
+    refresh_rules_list();
+    if (@{$S{rules}}) {
+        $rules_list->selectionSet(0);
+        $S{sel_idx} = 0;
+        load_editor_from_rule( $S{rules}[0] );
+    } else {
+        clear_editor();
+    }
+    set_status(sprintf "Loaded %d rule(s) from %d file(s)",
+               scalar @{$S{rules}}, scalar @paths);
+}
+
+sub on_rule_pick {
+    my @sel = $rules_list->curselection;
+    return unless @sel;
+    my $i = $sel[0];
+    $S{sel_idx} = $i;
+    load_editor_from_rule($S{rules}[$i]);
+}
+
+sub do_add_rule {
+    my $dlg = $mw->DialogBox(-title => 'New rule',
+                             -buttons => ['OK', 'Cancel']);
+    my %v = (name => '', trigger => 'chat_message');
+    $dlg->add('Label', -text => 'Rule name ([A-Za-z][A-Za-z0-9._-]{0,31}):')
+        ->pack(-anchor => 'w', -padx => 8, -pady => 2);
+    my $e = $dlg->add('Entry', -textvariable => \$v{name}, -width => 32)
+                ->pack(-padx => 8, -pady => 2);
+    $e->focus;
+    $dlg->add('Label', -text => 'Trigger:')
+        ->pack(-anchor => 'w', -padx => 8, -pady => 2);
+    $dlg->add('Optionmenu',
+              -options  => [ [ 'chat_message' => 'chat_message' ],
+                             [ 'bitchat_peer_first_seen' => 'bitchat_peer_first_seen' ],
+                             [ 'periodic' => 'periodic' ] ],
+              -variable => \$v{trigger},
+    )->pack(-anchor => 'w', -padx => 8, -pady => 2);
+    my $ans = $dlg->Show // 'Cancel';
+    return unless $ans eq 'OK' || $ans eq 'Ok';
+    $v{name} =~ s/^\s+|\s+$//g;
+    return msg('Bad name', 'Rule name must match [A-Za-z][A-Za-z0-9._-]{0,31}.')
+        unless $v{name} =~ /^[A-Za-z][A-Za-z0-9._-]{0,31}$/;
+    for my $r (@{$S{rules}}) {
+        return msg('Duplicate', "A rule named '$v{name}' already exists in "
+                              . $r->{source} . ".")
+            if $r->{name} eq $v{name};
+    }
+    # New rules append to the primary file. If the primary doesn't yet
+    # exist, create it (empty) so the append target is well-defined.
+    my $dest = $S{primary};
+    if (!exists $S{files}{$dest}) {
+        $S{files}{$dest} = [];
+        push @{$S{order}}, $dest;
+    }
+    my $lines = $S{files}{$dest};
+    my $starter_kv = starter_kv_for_trigger($v{trigger});
+    $starter_kv->{trigger} = $v{trigger};
+    my $new = {
+        name    => $v{name},
+        enabled => 1,
+        source  => $dest,
+        kv      => $starter_kv,
+        # start_ln/end_ln get assigned when we write, not now.
+    };
+    push @{$S{rules}}, $new;
+    $S{sel_idx} = $#{ $S{rules} };
+    refresh_rules_list();
+    $rules_list->selectionClear(0, 'end');
+    $rules_list->selectionSet($S{sel_idx});
+    load_editor_from_rule($new);
+    set_status("New rule '$v{name}' — edit + Save to write it to $dest");
+}
+
+sub do_toggle_enabled {
+    my $r = current_rule() or return;
+    $r->{enabled} = $r->{enabled} ? 0 : 1;
+    my $body = editor_kv_dump();
+    write_rule_back($r, $body);
+    refresh_rules_list();
+    reselect_current();
+    set_status(($r->{enabled} ? "enabled" : "disabled")
+             . " '$r->{name}' in " . basename($r->{source}));
+}
+
+sub do_delete_rule {
+    my $r = current_rule() or return;
+    my $ans = $mw->messageBox(
+        -title   => 'Delete rule',
+        -message => "Delete '$r->{name}' from " . $r->{source} . "?",
+        -type    => 'OKCancel',
+        -icon    => 'question',
+        -default => 'cancel',
+    );
+    return unless $ans eq 'Ok' || $ans eq 'OK';
+    delete_rule_from_file($r);
+    # Drop from the in-memory rules list + reload the file we edited.
+    reload_file( $r->{source} );
+    refresh_rules_list();
+    clear_editor();
+    set_status("deleted '$r->{name}' from " . basename($r->{source}));
+}
+
+sub do_save_rule {
+    my $r = current_rule() or return msg('No rule', 'Pick a rule to save.');
+    my $kv = editor_kv_dump();
+    # Cheap client-side validation before the write. The daemon will
+    # re-validate on next load; this just catches shape errors early.
+    if (my $err = validate_kv($kv)) {
+        return msg('Invalid rule', $err);
+    }
+    $r->{kv} = $kv;
+    write_rule_back($r, $kv);
+    refresh_rules_list();
+    reselect_current();
+    set_status("saved '$r->{name}' to " . $r->{source}
+             . "  (restart net-chat-autoresponder to apply)");
+}
+
+sub show_restart_hint {
+    my $body = <<'MSG';
+net-chat-autoresponder reads its config once at startup.
+Apply saved changes with one of:
+
+  sudo systemctl restart net-chat-autoresponder
+
+Or, for a smoke test without touching systemd:
+
+  sudo -u root net-chat-autoresponder --once --dry-run
+
+There is no in-band SIGHUP / REPAIR action for this today.
+MSG
+    $mw->messageBox(-title => 'Restart the autoresponder',
+                    -message => $body, -type => 'OK', -icon => 'info');
+}
+
+# ====================================================================
+# Editor form (right pane) — dynamic per trigger
+# ====================================================================
+
+# Persistent shell: create $editor_frame plus the always-present name +
+# trigger row. Trigger-specific rows are torn down and rebuilt whenever
+# the trigger changes.
+sub build_editor_shell {
+    $right_frame->Label(-text => 'Rule editor',
+                        -font => '{Helvetica} 9 bold')
+                ->pack(-side => 'top', -anchor => 'w', -padx => 4, -pady => 2);
+    $editor_frame = $right_frame->Frame->pack(-side => 'top', -fill => 'both',
+                                              -expand => 1, -padx => 4, -pady => 2);
+    build_editor_form();
+}
+
+# Render form rows from scratch based on $E{trigger}. Field values live
+# in $E{fields}{<key>} so save can serialize them without asking the
+# widgets. Unset $E{fields} at build time so a trigger flip drops keys
+# that don't belong to the new trigger.
+sub build_editor_form {
+    $_->destroy for $editor_frame->children;
+    $E{fields} //= {};
+    my $trig = $E{trigger} // 'chat_message';
+
+    row_entry( $editor_frame, 'Name:',    'name',    32 );
+    row_option($editor_frame, 'Trigger:', 'trigger',
+        [ [ 'chat_message'             => 'chat_message' ],
+          [ 'bitchat_peer_first_seen'  => 'bitchat_peer_first_seen' ],
+          [ 'periodic'                 => 'periodic' ] ],
+        sub {
+            $E{trigger} = $E{fields}{trigger};
+            build_editor_form();
+        },
+    );
+    row_option($editor_frame, 'Channel:', 'channel',
+        [ [ 'bitchat_dm' => 'bitchat_dm' ],
+          [ 'chat_post'  => 'chat_post' ],
+          [ 'noop'       => 'noop' ] ],
+    );
+    row_entry( $editor_frame, 'Target:',    'target',    48 );
+    row_multi( $editor_frame, 'Body:',      'body' );
+    row_entry( $editor_frame, 'Dedup TTL:', 'dedup_ttl', 12 );
+
+    if ($trig eq 'bitchat_peer_first_seen') {
+        row_entry( $editor_frame, 'Match:', 'match', 48 );
+    } elsif ($trig eq 'chat_message') {
+        row_entry( $editor_frame, 'Session:',    'session',    32 );
+        row_entry( $editor_frame, 'Match:',      'match',      48 );
+        row_entry( $editor_frame, 'From:',       'from',       32 );
+        row_entry( $editor_frame, 'Ack target:', 'ack_target', 32 );
+    } elsif ($trig eq 'periodic') {
+        row_entry( $editor_frame, 'Every:',      'every',      12 );
+        row_option($editor_frame, 'Mode:',       'mode',
+            [ [ '(single-fire)' => '' ],
+              [ 'fanout_bitchat_peers' => 'fanout_bitchat_peers' ] ],
+        );
+        row_entry( $editor_frame, 'Ack key:',    'ack_key',    32 );
+        row_entry( $editor_frame, 'Acked TTL:',  'acked_ttl',  12 );
+    }
+
+    my $meta = $editor_frame->Frame->pack(-side => 'top', -fill => 'x', -pady => 4);
+    $E{source_label} = $meta->Label(
+        -text => 'Source file: (unsaved)',
+        -foreground => '#444',
+        -anchor => 'w',
+    )->pack(-side => 'left', -padx => 4);
+}
+
+sub row_entry {
+    my ($parent, $label, $key, $width) = @_;
+    my $row = $parent->Frame->pack(-side => 'top', -fill => 'x', -pady => 1);
+    $row->Label(-text => $label, -width => 12, -anchor => 'w')
+        ->pack(-side => 'left');
+    $E{fields}{$key} //= '';
+    $row->Entry(-textvariable => \$E{fields}{$key}, -width => $width)
+        ->pack(-side => 'left', -fill => 'x', -expand => 1);
+}
+
+sub row_multi {
+    my ($parent, $label, $key) = @_;
+    my $row = $parent->Frame->pack(-side => 'top', -fill => 'x', -pady => 1);
+    $row->Label(-text => $label, -width => 12, -anchor => 'nw')
+        ->pack(-side => 'left');
+    my $t = $row->Scrolled('Text',
+        -height     => 4,
+        -width      => 60,
+        -wrap       => 'word',
+        -scrollbars => 'oe',
+        -font       => '{Monospace} 10',
+    )->pack(-side => 'left', -fill => 'x', -expand => 1);
+    $E{_multi}{$key} = $t;
+    my $init = $E{fields}{$key} // '';
+    $t->delete('1.0', 'end');
+    $t->insert('end', $init);
+    $t->bind('<KeyRelease>', sub {
+        $E{fields}{$key} = $t->get('1.0', 'end-1c');
+    });
+    $E{fields}{$key} = $init;
+}
+
+sub row_option {
+    my ($parent, $label, $key, $options, $on_change) = @_;
+    my $row = $parent->Frame->pack(-side => 'top', -fill => 'x', -pady => 1);
+    $row->Label(-text => $label, -width => 12, -anchor => 'w')
+        ->pack(-side => 'left');
+    $E{fields}{$key} //= $options->[0][1];
+    my %ok = map { $_->[1] => 1 } @$options;
+    $E{fields}{$key} = $options->[0][1]
+        unless defined $E{fields}{$key} && $ok{ $E{fields}{$key} };
+    $row->Optionmenu(
+        -options  => $options,
+        -variable => \$E{fields}{$key},
+        ($on_change ? (-command => sub { $on_change->() }) : ()),
+    )->pack(-side => 'left');
+}
+
+sub load_editor_from_rule {
+    my ($r) = @_;
+    # Reset field storage; take trigger from the rule so build_editor_form
+    # knows which trigger-specific rows to render.
+    $E{fields} = {};
+    $E{trigger} = $r->{kv}{trigger} // 'chat_message';
+    build_editor_form();
+    # After build, populate every field from $r->{kv} (unknown keys are
+    # silently discarded when the trigger changes and their widget goes
+    # away — that's fine, save only serialises known keys).
+    $E{fields}{name} = $r->{name};
+    for my $k (keys %{$r->{kv}}) {
+        next if $k eq 'name';
+        if (exists $E{fields}{$k}) {
+            $E{fields}{$k} = $r->{kv}{$k};
+        }
+    }
+    # Body sits in a Text widget, not a scalar-bound Entry — sync it.
+    if (my $t = $E{_multi}{body}) {
+        $t->delete('1.0', 'end');
+        $t->insert('end', $r->{kv}{body} // '');
+        $E{fields}{body} = $r->{kv}{body} // '';
+    }
+    $E{source_label}->configure(
+        -text => "Source file: $r->{source}"
+               . (defined $r->{start_ln}
+                    ? sprintf("  (lines %d-%d)",
+                              $r->{start_ln}+1, ($r->{end_ln}//$r->{start_ln})+1)
+                    : "  (unsaved)"),
+    );
+}
+
+sub clear_editor {
+    $E{fields} = {};
+    $E{trigger} = 'chat_message';
+    build_editor_form();
+}
+
+sub editor_kv_dump {
+    my %kv;
+    # Sync the Text-backed 'body' widget one more time in case the
+    # trailing KeyRelease didn't fire.
+    if (my $t = $E{_multi}{body}) {
+        $E{fields}{body} = $t->get('1.0', 'end-1c');
+    }
+    for my $k (keys %{ $E{fields} }) {
+        next if $k eq 'name';
+        my $v = $E{fields}{$k};
+        next unless defined $v && length $v;
+        $kv{$k} = $v;
+    }
+    # Rule NAME lives on $r->{name}; the editor's 'name' scalar
+    # rewrites $r->{name} at save time — see do_save_rule / write_rule_back.
+    return \%kv;
+}
+
+sub current_rule {
+    return undef unless defined $S{sel_idx};
+    return $S{rules}[ $S{sel_idx} ];
+}
+
+# ====================================================================
+# File parsing + save-back
+# ====================================================================
+
+# Load order matches the daemon (bin/net-chat-autoresponder:443-459): the
+# primary file first, then <primary>.d/*.conf sorted. Primary that
+# doesn't exist yet is fine — we're editing to create it.
+sub overlay_paths {
+    my ($primary) = @_;
+    (my $overlay = $primary) =~ s/\.conf$//;
+    $overlay .= '.d';
+    my @paths;
+    push @paths, $primary if -e $primary;
+    if (-d $overlay) {
+        opendir my $dh, $overlay or return @paths;
+        push @paths, map { "$overlay/$_" }
+                     sort grep { /\.conf$/ && !/^\./ } readdir $dh;
+        closedir $dh;
+    }
+    return @paths;
+}
+
+sub slurp_lines {
+    my ($path) = @_;
+    open my $fh, '<', $path or return ();
+    my @lines = <$fh>;
+    close $fh;
+    chomp @lines;
+    return @lines;
+}
+
+# Extract every [rule.NAME] / disabled `; [rule.NAME]` section from
+# @$lines and stash into $out{name}. Rule sections spans from their
+# header line down to (but excluding) the next [section] header of any
+# kind, or EOF. Trailing blank lines are trimmed off the range so
+# save-back doesn't devour blank separators between rules.
+sub parse_rules_from {
+    my ($path, $lines, $out, $order) = @_;
+    my @secs;
+    my $cur;
+    for (my $i = 0; $i <= $#$lines; $i++) {
+        my $line = $lines->[$i];
+        if ($line =~ /^\s*\[([^\]]+)\]\s*$/) {
+            _finish_section($cur, $i - 1, $lines) if $cur;
+            my $header = $1;
+            if ($header =~ /^rule\.([A-Za-z][A-Za-z0-9._-]{0,31})$/) {
+                $cur = { name => $1, enabled => 1, source => $path,
+                         kv => {}, start_ln => $i };
+                push @secs, $cur;
+            } else {
+                $cur = undef;
+            }
+            next;
+        }
+        if ($line =~ /^\s*[;#]\s*\[([^\]]+)\]\s*$/) {
+            _finish_section($cur, $i - 1, $lines) if $cur;
+            my $header = $1;
+            if ($header =~ /^rule\.([A-Za-z][A-Za-z0-9._-]{0,31})$/) {
+                $cur = { name => $1, enabled => 0, source => $path,
+                         kv => {}, start_ln => $i };
+                push @secs, $cur;
+            } else {
+                $cur = undef;
+            }
+            next;
+        }
+        next unless $cur;
+        # Body kv accumulation. Disabled rules have every line prefixed
+        # with '; ' by our writer, so match that shape for kv extraction.
+        if ($cur->{enabled}) {
+            if ($line =~ /^\s*([\w.-]+)\s*=\s*(.*?)\s*$/) {
+                $cur->{kv}{$1} = $2;
+            }
+        } else {
+            if ($line =~ /^\s*[;#]\s*([\w.-]+)\s*=\s*(.*?)\s*$/) {
+                $cur->{kv}{$1} //= $2;
+            }
+        }
+    }
+    _finish_section($cur, $#$lines, $lines) if $cur;
+    for my $s (@secs) {
+        my $name = $s->{name};
+        push @$order, $name unless exists $out->{$name};
+        # Last-write-wins (later overlay REPLACES earlier definition),
+        # mirroring bin/net-chat-autoresponder:471-478.
+        $out->{$name} = $s;
+    }
+}
+
+sub _finish_section {
+    my ($sec, $end, $lines) = @_;
+    return unless $sec;
+    while ($end > $sec->{start_ln} && $lines->[$end] =~ /^\s*$/) {
+        $end--;
+    }
+    $sec->{end_ln} = $end;
+}
+
+# Serialize a rule to file text. Header + key=value lines in a canonical
+# order (mirrors the shape of the sample file so diffs stay readable).
+sub render_rule {
+    my ($r, $kv) = @_;
+    my @out;
+    my $prefix = $r->{enabled} ? '' : '; ';
+    push @out, "$prefix\[rule.$r->{name}\]";
+    my @order = qw(trigger session match from ack_target every mode
+                   ack_key acked_ttl dedup_ttl channel target body);
+    my %seen;
+    for my $k (@order) {
+        next unless exists $kv->{$k};
+        my $v = $kv->{$k};
+        next unless defined $v && length $v;
+        $seen{$k} = 1;
+        push @out, "$prefix$k = $v";
+    }
+    for my $k (sort keys %$kv) {
+        next if $seen{$k};
+        my $v = $kv->{$k};
+        next unless defined $v && length $v;
+        push @out, "$prefix$k = $v";
+    }
+    return @out;
+}
+
+# Replace an existing rule's line range (or append when start_ln
+# undefined) with freshly-rendered content, then rewrite the file.
+sub write_rule_back {
+    my ($r, $kv) = @_;
+    # Editor may have renamed the rule; keep $r->{name} in sync.
+    if (defined $E{fields}{name} && length $E{fields}{name}
+        && $E{fields}{name} =~ /^[A-Za-z][A-Za-z0-9._-]{0,31}$/)
+    {
+        $r->{name} = $E{fields}{name};
+    }
+    $r->{kv} = $kv;
+    my $path  = $r->{source};
+    my $lines = $S{files}{$path} //= [];
+    my @new_body = render_rule($r, $kv);
+
+    if (defined $r->{start_ln}) {
+        my $start = $r->{start_ln};
+        my $end   = $r->{end_ln} // $start;
+        splice @$lines, $start, ($end - $start + 1), @new_body;
+    } else {
+        # Append; add a blank separator if the file isn't empty.
+        push @$lines, '' if @$lines && $lines->[-1] ne '';
+        push @$lines, @new_body;
+    }
+    write_file_atomic($path, $lines);
+    # Full reparse of the file we touched so start_ln/end_ln stay valid
+    # for the next edit. Reparsing every file would drop any yet-unsaved
+    # edits on other rules — cheap and correct to only redo the one.
+    reload_file($path);
+    # Reload_file may have re-created the rule hash — find it by name
+    # and re-select so the editor + list stay pointing at it.
+    for my $i (0 .. $#{ $S{rules} }) {
+        if ($S{rules}[$i]{name} eq $r->{name}
+            && $S{rules}[$i]{source} eq $path)
+        {
+            $S{sel_idx} = $i;
+            last;
+        }
+    }
+}
+
+sub delete_rule_from_file {
+    my ($r) = @_;
+    return unless defined $r->{start_ln};
+    my $lines = $S{files}{ $r->{source} } or return;
+    my $start = $r->{start_ln};
+    my $end   = $r->{end_ln} // $start;
+    # Also swallow a leading blank line so we don't leave a double-gap.
+    if ($start > 0 && $lines->[$start-1] =~ /^\s*$/) {
+        $start--;
+    }
+    splice @$lines, $start, ($end - $start + 1);
+    write_file_atomic($r->{source}, $lines);
+}
+
+# Refresh %S{rules} for one file: reparse and merge back into the ordered
+# list. Preserves rules from OTHER files unchanged.
+sub reload_file {
+    my ($path) = @_;
+    my @lines = slurp_lines($path);
+    $S{files}{$path} = \@lines;
+    # Rebuild %S{rules} from all files (cheap; O(files*lines)).
+    my %by_name; my @name_order;
+    for my $p (@{$S{order}}) {
+        my $ls = $S{files}{$p} // [];
+        parse_rules_from($p, $ls, \%by_name, \@name_order);
+    }
+    $S{rules} = [ map { $by_name{$_} } @name_order ];
+}
+
+sub write_file_atomic {
+    my ($path, $lines) = @_;
+    my $dir = dirname($path);
+    unless (-d $dir) {
+        # Mostly for the .d/ overlay directory on a fresh install.
+        mkdir $dir or return msg('mkdir failed', "mkdir $dir: $!");
+    }
+    my $tmp = "$path.tmp.$$";
+    if (open my $fh, '>', $tmp) {
+        print {$fh} join("\n", @$lines);
+        print {$fh} "\n" if @$lines && $lines->[-1] ne '';
+        close $fh or return msg('close failed', "close $tmp: $!");
+    } else {
+        return msg('open failed', "open $tmp: $!");
+    }
+    if (-e $path) {
+        File::Copy::copy($path, "$path.bak")
+            or warn "backup $path: $!";
+    }
+    rename $tmp, $path or return msg('rename failed', "rename $tmp: $!");
+    return 1;
+}
+
+sub refresh_rules_list {
+    $rules_list->delete(0, 'end');
+    for my $r (@{ $S{rules} }) {
+        my $mark = $r->{enabled} ? '[x]' : '[ ]';
+        my $src  = basename( $r->{source} );
+        my $trig = $r->{kv}{trigger} // '?';
+        $rules_list->insert('end',
+            sprintf("%s %-20s %-24s %s", $mark, $r->{name}, $trig, $src));
+    }
+}
+
+sub reselect_current {
+    return unless defined $S{sel_idx};
+    $rules_list->selectionClear(0, 'end');
+    $rules_list->selectionSet($S{sel_idx});
+    load_editor_from_rule( $S{rules}[ $S{sel_idx} ] );
+}
+
+# ====================================================================
+# Rule validation (cheap client-side; daemon re-validates)
+# ====================================================================
+
+sub validate_kv {
+    my ($kv) = @_;
+    my $trig = $kv->{trigger} // '';
+    return "trigger= required" unless length $trig;
+    return "bad trigger '$trig'"
+        unless $trig =~ /^(bitchat_peer_first_seen|chat_message|periodic)$/;
+    my $ch = $kv->{channel} // '';
+    return "channel= required" unless length $ch;
+    return "bad channel '$ch'"
+        unless $ch =~ /^(bitchat_dm|chat_post|noop)$/;
+    if ($ch ne 'noop') {
+        return "target= required for channel=$ch"
+            unless defined $kv->{target} && length $kv->{target};
+        return "body= required for channel=$ch"
+            unless defined $kv->{body};
+    }
+    if ($ch eq 'bitchat_dm'
+        && defined $kv->{target}
+        && $kv->{target} !~ /\$\{/
+        && $kv->{target} !~ /^[0-9a-f]{16}$/i)
+    {
+        return "channel=bitchat_dm target must be 16 lowercase hex (got '$kv->{target}')";
+    }
+    if ($trig eq 'chat_message') {
+        return "chat_message: session= required"
+            unless defined $kv->{session} && length $kv->{session};
+        return "chat_message: session has forbidden chars"
+            unless $kv->{session} =~ /^[A-Za-z0-9._-]{1,64}$/;
+        return "chat_message: match= required"
+            unless defined $kv->{match} && length $kv->{match};
+        if (defined $kv->{ack_target} && length $kv->{ack_target}) {
+            return "ack_target= requires channel=noop"
+                unless $ch eq 'noop';
+            return "ack_target has forbidden chars"
+                unless $kv->{ack_target} =~ /^[A-Za-z][A-Za-z0-9._-]{0,31}$/;
+        }
+    }
+    if ($trig eq 'periodic') {
+        return "periodic: every= required"
+            unless defined $kv->{every} && length $kv->{every};
+        return "periodic does not accept match="
+            if defined $kv->{match} && length $kv->{match};
+        my $mode = $kv->{mode} // '';
+        if (length $mode && $mode ne 'fanout_bitchat_peers') {
+            return "unknown mode '$mode'";
+        }
+        if ($mode eq 'fanout_bitchat_peers') {
+            return "fanout_bitchat_peers requires channel=bitchat_dm"
+                unless $ch eq 'bitchat_dm';
+            return "fanout_bitchat_peers requires ack_key="
+                unless defined $kv->{ack_key} && length $kv->{ack_key};
+        }
+    }
+    return undef;
+}
+
+sub starter_kv_for_trigger {
+    my ($trig) = @_;
+    if ($trig eq 'bitchat_peer_first_seen') {
+        return {
+            channel   => 'bitchat_dm',
+            match     => '.*',
+            dedup_ttl => '15m',
+            target    => '${peer_id}',
+            body      => 'hello ${nickname}',
+        };
+    } elsif ($trig eq 'periodic') {
+        return {
+            channel => 'chat_post',
+            every   => '5m',
+            target  => 'ops',
+            body    => 'periodic ping from ${host} at ${now}',
+        };
+    } else {   # chat_message
+        return {
+            channel => 'chat_post',
+            session => 'ops',
+            match   => '(?i)^!hello\b',
+            target  => '${session}',
+            body    => 'hi ${sender}',
+        };
+    }
+}
+
+# ====================================================================
+# Test pane
+# ====================================================================
+
+sub do_test {
+    my $kv = editor_kv_dump();
+    my $name = $E{fields}{name} // '(unnamed)';
+    if (my $err = validate_kv($kv)) {
+        _test_clear();
+        _test_line("cannot test: $err\n", 'err');
+        return;
+    }
+    my $trig = $kv->{trigger};
+    _test_clear();
+    _test_line("Testing rule '$name' (trigger=$trig, channel=$kv->{channel})\n", 'bold');
+    _test_line(" listen=$listen_var  N=$sample_n\n");
+
+    if    ($trig eq 'bitchat_peer_first_seen') { _test_ble($name, $kv) }
+    elsif ($trig eq 'chat_message')            { _test_chat($name, $kv) }
+    elsif ($trig eq 'periodic')                { _test_periodic($name, $kv) }
+    set_status("Test complete.");
+}
+
+sub _test_ble {
+    my ($name, $kv) = @_;
+    my $rows = _snapshot('bitchat_peers') // return;
+    _test_line(sprintf("  sampled %d bitchat_peers row(s)\n", scalar @$rows));
+    my $re = _try_compile($kv->{match} // '.*') // return;
+    my $n_shown = 0;
+    my $n_hit = 0;
+    my @sorted = sort { ($b->{last_seen}//0) cmp ($a->{last_seen}//0) } @$rows;
+    my $n = @sorted; my $limit = $sample_n;
+    $limit = $n if $n < $limit;
+    for my $r (@sorted[0..$limit-1]) {
+        $n_shown++;
+        my $nick = $r->{nickname} // '';
+        my $pid  = $r->{peer_id} // '';
+        if ($nick =~ $re) {
+            $n_hit++;
+            my %cap = %+;
+            my $ctx = { peer_id => $pid, nickname => $nick,
+                        sender  => 'bitchat-relay', session => '',
+                        map { ("cap.$_" => $cap{$_}) } keys %cap };
+            _test_line(sprintf("  HIT peer=%s nick=%s\n", $pid, $nick), 'hit');
+            _test_line(sprintf("      -> %s '%s'\n",
+                               _subst($kv->{target}, $ctx),
+                               _subst($kv->{body}, $ctx)), 'resolved');
+        } else {
+            _test_line(sprintf("  --- peer=%s nick=%s\n", $pid, $nick), 'miss');
+        }
+    }
+    _test_line(sprintf("\n%d row(s) sampled, %d matched\n", $n_shown, $n_hit),
+               'bold');
+}
+
+sub _test_chat {
+    my ($name, $kv) = @_;
+    my $sess = $kv->{session} // '';
+    (my $q = $sess) =~ s/'/''/g;
+    my $where = "session = '$q'";
+    my $rows = _snapshot('chat_messages', where => $where) // return;
+    _test_line(sprintf("  sampled %d chat_messages row(s) in session=%s\n",
+                       scalar @$rows, $sess));
+    my $re = _try_compile($kv->{match} // '.*') // return;
+    my @sorted = sort { ($b->{ts}//0) cmp ($a->{ts}//0) } @$rows;
+    my $n = @sorted; my $limit = $sample_n;
+    $limit = $n if $n < $limit;
+    my $n_shown = 0; my $n_hit = 0;
+    for my $r (@sorted[0..$limit-1]) {
+        $n_shown++;
+        my $sender = $r->{sender} // '';
+        my $body   = $r->{body}   // '';
+        my $matched_from = !defined $kv->{from}
+                        || !length $kv->{from}
+                        || $kv->{from} eq $sender;
+        my $matched_re   = $body =~ $re;
+        if ($matched_from && $matched_re) {
+            $n_hit++;
+            my %cap = %+;
+            my $ctx = { peer_id => ($cap{peer_id} // ''),
+                        nickname => '',
+                        sender  => $sender, session => $sess,
+                        map { ("cap.$_" => $cap{$_}) } keys %cap };
+            _test_line(sprintf("  HIT sender=%s body=%s\n",
+                               $sender, _truncate($body, 60)), 'hit');
+            if (($kv->{channel} // '') eq 'noop') {
+                _test_line("      -> (noop; no wire post; ack recorded)\n",
+                           'resolved');
+            } else {
+                _test_line(sprintf("      -> %s '%s'\n",
+                                   _subst($kv->{target}, $ctx),
+                                   _subst($kv->{body}, $ctx)), 'resolved');
+            }
+        } else {
+            _test_line(sprintf("  --- sender=%s body=%s%s\n",
+                               $sender, _truncate($body, 60),
+                               (!$matched_from ? "  [from!=$kv->{from}]" : '')),
+                       'miss');
+        }
+    }
+    _test_line(sprintf("\n%d row(s) sampled, %d matched\n", $n_shown, $n_hit),
+               'bold');
+}
+
+sub _test_periodic {
+    my ($name, $kv) = @_;
+    _test_line("periodic rule — no history to sample; showing a synthetic tick.\n");
+    my $mode = $kv->{mode} // '';
+    if ($mode eq 'fanout_bitchat_peers') {
+        my $rows = _snapshot('bitchat_peers') // return;
+        _test_line(sprintf("  %d BLE peer(s) known — would DM each unless acked\n",
+                           scalar @$rows));
+        my $limit = $sample_n;
+        $limit = @$rows if $limit > @$rows;
+        for my $r (@{$rows}[0..$limit-1]) {
+            my $pid  = $r->{peer_id}  // '';
+            my $nick = $r->{nickname} // '';
+            my $ctx = { peer_id => $pid, nickname => $nick,
+                        sender  => 'net-chat-autoresponder', session => '' };
+            _test_line(sprintf("  -> DM %s (%s): '%s'\n",
+                               $pid, $nick,
+                               _subst($kv->{body}, $ctx)), 'resolved');
+        }
+    } else {
+        my $ctx = { peer_id => '', nickname => 'net-chat-autoresponder',
+                    sender => 'net-chat-autoresponder', session => '' };
+        _test_line(sprintf("  target -> %s\n", _subst($kv->{target}, $ctx)),
+                   'resolved');
+        _test_line(sprintf("  body   -> %s\n", _subst($kv->{body},   $ctx)),
+                   'resolved');
+    }
+}
+
+sub _snapshot {
+    my ($table, %args) = @_;
+    my $cli = eval {
+        NetMgr::Client->new(listen => $listen_var, timeout => 5);
+    };
+    if (!$cli) {
+        _test_line("connect $listen_var failed: $@\n", 'err');
+        return undef;
+    }
+    my $ok = eval { $cli->hello(consumer => "autoresponder-gui.$$"); 1 };
+    if (!$ok) {
+        _test_line("HELLO failed: $@\n", 'err');
+        eval { $cli->bye }; return undef;
+    }
+    my $rows = eval { $cli->snapshot(1, $table, %args) };
+    if ($@ || !defined $rows) {
+        my $e = $@; chomp $e;
+        _test_line("snapshot $table failed: $e\n", 'err');
+        eval { $cli->bye }; return undef;
+    }
+    # Client->snapshot leaves the wire envelope on each row; strip so
+    # rule fields see just the columns (Multi::snapshot_all:198-200).
+    for my $r (@$rows) {
+        delete @{$r}{qw(op sub table mode)};
+    }
+    eval { $cli->bye };
+    return $rows;
+}
+
+# Substitution mirroring bin/net-chat-autoresponder subst(). Kept small
+# — only the token vocabulary the rule engine supports.
+sub _subst {
+    my ($s, $ctx) = @_;
+    return '' unless defined $s;
+    $s =~ s/\$\$/\x01/g;
+    $s =~ s/
+        \$\{
+          ( peer_id | nickname | sender | session | now | host
+          | cap\.[A-Za-z_][A-Za-z0-9_]*
+          )
+        \}
+    / _subst_val($1, $ctx) /gex;
+    $s =~ s/\x01/\$/g;
+    return $s;
+}
+
+my $HOST_CACHED;
+sub _subst_val {
+    my ($tok, $ctx) = @_;
+    if ($tok eq 'now') {
+        my @t = gmtime;
+        return sprintf('%02d:%02d:%02d', $t[2], $t[1], $t[0]);
+    }
+    if ($tok eq 'host') {
+        unless (defined $HOST_CACHED) {
+            require Sys::Hostname;
+            $HOST_CACHED = Sys::Hostname::hostname() // '';
+        }
+        return $HOST_CACHED;
+    }
+    return defined $ctx->{$tok} ? $ctx->{$tok} : '';
+}
+
+sub _try_compile {
+    my ($src) = @_;
+    my $re;
+    local $SIG{ALRM} = sub { die "timeout\n" };
+    alarm 2;
+    my $ok = eval { $re = qr/$src/; 1 };
+    alarm 0;
+    unless ($ok) {
+        _test_line("regex compile failed: $@\n", 'err');
+        return undef;
+    }
+    return $re;
+}
+
+sub _test_clear { $test_text->delete('1.0', 'end') }
+
+sub _test_line {
+    my ($t, @tags) = @_;
+    $test_text->insert('end', $t, @tags ? [ @tags ] : ());
+}
+
+sub _truncate {
+    my ($s, $n) = @_;
+    return $s unless defined $s && length $s > $n;
+    return substr($s, 0, $n) . '...';
+}
+
+# ====================================================================
+# Misc helpers
+# ====================================================================
+
+sub set_status { $status_lbl->configure(-text => " $_[0]") }
+sub msg {
+    my ($title, $body) = @_;
+    $mw->messageBox(-title => $title, -message => $body,
+                    -type => 'OK', -icon => 'info');
+    return undef;
+}
+
+sub usage {
+    my ($rc) = @_;
+    print <<'USAGE';
+net-autoresponder-gui — Tk editor + live tester for net-chat-autoresponder rules.
+
+Usage:
+  net-autoresponder-gui [--listen HOST:PORT]
+                        [--file /etc/net-mgr/net-chat-autoresponder.conf]
+
+  --listen HOST:PORT   daemon to sample bitchat_peers / chat_messages from
+                       (default 127.0.0.1:7531; env NET_MGR_LISTEN)
+  --file PATH          primary config; also loads adjacent <path>.d/*.conf
+
+Left pane: rules across the primary + overlays, checkbox = enabled,
+suffix = origin filename. Right pane: rule editor whose fields adapt to
+the trigger. Save-back writes to the rule's origin file (atomic + .bak).
+Bottom pane: sample recent rows via NetMgr::Client and re-run the rule's
+match / from / session filters against them; periodic rules just show
+the resolved wire post at a synthetic tick.
+
+The autoresponder loads config once at startup — restart the service
+after Save:
+  sudo systemctl restart net-chat-autoresponder
+USAGE
+    exit($rc // 0);
+}
