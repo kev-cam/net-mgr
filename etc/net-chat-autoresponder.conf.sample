@@ -72,6 +72,8 @@ state_file   = /var/lib/net-mgr/net-chat-autoresponder.seen
 ;   dedup_ttl  — window during which a repeat first-seen for the same
 ;                peer_id will NOT re-fire this rule. Default 30d. Set to 0
 ;                to fire on every insert. Suffix: s|m|h|d|w.
+;                Sample below uses 15m — see the comment above the rule
+;                for the over-fire-vs-under-fire tradeoff.
 ;   channel    — REQUIRED — bitchat_dm | chat_post
 ;   target     — REQUIRED literal string with ${…} substitution.
 ;                For channel=bitchat_dm the resolved value MUST be exactly
@@ -88,10 +90,19 @@ state_file   = /var/lib/net-mgr/net-chat-autoresponder.seen
 ;   ${cap.NAME}  any Perl named capture from `match`
 ;   $$           literal '$'
 ; --------------------------------------------------------------------------
+; dedup_ttl picked for "prefer over-firing" — every decrypted BLE msg
+; upserts bitchat_peers (bridge msg-path emit hook) and the 30s peer
+; poll re-upserts every in-range peer, so the underlying ROW stream
+; heartbeats for any peer that is present. 15m is long enough to
+; swallow a normal BLE visit (constant polls all get dedup-skipped
+; after the first greet) yet short enough that a peer who leaves
+; and returns later the same day gets re-greeted. 30d locked us into
+; "greet once ever until the seen-file is deleted" which is the wrong
+; side of the tradeoff.
 [rule.wifi-greeting]
 trigger    = bitchat_peer_first_seen
 match      = .*
-dedup_ttl  = 30d
+dedup_ttl  = 15m
 channel    = bitchat_dm
 target     = ${peer_id}
 body       = WIFI:T:WPA;S:video;P:InTheRoom;;

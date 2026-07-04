@@ -464,6 +464,31 @@ sub run_once {
                     # (First-seen greeting moved to bin/net-chat-autoresponder;
                     # see comment near the removed %greeted block above.)
 
+                    # Per-msg peer upsert: refresh bitchat_peers on ANY
+                    # decrypted BLE msg so a transmitting peer generates a
+                    # ROW event within seconds, not up to $PEER_POLL_S (30s)
+                    # later. Without this hook a peer whose row was inserted
+                    # BEFORE the autoresponder subscribed only re-emits on
+                    # the next wall-clock peer poll — the greeter would miss
+                    # the "someone in range just spoke" moment. Reuses the
+                    # existing $peer_cli connection and BITCHAT_PEER_UPSERT
+                    # verb (see the 30s poll handler below near line ~560).
+                    # Guarded by the same 16-hex regex used at line 475 so
+                    # System spam / peers without a Noise identity are
+                    # naturally skipped.
+                    if ($peer_cli
+                        && $sender_peer_id =~ /^[0-9a-fA-F]{16}$/
+                        && $sender ne 'System'
+                        && $sender ne $as)
+                    {
+                        my $up = 'BITCHAT_PEER_UPSERT '
+                               . 'peer_id=' . lc($sender_peer_id)
+                               . (length $sender ? " nickname=$sender" : '')
+                               . ' is_connected=1';
+                        eval { $peer_cli->send_recv($up) };
+                        warn "[bridge] per-msg peer upsert failed: $@" if $@;
+                    }
+
                     # WiFi onramp: match "WiFi?" (case-insensitive, tolerant
                     # of hyphen/space in "Wi-Fi?"). Respond with a WIFI: URI
                     # DM straight to the asker via helper stdin (bypass
