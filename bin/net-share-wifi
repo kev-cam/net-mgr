@@ -1,0 +1,435 @@
+#!/usr/bin/perl
+# net-share-wifi — list / emit / QR shared WiFi credentials from
+# /etc/net-mgr/shared-wifi.conf (+ shared-wifi.d/*.conf overlays).
+#
+# Data source: [wifi.LABEL] sections in shared-wifi.conf (grammar mirrors
+# the bitchat-bridge [wifi_response] section — ssid / auth / password /
+# hidden / note). Parsed via NetMgr::Config->load($path), which already
+# handles the "$path.d/*.conf" overlay convention used by /etc/net-mgr/config.
+#
+# Modes:
+#   net-share-wifi                          same as --list
+#   net-share-wifi --list                   tabular LABEL SSID AUTH HIDDEN NOTE
+#   net-share-wifi --list --json            JSON array (for the GUI picker)
+#   net-share-wifi --uri  LABEL             print WIFI:...;; URI
+#   net-share-wifi --uri  LABEL --note      print URI + note on the next line
+#   net-share-wifi --qr   LABEL             ASCII QR of the URI (needs qrencode)
+#   net-share-wifi --config PATH            override default config path
+#   net-share-wifi --help / --man           usage / POD
+#
+# Password NEVER appears in --list / --json / logs / warnings — only in
+# --uri / --qr, where the operator has explicitly asked to hand it out.
+#
+# Exit codes:
+#   0   ok (list emitted, uri/qr emitted, or empty list)
+#   1   --uri/--qr LABEL not found in loaded config
+#   2   bad args (mutually-exclusive flags, unknown flag, missing LABEL, etc.)
+#   3   config file present but malformed (Config.pm croak trapped)
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use Pod::Usage qw(pod2usage);
+use NetMgr::Config;
+
+my $DEFAULT_CONF = '/etc/net-mgr/shared-wifi.conf';
+
+my %opt;
+GetOptions(\%opt,
+    'list', 'uri=s', 'qr=s', 'note', 'json',
+    'config=s', 'help|h', 'man',
+) or pod2usage(-exitval => 2, -verbose => 0);
+
+pod2usage(-exitval => 0, -verbose => 1) if $opt{help};
+pod2usage(-exitval => 0, -verbose => 2) if $opt{man};
+
+# ---- flag validation -----------------------------------------------------
+
+if (defined $opt{uri} && defined $opt{qr}) {
+    warn "net-share-wifi: --uri and --qr are mutually exclusive\n";
+    exit 2;
+}
+if ($opt{note} && !defined $opt{uri}) {
+    warn "net-share-wifi: --note only meaningful with --uri\n";
+    exit 2;
+}
+if ($opt{json} && (defined $opt{uri} || defined $opt{qr})) {
+    warn "net-share-wifi: --json only meaningful with --list\n";
+    exit 2;
+}
+if (defined $opt{uri} && !length $opt{uri}) {
+    warn "net-share-wifi: --uri requires a LABEL\n";
+    exit 2;
+}
+if (defined $opt{qr} && !length $opt{qr}) {
+    warn "net-share-wifi: --qr requires a LABEL\n";
+    exit 2;
+}
+# Anything left in @ARGV after Getopt is unrecognized.
+if (@ARGV) {
+    warn "net-share-wifi: unexpected argument(s): @ARGV\n";
+    exit 2;
+}
+
+my $path = $opt{config} // $DEFAULT_CONF;
+
+# --config: if the operator names an explicit path, it MUST exist. The
+# default path is allowed to be missing (fresh install → empty list).
+if (defined $opt{config} && !-e $opt{config}) {
+    warn "net-share-wifi: --config path not found: $opt{config}\n";
+    exit 2;
+}
+
+# ---- load config ---------------------------------------------------------
+#
+# NetMgr::Config->load handles the primary + "$path.d/*.conf" overlay in
+# one call; missing primary AND missing overlay dir yields the empty %DEFAULTS
+# copy with no wifi.* keys. A malformed file croaks — we trap it and exit 3.
+
+my $cfg = eval { NetMgr::Config->load($path) };
+if (my $err = $@) {
+    chomp $err;
+    warn "net-share-wifi: $err\n";
+    exit 3;
+}
+
+# ---- world-readable-with-password warning --------------------------------
+#
+# Cheap check for the "cp from /tmp with 0644" mistake. Non-fatal — we
+# still emit the URI / list — but STDERR lets an operator catch it early.
+
+_warn_world_readable($path);
+if (-d "$path.d") {
+    for my $f (sort glob "$path.d/*.conf") {
+        _warn_world_readable($f);
+    }
+}
+
+# ---- collect valid entries -----------------------------------------------
+#
+# NetMgr::Config->load stashes each [wifi.LABEL] section under
+# $cfg->{"wifi.LABEL"} (dotted keys aren't in %DEFAULTS, so they show up
+# verbatim as top-level entries). Iterate, validate, keep the good ones.
+
+my %ENTRIES;      # label => { ssid, auth, password, hidden(bool), note }
+for my $section (sort keys %$cfg) {
+    next unless $section =~ /^wifi\.(.+)$/;
+    my $label = $1;
+    unless ($label =~ /^[A-Za-z0-9_.\-]+$/) {
+        warn "net-share-wifi: skipping section [wifi.$label]: "
+           . "label must match [A-Za-z0-9_.-]+\n";
+        next;
+    }
+    my $s = $cfg->{$section};
+    next unless ref $s eq 'HASH';
+
+    my $ssid = $s->{ssid};
+    unless (defined $ssid && length $ssid) {
+        warn "net-share-wifi: skipping [wifi.$label]: missing ssid\n";
+        next;
+    }
+    my $auth = $s->{auth} // 'WPA';
+    unless ($auth =~ /^(WPA|WPA2|WEP|nopass)$/i) {
+        warn "net-share-wifi: skipping [wifi.$label]: "
+           . "auth must be WPA|WPA2|WEP|nopass (got '$auth')\n";
+        next;
+    }
+    # Preserve case of nopass (lowercase) vs the others (uppercase) for
+    # URI emission, but stash normalized form for internal use.
+    my $auth_norm = (lc $auth eq 'nopass') ? 'nopass' : uc $auth;
+
+    my $pass = $s->{password};
+    if ($auth_norm ne 'nopass' && !(defined $pass && length $pass)) {
+        warn "net-share-wifi: skipping [wifi.$label]: "
+           . "auth=$auth_norm requires a password\n";
+        next;
+    }
+
+    my $hidden = defined $s->{hidden}
+              && $s->{hidden} =~ /^(1|true|yes|on)$/i ? 1 : 0;
+
+    $ENTRIES{$label} = {
+        ssid     => $ssid,
+        auth     => $auth_norm,
+        password => (defined $pass ? $pass : ''),
+        hidden   => $hidden,
+        note     => (defined $s->{note} ? $s->{note} : ''),
+    };
+}
+
+# ---- dispatch ------------------------------------------------------------
+
+if (defined $opt{uri}) {
+    do_uri($opt{uri});
+} elsif (defined $opt{qr}) {
+    do_qr($opt{qr});
+} else {
+    # default = --list
+    if ($opt{json}) {
+        do_list_json();
+    } else {
+        do_list_text();
+    }
+}
+exit 0;
+
+# --------------------------------------------------------------------------
+# --list (text)
+# --------------------------------------------------------------------------
+sub do_list_text {
+    # Empty is fine — silent, exit 0. Consistent with `ls` on an empty dir.
+    return unless %ENTRIES;
+
+    my @cols = qw(LABEL SSID AUTH HIDDEN NOTE);
+    my @rows = ([@cols]);
+    for my $label (sort keys %ENTRIES) {
+        my $e = $ENTRIES{$label};
+        push @rows, [
+            $label,
+            $e->{ssid},
+            $e->{auth},
+            $e->{hidden} ? 'true' : 'false',
+            $e->{note},
+        ];
+    }
+    my @w;
+    for my $r (@rows) {
+        for my $i (0 .. $#$r) {
+            my $len = length($r->[$i] // '');
+            $w[$i] = $len if !defined $w[$i] || $len > $w[$i];
+        }
+    }
+    for my $r (@rows) {
+        my @parts;
+        for my $i (0 .. $#$r) {
+            # Right-pad every column except the last for a clean tabular
+            # look; last column (NOTE) prints raw, no trailing padding.
+            if ($i == $#$r) {
+                push @parts, ($r->[$i] // '');
+            } else {
+                push @parts, sprintf("%-*s", $w[$i], ($r->[$i] // ''));
+            }
+        }
+        print join('  ', @parts), "\n";
+    }
+}
+
+# --------------------------------------------------------------------------
+# --list --json
+# --------------------------------------------------------------------------
+sub do_list_json {
+    require JSON::PP;
+    my @out;
+    for my $label (sort keys %ENTRIES) {
+        my $e = $ENTRIES{$label};
+        push @out, {
+            label  => $label,
+            ssid   => $e->{ssid},
+            auth   => $e->{auth},
+            hidden => ($e->{hidden} ? JSON::PP::true() : JSON::PP::false()),
+            note   => $e->{note},
+        };
+    }
+    # canonical => deterministic key order (test-friendly).
+    print JSON::PP->new->canonical->encode(\@out), "\n";
+}
+
+# --------------------------------------------------------------------------
+# --uri LABEL [--note]
+# --------------------------------------------------------------------------
+sub do_uri {
+    my ($label) = @_;
+    my $e = $ENTRIES{$label};
+    unless ($e) {
+        warn "net-share-wifi: no such WiFi entry: $label\n";
+        exit 1;
+    }
+    my $uri = wifi_uri($e);
+    print $uri;
+    # No trailing newline on the bare URI (design spec). The --note form
+    # separates URI and note with a blank line so shell captures like
+    # `net-share-wifi --uri foo --note | head -1` still work.
+    if ($opt{note} && length $e->{note}) {
+        print "\n\n", $e->{note}, "\n";
+    } else {
+        print "\n";
+    }
+}
+
+# --------------------------------------------------------------------------
+# --qr LABEL — pipe URI to qrencode if available, else fall back to URI.
+# --------------------------------------------------------------------------
+sub do_qr {
+    my ($label) = @_;
+    my $e = $ENTRIES{$label};
+    unless ($e) {
+        warn "net-share-wifi: no such WiFi entry: $label\n";
+        exit 1;
+    }
+    my $uri = wifi_uri($e);
+
+    my $have_qrencode = 0;
+    for my $dir (split /:/, ($ENV{PATH} // '')) {
+        if (-x "$dir/qrencode") { $have_qrencode = 1; last }
+    }
+
+    if ($have_qrencode) {
+        # `qrencode -t ANSIUTF8 -o - -` reads the URI from stdin (via -r
+        # or piped), but simplest is exec with the URI as an argument.
+        # Use system() so stdout goes straight to the terminal.
+        my $rc = system('qrencode', '-t', 'ANSIUTF8', '-o', '-', $uri);
+        if ($rc != 0) {
+            warn "net-share-wifi: qrencode failed (exit " . ($rc >> 8) . ")\n";
+            print $uri, "\n";
+        }
+    } else {
+        # No qrencode: print the URI to STDOUT (so scripts still work)
+        # and put the install hint on STDERR.
+        print $uri, "\n";
+        warn "install qrencode(1) for QR output "
+           . "(dnf install qrencode / apt install qrencode)\n";
+    }
+}
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+# Build the WIFI: URI. Escape rules match bin/net-bitchat-bridge:531-533 —
+# any of \ ; , " ' becomes \<char>. This keeps QR-reader compatibility
+# identical between net-share-wifi and the bridge's wifi_response path.
+sub wifi_uri {
+    my ($e) = @_;
+    my $esc = sub {
+        my $s = shift // '';
+        $s =~ s/([\\;,"'])/\\$1/g;
+        return $s;
+    };
+    my $ssid   = $esc->($e->{ssid});
+    my $auth   = uc $e->{auth};              # 'nopass' -> 'NOPASS'
+    my $pass   = $esc->($e->{password});
+    my $hidden = $e->{hidden} ? 1 : 0;
+
+    my $uri = 'WIFI:S:' . $ssid . ';T:' . $auth;
+    $uri .= ';P:' . $pass unless $auth eq 'NOPASS';
+    $uri .= ';H:true' if $hidden;
+    $uri .= ';;';
+    return $uri;
+}
+
+# Cheap "did someone chmod 0644 this file with a password in it?" check.
+# Runs after load(); warns to STDERR only. Skips silently for symlinks,
+# unreadable files, or files without any `password =` line.
+sub _warn_world_readable {
+    my ($file) = @_;
+    return unless -f $file && -r $file;
+    my @st = stat $file;
+    return unless @st;
+    my $mode = $st[2] & 07777;
+    return unless $mode & 0004;         # world-readable bit not set
+    # Only warn if the file actually contains credentials.
+    open my $fh, '<', $file or return;
+    my $has_password = 0;
+    while (my $line = <$fh>) {
+        next if $line =~ /^\s*[#;]/;
+        if ($line =~ /^\s*password\s*=/) { $has_password = 1; last }
+    }
+    close $fh;
+    return unless $has_password;
+    warn sprintf(
+        "net-share-wifi: %s is world-readable (mode %04o) and contains "
+      . "passwords; recommend `chmod 640 %s` (owner root:net-mgr)\n",
+        $file, $mode, $file);
+}
+
+__END__
+
+=head1 NAME
+
+net-share-wifi - list and hand out shared WiFi credentials from
+/etc/net-mgr/shared-wifi.conf
+
+=head1 SYNOPSIS
+
+  net-share-wifi                       # same as --list
+  net-share-wifi --list                # tabular LABEL SSID AUTH HIDDEN NOTE
+  net-share-wifi --list --json         # JSON array (for the picker GUI)
+  net-share-wifi --uri LABEL           # print WIFI:...;; URI, newline-terminated
+  net-share-wifi --uri LABEL --note    # URI, blank line, note
+  net-share-wifi --qr LABEL            # ASCII QR of the URI (needs qrencode)
+  net-share-wifi --config PATH         # override /etc/net-mgr/shared-wifi.conf
+  net-share-wifi --help
+  net-share-wifi --man
+
+=head1 DESCRIPTION
+
+C<net-share-wifi> reads [wifi.LABEL] sections out of
+F</etc/net-mgr/shared-wifi.conf> (and any overlay files under
+F</etc/net-mgr/shared-wifi.d/*.conf>) and prints them for humans, emits a
+C<WIFI:S:...;;> URI a QR reader can parse, or renders that URI as an ASCII
+QR code via C<qrencode(1)>.
+
+The section grammar mirrors the C<[wifi_response]> section in
+F<etc/bitchat-bridge.conf.sample>, so operators reuse the same key names
+(C<ssid>, C<auth>, C<password>, C<hidden>, C<note>) they already know.
+
+Overlay semantics match F</etc/net-mgr/config>: F<shared-wifi.d/*.conf> are
+loaded after the primary file in filename-sort order, and a duplicate
+C<[wifi.LABEL]> in a later file replaces the earlier one wholesale
+(per-section, not per-key).
+
+Passwords are stored cleartext because the WIFI: QR-code format has no hash
+mode: any tool that hands out the credential needs the plaintext PSK. The
+recommended mode is C<0640 root:net-mgr>. C<net-share-wifi> warns to STDERR
+(non-fatal) if a config file is world-readable and contains a C<password=>
+line.
+
+The password never appears in C<--list> or C<--json> output, only in
+C<--uri> and C<--qr>: the explicit "please hand it out" path.
+
+=head1 EXIT STATUS
+
+=over 4
+
+=item 0
+
+OK (list emitted, URI/QR emitted, or empty list).
+
+=item 1
+
+C<--uri LABEL> or C<--qr LABEL> named a LABEL that is not present in the
+loaded config.
+
+=item 2
+
+Bad arguments (mutually-exclusive flags, unknown flag, missing LABEL,
+C<--note> without C<--uri>, C<--json> without C<--list>, or C<--config>
+path missing).
+
+=item 3
+
+Config file present but malformed.
+
+=back
+
+=head1 FILES
+
+=over 4
+
+=item F</etc/net-mgr/shared-wifi.conf>
+
+Primary configuration file.
+
+=item F</etc/net-mgr/shared-wifi.d/*.conf>
+
+Optional overlay files, loaded in filename-sort order.
+
+=back
+
+=head1 SEE ALSO
+
+L<net-chat-autoresponder(1)>, L<net-bitchat-bridge(1)>
+
+=cut
