@@ -56,6 +56,7 @@ use Tk;
 use Tk::ROText;
 use Tk::DialogBox;
 use Tk::Optionmenu;
+use Tk::BrowseEntry;
 
 use NetMgr::Client;
 
@@ -83,6 +84,17 @@ my %S = (
     primary => $file,
     sel_idx => undef,   # index into $S{rules} of the currently-edited rule
 );
+
+# Snapshot of chat_sessions from the target daemon at Load time; used
+# as the BrowseEntry choice list for chat_message 'session' and
+# chat_post 'target' fields. Freeform typing remains allowed — the
+# autoresponder will chat_open a fresh session name on first fire.
+my @KNOWN_SESSIONS;   # arrayref of hashrefs { name, status, topic, ... }
+
+# Save-rule button reference, grabbed at action-bar creation and
+# toggled by update_save_state() based on whether trigger + channel
+# are both set to a non-blank value.
+my $save_btn;
 
 # --- Tk skeleton (net-cluster-gui:139-150 layout) --------------------
 my $mw = MainWindow->new(-title => "net-autoresponder-gui ($file)");
@@ -171,9 +183,10 @@ $test_text->tagConfigure('err',    -foreground => '#a00');
 $test_text->tagConfigure('resolved', -foreground => '#005');
 
 # --- Action bar -----------------------------------------------------
-$action_bar->Button(-text => 'Save rule',
-                    -command => \&do_save_rule)
-           ->pack(-side => 'left', -padx => 4);
+$save_btn = $action_bar->Button(-text => 'Save rule',
+                                -command => \&do_save_rule)
+                       ->pack(-side => 'left', -padx => 4);
+update_save_state();
 $action_bar->Button(-text => 'Reload from disk',
                     -command => \&do_load)
            ->pack(-side => 'left', -padx => 4);
@@ -195,6 +208,12 @@ sub do_load {
     $S{order}   = [];
     $S{rules}   = [];
     $S{sel_idx} = undef;
+
+    # Refresh the chat_sessions cache alongside the config reload so
+    # the session/target BrowseEntry dropdowns reflect the daemon's
+    # current sessions. Failure is non-fatal — dropdown is just empty
+    # and the operator can still type any name.
+    @KNOWN_SESSIONS = fetch_chat_sessions();
 
     my @paths = overlay_paths($file);
     unless (@paths) {
@@ -235,7 +254,9 @@ sub on_rule_pick {
 sub do_add_rule {
     my $dlg = $mw->DialogBox(-title => 'New rule',
                              -buttons => ['OK', 'Cancel']);
-    my %v = (name => '', trigger => 'chat_message');
+    # Seed trigger empty so the operator is FORCED to pick one — no
+    # accidental "chat_message with defaults" rule from a blind OK.
+    my %v = (name => '', trigger => '');
     $dlg->add('Label', -text => 'Rule name ([A-Za-z][A-Za-z0-9._-]{0,31}):')
         ->pack(-anchor => 'w', -padx => 8, -pady => 2);
     my $e = $dlg->add('Entry', -textvariable => \$v{name}, -width => 32)
@@ -244,9 +265,10 @@ sub do_add_rule {
     $dlg->add('Label', -text => 'Trigger:')
         ->pack(-anchor => 'w', -padx => 8, -pady => 2);
     $dlg->add('Optionmenu',
-              -options  => [ [ 'chat_message' => 'chat_message' ],
+              -options  => [ [ '(pick one)'              => '' ],
+                             [ 'chat_message'            => 'chat_message' ],
                              [ 'bitchat_peer_first_seen' => 'bitchat_peer_first_seen' ],
-                             [ 'periodic' => 'periodic' ] ],
+                             [ 'periodic'                => 'periodic' ] ],
               -variable => \$v{trigger},
     )->pack(-anchor => 'w', -padx => 8, -pady => 2);
     my $ans = $dlg->Show // 'Cancel';
@@ -254,6 +276,8 @@ sub do_add_rule {
     $v{name} =~ s/^\s+|\s+$//g;
     return msg('Bad name', 'Rule name must match [A-Za-z][A-Za-z0-9._-]{0,31}.')
         unless $v{name} =~ /^[A-Za-z][A-Za-z0-9._-]{0,31}$/;
+    return msg('No trigger', 'Pick a trigger before creating the rule.')
+        unless length $v{trigger};
     for my $r (@{$S{rules}}) {
         return msg('Duplicate', "A rule named '$v{name}' already exists in "
                               . $r->{source} . ".")
@@ -267,8 +291,9 @@ sub do_add_rule {
         push @{$S{order}}, $dest;
     }
     my $lines = $S{files}{$dest};
-    my $starter_kv = starter_kv_for_trigger($v{trigger});
-    $starter_kv->{trigger} = $v{trigger};
+    # Don't seed channel/target/body/session — the operator must fill
+    # them in explicitly. Save stays disabled until channel is picked.
+    my $starter_kv = { trigger => $v{trigger} };
     my $new = {
         name    => $v{name},
         enabled => 1,
@@ -370,31 +395,49 @@ sub build_editor_shell {
 sub build_editor_form {
     $_->destroy for $editor_frame->children;
     $E{fields} //= {};
-    my $trig = $E{trigger} // 'chat_message';
+    # Empty trigger means "unpicked" — trigger-specific rows are not
+    # rendered until the operator picks a real trigger.
+    my $trig = $E{trigger} // '';
+    my $chan = $E{fields}{channel} // '';
 
     row_entry( $editor_frame, 'Name:',    'name',    32 );
     row_option($editor_frame, 'Trigger:', 'trigger',
-        [ [ 'chat_message'             => 'chat_message' ],
-          [ 'bitchat_peer_first_seen'  => 'bitchat_peer_first_seen' ],
-          [ 'periodic'                 => 'periodic' ] ],
+        [ [ '(pick one)'                => '' ],
+          [ 'chat_message'              => 'chat_message' ],
+          [ 'bitchat_peer_first_seen'   => 'bitchat_peer_first_seen' ],
+          [ 'periodic'                  => 'periodic' ] ],
         sub {
             $E{trigger} = $E{fields}{trigger};
             build_editor_form();
         },
     );
     row_option($editor_frame, 'Channel:', 'channel',
-        [ [ 'bitchat_dm' => 'bitchat_dm' ],
+        [ [ '(pick one)' => '' ],
+          [ 'bitchat_dm' => 'bitchat_dm' ],
           [ 'chat_post'  => 'chat_post' ],
           [ 'noop'       => 'noop' ] ],
+        sub {
+            # Channel change swaps the Target row between a plain Entry
+            # (bitchat_dm/noop, freeform peer_id / ${var}) and a
+            # BrowseEntry backed by chat_sessions (chat_post).
+            build_editor_form();
+        },
     );
-    row_entry( $editor_frame, 'Target:',    'target',    48 );
+    # Target row: BrowseEntry backed by chat_sessions when
+    # channel=chat_post (target IS a session name in that case); plain
+    # Entry otherwise (bitchat_dm wants a 16-hex peer_id or ${var}).
+    if ($chan eq 'chat_post') {
+        row_browse_entry($editor_frame, 'Target:', 'target', 48, \@KNOWN_SESSIONS);
+    } else {
+        row_entry( $editor_frame, 'Target:', 'target', 48 );
+    }
     row_multi( $editor_frame, 'Body:',      'body' );
     row_entry( $editor_frame, 'Dedup TTL:', 'dedup_ttl', 12 );
 
     if ($trig eq 'bitchat_peer_first_seen') {
         row_entry( $editor_frame, 'Match:', 'match', 48 );
     } elsif ($trig eq 'chat_message') {
-        row_entry( $editor_frame, 'Session:',    'session',    32 );
+        row_browse_entry($editor_frame, 'Session:', 'session', 32, \@KNOWN_SESSIONS);
         row_entry( $editor_frame, 'Match:',      'match',      48 );
         row_entry( $editor_frame, 'From:',       'from',       32 );
         row_entry( $editor_frame, 'Ack target:', 'ack_target', 32 );
@@ -414,6 +457,10 @@ sub build_editor_form {
         -foreground => '#444',
         -anchor => 'w',
     )->pack(-side => 'left', -padx => 4);
+
+    # Toggle Save enable/disable based on whether trigger + channel
+    # are both non-blank now that we've refreshed the widget state.
+    update_save_state();
 }
 
 sub row_entry {
@@ -453,9 +500,15 @@ sub row_option {
     my $row = $parent->Frame->pack(-side => 'top', -fill => 'x', -pady => 1);
     $row->Label(-text => $label, -width => 12, -anchor => 'w')
         ->pack(-side => 'left');
-    $E{fields}{$key} //= $options->[0][1];
+    # Default to the empty sentinel (never auto-pick the first entry).
+    # Every option list that reaches here has '' as a valid value —
+    # either as the '(pick one)' sentinel (trigger, channel) or the
+    # legitimate '(single-fire)' mode. So a fresh rule shows a picker
+    # that requires an explicit selection instead of silently seeding
+    # bitchat_dm / chat_message and validating on Save.
+    $E{fields}{$key} //= '';
     my %ok = map { $_->[1] => 1 } @$options;
-    $E{fields}{$key} = $options->[0][1]
+    $E{fields}{$key} = ''
         unless defined $E{fields}{$key} && $ok{ $E{fields}{$key} };
     $row->Optionmenu(
         -options  => $options,
@@ -464,12 +517,38 @@ sub row_option {
     )->pack(-side => 'left');
 }
 
+# BrowseEntry variant for fields that map to chat_sessions.name — a
+# combo-box: dropdown of known session names for pick-with-mouse, but
+# still typeable so an operator can name a session that doesn't yet
+# exist (autoresponder chat_opens on first fire).
+sub row_browse_entry {
+    my ($parent, $label, $key, $width, $choices_ref) = @_;
+    my $row = $parent->Frame->pack(-side => 'top', -fill => 'x', -pady => 1);
+    $row->Label(-text => $label, -width => 12, -anchor => 'w')
+        ->pack(-side => 'left');
+    $E{fields}{$key} //= '';
+    my $be = $row->BrowseEntry(
+        -variable  => \$E{fields}{$key},
+        -width     => $width,
+        -listwidth => 40,
+    )->pack(-side => 'left', -fill => 'x', -expand => 1);
+    for my $s (@{ $choices_ref // [] }) {
+        my $name = ref($s) ? $s->{name} : $s;
+        next unless defined $name && length $name;
+        $be->insert('end', $name);
+    }
+}
+
 sub load_editor_from_rule {
     my ($r) = @_;
     # Reset field storage; take trigger from the rule so build_editor_form
     # knows which trigger-specific rows to render.
     $E{fields} = {};
-    $E{trigger} = $r->{kv}{trigger} // 'chat_message';
+    $E{trigger} = $r->{kv}{trigger} // '';
+    # Pre-seed channel so build_editor_form picks the right Target
+    # widget shape (BrowseEntry when chat_post, plain Entry otherwise)
+    # before the post-build population loop runs.
+    $E{fields}{channel} = $r->{kv}{channel} if defined $r->{kv}{channel};
     build_editor_form();
     # After build, populate every field from $r->{kv} (unknown keys are
     # silently discarded when the trigger changes and their widget goes
@@ -494,11 +573,12 @@ sub load_editor_from_rule {
                               $r->{start_ln}+1, ($r->{end_ln}//$r->{start_ln})+1)
                     : "  (unsaved)"),
     );
+    update_save_state();
 }
 
 sub clear_editor {
     $E{fields} = {};
-    $E{trigger} = 'chat_message';
+    $E{trigger} = '';
     build_editor_form();
 }
 
@@ -979,6 +1059,45 @@ sub _test_periodic {
         _test_line(sprintf("  body   -> %s\n", _subst($kv->{body},   $ctx)),
                    'resolved');
     }
+}
+
+# Snapshot chat_sessions from the target daemon so the session/target
+# BrowseEntry dropdowns can offer known names. Returns a list of
+# hashrefs sorted by name; empty list on any failure (daemon down,
+# table missing on a fresh install, etc). Deliberately quiet — the
+# fallback (empty dropdown, freeform typing) is a fine degraded mode.
+sub fetch_chat_sessions {
+    my $cli = eval {
+        NetMgr::Client->new(listen => $listen_var, timeout => 5);
+    };
+    return () unless $cli;
+    my $ok = eval { $cli->hello(consumer => "autoresponder-gui.$$"); 1 };
+    unless ($ok) {
+        eval { $cli->bye };
+        return ();
+    }
+    my $rows = eval { $cli->snapshot(1, 'chat_sessions') };
+    eval { $cli->bye };
+    return () unless ref($rows) eq 'ARRAY';
+    for my $r (@$rows) {
+        delete @{$r}{qw(op sub table mode)};
+    }
+    return sort { ($a->{name} // '') cmp ($b->{name} // '') } @$rows;
+}
+
+# Enable Save only when trigger AND channel are both explicitly picked
+# (non-blank). The empty '(pick one)' sentinel value fails this check
+# so a fresh rule can't be Saved without the operator picking both
+# sinks — the click just silently no-ops instead of firing an
+# 'Invalid rule' dialog for a trivially unfinished form. Guarded on
+# $save_btn because build_editor_form runs during the Tk skeleton
+# setup, before the action bar has been created.
+sub update_save_state {
+    return unless defined $save_btn;
+    my $trig = $E{fields}{trigger} // '';
+    my $chan = $E{fields}{channel} // '';
+    my $state = (length $trig && length $chan) ? 'normal' : 'disabled';
+    $save_btn->configure(-state => $state);
 }
 
 sub _snapshot {
