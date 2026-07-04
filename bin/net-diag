@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-# net-diag — host-level network diagnostics. Three modes:
+# net-diag — host-level network diagnostics. Four modes:
 #
 #   net-diag                       # local: introspect THIS host
 #                                  # (no daemon contact)
@@ -9,6 +9,9 @@
 #   net-diag NAME-OR-IP            # DB lookup: dump everything the
 #                                  # local daemon knows about that
 #                                  # machine (snapshots its tables)
+#   net-diag --watch               # periodic-check mode: sample every
+#                                  # 5s, report to stdout / chat / ...
+#                                  # optionally --repair on failure
 #
 # The local + remote modes don't need any DB knowledge — they ask
 # the host (or its daemon) about its own interfaces, routes, DNS
@@ -22,14 +25,41 @@
 # hostnames, aliases, and friendly_names. Multiple matches are
 # printed in turn.
 #
+# --watch mode is a resident diagnostic. Each 5s tick (see --interval):
+#   - looks up the default v4 gateway (ip -4 route show default),
+#   - pings gateway + 8.8.8.8,
+#   - runs a fresh DNS lookup (dig +time=2 +tries=1 against the gateway
+#     for a random-labeled probe under example.invalid) so caches
+#     never mask a broken resolver — same discipline as clevo's
+#     watcher,
+#   - captures wifi bssid / signal / nmcli state when the default
+#     iface is wifi,
+#   - assigns a verdict (ok | degraded | down) from those samples.
+# With --repair, K consecutive 'down' verdicts trigger a reconnect:
+# wifi -> `nmcli device disconnect <iface> && nmcli device connect
+# <iface>`; ethernet -> `ip link set <iface> down/up` (or dhclient
+# -r/-1 if we have it). 60s cooldown between repairs. --report=<sink>
+# publishes each tick's line to stdout (default), a chat session,
+# a file, or syslog — multiple --report flags fan out to all.
+#
 # Options:
 #   --remote HOST[:PORT]    run host-debug against a remote daemon
-#   --listen HOST[:PORT]    DB-lookup mode: which daemon to query
+#   --listen HOST[:PORT]    daemon endpoint (DB mode + --report=chat)
 #                           (default 127.0.0.1:7531)
 #   --no-dns                DB mode: skip local-resolver lookups
 #   --no-rdns               DB mode: skip reverse DNS only
 #   --raw                   DB mode: don't translate '<ip>:<method>'
 #                           source fields to '<hostname>:<method>'
+#   --watch                 enter periodic-check mode (5s default)
+#   --interval=N            watch cadence in seconds (>=2, default 5)
+#   --repair                on K=2 consecutive 'down' verdicts,
+#                           attempt an interface reconnect
+#   --report=SPEC           publish each tick to a sink; repeatable.
+#                           SPEC := KIND[:TARGET].  KINDs:
+#                             stdout             (default)
+#                             chat:SESSION       via loopback daemon
+#                             file:PATH          appended, line-buffered
+#                             syslog[:FACILITY]  logger(1), default user
 #   -h / --help
 #
 # Exit: 0 on success · 1 on no match (DB mode) · 2 on bad args
@@ -41,26 +71,62 @@ use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
 use Socket qw(inet_pton inet_ntop AF_INET AF_INET6);
+use Time::HiRes qw(time sleep);
+use POSIX ();
 
 use NetMgr::Client;
 
 my ($listen, $remote, $no_dns, $no_rdns, $raw, $help);
+my ($watch, $interval, $repair);
+my @report_specs;
 GetOptions(
     'listen=s'  => \$listen,
     'remote=s'  => \$remote,
     'no-dns'    => \$no_dns,
     'no-rdns'   => \$no_rdns,
     'raw'       => \$raw,
+    'watch'     => \$watch,
+    'interval=i'=> \$interval,
+    'repair'    => \$repair,
+    'report=s'  => \@report_specs,
     'help|h'    => \$help,
 ) or usage(2);
 usage(0) if $help;
 usage(2) if @ARGV > 1;
 
+# --watch is only meaningful without a positional DB-lookup arg.
+# --repair / --interval / --report only make sense with --watch (or
+# implicitly with the local/remote no-arg modes, but we scope them
+# to --watch to keep the one-shot modes unchanged).
+if (@ARGV && ($watch || $repair || defined $interval || @report_specs)) {
+    print STDERR "net-diag: --watch/--repair/--interval/--report are "
+               . "incompatible with a positional NAME|IP argument.\n";
+    usage(2);
+}
+if (!$watch && ($repair || defined $interval || @report_specs)) {
+    print STDERR "net-diag: --repair/--interval/--report require --watch.\n";
+    usage(2);
+}
+if (defined $interval && $interval < 2) {
+    print STDERR "net-diag: --interval must be >= 2 seconds (got $interval)\n";
+    usage(2);
+}
+
 # Mode dispatch:
-#   no positional + no --remote → local host introspection
+#   --watch                     → cmd_watch (loop, sinks, optional repair)
+#   no positional + no --remote → local host introspection (one-shot)
 #   no positional + --remote     → remote-via-daemon host introspection
 #   one positional               → DB lookup against local daemon
 #                                  (--remote ignored — they're orthogonal)
+if ($watch) {
+    cmd_watch(
+        interval => ($interval // 5),
+        repair   => $repair,
+        specs    => (@report_specs ? \@report_specs : ['stdout']),
+        listen   => $listen,
+    );
+    exit 0;
+}
 if (!@ARGV) {
     if (defined $remote) {
         do_remote_host_debug($remote);
@@ -412,6 +478,9 @@ Usage:
   net-diag --remote HOST[:PORT]  # introspect a remote host via its
                                  # net-mgr daemon (POLL host-debug)
   net-diag [opts] <name|IP>      # DB lookup against the local daemon
+  net-diag --watch [--repair]    # periodic-check mode (gw/inet/dns
+       [--interval N]            # ping every N s, K=2 downs -> repair)
+       [--report=SPEC ...]
 
 Local + remote modes report: interfaces (mac/kind/addrs/flags),
 routes (v4 + v6), DNS resolver config (resolv.conf + resolvectl),
@@ -423,12 +492,29 @@ DB knows: interfaces, addresses with their source fields, WiFi AP
 association, DHCP lease records, all known names, open ports, and
 a fresh local-resolver DNS view.
 
-Options (DB-lookup mode only):
+Watch mode samples gateway + internet + DNS every --interval (5s
+default) and reports a compact verdict line via each --report sink.
+With --repair, 2 consecutive 'down' verdicts trigger a wifi or
+ethernet cycle (60s cooldown). --report=SPEC is 'stdout',
+'chat:SESSION', 'file:PATH', or 'syslog[:FACILITY]'; repeat to
+publish to several sinks. --repair calls ip/nmcli/dhclient — run
+under sudo or the repair path will no-op.
+
+Options (DB-lookup mode):
   --listen HOST[:PORT]   daemon to query (default 127.0.0.1:7531)
   --no-dns               skip local-resolver DNS lookups
   --no-rdns              skip reverse DNS only
   --raw                  don't translate IP-shaped source prefixes
                          to hostnames
+
+Options (watch mode):
+  --watch                enter periodic-check mode
+  --interval N           tick cadence in seconds (>=2, default 5)
+  --repair               reconnect on K=2 consecutive 'down' verdicts
+  --report=SPEC          repeatable sink; SPEC := KIND[:TARGET]
+                         (stdout | chat:SESSION | file:PATH |
+                          syslog[:FACILITY])
+  --listen HOST[:PORT]   loopback daemon for --report=chat:*
 
 Exit: 0 ok · 1 DB no-match · 2 bad args · 4 daemon connect.
 EOF
