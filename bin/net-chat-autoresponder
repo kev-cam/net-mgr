@@ -64,6 +64,27 @@ my @periodic_rules = grep { $_->{trigger} eq 'periodic' }                @RULES;
 my %chat_sessions;
 $chat_sessions{$_->{session}}++ for @chat_rules;
 
+# Peer identity map — updated on every bitchat_peers ROW. Enables:
+#   - periodic fanout rules (mode=fanout_bitchat_peers) to iterate live
+#     BLE peers by peer_id — see fire_periodic_rules.
+#   - chat_message ack rules (ack_target=NAME) to reverse-map a nickname
+#     captured from a mesh reply back to the peer_id, so we can mark
+#     that peer as having ack'd a fanout broadcast — see on_chat_row.
+# NOT persisted. On restart the stream re-subscribe replays the current
+# bitchat_peers table within one poll (~30s), so a periodic fanout
+# missing its peer map for the very first tick just fans out to an
+# empty set — the acked-set persists via SeenFile, no double-fire.
+# Collision caveat: nickname is not unique on the mesh (see the schema
+# comment on bitchat_peers.nickname — VARCHAR(64) NULL, no UNIQUE). A
+# second peer choosing the same nickname will overwrite this map's
+# nick->pid mapping; the ack then attributes to whichever peer wrote
+# most recently. Peer_id is the schema-authoritative identity, but
+# chat_messages.body only carries the nickname (see the bridge's tag
+# construction in bin/net-bitchat-bridge:555-558), so this map is the
+# best identity recovery available today without a schema change.
+my %NICK_TO_PID;    # nickname => peer_id
+my %PEER_LAST_SEEN; # peer_id  => epoch (last bitchat_peers ROW time)
+
 # In-memory timer for periodic rules — deliberately NOT persisted. On
 # restart the first fire happens after 'every' seconds, not immediately,
 # so a supervisor loop that flaps the service doesn't spam the mesh.
@@ -152,6 +173,15 @@ sub on_peer_row {
     my $pid = lc($kv->{peer_id} // '');
     return unless $pid =~ /^[0-9a-f]{16}$/;
     my $nick = $kv->{nickname} // '';
+    # Refresh the shared peer identity map BEFORE the ble-rule loop so a
+    # periodic-fanout rule that fires on the very next tick already sees
+    # this peer (the main loop runs fire_periodic_rules BEFORE the ROW
+    # handler on the same tick). Skip the nickname->pid entry when the
+    # nickname is empty — a nickless peer can still be fanned out to
+    # (we DM by peer_id) but has no way for the operator to see who they
+    # are in a chat_messages log line.
+    $NICK_TO_PID{$nick}    = $pid if length $nick;
+    $PEER_LAST_SEEN{$pid}  = time;
     for my $r (@ble_rules) {
         my %cap;
         if (my $re = $r->{_re}) {
@@ -172,23 +202,65 @@ sub fire_periodic_rules {
     my $now = time;
     for my $r (@$rules) {
         next if !defined $r->{_next_fire} || $r->{_next_fire} > $now;
-        # ${peer_id}/${session}/cap.* aren't meaningful for a wall-clock
-        # trigger; leave them empty and let subst() fall through. The
-        # ${nickname} slot carries the global 'as' (per design brief) so
-        # a broadcast rule can self-identify without re-typing the name.
-        my $ctx = {
-            peer_id  => '',
-            nickname => ($GLOBAL->{as} // ''),
-            sender   => ($GLOBAL->{as} // ''),
-            session  => '',
-        };
-        dispatch($r, $ctx);
+        if (($r->{mode} // '') eq 'fanout_bitchat_peers') {
+            _fire_fanout_bitchat_peers($r, $now);
+        } else {
+            # ${peer_id}/${session}/cap.* aren't meaningful for a wall-clock
+            # trigger; leave them empty and let subst() fall through. The
+            # ${nickname} slot carries the global 'as' (per design brief) so
+            # a broadcast rule can self-identify without re-typing the name.
+            my $ctx = {
+                peer_id  => '',
+                nickname => ($GLOBAL->{as} // ''),
+                sender   => ($GLOBAL->{as} // ''),
+                session  => '',
+            };
+            dispatch($r, $ctx);
+        }
         # Re-anchor next fire to `now`, NOT (prev _next_fire + every).
         # If the loop was blocked for a long time (parse hang, slow
         # daemon, laptop suspend), we do NOT want to catch up by
-        # firing back-to-back and spamming the mesh.
+        # firing back-to-back and spamming the mesh. Re-anchor is once
+        # PER RULE, not once per fanout target — a fanout rule that DMs
+        # 20 peers still bumps its own next_fire only once.
         $r->{_next_fire} = $now + $r->{_every_secs};
     }
+}
+
+# Per-peer DM fanout for a periodic rule with mode=fanout_bitchat_peers.
+# Iterates %PEER_LAST_SEEN (the reactor's live-peer set, refreshed by
+# on_peer_row) and dispatches one DM per non-acked peer. Peers whose
+# peer_id has been recorded as ack'd (via a chat_message rule with
+# ack_target= — see on_chat_row) inside the rule's acked_ttl window
+# are skipped silently. Reverse-lookup of nickname from peer_id is
+# best-effort and only used to populate ${nickname} in the DM body —
+# the DM target is peer_id, so nick-empty peers still get the DM.
+sub _fire_fanout_bitchat_peers {
+    my ($r, $now) = @_;
+    my $ack_key = $r->{ack_key};
+    my $ttl     = $r->{_acked_ttl_secs} // 0;
+    my ($fired, $skipped) = (0, 0);
+    # Reverse map built lazily each tick — O(peers) but a periodic
+    # tick is a coarse event; a hot-path optimisation (maintain
+    # %PID_TO_NICK alongside %NICK_TO_PID) is easy to add later.
+    my %pid_to_nick;
+    while (my ($n, $p) = each %NICK_TO_PID) { $pid_to_nick{$p} //= $n }
+    for my $pid (sort keys %PEER_LAST_SEEN) {
+        if (defined $ack_key && length $ack_key && $ttl > 0) {
+            my $seen_key = "$ack_key\tacked\t$pid";
+            if ($SEEN->check($seen_key, $ttl)) { $skipped++; next }
+        }
+        my $ctx = {
+            peer_id  => $pid,
+            nickname => ($pid_to_nick{$pid} // ''),
+            sender   => ($GLOBAL->{as} // ''),
+            session  => '',
+        };
+        dispatch($r, $ctx) and $fired++;
+    }
+    warn "[autoresponder $r->{name}] fanout: $fired fired, "
+       . "$skipped acked-skipped ("
+       . scalar(keys %PEER_LAST_SEEN) . " peers known)\n";
 }
 
 sub on_chat_row {
@@ -206,6 +278,35 @@ sub on_chat_row {
         my $ctx = { peer_id => ($cap{peer_id} // ''), nickname => '',
                     sender  => $sender, session => $sess,
                     map { ("cap.$_" => $cap{$_}) } keys %cap };
+
+        # ack_target=NAME — this is an ACK-drop rule (see design brief).
+        # A mesh reply matched by `match` was tagged by the bridge as
+        # '[NICK@bitchat[/chan]] BODY' (bin/net-bitchat-bridge:555-558)
+        # so the rule's regex extracts (?<nick>...) from that prefix.
+        # We reverse-look up the peer_id via %NICK_TO_PID (populated by
+        # on_peer_row) and mark that peer as having ack'd the periodic
+        # fanout named by ack_target. NO dispatch — this is pure state
+        # mutation. The next fanout tick will skip this peer for
+        # acked_ttl seconds. Peers we haven't yet seen a bitchat_peers
+        # ROW for cannot be marked (no peer_id available); the ack is
+        # dropped with a log line so the operator can spot the miss.
+        if (defined $r->{ack_target} && length $r->{ack_target}) {
+            my $nick = $cap{nick} // '';
+            my $pid  = length $nick ? ($NICK_TO_PID{$nick} // '') : '';
+            if (!length $pid) {
+                warn "[autoresponder $r->{name}] ack_target=$r->{ack_target}"
+                   . " nick='$nick' — no peer_id known yet, ack dropped\n";
+            } else {
+                my $seen_key = "$r->{ack_target}\tacked\t$pid";
+                $SEEN->record($seen_key);
+                warn "[autoresponder $r->{name}] ack_target=$r->{ack_target}"
+                   . " marked $nick ($pid) acked\n";
+            }
+            # ack rules never dispatch. Do NOT fall through to the
+            # dedup/dispatch path below.
+            next;
+        }
+
         my $key = "$r->{name}\t$sender";
         next if $r->{dedup_ttl} > 0 && $SEEN->check($key, $r->{dedup_ttl});
         $SEEN->record($key) if dispatch($r, $ctx) && $r->{dedup_ttl} > 0;
@@ -214,6 +315,13 @@ sub on_chat_row {
 
 sub dispatch {
     my ($r, $ctx) = @_;
+    # channel=noop: pure state-mutation rule. Currently the ack-target
+    # path in on_chat_row bypasses dispatch entirely, but we accept a
+    # dispatch call so a future rule could combine ack-dropping with
+    # in-process side effects (e.g. metrics counter) without a wire post.
+    if ($r->{channel} eq 'noop') {
+        return 1;
+    }
     my $target = subst($r->{target}, $ctx);
     my $body   = subst($r->{body},   $ctx);
     utf8::upgrade($body);
@@ -404,14 +512,20 @@ sub _compile_rule {
 
     my $ch = $r->{channel} or die "no channel=";
     die "bad channel '$ch'"
-        unless $ch eq 'bitchat_dm' || $ch eq 'chat_post';
+        unless $ch eq 'bitchat_dm' || $ch eq 'chat_post' || $ch eq 'noop';
 
-    die "no target=" unless defined $r->{target} && length $r->{target};
-    die "no body="   unless defined $r->{body};
+    # target/body are required for wire channels only. channel=noop
+    # rules mutate in-process state (SEEN, %NICK_TO_PID) and produce no
+    # wire traffic, so those fields are optional there.
+    if ($ch ne 'noop') {
+        die "no target=" unless defined $r->{target} && length $r->{target};
+        die "no body="   unless defined $r->{body};
+    }
 
     # Rule-load target validation for bitchat_dm literals. If the target
     # contains ${...} we defer until per-fire; otherwise it MUST be 16 hex.
     if ($ch eq 'bitchat_dm'
+        && defined $r->{target}
         && $r->{target} !~ /\$\{/
         && $r->{target} !~ /^[0-9a-f]{16}$/i)
     {
@@ -429,6 +543,20 @@ sub _compile_rule {
             unless defined $sess && length $sess;
         die "chat_message session sanitize: '$sess' has forbidden chars"
             unless $sess =~ /^[A-Za-z0-9._-]{1,64}$/;
+        # ack_target=NAME: marks the sender's peer_id as ack'ing the named
+        # periodic-fanout rule (via ack_key= on that rule). Restrict the
+        # NAME to the same shape as [rule.NAME] so it can't smuggle a tab
+        # into the SeenFile key encoding "ack_target\tacked\tpeer_id".
+        if (defined $r->{ack_target} && length $r->{ack_target}) {
+            die "ack_target='$r->{ack_target}' has forbidden chars "
+              . "(use [A-Za-z][A-Za-z0-9._-]{0,31})"
+                unless $r->{ack_target} =~ /^[A-Za-z][A-Za-z0-9._-]{0,31}$/;
+            # Ack rules are pure state mutation — enforce channel=noop
+            # so an operator can't accidentally combine ack-dropping
+            # with a wire post that would defeat the ack semantics.
+            die "ack_target= requires channel=noop (got $ch)"
+                unless $ch eq 'noop';
+        }
     }
     if ($trigger eq 'periodic') {
         # `every` REQUIRED. Enforce a 5s floor so a typo like `every=0.5s`
@@ -444,6 +572,30 @@ sub _compile_rule {
         # confuses readers of the config. Fail load instead.
         die "periodic trigger does not accept match="
             if defined $r->{match};
+
+        # mode=fanout_bitchat_peers: iterate live BLE peers and DM each
+        # one whose peer_id hasn't been marked ack'd within acked_ttl.
+        # Requires channel=bitchat_dm (per-peer) and an ack_key= naming
+        # the SeenFile bucket that chat_message ack_target rules will
+        # populate. Missing/empty mode = the legacy single-fire path.
+        my $mode = $r->{mode} // '';
+        die "periodic mode='$mode' not recognised "
+          . "(supported: fanout_bitchat_peers)"
+            if length $mode && $mode ne 'fanout_bitchat_peers';
+        if ($mode eq 'fanout_bitchat_peers') {
+            die "fanout_bitchat_peers requires channel=bitchat_dm (got $ch)"
+                unless $ch eq 'bitchat_dm';
+            die "fanout_bitchat_peers requires ack_key="
+                unless defined $r->{ack_key} && length $r->{ack_key};
+            die "ack_key='$r->{ack_key}' has forbidden chars "
+              . "(use [A-Za-z][A-Za-z0-9._-]{0,31})"
+                unless $r->{ack_key} =~ /^[A-Za-z][A-Za-z0-9._-]{0,31}$/;
+            my $atl = $r->{acked_ttl} // '1h';
+            my $sec = _parse_duration($atl);
+            die "acked_ttl='$atl' must be > 0 (parsed as ${sec}s)"
+                unless $sec > 0;
+            $r->{_acked_ttl_secs} = $sec;
+        }
     }
     $match = '.*' unless defined $match;
     my $re = _compile_re($match);

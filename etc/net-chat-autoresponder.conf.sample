@@ -147,45 +147,19 @@ target     = ${session}
 body       = hi ${sender} — net-chat-autoresponder alive
 
 ; --------------------------------------------------------------------------
-; Rule 4 — periodic BLE broadcast heartbeat (WIFI URI diagnostic).
+; Rule 4 (retired) — periodic BLE MESH BROADCAST of the WIFI URI.
 ;
-; WHAT THIS DOES
-;   Every `every` seconds, chat_post into the bitchat-bridge session with
-;   a plain (no @HEX16: prefix) body. The bridge's SUBSCRIBE loop picks
-;   the row up (bin/net-bitchat-bridge:343-407), passes the sender-echo
-;   guard at :376 (our sender is 'net-chat-autoresponder' not the
-;   bridge's own 'bitchat-relay') AND the tag guard at :377 (the body
-;   does NOT start with '[X@bitchat...]'), then encodes
-;   {"cmd":"send","body":"..."} to the helper stdin with NO to_peer
-;   field — which the Rust helper fans out as a BLE MESH BROADCAST to
-;   every peer in range.
+; Superseded by rule.wifi-fanout + rule.wifi-ack below. The broadcast
+; version had no way to suppress itself once a peer had already joined
+; the WiFi — every peer in range saw the URI repost every minute
+; forever. The fanout+ack pair fixes that: it DMs each peer individually
+; and stops DMing that peer as soon as they reply 'y'/'yes'/'ok'.
 ;
-; WHY IT EXISTS (diagnostic — not a permanent production rule)
-;   The WIFI-greeting DM (rule.wifi-greeting) fires ONCE per peer per
-;   dedup window on bitchat_peers first-seen. If a peer never appears
-;   in bitchat_peers (silent decrypt failure, upsert path stuck, out
-;   of Noise handshake, etc.) the greeter never fires and that peer
-;   assumes we can't see them. A periodic BROADCAST bypasses the
-;   first-seen gate — it goes out unconditionally — so a peer who
-;   never got the DM will still see the WIFI URI on the mesh. That
-;   differentiates two failure modes cheaply:
-;     BLE reachable + greeter not firing  (broadcast arrives, DM does not)
-;     Peer not visible at all             (neither arrives)
-;
-; HOW TO DISABLE
-;   Comment the rule out (prepend ';' to each key) and restart the
-;   responder. Or drop an override into
-;   /etc/net-mgr/net-chat-autoresponder.d/*.conf with the same section
-;   header ([rule.wifi-broadcast]) and no keys — the last-write-wins
-;   merge in load_config() will strip it out on next load.
-;
-; RATE / POLITENESS
-;   60s is aggressive on purpose — it makes the diagnostic near-instant
-;   to observe from another BLE endpoint. Once the diagnostic has
-;   answered the question, BUMP TO 5m OR 15m in production. The bridge
-;   has NO outbound rate limit (see net-bitchat-bridge:392-407 — every
-;   ROW is immediately json-encoded and printed to helper stdin), so
-;   the rule's own `every=` IS the rate limit on BLE spam.
+; The old broadcast rule is preserved commented-out as a diagnostic —
+; uncomment temporarily if you need to check "does ANY BLE peer see
+; anything from us" (broadcast bypasses the bitchat_peers first-seen
+; and per-peer DM paths entirely). See rule.wifi-fanout below for the
+; production replacement.
 ;
 ; PERIODIC-RULE GRAMMAR (in addition to channel/target/body above):
 ;   trigger    — REQUIRED — 'periodic'
@@ -195,13 +169,17 @@ body       = hi ${sender} — net-chat-autoresponder alive
 ;   match      — MUST NOT be set (periodic has no regex — fails load).
 ;   dedup_ttl  — forced to 0 internally; every interval fires
 ;                unconditionally.
+;   mode       — optional — 'fanout_bitchat_peers' turns the rule into
+;                per-peer DM fanout (see rule.wifi-fanout below).
+;                Absent/empty = legacy single-fire path (this rule).
 ;
 ; Periodic-only substitution tokens (in addition to $$ for a literal
 ; '$'; ${cap.*} is NOT available on periodic — no regex, no captures):
 ;   ${now}       current UTC HH:MM:SS (rendered per fire)
 ;   ${host}      Sys::Hostname::hostname()
-;   ${nickname}  [global].as
+;   ${nickname}  [global].as  (or the peer's nickname for fanout rules)
 ;   ${sender}    [global].as (same as nickname on periodic)
+;   ${peer_id}   16-hex peer id — ONLY meaningful for mode=fanout_bitchat_peers
 ;
 ; TIMER SEMANTICS
 ;   Timer state is IN-MEMORY only, NOT persisted. On restart the first
@@ -210,9 +188,136 @@ body       = hi ${sender} — net-chat-autoresponder alive
 ;   Loop granularity is 10s (recv_line timeout), so an `every` value
 ;   below 10s effectively rounds up to the next tick.
 ; --------------------------------------------------------------------------
-[rule.wifi-broadcast]
+; [rule.wifi-broadcast]              ; see rule.wifi-fanout below
+; trigger    = periodic
+; every      = 60s
+; channel    = chat_post
+; target     = bitchat-bridge
+; body       = WIFI:T:WPA;S:video;P:InTheRoom;; — did you get this? reply "ok" if you did.
+
+; --------------------------------------------------------------------------
+; Rule 5 — per-peer DM fanout for the WiFi URI (production replacement
+; for the retired rule.wifi-broadcast above).
+;
+; WHAT THIS DOES
+;   Every `every` seconds, iterate the reactor's live-peer set
+;   (%PEER_LAST_SEEN, populated from bitchat_peers ROW events) and DM
+;   the WIFI: URI to each peer_id that has NOT already been marked as
+;   ack'd for ack_key=wifi-broadcast. Peers who reply 'y' / 'yes' /
+;   'ok' in the mesh (rule.wifi-ack below) get their peer_id recorded
+;   in the SeenFile under that ack_key, and the next fanout tick
+;   skips them for `acked_ttl` seconds.
+;
+; ACK PERSISTENCE
+;   The ack record lives in the same SeenFile
+;   (/var/lib/net-mgr/net-chat-autoresponder.seen, see [global].state_file)
+;   as first-seen dedup. Keys are of the form
+;       "<ack_key>\tacked\t<peer_id>"
+;   which fits the same key-encoding convention used by first-seen
+;   dedup ("<rule_name>\t<peer_id>"). In-process ack state is
+;   authoritative during the reactor's lifetime; the on-disk log lets
+;   a restarted reactor honour recent acks without re-DMing peers who
+;   already replied.
+;
+; ACK TTL — WHY 1h?
+;   Long enough to cover a normal event: a peer who joins the WiFi,
+;   walks away for lunch, and comes back mid-afternoon is not re-DM'd.
+;   Short enough that a peer who dropped off the WiFi (moved, laptop
+;   suspend, network reset) gets a fresh reminder within an hour of
+;   returning. Bump to `acked_ttl = 6h` for a persistent event, or
+;   drop to `10m` for a rapid-iteration diagnostic.
+;
+; PEER-VISIBILITY LIMITATION
+;   Peers we haven't yet received a bitchat_peers ROW for (fresh
+;   arrivals within the last poll cycle, silent decrypt failures)
+;   are absent from %PEER_LAST_SEEN and therefore not fanned out to.
+;   The DM they miss will land on the next tick after their ROW event
+;   arrives — under the default 30s peer poll that's a bounded ~1min
+;   worst case.
+;
+; NICKNAME COLLISION LIMITATION
+;   The reactor's %NICK_TO_PID reverse map (which the ack rule uses
+;   to decode 'y' from '[alice@bitchat] y' back into a peer_id) is
+;   nickname-keyed — the bridge tag drops sender_peer_id (see the
+;   investigation in bin/net-bitchat-bridge:555-558). If two distinct
+;   BLE peers both nickname themselves 'alice', an ack from either
+;   marks whichever peer_id was written to %NICK_TO_PID most recently.
+;   Schema-authoritative identity is peer_id (bitchat_peers PRIMARY
+;   KEY, VARCHAR(16)); closing the gap requires threading peer_id
+;   into chat_messages, which is a schema-migration change out of
+;   scope for this rule pair.
+;
+; FANOUT-RULE GRAMMAR (in addition to trigger/every/channel above):
+;   mode       — REQUIRED for fanout — 'fanout_bitchat_peers'.
+;   channel    — MUST be 'bitchat_dm' (validated at load).
+;   target     — MUST resolve to a 16-hex peer_id via ${…} substitution.
+;                In practice this is literally '${peer_id}'.
+;   body       — DM payload. All periodic tokens are available;
+;                ${nickname} is the peer's nickname when known (empty
+;                if we haven't decoded a bitchat_peers ROW for them
+;                with a non-empty nickname yet).
+;   ack_key    — REQUIRED — the SeenFile bucket that a chat_message
+;                rule with matching ack_target= populates. Grammar:
+;                [A-Za-z][A-Za-z0-9._-]{0,31} (same as rule NAME).
+;   acked_ttl  — optional — SeenFile freshness window; default 1h.
+;                Suffix s|m|h|d|w. MUST be > 0.
+; --------------------------------------------------------------------------
+[rule.wifi-fanout]
 trigger    = periodic
 every      = 60s
-channel    = chat_post
-target     = bitchat-bridge
-body       = WIFI:T:WPA;S:video;P:InTheRoom;; — did you get this? reply "ok" if you did.
+mode       = fanout_bitchat_peers
+channel    = bitchat_dm
+target     = ${peer_id}
+body       = WIFI:T:WPA;S:video;P:InTheRoom;;  Reply 'y' to stop these.
+ack_key    = wifi-broadcast
+acked_ttl  = 1h
+
+; --------------------------------------------------------------------------
+; Rule 6 — ack-drop for the wifi-fanout above.
+;
+; WHAT THIS DOES
+;   Listens on the bitchat-bridge chat session for a mesh reply whose
+;   body matches y / yes / ok (case-insensitive, allowing leading
+;   whitespace). The tagged form the bridge writes is
+;       '[NICK@bitchat] BODY'  or  '[NICK@bitchat/#channel] BODY'
+;   (see bin/net-bitchat-bridge:555-558), so the match regex extracts
+;   (?<nick>...) from that prefix.
+;
+;   The rule's channel=noop is required (validated at load) — this is
+;   a pure state-mutation rule, not a wire post. The reactor
+;   reverse-looks up the peer_id via %NICK_TO_PID and records
+;   "wifi-broadcast\tacked\t<peer_id>" into the SeenFile. The next
+;   fanout tick sees this ack and skips the peer.
+;
+; ACK-DROP RULE GRAMMAR:
+;   trigger    — 'chat_message'
+;   session    — chat session to listen on ('bitchat-bridge' for the
+;                bridge-tagged mesh feed).
+;   match      — REQUIRED — regex with a named (?<nick>...) capture
+;                that pulls the nickname out of the bridge tag prefix.
+;                Any capture named 'nick' is used; capture named
+;                'peer_id' is ignored here (no 16-hex in the bridge
+;                tag today — see the "nickname collision" note above).
+;   ack_target — REQUIRED — the ack_key= of a periodic fanout rule
+;                whose acked_ttl set the SeenFile bucket name.
+;                Grammar: [A-Za-z][A-Za-z0-9._-]{0,31}.
+;   channel    — MUST be 'noop'. Wire channels are rejected at load
+;                to prevent an ack rule from accidentally leaking a
+;                reply back into the mesh.
+;   target     — optional (ignored on channel=noop).
+;   body       — optional (ignored on channel=noop).
+;
+; UNKNOWN-PEER HANDLING
+;   If the nick captured from the reply isn't in %NICK_TO_PID (peer
+;   never showed up on bitchat_peers, or hadn't yet as of this reply),
+;   the ack is dropped with a WARN log line and no SeenFile record is
+;   written. On the next fanout tick that peer will still be DM'd —
+;   which is the safe default: better to occasionally re-DM a peer
+;   who did ack than to permanently suppress a peer who didn't.
+; --------------------------------------------------------------------------
+[rule.wifi-ack]
+trigger    = chat_message
+session    = bitchat-bridge
+match      = ^\[(?<nick>[^@\]/]+)(?:/[^@\]]+)?@bitchat[^\]]*\]\s+(?i)(y|yes|ok)\s*$
+ack_target = wifi-broadcast
+channel    = noop
