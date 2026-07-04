@@ -37,10 +37,14 @@ as           = net-chat-autoresponder
 
 ; Comma-separated list of sender names whose chat_message rows we drop
 ; unconditionally. Prevents self-loop when a rule listens on a session
-; the reactor also posts into. Add 'bitchat-relay' if any chat_message
-; rule listens on session=bitchat-bridge (otherwise the bridge's own
-; '[SENDER@bitchat] body' relays would trigger it).
-echo_ignore  = net-chat-autoresponder, bitchat-relay
+; the reactor also posts into. Our own 'as' name is always ignored —
+; add senders here only when you want to filter them out.
+; NOTE: do NOT globally add 'bitchat-relay'. The bridge stamps BLE
+; inbound with that sender, and any chat_message rule that reacts to
+; BLE traffic (e.g. rule.wifi-on-request below) depends on it being
+; visible. If you have a rule that would echo-loop, use a per-rule
+; `from` filter instead.
+echo_ignore  = net-chat-autoresponder
 
 ; Dedup state file. Persists across restarts. A fresh install with an
 ; empty state file greets every already-connected peer exactly once —

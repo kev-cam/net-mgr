@@ -143,9 +143,9 @@ sub on_peer_row {
         my $ctx = { peer_id => $pid, nickname => $nick,
                     sender  => 'bitchat-relay', session => '',
                     map { ("cap.$_" => $cap{$_}) } keys %cap };
-        next if $r->{dedup_ttl} > 0
-             && $SEEN->hit("$r->{name}\t$pid", $r->{dedup_ttl});
-        dispatch($r, $ctx);
+        my $key = "$r->{name}\t$pid";
+        next if $r->{dedup_ttl} > 0 && $SEEN->check($key, $r->{dedup_ttl});
+        $SEEN->record($key) if dispatch($r, $ctx) && $r->{dedup_ttl} > 0;
     }
 }
 
@@ -164,9 +164,9 @@ sub on_chat_row {
         my $ctx = { peer_id => ($cap{peer_id} // ''), nickname => '',
                     sender  => $sender, session => $sess,
                     map { ("cap.$_" => $cap{$_}) } keys %cap };
-        next if $r->{dedup_ttl} > 0
-             && $SEEN->hit("$r->{name}\t$sender", $r->{dedup_ttl});
-        dispatch($r, $ctx);
+        my $key = "$r->{name}\t$sender";
+        next if $r->{dedup_ttl} > 0 && $SEEN->check($key, $r->{dedup_ttl});
+        $SEEN->record($key) if dispatch($r, $ctx) && $r->{dedup_ttl} > 0;
     }
 }
 
@@ -180,13 +180,13 @@ sub dispatch {
         unless ($target =~ /^[0-9a-f]{16}$/) {
             warn "[autoresponder $r->{name}] bitchat_dm target not 16-hex:"
                . " '$target' — skip\n";
-            return;
+            return 0;
         }
         my $preview = length($body) > 60
                     ? substr($body, 0, 60) . '...' : $body;
         if ($opt{'dry-run'}) {
             warn "[autoresponder dry-run $r->{name}] DM $target: $preview\n";
-            return;
+            return 1;
         }
         # Route via bridge's @HEX16: prefix convention (bridge:409-411).
         # net-chat-autoresponder posts to bitchat-bridge session; bridge's
@@ -196,25 +196,28 @@ sub dispatch {
                                       as      => $GLOBAL->{as}); 1 };
         if (!$ok) {
             warn "[autoresponder $r->{name}] chat_post(DM) failed: $@";
-        } else {
-            warn "[autoresponder $r->{name}] DM $target: $preview\n";
+            return 0;
         }
+        warn "[autoresponder $r->{name}] DM $target: $preview\n";
+        return 1;
     } elsif ($r->{channel} eq 'chat_post') {
         my $preview = length($body) > 60
                     ? substr($body, 0, 60) . '...' : $body;
         if ($opt{'dry-run'}) {
             warn "[autoresponder dry-run $r->{name}] post $target: $preview\n";
-            return;
+            return 1;
         }
         my $ok = eval { $W->chat_post(session => $target, body => $body,
                                       as => $GLOBAL->{as}); 1 };
         if (!$ok) {
             warn "[autoresponder $r->{name}] chat_post failed: $@";
-        } else {
-            warn "[autoresponder $r->{name}] post $target: $preview\n";
+            return 0;
         }
+        warn "[autoresponder $r->{name}] post $target: $preview\n";
+        return 1;
     } else {
         warn "[autoresponder $r->{name}] unknown channel '$r->{channel}'\n";
+        return 0;
     }
 }
 
@@ -472,16 +475,17 @@ sub _load {
     close $fh;
 }
 
-sub hit {
+sub check {
     my ($self, $key, $ttl) = @_;
-    my $now = time;
     my $prev = $self->{mem}{$key};
-    if (defined $prev && ($now - $prev) <= $ttl) {
-        return 1;
-    }
+    return defined $prev && (time - $prev) <= $ttl;
+}
+
+sub record {
+    my ($self, $key) = @_;
+    my $now = time;
     $self->{mem}{$key} = $now;
     $self->_append($key, $now);
-    return 0;
 }
 
 sub _append {

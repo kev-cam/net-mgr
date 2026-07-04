@@ -13,7 +13,10 @@ Wants=net-mgr.service
 Type=simple
 ExecStart=/usr/local/bin/net-chat-autoresponder --config /etc/net-mgr/net-chat-autoresponder.conf
 Restart=on-failure
-RestartSec=2
+# Matches net-mgr.service's own cadence — since After=net-mgr.service returns
+# as soon as ExecStart is invoked (not when 127.0.0.1:7531 is bound), a cold
+# boot briefly crash-loops while the daemon comes up. 5s dampens that.
+RestartSec=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=net-chat-autoresponder
