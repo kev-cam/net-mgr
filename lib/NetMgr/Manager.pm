@@ -6233,18 +6233,26 @@ sub _bitchat_relay_fanout {
     return $count;
 }
 
-# ---- REPAIR (loopback or may_repair) -----------------------------------
+# ---- REPAIR (default-allow, [repair] gates) ----------------------------
 #
 # Allowlisted host-maintenance actions the daemon runs on the caller's behalf.
-# Admission: loopback OR an AUTH'd connection whose key is on
-# /etc/net-mgr/allowed_repairers (may_repair cap). Called by bin/net-diag
-# under --repair when it's running unprivileged, so a non-root operator can
-# still self-heal a wedged interface via the root daemon (which has
-# CAP_NET_ADMIN). Fanned out remotely by `net-cluster repair`, which signs
-# the connection with a may_repair key. Each action is individually
-# kill-switchable via the [repair] section of the config (default: allow all
-# — "allow unless prohibited", explicit prohibit_all / prohibit_<action> =
-# true refuses).
+# Admission: DEFAULT ALLOW. Any caller (loopback or remote, authenticated
+# or not) reaches the action dispatcher unless the [repair] config section
+# prohibits it. Two prohibition switches:
+#
+#   [repair]
+#   prohibit_remote      = true   ; refuse non-loopback callers (default false)
+#   prohibit_unauth      = true   ; refuse remote callers who did not AUTH
+#                                 ; (default false; ignored on loopback)
+#   prohibit_all         = true   ; kill switch, refuses every action
+#   prohibit_<action>    = true   ; per-action kill (wifi_cycle, ...)
+#
+# Rationale: net-mgr already runs as root and the cluster is a trusted
+# private mesh; requiring a per-node allowlist file for what is really
+# just a link-cycle is too much friction. Operators who want the tighter
+# posture set prohibit_remote or prohibit_unauth explicitly. The may_repair
+# AUTH cap is still computed (see _handle_auth_response) so operators can
+# still gate specific actions off may_repair via config policy externally.
 #
 # Wire format:
 #   REPAIR action=<name> [iface=<name>] [name=<conn>]
@@ -6262,12 +6270,17 @@ sub _bitchat_relay_fanout {
 # shell so validated args are passed through as argv without word-splitting.
 sub _handle_repair {
     my ($self, $cli, $cmd) = @_;
-    unless (_peer_is_loopback($cli)
-            || ($cli->{auth} && $cli->{auth}{may_repair})) {
+    my $rcfg = ($self->{config}{repair} ||= {});
+    my $is_lb = _peer_is_loopback($cli);
+    if (!$is_lb && _repair_is_true($rcfg->{prohibit_remote})) {
         return $self->_send($cli, format_err(
-            "REPAIR: not authorized — must be loopback or"
-          . " authenticated with may_repair cap"
-          . " (add the key to /etc/net-mgr/allowed_repairers)"));
+            "REPAIR: remote callers refused by [repair] prohibit_remote"));
+    }
+    if (!$is_lb && _repair_is_true($rcfg->{prohibit_unauth})
+                && !($cli->{auth} && $cli->{auth}{verified})) {
+        return $self->_send($cli, format_err(
+            "REPAIR: unauthenticated remote callers refused by"
+          . " [repair] prohibit_unauth"));
     }
 
     my $kv = $cmd->{kv} || {};
@@ -6292,7 +6305,7 @@ sub _handle_repair {
 
     # Config gate — default ALLOW. prohibit_all is the master switch;
     # prohibit_<action> is per-rung. Both default off/absent = allowed.
-    my $rcfg = $self->{config}{repair} || {};
+    # ($rcfg already declared at the scope check above.)
     if (_repair_is_true($rcfg->{prohibit_all})) {
         return $self->_send($cli,
             format_err("REPAIR: all actions prohibited by [repair] prohibit_all"));

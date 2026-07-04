@@ -180,21 +180,37 @@ domain   = grfx.com
 # method      = auto              # auto | iptables | socat
 # allow_peers = 192.168.0.0/16
 
-# Kill switch for the REPAIR verb (loopback-only host maintenance called by
-# bin/net-diag under --repair when running unprivileged — the daemon runs
-# the ip/nmcli/dhclient commands so a non-root operator can still self-heal).
-# Default: allow all. Each key is optional; a per-action prohibit_<name> =
-# true refuses just that action, and prohibit_all = true is the master
-# switch. Truthy tokens: on | yes | true | 1 (case-insensitive). Absent /
-# off / no / false / 0 = allowed.
+# Kill switches for the REPAIR verb (host maintenance called by bin/net-diag
+# under --repair, and by remote peers via `net-cluster repair` — the daemon
+# runs the ip/nmcli/dhclient commands so a non-root operator can still
+# self-heal a wedged interface).
 #
-# Actions:
-#   wifi_cycle      — nmcli device disconnect + connect
-#   ethernet_cycle  — ip link set IFACE down + up
-#   dhcp_cycle      — dhclient -r + dhclient (else dhcpcd -k + dhcpcd)
-#   conn_up         — nmcli connection up NAME
-#   conn_down       — nmcli connection down NAME
+# ADMISSION MODEL: default ALLOW. Any caller (loopback OR remote,
+# authenticated OR not) reaches the action dispatcher unless one of the
+# prohibit_* keys refuses. Rationale: net-mgr already runs as root, the
+# cluster is a trusted private mesh, and requiring a per-node allowlist
+# file just to bounce a wedged link is more friction than the risk warrants.
+# Sites that want stricter posture set prohibit_remote (block non-loopback)
+# or prohibit_unauth (require an --auth signed connection for remote).
+#
+# Each key is optional. Truthy tokens: on | yes | true | 1
+# (case-insensitive). Absent / off / no / false / 0 = allowed.
+#
+# Admission gates:
+#   prohibit_remote     — refuse non-loopback callers entirely
+#   prohibit_unauth     — refuse remote callers that did NOT AUTH
+#                         (loopback callers ignore this)
+#
+# Per-action kill switches (any one refuses just that action):
+#   prohibit_all        — master switch, refuses every action
+#   prohibit_wifi_cycle       nmcli device disconnect + connect
+#   prohibit_ethernet_cycle   ip link set IFACE down + up
+#   prohibit_dhcp_cycle       dhclient -r + dhclient (else dhcpcd)
+#   prohibit_conn_up          nmcli connection up NAME
+#   prohibit_conn_down        nmcli connection down NAME
 [repair]
+# prohibit_remote         = false
+# prohibit_unauth         = false
 # prohibit_all            = false
 # prohibit_wifi_cycle     = false
 # prohibit_ethernet_cycle = false
