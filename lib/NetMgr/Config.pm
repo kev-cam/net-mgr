@@ -209,8 +209,23 @@ sub load {
     $path //= $ENV{NET_MGR_CONF} // '/etc/net-mgr/config';
     my $cfg = _deep_copy(\%DEFAULTS);
 
-    if (-e $path) {
-        open my $fh, '<', $path or croak "open $path: $!";
+    # Load order: main file first, then sibling <path>.d/*.conf in
+    # filename-sort order. Overlay files are optional; a missing dir is
+    # silently ignored. Each overlay is parsed the same way as the main
+    # file — sections + keys merge into the accumulating $cfg, so an
+    # overlay setting [repair] prohibit_unauth = true adds that key
+    # without disturbing anything else in the main config's [repair].
+    # Last-write-wins on collision (later overlays override earlier ones,
+    # and every overlay overrides main).
+    my @paths = ($path);
+    (my $dotd = $path) =~ s{/*$}{.d};
+    if (-d $dotd) {
+        push @paths, sort glob "$dotd/*.conf";
+    }
+
+    for my $p (@paths) {
+        next unless -e $p;
+        open my $fh, '<', $p or croak "open $p: $!";
         my $section;
         my $subsection;     # for named sections like [ipv6_vlan "he_net"]
         my $lineno = 0;
@@ -234,7 +249,7 @@ sub load {
                 $cfg->{$section} //= {};
                 next;
             }
-            croak "$path:$lineno: line outside any section: $line" unless defined $section;
+            croak "$p:$lineno: line outside any section: $line" unless defined $section;
 
             if ($section eq 'bindings') {
                 if ($line =~ /^machine\s+"([^"]+)"\s*=\s*(.*)$/) {
@@ -243,7 +258,7 @@ sub load {
                     $cfg->{bindings}{machines}{$name} = [ map { lc } @macs ];
                     next;
                 }
-                croak "$path:$lineno: bad [bindings] line: $line";
+                croak "$p:$lineno: bad [bindings] line: $line";
             }
 
             # [uplinks]
@@ -259,7 +274,7 @@ sub load {
                     my $role   = (@t && $t[0] =~ /^(active|backup)$/i) ? lc shift @t
                                                                        : 'active';
                     my $target = shift @t;
-                    croak "$path:$lineno: [uplinks] $label needs a target"
+                    croak "$p:$lineno: [uplinks] $label needs a target"
                         unless defined $target;
                     my ($via, $interval);
                     while (@t) {
@@ -267,7 +282,7 @@ sub load {
                         if    (lc $kw eq 'via')      { $via      = shift @t }
                         elsif (lc $kw eq 'interval') { $interval = parse_duration(shift @t) }
                         else {
-                            croak "$path:$lineno: [uplinks] $label: unknown token '$kw'";
+                            croak "$p:$lineno: [uplinks] $label: unknown token '$kw'";
                         }
                     }
                     $interval //= ($role eq 'backup' ? 3600 : 60);
@@ -279,7 +294,7 @@ sub load {
                     };
                     next;
                 }
-                croak "$path:$lineno: bad [uplinks] line: $line";
+                croak "$p:$lineno: bad [uplinks] line: $line";
             }
 
             if ($line =~ /^([A-Za-z_][\w-]*)\s*=\s*(.*)$/) {
@@ -295,7 +310,7 @@ sub load {
                 $cfg->{$section}{$k} = $v;
                 next;
             }
-            croak "$path:$lineno: unparseable line: $line";
+            croak "$p:$lineno: unparseable line: $line";
         }
         close $fh;
     }

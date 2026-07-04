@@ -3,6 +3,17 @@
 # Other files in /etc/net-mgr/ are loaded by their own components
 # (e.g. /etc/net-mgr/dhcp for the dhcp/dnsmasq integration).
 #
+# OVERLAYS: files matching /etc/net-mgr/config.d/*.conf are loaded AFTER
+# this file in filename-sort order. Each overlay is parsed the same INI
+# grammar and merges its sections + keys into the accumulating config.
+# Last-write-wins on collision (any key set in a later overlay overrides
+# earlier overlays and this file). Missing config.d is silently ignored.
+# The `.d` sibling tracks the config path — if NET_MGR_CONF points to
+# /path/to/foo, its overlay dir is /path/to/foo.d. Use overlays to drop
+# in site-specific policy without editing the packaged file — e.g. a
+# /etc/net-mgr/config.d/10-repair-strict.conf that just contains
+# `[repair]\nprohibit_unauth = true` to require --auth on remote REPAIR.
+#
 # Client tools (net-chat, net-lookup, net-ssh/net-vnc, ...) also read a
 # per-user file at ~/.config/net-mgr/config that overlays this one. The
 # [servers] section below is most useful there.
