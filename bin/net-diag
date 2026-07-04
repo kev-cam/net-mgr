@@ -504,6 +504,22 @@ sub cmd_watch {
 
     my $consecutive_downs = 0;
     my $last_repair_ts    = 0;
+    # Multi-stage repair ladder state. Stage 0 = "cycle the currently-active
+    # connection" (the original behavior). Stages 1..N walk through the
+    # alternate saved profiles from nmcli (see _watch_list_alt_profiles):
+    # first an alternate WiFi profile, then a wired profile if we have one,
+    # then remaining WiFi profiles. After a full pass we set a longer
+    # backoff so a chronically-down uplink doesn't burn nmcli cycles
+    # forever. Cache alt_profiles for CACHE_TTL seconds so we survive a
+    # brief NM restart without re-enumerating on every trigger.
+    my %repair_state = (
+        stage              => 0,
+        alt_wifi           => [],
+        alt_eth            => [],
+        alt_active_name    => undef,
+        profiles_ts        => 0,
+        long_backoff_until => 0,
+    );
 
     local $SIG{INT}  = sub { _emit_all(\@sinks, "[net-diag] SIGINT — exiting");
                              _close_sinks(\@sinks); exit 0 };
@@ -520,9 +536,10 @@ sub cmd_watch {
 
         if ($do_repair
             && $consecutive_downs >= WATCH_DOWNS_FOR_REPAIR
-            && (time() - $last_repair_ts) >= WATCH_REPAIR_COOLDOWN_S)
+            && (time() - $last_repair_ts) >= WATCH_REPAIR_COOLDOWN_S
+            && time() >= $repair_state{long_backoff_until})
         {
-            my $verb = _watch_repair($tick, \@sinks);
+            my $verb = _watch_repair($tick, \@sinks, \%repair_state);
             $last_repair_ts = time();
             $consecutive_downs = 0;
             # After a repair, wait one full interval before the next
@@ -566,16 +583,18 @@ sub _watch_tick {
     $t{nm_state} = _watch_nm_state();
 
     # Verdict:
-    #   down     if gateway is unreachable, or both inet + dns fail
-    #   degraded if any single probe fails, or RTT elevated
+    #   down     if gateway ping loses, internet ping loses, OR DNS query
+    #            fails. Any one of the three is treated as fatal. DNS
+    #            especially: the clevo pattern (ICMP-to-IP fine but the
+    #            fe80:: link-local resolver's NUD entry goes STALE and every
+    #            lookup stalls) used to keep verdict at 'degraded' forever
+    #            because it was only one of three probes — the box "had
+    #            connectivity" but nothing resolved and --repair never
+    #            fired. Escalating a pure dns=FAIL to 'down' fixes that.
+    #   degraded if all probes ok but one of the RTTs / DNS time is elevated
     #   ok       otherwise
-    my $fails =    ($gw_probe->{ok}   ? 0 : 1)
-                 + ($inet_probe->{ok} ? 0 : 1)
-                 + ($dns_probe->{ok}  ? 0 : 1);
-    if (!$gw_probe->{ok} || $fails >= 2) {
+    if (!$gw_probe->{ok} || !$inet_probe->{ok} || !$dns_probe->{ok}) {
         $t{verdict} = 'down';
-    } elsif ($fails == 1) {
-        $t{verdict} = 'degraded';
     } elsif ((defined $t{gw_rtt_ms}   && $t{gw_rtt_ms}   > WATCH_RTT_DEGRADED_MS)
           || (defined $t{inet_rtt_ms} && $t{inet_rtt_ms} > WATCH_RTT_DEGRADED_MS)
           || (defined $t{dns_ms}      && $t{dns_ms}      > WATCH_DNS_DEGRADED_MS)) {
@@ -705,12 +724,32 @@ sub _watch_hostname {
 # --- repair ladder ---------------------------------------------------
 #
 # Called only when K consecutive 'down' verdicts have accumulated AND
-# the cooldown has elapsed. Picks wifi vs ethernet from the default
-# iface's classification. Returns a short verb ('wifi cycle',
-# 'ethernet cycle', 'no default iface — nothing to repair') for the
-# post-repair log message.
+# the cooldown has elapsed AND the long-backoff window (set after a full
+# ladder wrap) has passed.
+#
+# Multi-stage ladder driven by \%state (see cmd_watch):
+#   stage 0  cycle whatever's currently active on iface_default
+#            (nmcli device disconnect+connect for wifi, ip link + DHCP
+#             for ethernet). This is the original single-step behavior.
+#   stage 1  bring up the FIRST alternate saved WiFi profile.
+#   stage 2  bring up the wired profile (if one exists) — the "toggle
+#            Ethernet as fallback" step. Skipped when no wired profile.
+#   stage 3+ walk the remaining alternate WiFi profiles.
+#   wrap     after all stages exhausted: reset to stage 0 and arm a
+#            long backoff (WATCH_REPAIR_COOLDOWN_S * 4). Keeps a
+#            perma-broken uplink from thrashing the radios.
+#
+# Between stages the caller's normal gate (K=2 downs + 60s cooldown)
+# still applies — this function fires exactly one action per call.
+#
+# Alt profile enumeration is cached in \%state for CACHE_TTL seconds so
+# repeated triggers don't re-shell nmcli every time. Enumeration itself
+# is unprivileged; only the con-up execution needs root/polkit or a
+# daemon delegation.
+use constant WATCH_PROFILE_CACHE_TTL_S => 1800;   # 30 min
+
 sub _watch_repair {
-    my ($tick, $sinks) = @_;
+    my ($tick, $sinks, $state) = @_;
     my $iface = $tick->{iface_default};
     my $kind  = $tick->{iface_kind};
     unless (defined $iface && length $iface) {
@@ -718,6 +757,103 @@ sub _watch_repair {
             "[net-diag/repair] no default route — nothing to cycle");
         return "no-op (no default iface)";
     }
+
+    my $now = time();
+    # Refresh the alt-profile cache lazily — on first use, on expiry, and
+    # whenever the currently-active profile has changed (so an earlier
+    # ladder step that succeeded shows up in the "currently active"
+    # exclusion the next time we enumerate).
+    my $active = _watch_active_profile($iface);
+    my $expired  = ($now - ($state->{profiles_ts} // 0))
+                       > WATCH_PROFILE_CACHE_TTL_S;
+    my $active_changed = (
+        (defined $active ? $active : '')
+     ne (defined $state->{alt_active_name} ? $state->{alt_active_name} : '')
+    );
+    if ($expired || $active_changed
+        || (!@{ $state->{alt_wifi} } && !@{ $state->{alt_eth} }))
+    {
+        my ($wifi, $eth) = _watch_list_alt_profiles($active);
+        $state->{alt_wifi}        = $wifi;
+        $state->{alt_eth}         = $eth;
+        $state->{alt_active_name} = $active;
+        $state->{profiles_ts}     = $now;
+        _emit_all($sinks, sprintf(
+            "[net-diag/repair] profile cache: active='%s' "
+          . "alt_wifi=[%s] alt_eth=[%s]",
+            $active // '?',
+            join(',', map { $_->{name} } @{ $state->{alt_wifi} }),
+            join(',', map { $_->{name} } @{ $state->{alt_eth}  })));
+    }
+
+    # Build the ladder from stage 1 upward as an ordered list of
+    # {kind => wifi|ethernet, name => PROFILE} steps. Stage 0 is the
+    # cycle-current-iface step handled separately.
+    my @ladder;
+    my $wifi = $state->{alt_wifi};
+    my $eth  = $state->{alt_eth};
+    push @ladder, { kind => 'wifi',     name => $wifi->[0]{name} }
+        if @$wifi >= 1;
+    push @ladder, { kind => 'ethernet', name => $eth->[0]{name}  }
+        if @$eth  >= 1;
+    for my $i (1 .. $#$wifi) {
+        push @ladder, { kind => 'wifi', name => $wifi->[$i]{name} };
+    }
+
+    my $stage = $state->{stage} // 0;
+
+    # Stage 0: cycle current iface (original behavior).
+    if ($stage == 0) {
+        my $verb = _watch_repair_stage0($iface, $kind, $sinks);
+        # Advance. If we have no alt profiles at all, wrap immediately —
+        # there's nowhere else to go.
+        if (!@ladder) {
+            $state->{long_backoff_until} = $now
+                + WATCH_REPAIR_COOLDOWN_S * 4;
+            _emit_all($sinks, sprintf(
+                "[net-diag/repair] no alt profiles known — long backoff "
+              . "%ds before retrying stage 0",
+                WATCH_REPAIR_COOLDOWN_S * 4));
+            $state->{stage} = 0;
+        } else {
+            $state->{stage} = 1;
+        }
+        return "$verb [stage 0/" . scalar(@ladder) . "]";
+    }
+
+    # Stages 1..N: bring up one alternate profile per trigger.
+    my $idx = $stage - 1;
+    if ($idx > $#ladder) {
+        # Shouldn't happen (we wrap below) but be defensive: reset.
+        $state->{stage} = 0;
+        $state->{long_backoff_until} = $now + WATCH_REPAIR_COOLDOWN_S * 4;
+        _emit_all($sinks,
+            "[net-diag/repair] ladder overrun — resetting to stage 0 "
+          . "with long backoff");
+        return "ladder wrap";
+    }
+    my $step = $ladder[$idx];
+    my $verb = _watch_repair_stage_conn_up($step, $sinks);
+
+    # Advance / wrap.
+    $state->{stage} = $stage + 1;
+    my $total = scalar @ladder;
+    if ($state->{stage} > $total) {
+        $state->{stage} = 0;
+        $state->{long_backoff_until} = $now + WATCH_REPAIR_COOLDOWN_S * 4;
+        _emit_all($sinks, sprintf(
+            "[net-diag/repair] ladder wrap after stage %d — long backoff "
+          . "%ds before restarting at stage 0",
+            $stage, WATCH_REPAIR_COOLDOWN_S * 4));
+    }
+    return "$verb [stage $stage/$total]";
+}
+
+# Stage 0: cycle whatever's currently active on the default iface. This
+# is the original single-step behavior, factored out so the ladder
+# dispatcher can call it uniformly.
+sub _watch_repair_stage0 {
+    my ($iface, $kind, $sinks) = @_;
 
     # Non-root delegates to the loopback daemon's REPAIR verb (which has
     # CAP_NET_ADMIN and enforces its own per-action [repair] gates). Root
@@ -773,6 +909,108 @@ sub _watch_repair {
         _watch_run($sinks, 'dhcpcd', $iface);
     }
     return "ethernet cycle ($iface)";
+}
+
+# Stages 1+: bring up a specific NM profile by name. Root shells nmcli
+# directly; non-root delegates to the daemon's 'conn_up' REPAIR verb
+# (which is already registered and validates the name). Delegation
+# failure falls through to a direct shell — same discipline as stage 0
+# so a wedged daemon can't strand the ladder.
+sub _watch_repair_stage_conn_up {
+    my ($step, $sinks) = @_;
+    my $name = $step->{name};
+    my $kind = $step->{kind};
+    my $via_daemon = ($> != 0);
+    my $path_tag   = $via_daemon ? 'via-daemon' : 'direct-shell';
+
+    _emit_all($sinks, sprintf(
+        "[net-diag/repair] alt %s profile up name='%s' (%s)",
+        $kind, $name, $path_tag));
+
+    if ($via_daemon) {
+        my $ok = _watch_repair_via_daemon($sinks, 'conn_up',
+                                          name => $name);
+        return "alt $kind '$name' via daemon" if $ok;
+        _emit_all($sinks,
+            "[net-diag/repair]   daemon delegation failed — "
+          . "falling back to direct shell-out");
+    }
+    _watch_run($sinks, 'nmcli', 'connection', 'up', 'id', $name);
+    return "alt $kind '$name'";
+}
+
+# Enumerate saved NM connections and split them into (alt_wifi, alt_eth)
+# lists, excluding the currently-active profile ($skip_name). Only saved
+# 802-11-wireless profiles with AUTOCONNECT=yes are kept in alt_wifi —
+# an autoconnect=no profile is usually a venue/guest SSID the operator
+# intentionally kept dormant; forcing it on during a repair-storm is
+# rude. Ethernet profiles are kept unconditionally — the fallback-to-
+# wired step is the whole point of stage 2.
+#
+# Terse-mode parsing note: nmcli -t uses ':' as the field separator and
+# '\' to escape ':' or '\' inside a value. We ask for a fixed column
+# order (NAME,TYPE,AUTOCONNECT) so NAME is the ONLY column that can
+# contain a colon; TYPE and AUTOCONNECT are constants from a known set.
+# We split from the right (TYPE and AUTOCONNECT are the last two fields)
+# so a name like "foo:bar" doesn't upset column indexing.
+sub _watch_list_alt_profiles {
+    my ($skip_name) = @_;
+    return ([], []) unless _watch_have('nmcli');
+    my $out = `nmcli -t -f NAME,TYPE,AUTOCONNECT con show 2>/dev/null`;
+    return ([], []) unless defined $out;
+    my (@wifi, @eth);
+    for my $line (split /\n/, $out) {
+        next unless length $line;
+        my ($name, $type, $ac) = _watch_nmcli_parse_row($line, 3);
+        next unless defined $name && length $name;
+        next if defined $skip_name && $name eq $skip_name;
+        if ($type eq '802-11-wireless') {
+            next unless defined $ac && $ac eq 'yes';
+            push @wifi, { name => $name, kind => 'wifi' };
+        }
+        elsif ($type eq '802-3-ethernet') {
+            push @eth, { name => $name, kind => 'ethernet' };
+        }
+    }
+    return (\@wifi, \@eth);
+}
+
+# Find the profile name currently active on $iface. Unprivileged.
+# Returns undef if no active profile is bound to that device.
+sub _watch_active_profile {
+    my ($iface) = @_;
+    return undef unless defined $iface && length $iface;
+    return undef unless _watch_have('nmcli');
+    my $out = `nmcli -t -f NAME,DEVICE,STATE con show --active 2>/dev/null`;
+    return undef unless defined $out;
+    for my $line (split /\n/, $out) {
+        next unless length $line;
+        my ($name, $device, $state) = _watch_nmcli_parse_row($line, 3);
+        next unless defined $device && $device eq $iface;
+        next unless defined $state  && $state  eq 'activated';
+        return $name;
+    }
+    return undef;
+}
+
+# Split one nmcli -t row into $ncols fields, honoring '\:' and '\\'
+# escapes. TYPE / AUTOCONNECT / STATE / DEVICE values contain no colons
+# or backslashes, so we peel the trailing $ncols-1 fields off the right
+# and take everything remaining as the NAME. That way a NAME like
+# "foo:bar" (which nmcli would emit as "foo\:bar") isn't mis-split.
+sub _watch_nmcli_parse_row {
+    my ($line, $ncols) = @_;
+    return () unless defined $line && length $line;
+    # Split on ':' NOT preceded by '\'. Perl's lookbehind handles this.
+    my @parts = split /(?<!\\):/, $line;
+    return () if @parts < $ncols;
+    my @tail = splice @parts, -($ncols - 1);
+    my $name = join(':', @parts);   # everything left over is the NAME
+    for ($name) {
+        s/\\:/:/g;
+        s/\\\\/\\/g;
+    }
+    return ($name, @tail);
 }
 
 # Delegate one REPAIR action to the loopback daemon. Returns true on OK,
