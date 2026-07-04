@@ -35,24 +35,22 @@ as = bitchat-relay
 listen = 127.0.0.1:7531
 
 [bitchat_bridge]
-# First-seen greeting: when a BLE peer_id first appears (from an inbound
-# msg OR the periodic peers cmd_reply), DM this string to them ONCE per
-# daemon lifetime. Absent / empty = feature off (default).
-#
-# The canonical use is an Android/iOS WIFI: QR-code URI. Android's
-# Messages, Signal, and most modern chat apps render such a string as
-# a tap-to-join WiFi credential without the peer having to type SSID
-# or password. Format:
-#     WIFI:T:<auth>;S:<ssid>;P:<password>;;
-# where <auth> is WPA | WPA2 | WEP | nopass (drop P: for nopass).
-#
-# For the video-c bridge (SSID "video", password "InTheRoom") this is:
-#     greeting = WIFI:T:WPA;S:video;P:InTheRoom;;
-#
-# The set of already-greeted peers is in-memory only — a helper respawn
-# or daemon restart will re-greet everyone. That's acceptable for tier-0
-# because the WIFI: URI is idempotent from the user's side.
-#greeting = WIFI:T:WPA;S:video;P:InTheRoom;;
+# NOTE (removed after 2026-07): the `greeting =` key moved to the new
+# net-chat-autoresponder service. Configure the WIFI-URL first-seen
+# greeting via a [rule.wifi-greeting] section in
+# /etc/net-mgr/net-chat-autoresponder.conf (or in a
+# /etc/net-mgr/net-chat-autoresponder.d/*.conf overlay).
+# Example that reproduces the old default:
+#     [rule.wifi-greeting]
+#     trigger    = bitchat_peer_first_seen
+#     match      = .*
+#     dedup_ttl  = 30d
+#     channel    = bitchat_dm
+#     target     = ${peer_id}
+#     body       = WIFI:T:WPA;S:video;P:InTheRoom;;
+# The wire path (autoresponder chat_post → bitchat-bridge session →
+# helper stdin DM) is unchanged; only the source of the greeting text
+# moved.
 
 # Per-site BLE nickname advertised over BitChat. Every bridge built from
 # bigsony's tree currently defaults to "bigsony-bridge" (compiled into

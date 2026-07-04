@@ -1,0 +1,132 @@
+; /etc/net-mgr/net-chat-autoresponder.conf
+; ==========================================================================
+; net-chat-autoresponder rule set. INI format:
+;
+;   ; comments start with ';' or '#'
+;   [global]                     ; optional; defaults shown below
+;   [rule.NAME]                  ; one section per rule; NAME = [A-Za-z][A-Za-z0-9._-]{0,31}
+;
+; Overlays: /etc/net-mgr/net-chat-autoresponder.d/*.conf are loaded AFTER
+; this file in filename-sort order. A duplicate [rule.NAME] REPLACES the
+; earlier one (last-write-wins per rule name), so a site can override the
+; wifi-greeting body by dropping ONE file into the .d/ directory without
+; editing the packaged default.
+;
+; State (dedup) file: /var/lib/net-mgr/net-chat-autoresponder.seen —
+; owned by the reactor, one line per dedup key ('key\tepoch\n', append-only,
+; lazy-pruned). Delete it to force every rule to fire again.
+;
+; See bin/net-chat-autoresponder --help for CLI. See project_bitchat-bridge
+; memory note for the wire-path story (bridge:409-411 strips the '@HEX16:'
+; prefix and DMs the peer via helper stdin).
+; ==========================================================================
+
+[global]
+; NetMgr::Client target — loopback because `as` is trusted by the daemon
+; only for loopback connections (see netchat gotcha #6). Non-loopback
+; deployments should add auth_key_id/auth_key_file here and the responder
+; will $R->auth()/$W->auth() after HELLO. Not needed today because the
+; canonical caller (video-c) runs the responder next to its daemon.
+listen       = 127.0.0.1:7531
+
+; Sender attribution stamped onto every OBSERVE kind=chat_msg. Used as the
+; sender field in the chat_messages row and as the primary self-loop
+; guard: on_chat_row drops any row whose sender is in echo_ignore
+; (default is JUST this value).
+as           = net-chat-autoresponder
+
+; Comma-separated list of sender names whose chat_message rows we drop
+; unconditionally. Prevents self-loop when a rule listens on a session
+; the reactor also posts into. Add 'bitchat-relay' if any chat_message
+; rule listens on session=bitchat-bridge (otherwise the bridge's own
+; '[SENDER@bitchat] body' relays would trigger it).
+echo_ignore  = net-chat-autoresponder, bitchat-relay
+
+; Dedup state file. Persists across restarts. A fresh install with an
+; empty state file greets every already-connected peer exactly once —
+; which is the right behaviour when a new site comes up.
+state_file   = /var/lib/net-mgr/net-chat-autoresponder.seen
+
+; --------------------------------------------------------------------------
+; Rule 1 — the WIFI-URL greeting on first-seen BLE peer sighting.
+;
+; This REPLACES the in-process greeter that used to live in
+; net-bitchat-bridge under [bitchat_bridge].greeting. Wire path:
+;
+;   bitchat_peers ROW op=insert  --stream-->  autoresponder $R
+;   autoresponder $W chat_post   session=bitchat-bridge
+;                                body='@<peer_id>: WIFI:...'  as=net-chat-autoresponder
+;   daemon _emit_change --stream--> bridge $sub
+;   bridge strips '@<hex>:' prefix (bridge:409-411)
+;   bridge writes {cmd:send, to_peer:<pid>, body:'WIFI:...'} to helper stdin
+;   BLE DM to the peer — BitChat clients render WIFI: URIs as click-to-join.
+;
+; Keys:
+;   trigger    — REQUIRED — one of bitchat_peer_first_seen | chat_message
+;   match      — optional Perl regex on bitchat_peers.nickname (default '.*').
+;                Named captures land in ${cap.NAME} for target/body.
+;   dedup_ttl  — window during which a repeat first-seen for the same
+;                peer_id will NOT re-fire this rule. Default 30d. Set to 0
+;                to fire on every insert. Suffix: s|m|h|d|w.
+;   channel    — REQUIRED — bitchat_dm | chat_post
+;   target     — REQUIRED literal string with ${…} substitution.
+;                For channel=bitchat_dm the resolved value MUST be exactly
+;                16 lowercase hex (validated at load AND per-fire).
+;                For channel=chat_post it is the session name.
+;   body       — REQUIRED literal string with ${…} substitution.
+;
+; Substitution tokens (target + body):
+;   ${peer_id}   the 16-hex BitChat peer id (bitchat_peers row) or,
+;                for chat_message rules, the value of the peer_id capture
+;   ${nickname}  bitchat_peers.nickname (empty for chat_message)
+;   ${sender}    chat_messages.sender (or 'bitchat-relay' for BLE rules)
+;   ${session}   chat_messages.session (empty for BLE rules)
+;   ${cap.NAME}  any Perl named capture from `match`
+;   $$           literal '$'
+; --------------------------------------------------------------------------
+[rule.wifi-greeting]
+trigger    = bitchat_peer_first_seen
+match      = .*
+dedup_ttl  = 30d
+channel    = bitchat_dm
+target     = ${peer_id}
+body       = WIFI:T:WPA;S:video;P:InTheRoom;;
+
+; --------------------------------------------------------------------------
+; Rule 2 — reply with the same URI when anyone types 'wifi?' in the bridge
+; session. Regex is anchored to the bridge's tagged inbound format
+; '[SENDER@bitchat[/chan]] body' (bridge:562-565). v1 replies broadcast
+; into bitchat-bridge — the bridge re-radiates to all BLE peers; a future
+; revision could DM the asker specifically once we thread sender_peer_id
+; through the tag.
+;
+; chat_message keys (in addition to trigger/channel/target/body):
+;   session    — REQUIRED — chat_messages.session to listen on. Sanitized to
+;                [A-Za-z0-9._-]{1,64} before the WHERE clause is built.
+;   match      — REQUIRED — Perl regex on chat_messages.body. Named
+;                captures land in ${cap.NAME}.
+;   from       — optional — only fires when chat_messages.sender equals
+;                this string exactly.
+;   dedup_ttl  — default 0 for chat_message (fire on every match). When
+;                set the dedup key is 'RULE_NAME\tsender'.
+; --------------------------------------------------------------------------
+[rule.wifi-on-request]
+trigger    = chat_message
+session    = bitchat-bridge
+match      = ^\[[^\]]+@bitchat[^\]]*\]\s+(?i)wi-?fi\??\s*$
+dedup_ttl  = 5m
+channel    = chat_post
+target     = ${session}
+body       = WIFI:T:WPA;S:video;P:InTheRoom;;
+
+; --------------------------------------------------------------------------
+; Rule 3 — ops-channel liveness probe. Someone types '!hello', we ack.
+; No dedup: every ping gets an ack, which is the whole point of a probe.
+; --------------------------------------------------------------------------
+[rule.ops-hello]
+trigger    = chat_message
+session    = ops
+match      = (?i)^!hello\b
+channel    = chat_post
+target     = ${session}
+body       = hi ${sender} — net-chat-autoresponder alive

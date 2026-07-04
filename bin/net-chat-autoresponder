@@ -1,0 +1,547 @@
+#!/usr/bin/perl
+# net-chat-autoresponder — rule-driven reactor for the net-mgr chat stream.
+#
+# Loads /etc/net-mgr/net-chat-autoresponder.conf (INI) plus any overlays
+# in /etc/net-mgr/net-chat-autoresponder.d/*.conf, subscribes to the
+# daemon streams the rules reference (bitchat_peers first-seen and/or
+# chat_messages per session), and dispatches chat_post replies via
+# NetMgr::Client on loopback.
+#
+# Split of concerns:
+#   - net-bitchat-bridge remains the BLE plumbing (helper supervisor,
+#     nickname wiring, cross-site relay, WIFI?-in-DM onramp).
+#   - THIS process owns rule-based reactions — first-seen greetings, chat
+#     canned replies, etc. — that were formerly ad-hoc knobs on the bridge.
+#     Moving the wifi-greeting here means an operator can override the
+#     greeting body by editing one INI file in
+#     /etc/net-mgr/net-chat-autoresponder.d/ WITHOUT touching the bridge.
+#
+# Two clients, per the house style at net-bitchat-bridge:213-217 and
+# net-chat cmd_test:512-513:
+#   $R — read/SUBSCRIBE socket (stream-only; no snapshot replay at boot).
+#   $W — write/OBSERVE socket (chat_post). Both talk loopback:7531.
+#
+# Usage:
+#   net-chat-autoresponder [--config FILE] [--listen H:P] [--once] [--dry-run]
+#
+# See etc/net-chat-autoresponder.conf.sample for the rule grammar.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use Fcntl qw(:flock O_RDWR O_CREAT O_APPEND);
+use NetMgr::Client;
+use NetMgr::Protocol qw(parse_line);
+
+$SIG{PIPE} = 'IGNORE';                      # net-chat:60 shape
+$| = 1;
+
+my %opt = (config => '/etc/net-mgr/net-chat-autoresponder.conf');
+GetOptions(\%opt, 'config=s', 'listen=s', 'once', 'dry-run', 'help')
+    or usage(2);
+usage(0) if $opt{help};
+
+# ---- 1. Load rules ----------------------------------------------------------
+my ($GLOBAL, @RULES) = load_config($opt{config});
+$GLOBAL->{listen} = $opt{listen} if $opt{listen};
+
+# echo_ignore: drop chat_message rows whose sender matches any of these.
+# The rule's own $as is always ignored (self-loop guard).
+my %ignore = map { $_ => 1 }
+             grep { length }
+             map  { s/^\s+|\s+$//gr }
+             split /,/, ($GLOBAL->{echo_ignore} // $GLOBAL->{as} // '');
+$ignore{ $GLOBAL->{as} } = 1 if defined $GLOBAL->{as} && length $GLOBAL->{as};
+
+my $SEEN = SeenFile->open($GLOBAL->{state_file}
+                          // '/var/lib/net-mgr/net-chat-autoresponder.seen');
+
+my @ble_rules  = grep { $_->{trigger} eq 'bitchat_peer_first_seen' } @RULES;
+my @chat_rules = grep { $_->{trigger} eq 'chat_message' }            @RULES;
+my %chat_sessions;
+$chat_sessions{$_->{session}}++ for @chat_rules;
+
+warn "[autoresponder] loaded " . scalar(@RULES) . " rule(s) from $opt{config}"
+   . " ("      . scalar(@ble_rules)  . " bitchat_peer_first_seen"
+   . ", "      . scalar(@chat_rules) . " chat_message)\n";
+
+# ---- 2. Two connections -----------------------------------------------------
+my $R = NetMgr::Client->new(listen => $GLOBAL->{listen}, timeout => 6);
+$R->hello(consumer => "autoresponder.sub.$$");
+my $W = NetMgr::Client->new(listen => $GLOBAL->{listen}, timeout => 6,
+                            as => $GLOBAL->{as});
+$W->hello(consumer => "autoresponder.ctrl.$$");
+
+# ---- 3. Subscribe — mode=stream ONLY (no snapshot/history replay) -----------
+# Streaming-only is deliberate: the whole point of the daemon-owned
+# bitchat_peers table is that op=insert lifecycle events are already
+# authoritative first-seen signals. Replaying a snapshot at boot would
+# re-greet every peer the daemon has ever seen. The SeenFile is a
+# belt-and-braces defence against the daemon changing its emit semantics.
+my $next_sub = 1;
+if (@ble_rules) {
+    $R->send_line("SUBSCRIBE sub=" . $next_sub++
+                . " mode=stream FROM bitchat_peers");
+    warn "[autoresponder] SUBSCRIBE bitchat_peers (stream)\n";
+}
+for my $s (sort keys %chat_sessions) {
+    (my $q = $s) =~ s/'/''/g;    # SQL-string escape inside the WHERE
+    $R->send_line("SUBSCRIBE sub=" . $next_sub++
+                . " mode=stream FROM chat_messages WHERE session = '$q'");
+    warn "[autoresponder] SUBSCRIBE chat_messages session=$s\n";
+}
+
+# ---- 4. React loop (net-watch:77-92 shape) ----------------------------------
+while (1) {
+    my $line = $R->recv_line(10);
+    $SEEN->prune;
+    next unless defined $line;
+    my $c = eval { parse_line($line) };
+    if ($@) { warn "[autoresponder] parse: $@"; next }
+    next unless $c;
+    if ($c->{verb} eq 'ERR') {
+        warn "[autoresponder] stream ERR: $c->{msg}\n";
+        last;
+    }
+    next unless $c->{verb} eq 'ROW';
+    my $kv = $c->{kv} // {};
+    my $t  = $kv->{table} // '';
+    if    ($t eq 'bitchat_peers') { on_peer_row($kv) }
+    elsif ($t eq 'chat_messages') { on_chat_row($kv) }
+    last if $opt{once};
+}
+eval { $R->bye }; eval { $W->bye };
+exit 0;
+
+# ---- handlers ---------------------------------------------------------------
+
+sub on_peer_row {
+    my ($kv) = @_;
+    # First-seen semantics. The design's authoritative signal is
+    # op=insert; the current daemon (_handle_bitchat_peer_upsert at
+    # Manager.pm:6075) hardcodes op=update, so we ALSO accept update
+    # rows and lean on SeenFile as the primary dedup gate. The
+    # first_seen==last_seen fallback is here for a future world where
+    # the daemon starts distinguishing insert-vs-update on this table.
+    my $op = $kv->{op} // '';
+    my $first = $op eq 'insert'
+             || $op eq 'update'
+             || (defined $kv->{first_seen} && defined $kv->{last_seen}
+                                          && $kv->{first_seen} eq $kv->{last_seen});
+    return unless $first;
+    my $pid = lc($kv->{peer_id} // '');
+    return unless $pid =~ /^[0-9a-f]{16}$/;
+    my $nick = $kv->{nickname} // '';
+    for my $r (@ble_rules) {
+        my %cap;
+        if (my $re = $r->{_re}) {
+            next unless $nick =~ $re;
+            %cap = %+;
+        }
+        my $ctx = { peer_id => $pid, nickname => $nick,
+                    sender  => 'bitchat-relay', session => '',
+                    map { ("cap.$_" => $cap{$_}) } keys %cap };
+        next if $r->{dedup_ttl} > 0
+             && $SEEN->hit("$r->{name}\t$pid", $r->{dedup_ttl});
+        dispatch($r, $ctx);
+    }
+}
+
+sub on_chat_row {
+    my ($kv) = @_;
+    return unless ($kv->{op} // '') eq 'insert';
+    my $sender = $kv->{sender} // '';
+    return if $ignore{$sender};
+    my $sess = $kv->{session} // '';
+    my $body = $kv->{body}    // '';
+    for my $r (@chat_rules) {
+        next unless $r->{session} eq $sess;
+        next if defined $r->{from} && $r->{from} ne $sender;
+        next unless $body =~ $r->{_re};
+        my %cap = %+;
+        my $ctx = { peer_id => ($cap{peer_id} // ''), nickname => '',
+                    sender  => $sender, session => $sess,
+                    map { ("cap.$_" => $cap{$_}) } keys %cap };
+        next if $r->{dedup_ttl} > 0
+             && $SEEN->hit("$r->{name}\t$sender", $r->{dedup_ttl});
+        dispatch($r, $ctx);
+    }
+}
+
+sub dispatch {
+    my ($r, $ctx) = @_;
+    my $target = subst($r->{target}, $ctx);
+    my $body   = subst($r->{body},   $ctx);
+    utf8::upgrade($body);
+
+    if ($r->{channel} eq 'bitchat_dm') {
+        unless ($target =~ /^[0-9a-f]{16}$/) {
+            warn "[autoresponder $r->{name}] bitchat_dm target not 16-hex:"
+               . " '$target' — skip\n";
+            return;
+        }
+        my $preview = length($body) > 60
+                    ? substr($body, 0, 60) . '...' : $body;
+        if ($opt{'dry-run'}) {
+            warn "[autoresponder dry-run $r->{name}] DM $target: $preview\n";
+            return;
+        }
+        # Route via bridge's @HEX16: prefix convention (bridge:409-411).
+        # net-chat-autoresponder posts to bitchat-bridge session; bridge's
+        # SUBSCRIBE loop strips the prefix and DMs the peer over BLE.
+        my $ok = eval { $W->chat_post(session => 'bitchat-bridge',
+                                      body    => "\@$target: $body",
+                                      as      => $GLOBAL->{as}); 1 };
+        if (!$ok) {
+            warn "[autoresponder $r->{name}] chat_post(DM) failed: $@";
+        } else {
+            warn "[autoresponder $r->{name}] DM $target: $preview\n";
+        }
+    } elsif ($r->{channel} eq 'chat_post') {
+        my $preview = length($body) > 60
+                    ? substr($body, 0, 60) . '...' : $body;
+        if ($opt{'dry-run'}) {
+            warn "[autoresponder dry-run $r->{name}] post $target: $preview\n";
+            return;
+        }
+        my $ok = eval { $W->chat_post(session => $target, body => $body,
+                                      as => $GLOBAL->{as}); 1 };
+        if (!$ok) {
+            warn "[autoresponder $r->{name}] chat_post failed: $@";
+        } else {
+            warn "[autoresponder $r->{name}] post $target: $preview\n";
+        }
+    } else {
+        warn "[autoresponder $r->{name}] unknown channel '$r->{channel}'\n";
+    }
+}
+
+# ${peer_id} ${nickname} ${sender} ${session} ${cap.NAME} — everything else
+# passes through literally. '$$' escapes a literal '$'.
+sub subst {
+    my ($s, $ctx) = @_;
+    return '' unless defined $s;
+    $s =~ s/\$\$/\x01/g;
+    $s =~ s/
+        \$\{
+          ( peer_id | nickname | sender | session
+          | cap\.[A-Za-z_][A-Za-z0-9_]*
+          )
+        \}
+    / defined $ctx->{$1} ? $ctx->{$1} : '' /gex;
+    $s =~ s/\x01/\$/g;
+    return $s;
+}
+
+# ---- config -----------------------------------------------------------------
+
+# Parse an INI file into { section => { key => value } }. Config::Tiny if
+# available (matches the rest of the tree); otherwise a hand parser that
+# understands [section], key=value, and ';'/'#' comments. Sections may
+# repeat (later value wins per key). Unknown/unused characters passed
+# through — no shell substitution.
+sub _load_ini {
+    my ($path) = @_;
+    return {} unless -r $path;
+    if (eval { require Config::Tiny; 1 }) {
+        my $t = Config::Tiny->read($path)
+            or die "$path: " . Config::Tiny->errstr . "\n";
+        # Config::Tiny returns a plain hash with section names; _ is root.
+        return { %$t };
+    }
+    open my $fh, '<', $path or die "$path: $!\n";
+    my %cfg;
+    my $section = '_';
+    while (<$fh>) {
+        s/^\s+|\s+$//g;
+        next if !length || /^[;#]/;
+        if (/^\[(.+?)\]\s*$/) { $section = $1; next }
+        if (/^([\w.-]+)\s*=\s*(.*)$/) { $cfg{$section}{$1} = $2 }
+    }
+    close $fh;
+    return \%cfg;
+}
+
+# load_config($primary_path):
+#   Read $primary_path plus /etc/net-mgr/<basename>.d/*.conf overlays in
+#   filename-sort order. Duplicate [rule.NAME] REPLACES the earlier one
+#   (last-write-wins). Returns ($GLOBAL, @RULES).
+sub load_config {
+    my ($primary) = @_;
+
+    (my $overlay_dir = $primary) =~ s/\.conf$//;
+    $overlay_dir .= '.d';
+
+    my @paths;
+    push @paths, $primary if -e $primary;
+    if (-d $overlay_dir) {
+        opendir my $dh, $overlay_dir or die "$overlay_dir: $!\n";
+        push @paths, map { "$overlay_dir/$_" }
+                     sort grep { /\.conf$/ && !/^\./ } readdir $dh;
+        closedir $dh;
+    }
+    unless (@paths) {
+        die "no config: neither $primary nor $overlay_dir/*.conf exists\n";
+    }
+
+    my %global;
+    my %rules;   # NAME => rule hash
+    my @order;   # rule-name order for evaluation
+    for my $p (@paths) {
+        warn "[autoresponder] load $p\n";
+        my $ini = _load_ini($p);
+        # Merge [global] (later files override individual keys).
+        if (ref $ini->{global} eq 'HASH') {
+            @global{ keys %{$ini->{global}} } = values %{$ini->{global}};
+        }
+        for my $sec (sort keys %$ini) {
+            next unless $sec =~ /^rule\.([A-Za-z][A-Za-z0-9._-]{0,31})$/;
+            my $name = $1;
+            my $body = $ini->{$sec};
+            next unless ref $body eq 'HASH';
+            push @order, $name unless exists $rules{$name};
+            $rules{$name} = { %$body, name => $name, _source => $p };
+        }
+    }
+
+    # Defaults.
+    $global{listen}       //= '127.0.0.1:7531';
+    $global{as}           //= 'net-chat-autoresponder';
+    $global{state_file}   //= '/var/lib/net-mgr/net-chat-autoresponder.seen';
+    $global{echo_ignore}  //= $global{as};
+
+    # Compile / validate rules.
+    my @rules;
+    for my $name (@order) {
+        my $r = $rules{$name};
+        my $ok = eval { _compile_rule($r); 1 };
+        if (!$ok) {
+            my $e = $@; chomp $e;
+            warn "[autoresponder] rule '$name' skipped: $e\n";
+            next;
+        }
+        push @rules, $r;
+    }
+
+    return (\%global, @rules);
+}
+
+# Fills $r->{_re}, $r->{dedup_ttl} (seconds), validates required keys.
+sub _compile_rule {
+    my ($r) = @_;
+    my $trigger = $r->{trigger}
+        or die "no trigger=";
+    die "bad trigger '$trigger'"
+        unless $trigger eq 'bitchat_peer_first_seen'
+            || $trigger eq 'chat_message';
+
+    my $ch = $r->{channel} or die "no channel=";
+    die "bad channel '$ch'"
+        unless $ch eq 'bitchat_dm' || $ch eq 'chat_post';
+
+    die "no target=" unless defined $r->{target} && length $r->{target};
+    die "no body="   unless defined $r->{body};
+
+    # Rule-load target validation for bitchat_dm literals. If the target
+    # contains ${...} we defer until per-fire; otherwise it MUST be 16 hex.
+    if ($ch eq 'bitchat_dm'
+        && $r->{target} !~ /\$\{/
+        && $r->{target} !~ /^[0-9a-f]{16}$/i)
+    {
+        die "channel=bitchat_dm target must be 16 lowercase hex "
+          . "(got '$r->{target}')";
+    }
+
+    # Compile regex under a 2s alarm — pathological patterns fail rule-load
+    # rather than crashing the reactor mid-flight.
+    my $match = $r->{match};
+    if ($trigger eq 'chat_message') {
+        die "chat_message trigger needs match=" unless defined $match;
+        my $sess = $r->{session};
+        die "chat_message trigger needs session="
+            unless defined $sess && length $sess;
+        die "chat_message session sanitize: '$sess' has forbidden chars"
+            unless $sess =~ /^[A-Za-z0-9._-]{1,64}$/;
+    }
+    $match = '.*' unless defined $match;
+    my $re = _compile_re($match);
+    $r->{_re} = $re;
+
+    # Duration parse. Default 30d for BLE first-seen; 0 for chat_message.
+    my $default_ttl = $trigger eq 'bitchat_peer_first_seen' ? '30d' : '0';
+    my $ttl = $r->{dedup_ttl} // $default_ttl;
+    $r->{dedup_ttl} = _parse_duration($ttl);
+    return 1;
+}
+
+sub _compile_re {
+    my ($src) = @_;
+    my $re;
+    local $SIG{ALRM} = sub { die "regex compile timeout\n" };
+    alarm(2);
+    # `use re 'strict'` (experimental pragma) turns dubious constructs
+    # into hard errors so a rule file typo fails at load, not mid-flight.
+    # Wrapped in a no-warnings scope so we don't spam every parent load.
+    my $ok = eval {
+        no warnings 'experimental::re_strict';
+        use re 'strict';
+        $re = qr/$src/;
+        1;
+    };
+    alarm(0);
+    die "bad regex /$src/: $@" unless $ok;
+    return $re;
+}
+
+sub _parse_duration {
+    my ($s) = @_;
+    return 0 unless defined $s;
+    $s =~ s/^\s+|\s+$//g;
+    return 0 if $s eq '' || $s eq '0';
+    return $1 * 604800 if $s =~ /^(\d+)w$/i;
+    return $1 * 86400  if $s =~ /^(\d+)d$/i;
+    return $1 * 3600   if $s =~ /^(\d+)h$/i;
+    return $1 * 60     if $s =~ /^(\d+)m$/i;
+    return $1 + 0      if $s =~ /^(\d+)s?$/i;
+    die "bad duration '$s' (use e.g. 30d, 5m, 90s, 0)\n";
+}
+
+sub usage {
+    my ($rc) = @_;
+    print STDERR <<'USAGE';
+net-chat-autoresponder — rule-driven reactor for net-chat.
+
+  net-chat-autoresponder [--config FILE] [--listen H:P] [--once] [--dry-run]
+
+Flags:
+  --config FILE  primary INI (default /etc/net-mgr/net-chat-autoresponder.conf)
+                 Overlays in <primary>.d/*.conf are loaded after in sort order.
+  --listen H:P   override [global].listen
+  --once         process one row then exit (smoke test)
+  --dry-run      log what would be posted, don't actually contact the daemon
+
+See etc/net-chat-autoresponder.conf.sample for the rule grammar.
+USAGE
+    exit($rc // 0);
+}
+
+# ---- SeenFile ---------------------------------------------------------------
+# Append-only 'key\tepoch\n' log. hit(key, ttl) returns 1 if key was seen
+# with age <= ttl, otherwise records and returns 0. prune() rewrites the
+# file when >2x live entries have expired. flock during writes.
+package SeenFile;
+
+use strict;
+use warnings;
+use Fcntl qw(:flock O_RDWR O_CREAT O_APPEND);
+
+sub open {   ## no critic (Subroutines::ProhibitBuiltinHomonyms)
+    my ($class, $path) = @_;
+    # Ensure parent dir exists — systemd StateDirectory=net-mgr already
+    # creates /var/lib/net-mgr/, but a hand-run smoke test off-service
+    # deserves a sensible error.
+    (my $parent = $path) =~ s{/[^/]+$}{};
+    if (length $parent && !-d $parent) {
+        mkdir $parent
+            or warn "[autoresponder] mkdir $parent: $! "
+                  . "(state persistence disabled)\n";
+    }
+    my $self = bless { path => $path, mem => {}, dirty => 0 }, $class;
+    $self->_load;
+    return $self;
+}
+
+sub _load {
+    my ($self) = @_;
+    return unless -e $self->{path};
+    CORE::open(my $fh, '<', $self->{path})
+        or do {
+            warn "[autoresponder] open $self->{path}: $!\n";
+            return;
+        };
+    while (<$fh>) {
+        chomp;
+        next unless length;
+        my ($k, $t) = split /\t/, $_, 2;
+        next unless defined $k && defined $t && $t =~ /^\d+$/;
+        # Later record wins on duplicate keys.
+        $self->{mem}{$k} = $t + 0;
+    }
+    close $fh;
+}
+
+sub hit {
+    my ($self, $key, $ttl) = @_;
+    my $now = time;
+    my $prev = $self->{mem}{$key};
+    if (defined $prev && ($now - $prev) <= $ttl) {
+        return 1;
+    }
+    $self->{mem}{$key} = $now;
+    $self->_append($key, $now);
+    return 0;
+}
+
+sub _append {
+    my ($self, $key, $ts) = @_;
+    my $fh;
+    unless (sysopen $fh, $self->{path},
+            O_RDWR | O_CREAT | O_APPEND)
+    {
+        warn "[autoresponder] open $self->{path}: $! "
+           . "(dedup not persisted this round)\n";
+        return;
+    }
+    flock $fh, LOCK_EX;
+    print $fh "$key\t$ts\n";
+    flock $fh, LOCK_UN;
+    close $fh;
+    $self->{dirty}++;
+}
+
+# Called on every loop tick; cheap unless the file has grown a lot.
+sub prune {
+    my ($self) = @_;
+    return unless $self->{dirty} >= 32;  # rate-limit rewrites
+    return unless -f $self->{path};
+
+    # Count expired vs live from the ON-DISK log (not %mem, which is
+    # dedup'd). If >2x expired-vs-live, rewrite.
+    CORE::open(my $fh, '<', $self->{path}) or return;
+    my $live = 0;
+    my $expired = 0;
+    my $now = time;
+    my %latest;
+    while (<$fh>) {
+        chomp;
+        my ($k, $t) = split /\t/, $_, 2;
+        next unless defined $k && defined $t && $t =~ /^\d+$/;
+        $latest{$k} = $t + 0;
+    }
+    close $fh;
+    for my $t (values %latest) {
+        # We can't know per-key TTL here — assume 30d as the outer bound.
+        # An entry stays "live" for the coarse window and is compacted
+        # once that window elapses. Any newer hit resets it.
+        if ($now - $t <= 30 * 86400) { $live++ } else { $expired++ }
+    }
+    return unless $expired > $live;   # >50% expired = compact
+
+    my $tmp = $self->{path} . ".tmp.$$";
+    if (CORE::open(my $out, '>', $tmp)) {
+        for my $k (sort keys %latest) {
+            next if $now - $latest{$k} > 30 * 86400;
+            print $out "$k\t$latest{$k}\n";
+        }
+        close $out;
+        rename $tmp, $self->{path}
+            or warn "[autoresponder] rename $tmp -> $self->{path}: $!\n";
+        $self->{dirty} = 0;
+    } else {
+        warn "[autoresponder] compact open $tmp: $!\n";
+    }
+}
+
+1;

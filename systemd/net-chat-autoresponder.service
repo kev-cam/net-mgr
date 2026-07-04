@@ -1,0 +1,29 @@
+[Unit]
+Description=net-mgr chat autoresponder (rule-driven BLE greeter + chat reactor)
+Documentation=file:/etc/net-mgr/net-chat-autoresponder.conf
+After=network-online.target net-mgr.service
+Wants=net-mgr.service
+# NOT a hard dep on the bridge. The autoresponder is useful even if the
+# bridge isn't running (chat_post rules still fire); when the bridge IS
+# up, the BLE-DM path (channel=bitchat_dm) lights up automatically because
+# the bridge already subscribes to the bitchat-bridge session and strips
+# the '@HEX16:' prefix (bridge:409-411).
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/net-chat-autoresponder --config /etc/net-mgr/net-chat-autoresponder.conf
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=net-chat-autoresponder
+User=root
+# StateDirectory ensures /var/lib/net-mgr exists (0755 root:root) at
+# service start, so the SeenFile dedup log has somewhere to land on a
+# clean install. Matches the systemd convention used by net-mgr.service.
+StateDirectory=net-mgr
+# ProtectHome=false is deliberate — matches the rest of net-mgr; see
+# project_net-mgr-fresh-install-issues.md for why we don't set it here.
+
+[Install]
+WantedBy=multi-user.target
