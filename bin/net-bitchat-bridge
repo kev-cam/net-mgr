@@ -225,12 +225,17 @@ sub run_once {
         } else {
             warn "[bridge] SUBSCRIBE sent for session=$session\n";
         }
-        # Ensure the session row exists. On a fresh box the bridge may
-        # subscribe long before it ever posts (no BLE traffic yet), and
-        # sibling tools that chat_post INTO this session get "no such
-        # session" until we've created it. A single startup marker is
-        # the cheapest fix — idempotent, human-readable, and doubles as
-        # a "bridge came up" beacon that other observers can consume.
+        # Ensure the session row exists. chat_post rejects unknown
+        # sessions ("no such session"), so on a fresh box where the
+        # bridge has never had BLE traffic to prime it, sibling tools
+        # (net-chat-autoresponder wifi-greeting) fail every dispatch
+        # until we've called chat_open. CHAT_OPEN is idempotent — it
+        # returns op=exists if the session is already there.
+        eval { $cli->chat_open(name => $session); };
+        warn "[bridge] chat_open($session) failed: $@" if $@;
+        # Startup marker doubles as an operator-visible "bridge came
+        # up" beacon and validates the write channel is healthy. Safe
+        # to run against the just-opened session.
         my $marker = "[bridge] online nick="
                    . (length($nickname) ? $nickname : "(compiled-default)");
         eval { $cli->chat_post(session => $session, body => $marker); };
