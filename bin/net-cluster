@@ -13,6 +13,8 @@
 #   net-cluster diff <table> [--key=col,…]      — show only divergent rows
 #   net-cluster observe kind=K k=v ...          — fan out one OBSERVE
 #   net-cluster master kind=K k=v ...           — OBSERVE on master only
+#   net-cluster repair action=A k=v ...         — fan out one REPAIR
+#                                                 (loopback or may_repair)
 #
 # Common flags:
 #   --listen HOST:PORT     local seed daemon for discovery (default 127.0.0.1)
@@ -77,6 +79,11 @@ $auth = 1 if $cmd eq 'put' && !$auth;
 # it needs no signing — the no-fuss way to update a node when cross-node auth
 # (allowed_signers) isn't set up. Run it on each node, or let `update` fan out.
 $peers_opt = '127.0.0.1' if $cmd eq 'deploy' && !$peers_opt;
+# `repair` fans out a REPAIR verb (wifi/eth/dhcp cycle, conn up/down). Admission
+# on the daemon side is loopback OR may_repair, so sign by default — otherwise
+# any non-loopback peer refuses. Callers can still --peers 127.0.0.1 to hit the
+# local daemon unsigned, same as deploy.
+$auth = 1 if $cmd eq 'repair' && !$auth;
 
 # Build the Multi. Auth is wired as an empty hash so NetMgr::Client
 # falls back to its default key_id / key_file detection.
@@ -145,6 +152,7 @@ elsif ($cmd eq 'dhcp-cycle'){ unshift @ARGV, 'kind=dhcp_cycle'; $rc = cmd_observ
 elsif ($cmd eq 'poll')     { $rc = cmd_poll($multi) }
 elsif ($cmd eq 'put')      { $rc = cmd_put($multi) }
 elsif ($cmd eq 'master')   { $rc = cmd_master($multi) }
+elsif ($cmd eq 'repair')   { $rc = cmd_repair($multi) }
 else { warn "net-cluster: unknown command '$cmd'\n"; usage(2) }
 
 $multi->bye_all;
@@ -352,6 +360,38 @@ sub cmd_poll {
     return $any_err ? 1 : 0;
 }
 
+sub cmd_repair {
+    my ($m) = @_;
+    my %kv = _parse_kv(@ARGV) or do {
+        warn "repair: need action=<name> [iface=… | name=…]\n";
+        return 2;
+    };
+    unless (defined $kv{action} && length $kv{action}) {
+        warn "repair: need action=<name> "
+           . "(wifi_cycle, ethernet_cycle, dhcp_cycle, conn_up, conn_down)\n";
+        return 2;
+    }
+    my $any_err = 0;
+    for my $p ($m->peers) {
+        unless ($p->{client}) {
+            printf "%-20s ERR %s\n",
+                $p->{name}, ($p->{error} // 'not connected');
+            $any_err = 1; next;
+        }
+        my $r = eval { $p->{client}->repair(%kv) };
+        if ($@) {
+            my $e = $@; chomp $e;
+            $e =~ s/ at \S+ line \d+\.?\s*$//;   # drop croak location
+            printf "%-20s ERR %s\n", $p->{name}, $e;
+            $any_err = 1;
+        } else {
+            printf "%-20s %s\n", $p->{name}, ($r // 'no reply');
+            $any_err = 1 if !defined $r || $r !~ /^OK\b/;
+        }
+    }
+    return $any_err ? 1 : 0;
+}
+
 sub cmd_put {
     my ($m) = @_;
     my $local = shift @ARGV
@@ -482,6 +522,13 @@ Usage:
                                          gap 1..60s, settle 1..30s optional;
                                          one in-flight cycle per iface;
                                          auth-gated same as update)
+  net-cluster repair action=A k=v ...   (host-maintenance REPAIR fanout:
+                                         wifi_cycle/ethernet_cycle/dhcp_cycle
+                                         iface=IF, conn_up/conn_down name=CONN;
+                                         daemon admits loopback or a key on
+                                         /etc/net-mgr/allowed_repairers, so
+                                         signs by default; per-action kill
+                                         switch via [repair] prohibit_<action>)
 
 Common flags:
   --listen HOST:PORT     local seed daemon for discovery (127.0.0.1:7531)

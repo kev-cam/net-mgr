@@ -115,6 +115,17 @@ sub new {
             signers_path    => '/etc/net-mgr/allowed_debug',
             authorized_keys => undef,
         ),
+        # repair authorization: a dedicated allowlist of keys permitted to drive
+        # REPAIR (host-maintenance actions: wifi_cycle, ethernet_cycle,
+        # dhcp_cycle, conn_up/down) over the mesh. Same model as allowed_updaters
+        # — a key here can AUTH (Tier 7) and is flagged may_repair; loopback/local
+        # root is exempt. Kept separate from allowed_updaters so a REPAIR-capable
+        # operator can bounce a wedged link without also being able to redeploy
+        # the tree (scope minimization — one file per cap).
+        repair_auth_state => NetMgr::Auth::new_state(
+            signers_path    => '/etc/net-mgr/allowed_repairers',
+            authorized_keys => undef,
+        ),
         version => _read_version(),
         cluster => _load_cluster_state($args{config}),
     }, $class;
@@ -2389,6 +2400,12 @@ sub _handle_auth_response {
         if ($dok) { $ok = 1; $scope = 'debug'; }
         else      { $err = $derr // $err; }
     }
+    if (!$ok) {
+        my ($rok, $rerr) = NetMgr::Auth::verify(
+            $self->{repair_auth_state}, $auth->{key_id}, $auth->{nonce}, $sig);
+        if ($rok) { $ok = 1; $scope = 'repair'; }
+        else      { $err = $rerr // $err; }
+    }
     # Tier 6 — chat-key: keys persisted in chat_authorized_keys from prior
     # see-and-request approvals. The DB is the source of truth here (no static
     # /etc/net-mgr/allowed_* file), so we build a temp signers file from the
@@ -2416,13 +2433,14 @@ sub _handle_auth_response {
     my $may_update   = $self->_is_allowed_updater($auth->{key_id});
     my $may_internet = $self->_is_allowed_internet($auth->{key_id});
     my $may_debug    = $self->_is_allowed_debug($auth->{key_id});
+    my $may_repair   = $self->_is_allowed_repairer($auth->{key_id});
     $cli->{auth} = { key_id => $auth->{key_id}, verified => 1, scope => $scope,
                      may_update => $may_update, may_internet => $may_internet,
-                     may_debug => $may_debug,
+                     may_debug => $may_debug, may_repair => $may_repair,
                      ($chat_sessions ? (chat_sessions => $chat_sessions) : ()) };
     $self->_log("auth OK $cli->{peer} key_id=$auth->{key_id} scope=$scope"
               . ($may_update ? " +update" : "") . ($may_internet ? " +internet" : "")
-              . ($may_debug ? " +debug" : "")
+              . ($may_debug ? " +debug" : "") . ($may_repair ? " +repair" : "")
               . ($chat_sessions
                  ? " +chats=" . join(',', sort keys %$chat_sessions) : ""));
     $self->_send($cli, format_ok(key_id => $auth->{key_id}, scope => $scope));
@@ -2513,6 +2531,16 @@ sub _is_allowed_debug {
     return 0 unless defined $key_id && length $key_id;
     return scalar grep { $_ eq $key_id }
         NetMgr::Auth::principals('/etc/net-mgr/allowed_debug');
+}
+
+# True if $key_id is named in /etc/net-mgr/allowed_repairers — the allowlist of
+# keys permitted to drive REPAIR (wifi_cycle, ethernet_cycle, dhcp_cycle,
+# conn_up/down) over the mesh.
+sub _is_allowed_repairer {
+    my ($self, $key_id) = @_;
+    return 0 unless defined $key_id && length $key_id;
+    return scalar grep { $_ eq $key_id }
+        NetMgr::Auth::principals('/etc/net-mgr/allowed_repairers');
 }
 
 sub _peer_is_loopback {
@@ -6205,16 +6233,18 @@ sub _bitchat_relay_fanout {
     return $count;
 }
 
-# ---- REPAIR (loopback-only) --------------------------------------------
+# ---- REPAIR (loopback or may_repair) -----------------------------------
 #
 # Allowlisted host-maintenance actions the daemon runs on the caller's behalf.
-# Loopback-only: a remote peer can't drive our link/DHCP state even with AUTH
-# — mirrors the BITCHAT_PEER_UPSERT scope decision. Called by bin/net-diag
+# Admission: loopback OR an AUTH'd connection whose key is on
+# /etc/net-mgr/allowed_repairers (may_repair cap). Called by bin/net-diag
 # under --repair when it's running unprivileged, so a non-root operator can
 # still self-heal a wedged interface via the root daemon (which has
-# CAP_NET_ADMIN). Each action is individually kill-switchable via the
-# [repair] section of the config (default: allow all — "allow unless
-# prohibited", explicit prohibit_all / prohibit_<action> = true refuses).
+# CAP_NET_ADMIN). Fanned out remotely by `net-cluster repair`, which signs
+# the connection with a may_repair key. Each action is individually
+# kill-switchable via the [repair] section of the config (default: allow all
+# — "allow unless prohibited", explicit prohibit_all / prohibit_<action> =
+# true refuses).
 #
 # Wire format:
 #   REPAIR action=<name> [iface=<name>] [name=<conn>]
@@ -6232,8 +6262,13 @@ sub _bitchat_relay_fanout {
 # shell so validated args are passed through as argv without word-splitting.
 sub _handle_repair {
     my ($self, $cli, $cmd) = @_;
-    return $self->_send($cli, format_err("REPAIR: loopback-only"))
-        unless _peer_is_loopback($cli);
+    unless (_peer_is_loopback($cli)
+            || ($cli->{auth} && $cli->{auth}{may_repair})) {
+        return $self->_send($cli, format_err(
+            "REPAIR: not authorized — must be loopback or"
+          . " authenticated with may_repair cap"
+          . " (add the key to /etc/net-mgr/allowed_repairers)"));
+    }
 
     my $kv = $cmd->{kv} || {};
     my $action = $kv->{action} // '';
