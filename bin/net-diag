@@ -493,8 +493,9 @@ sub cmd_watch {
 
     if ($do_repair && $> != 0) {
         _emit_all(\@sinks,
-            "[net-diag] --repair requires root; ip/nmcli calls will "
-          . "fail — run under sudo or drop the flag.");
+            "[net-diag] --repair as non-root: link/DHCP cycles will be "
+          . "delegated to the loopback daemon's REPAIR verb "
+          . "(direct ip/nmcli shell-outs would fail without CAP_NET_ADMIN).");
     }
 
     my $hostname = _watch_hostname();
@@ -717,15 +718,50 @@ sub _watch_repair {
             "[net-diag/repair] no default route — nothing to cycle");
         return "no-op (no default iface)";
     }
+
+    # Non-root delegates to the loopback daemon's REPAIR verb (which has
+    # CAP_NET_ADMIN and enforces its own per-action [repair] gates). Root
+    # keeps the direct shell-out path — no need to bounce through the daemon
+    # when we can flip the interface ourselves. A daemon delegation failure
+    # falls through to the direct shell-out ladder below so a wedged /
+    # pre-REPAIR-verb daemon can't strand a stalled interface.
+    my $via_daemon = ($> != 0);
+    my $path_tag   = $via_daemon ? 'via-daemon' : 'direct-shell';
+
     if (defined $kind && $kind eq 'wifi') {
-        _emit_all($sinks, "[net-diag/repair] wifi cycle iface=$iface");
+        _emit_all($sinks,
+            "[net-diag/repair] wifi cycle iface=$iface ($path_tag)");
+        if ($via_daemon) {
+            my $ok = _watch_repair_via_daemon($sinks, 'wifi_cycle',
+                                              iface => $iface);
+            return "wifi cycle ($iface) via daemon" if $ok;
+            _emit_all($sinks,
+                "[net-diag/repair]   daemon delegation failed — "
+              . "falling back to direct shell-out");
+        }
         _watch_run($sinks, 'nmcli', 'device', 'disconnect', $iface);
         sleep 2;
         _watch_run($sinks, 'nmcli', 'device', 'connect', $iface);
         return "wifi cycle ($iface)";
     }
     # ethernet (or unclassified — treat like ethernet).
-    _emit_all($sinks, "[net-diag/repair] ethernet cycle iface=$iface");
+    _emit_all($sinks,
+        "[net-diag/repair] ethernet cycle iface=$iface ($path_tag)");
+    if ($via_daemon) {
+        # ethernet_cycle is link down/up on the daemon; follow with a
+        # dhcp_cycle so the interface actually gets a fresh lease. Only try
+        # dhcp_cycle when the link cycle succeeded — if the daemon refused
+        # the link cycle, the fall-through below runs the full local ladder.
+        my $ok = _watch_repair_via_daemon($sinks, 'ethernet_cycle',
+                                          iface => $iface);
+        if ($ok) {
+            _watch_repair_via_daemon($sinks, 'dhcp_cycle', iface => $iface);
+            return "ethernet cycle ($iface) via daemon";
+        }
+        _emit_all($sinks,
+            "[net-diag/repair]   daemon delegation failed — "
+          . "falling back to direct shell-out");
+    }
     _watch_run($sinks, 'ip', 'link', 'set', $iface, 'down');
     sleep 1;
     _watch_run($sinks, 'ip', 'link', 'set', $iface, 'up');
@@ -737,6 +773,39 @@ sub _watch_repair {
         _watch_run($sinks, 'dhcpcd', $iface);
     }
     return "ethernet cycle ($iface)";
+}
+
+# Delegate one REPAIR action to the loopback daemon. Returns true on OK,
+# false on any failure (connect refused, HELLO refused, ERR reply, croak).
+# All failure reasons are emitted to the sinks so the operator sees WHY
+# delegation fell through to the direct shell ladder.
+sub _watch_repair_via_daemon {
+    my ($sinks, $action, %kv) = @_;
+    my $cli = eval {
+        NetMgr::Client->new(listen => '127.0.0.1:7531', timeout => 15);
+    };
+    if ($@ || !$cli) {
+        my $e = $@ // 'connect failed';
+        chomp $e;
+        _emit_all($sinks, "[net-diag/repair]   daemon connect: $e");
+        return 0;
+    }
+    my $ok = eval {
+        $cli->hello(consumer => "net-diag-repair.$$");
+        my $reply = $cli->repair(action => $action, %kv);
+        _emit_all($sinks,
+            "[net-diag/repair]   daemon $action -> $reply");
+        1;
+    };
+    my $err = $@;
+    eval { $cli->bye };
+    if (!$ok) {
+        chomp $err;
+        _emit_all($sinks,
+            "[net-diag/repair]   daemon $action failed: $err");
+        return 0;
+    }
+    return 1;
 }
 
 sub _watch_run {

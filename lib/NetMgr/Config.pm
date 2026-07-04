@@ -163,6 +163,12 @@ my %DEFAULTS = (
     debug => {
         enabled => 'on',
     },
+    # repair: per-node kill switch for REPAIR verb actions (loopback-only host
+    # maintenance called by bin/net-diag under --repair when unprivileged).
+    # Default: allow all. Any prohibit_<action> = true (or the master
+    # prohibit_all) refuses that action with an ERR. Truthy tokens: on|yes|
+    # true|1 (case-insensitive). Absent / off / no / false / 0 = allowed.
+    repair => {},
     # Named net-mgr daemons client tools can connect to. Each key is a short
     # name mapped to host[:port]; the special key 'default' names the preferred
     # entry. Usually set in the per-user file (~/.config/net-mgr/config) and
@@ -363,6 +369,9 @@ my %ACTIVE = (
     chat       => [qw(archive_dir)],          # net-chat archive location
     deploy     => [qw(hosts user sudo ssh_opts make_args)],  # make deploy targets
     debug      => [qw(enabled)],              # gates POLL probes (NetMgr::Manager)
+    repair     => [qw(prohibit_all prohibit_wifi_cycle prohibit_ethernet_cycle
+                       prohibit_dhcp_cycle prohibit_conn_up prohibit_conn_down)],
+                                              # REPAIR verb per-action kill switches
 );
 
 # Returns a list of "[section] key" strings for entries in $path that

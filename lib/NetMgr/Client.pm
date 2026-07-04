@@ -485,6 +485,31 @@ sub chat_post {
     return $cmd->{kv} || {};
 }
 
+# Send REPAIR, expect OK. Loopback-only on the daemon side (see
+# NetMgr::Manager::_handle_repair) — this connection must be to
+# 127.0.0.1 / ::1 or the daemon will refuse. Returns the raw OK reply
+# line so the caller can log it verbatim; croaks on ERR (unknown action,
+# prohibited by config, missing/bad iface, shell-out failure).
+#
+# Actions:
+#   wifi_cycle      iface => IF
+#   ethernet_cycle  iface => IF
+#   dhcp_cycle      iface => IF
+#   conn_up         name  => CONN
+#   conn_down       name  => CONN
+sub repair {
+    my ($self, %kv) = @_;
+    croak "repair needs action=<name>"
+        unless defined $kv{action} && length $kv{action};
+    my $line = "REPAIR " . format_kv(%kv);
+    my $r = $self->send_recv($line);
+    croak "REPAIR: no reply from daemon" unless defined $r;
+    my $cmd = parse_line($r);
+    croak "REPAIR: $cmd->{msg}" if $cmd->{verb} eq 'ERR';
+    croak "REPAIR: unexpected reply '$r'" unless $cmd->{verb} eq 'OK';
+    return $r;
+}
+
 sub bye {
     my ($self) = @_;
     $self->send_line("BYE");

@@ -179,3 +179,25 @@ domain   = grfx.com
 [forward]
 # method      = auto              # auto | iptables | socat
 # allow_peers = 192.168.0.0/16
+
+# Kill switch for the REPAIR verb (loopback-only host maintenance called by
+# bin/net-diag under --repair when running unprivileged — the daemon runs
+# the ip/nmcli/dhclient commands so a non-root operator can still self-heal).
+# Default: allow all. Each key is optional; a per-action prohibit_<name> =
+# true refuses just that action, and prohibit_all = true is the master
+# switch. Truthy tokens: on | yes | true | 1 (case-insensitive). Absent /
+# off / no / false / 0 = allowed.
+#
+# Actions:
+#   wifi_cycle      — nmcli device disconnect + connect
+#   ethernet_cycle  — ip link set IFACE down + up
+#   dhcp_cycle      — dhclient -r + dhclient (else dhcpcd -k + dhcpcd)
+#   conn_up         — nmcli connection up NAME
+#   conn_down       — nmcli connection down NAME
+[repair]
+# prohibit_all            = false
+# prohibit_wifi_cycle     = false
+# prohibit_ethernet_cycle = false
+# prohibit_dhcp_cycle     = false
+# prohibit_conn_up        = false
+# prohibit_conn_down      = false

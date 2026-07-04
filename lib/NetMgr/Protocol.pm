@@ -67,6 +67,24 @@ package NetMgr::Protocol;
 #   CHAT_DELETE name=N                            -- owner: delete a chat +
 #                                                    its whole archive (destructive)
 #   (messages are posted with OBSERVE kind=chat_msg session=N body="...")
+#   REPAIR    action=<name> [iface=<name>] [name=<conn>]
+#                                            -- loopback-only. Allowlisted
+#                                              interface / connection
+#                                              maintenance actions the daemon
+#                                              performs on the caller's behalf
+#                                              (so an unprivileged tool like
+#                                              net-diag can drive them via the
+#                                              root daemon). Actions:
+#                                                wifi_cycle      iface=IF
+#                                                ethernet_cycle  iface=IF
+#                                                dhcp_cycle      iface=IF
+#                                                conn_up         name=CONN
+#                                                conn_down       name=CONN
+#                                              Each action can be individually
+#                                              disabled via [repair]
+#                                              prohibit_<action> in the
+#                                              daemon's config (default:
+#                                              allow all).
 #   BYE
 #
 # Replies (server → client):
@@ -141,6 +159,9 @@ sub parse_line {
     elsif ($verb eq 'CHAT_MEMBER_DELETE') { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'BITCHAT_PEER_UPSERT') { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'BITCHAT_PACKET_RELAY') { $cmd->{kv} = _parse_kv_only(\@toks) }
+    # Loopback-only host maintenance (link/DHCP cycle, nmcli conn up/down).
+    # Client side is bin/net-diag under --repair when running non-root.
+    elsif ($verb eq 'REPAIR')     { $cmd->{kv} = _parse_kv_only(\@toks) }
     # net-chat file transfer (data= is base64).
     elsif ($verb eq 'CHAT_PUT')       { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'CHAT_GET')       { $cmd->{kv} = _parse_kv_only(\@toks) }

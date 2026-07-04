@@ -1500,6 +1500,7 @@ sub _handle_line {
     elsif ($verb eq 'CHAT_MEMBER_DELETE') { $self->_handle_chat_member_delete($cli, $cmd) }
     elsif ($verb eq 'BITCHAT_PEER_UPSERT') { $self->_handle_bitchat_peer_upsert($cli, $cmd) }
     elsif ($verb eq 'BITCHAT_PACKET_RELAY') { $self->_handle_bitchat_packet_relay($cli, $cmd) }
+    elsif ($verb eq 'REPAIR')     { $self->_handle_repair($cli, $cmd) }
     elsif ($verb eq 'CHAT_PUT')       { $self->_handle_chat_put($cli, $cmd) }
     elsif ($verb eq 'CHAT_GET')       { $self->_handle_chat_get($cli, $cmd) }
     elsif ($verb eq 'CHAT_LS')        { $self->_handle_chat_ls($cli, $cmd) }
@@ -6202,6 +6203,211 @@ sub _bitchat_relay_fanout {
         }
     }
     return $count;
+}
+
+# ---- REPAIR (loopback-only) --------------------------------------------
+#
+# Allowlisted host-maintenance actions the daemon runs on the caller's behalf.
+# Loopback-only: a remote peer can't drive our link/DHCP state even with AUTH
+# — mirrors the BITCHAT_PEER_UPSERT scope decision. Called by bin/net-diag
+# under --repair when it's running unprivileged, so a non-root operator can
+# still self-heal a wedged interface via the root daemon (which has
+# CAP_NET_ADMIN). Each action is individually kill-switchable via the
+# [repair] section of the config (default: allow all — "allow unless
+# prohibited", explicit prohibit_all / prohibit_<action> = true refuses).
+#
+# Wire format:
+#   REPAIR action=<name> [iface=<name>] [name=<conn>]
+#
+# Actions (unknown names rejected):
+#   wifi_cycle      iface=IF        nmcli device disconnect + connect
+#   ethernet_cycle  iface=IF        ip link set IF down + up
+#   dhcp_cycle      iface=IF        dhclient -r + dhclient (else dhcpcd -k + dhcpcd)
+#   conn_up         name=CONN       nmcli connection up CONN
+#   conn_down       name=CONN       nmcli connection down CONN
+#
+# Iface names must match /^[a-zA-Z0-9_-]{1,32}$/. Connection names may be
+# more free-form (nmcli con names allow spaces / punctuation) but shell
+# metacharacters are rejected up front; system(LIST) below never invokes a
+# shell so validated args are passed through as argv without word-splitting.
+sub _handle_repair {
+    my ($self, $cli, $cmd) = @_;
+    return $self->_send($cli, format_err("REPAIR: loopback-only"))
+        unless _peer_is_loopback($cli);
+
+    my $kv = $cmd->{kv} || {};
+    my $action = $kv->{action} // '';
+    unless (length $action) {
+        return $self->_send($cli, format_err("REPAIR: missing action="));
+    }
+
+    my %HANDLERS = (
+        wifi_cycle     => \&_repair_wifi_cycle,
+        ethernet_cycle => \&_repair_ethernet_cycle,
+        dhcp_cycle     => \&_repair_dhcp_cycle,
+        conn_up        => \&_repair_conn_up,
+        conn_down      => \&_repair_conn_down,
+    );
+    unless (exists $HANDLERS{$action}) {
+        return $self->_send($cli,
+            format_err("REPAIR: unknown action '$action' "
+                     . "(expected one of: "
+                     . join(', ', sort keys %HANDLERS) . ")"));
+    }
+
+    # Config gate — default ALLOW. prohibit_all is the master switch;
+    # prohibit_<action> is per-rung. Both default off/absent = allowed.
+    my $rcfg = $self->{config}{repair} || {};
+    if (_repair_is_true($rcfg->{prohibit_all})) {
+        return $self->_send($cli,
+            format_err("REPAIR: all actions prohibited by [repair] prohibit_all"));
+    }
+    my $pkey = "prohibit_$action";
+    if (_repair_is_true($rcfg->{$pkey})) {
+        return $self->_send($cli,
+            format_err("REPAIR: action '$action' prohibited by [repair] $pkey"));
+    }
+
+    my ($rc, $err, $note) = eval { $HANDLERS{$action}->($self, $kv) };
+    if ($@) {
+        my $e = $@; chomp $e;
+        $self->_log("REPAIR $action: $e");
+        return $self->_send($cli, format_err("REPAIR: $e"));
+    }
+    if (defined $rc && $rc != 0) {
+        my $msg = "REPAIR: action '$action' failed rc=$rc"
+                . (defined $err  ? " ($err)"  : '')
+                . (defined $note ? " [$note]" : '');
+        $self->_log($msg);
+        return $self->_send($cli, format_err($msg));
+    }
+    $self->_log("REPAIR $action ok" . (defined $note ? " [$note]" : ''));
+    return $self->_send($cli, format_ok(
+        action => $action,
+        rc     => ($rc // 0),
+        (defined $note ? (note => $note) : ()),
+    ));
+}
+
+# on|yes|true|1 (case-insensitive) → true. Anything else (undef, off, no,
+# false, 0, empty, garbage) → false. Matches the token vocabulary the rest
+# of net-mgr uses for gate keys (see [bitchat_bridge] mode, [debug] enabled).
+sub _repair_is_true {
+    my ($v) = @_;
+    return 0 unless defined $v && length $v;
+    return $v =~ /^(1|on|yes|true)$/i ? 1 : 0;
+}
+
+sub _repair_valid_iface {
+    my ($v) = @_;
+    return defined $v && length $v && $v =~ /^[a-zA-Z0-9_-]{1,32}$/;
+}
+
+# nmcli connection names are free-form user strings and often contain
+# spaces / colons / dots. system(LIST) below doesn't shell-word-split so
+# spaces are safe, but reject anything that could confuse a shell-out or
+# a downstream operator (control chars, common shell metachars, leading '-'
+# so it can't be misparsed as an option).
+sub _repair_valid_conn_name {
+    my ($v) = @_;
+    return 0 unless defined $v && length $v;
+    return 0 if length($v) > 64;
+    return 0 if $v =~ /\A-/;                                    # no leading dash
+    return 0 if $v =~ m{[\x00-\x1f\x7f\`\$\\"'|;&<>()*?\[\]{}]}; # no meta/ctrl
+    return 1;
+}
+
+# Run one shell-out with argv-form system() (no shell involved). Returns
+# (rc, err); err is set only when exec itself failed.
+sub _repair_run {
+    my ($self, @cmd) = @_;
+    $self->_log("REPAIR shell: @cmd");
+    my $rc = system(@cmd);
+    if ($rc == -1) { return (127, "exec failed: $!") }
+    return ($rc >> 8, undef);
+}
+
+sub _repair_wifi_cycle {
+    my ($self, $kv) = @_;
+    my $iface = $kv->{iface};
+    die "wifi_cycle: missing or bad iface=<name>\n"
+        unless _repair_valid_iface($iface);
+    my ($rc, $err) = $self->_repair_run('nmcli', 'device', 'disconnect', $iface);
+    return ($rc, ($err // 'nmcli disconnect failed'), "iface=$iface") if $rc != 0;
+    sleep 2;
+    ($rc, $err) = $self->_repair_run('nmcli', 'device', 'connect', $iface);
+    return ($rc, ($err // 'nmcli connect failed'), "iface=$iface") if $rc != 0;
+    return (0, undef, "iface=$iface");
+}
+
+sub _repair_ethernet_cycle {
+    my ($self, $kv) = @_;
+    my $iface = $kv->{iface};
+    die "ethernet_cycle: missing or bad iface=<name>\n"
+        unless _repair_valid_iface($iface);
+    my ($rc, $err) = $self->_repair_run('ip', 'link', 'set', $iface, 'down');
+    return ($rc, ($err // 'ip link down failed'), "iface=$iface") if $rc != 0;
+    sleep 1;
+    ($rc, $err) = $self->_repair_run('ip', 'link', 'set', $iface, 'up');
+    return ($rc, ($err // 'ip link up failed'),   "iface=$iface") if $rc != 0;
+    return (0, undef, "iface=$iface");
+}
+
+sub _repair_dhcp_cycle {
+    my ($self, $kv) = @_;
+    my $iface = $kv->{iface};
+    die "dhcp_cycle: missing or bad iface=<name>\n"
+        unless _repair_valid_iface($iface);
+    # Mirror bin/net-diag's PATH probe: prefer dhclient (Debian/Ubuntu
+    # default), fall back to dhcpcd. Absolute paths would pin us to one
+    # distro; PATH lookup via system() is the same trick _watch_have uses.
+    my ($rel_cmd, $ren_cmd);
+    if (_repair_have('dhclient')) {
+        $rel_cmd = ['dhclient', '-r', $iface];
+        $ren_cmd = ['dhclient', '-1', $iface];
+    } elsif (_repair_have('dhcpcd')) {
+        $rel_cmd = ['dhcpcd', '-k', $iface];
+        $ren_cmd = ['dhcpcd', $iface];
+    } else {
+        die "dhcp_cycle: neither dhclient nor dhcpcd found on PATH\n";
+    }
+    my ($rc, $err) = $self->_repair_run(@$rel_cmd);
+    return ($rc, ($err // 'DHCP release failed'), "iface=$iface") if $rc != 0;
+    ($rc, $err) = $self->_repair_run(@$ren_cmd);
+    return ($rc, ($err // 'DHCP renew failed'),   "iface=$iface") if $rc != 0;
+    return (0, undef, "iface=$iface");
+}
+
+sub _repair_conn_up {
+    my ($self, $kv) = @_;
+    my $name = $kv->{name};
+    die "conn_up: missing or unsafe name=<connection>\n"
+        unless _repair_valid_conn_name($name);
+    my ($rc, $err) = $self->_repair_run('nmcli', 'connection', 'up', $name);
+    return ($rc, ($err // 'nmcli con up failed'), "name=$name") if $rc != 0;
+    return (0, undef, "name=$name");
+}
+
+sub _repair_conn_down {
+    my ($self, $kv) = @_;
+    my $name = $kv->{name};
+    die "conn_down: missing or unsafe name=<connection>\n"
+        unless _repair_valid_conn_name($name);
+    my ($rc, $err) = $self->_repair_run('nmcli', 'connection', 'down', $name);
+    return ($rc, ($err // 'nmcli con down failed'), "name=$name") if $rc != 0;
+    return (0, undef, "name=$name");
+}
+
+# Simple PATH probe — walk $ENV{PATH} for an executable named $prog. Used
+# by _repair_dhcp_cycle to pick dhclient vs dhcpcd without hardcoding
+# /sbin vs /usr/sbin (differs by distro).
+sub _repair_have {
+    my ($prog) = @_;
+    return 0 unless defined $prog && length $prog;
+    for my $d (split /:/, ($ENV{PATH} // '/usr/sbin:/usr/bin:/sbin:/bin')) {
+        return 1 if length $d && -x "$d/$prog";
+    }
+    return 0;
 }
 
 1;
