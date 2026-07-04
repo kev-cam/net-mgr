@@ -53,3 +53,15 @@ listen = 127.0.0.1:7531
 # or daemon restart will re-greet everyone. That's acceptable for tier-0
 # because the WIFI: URI is idempotent from the user's side.
 #greeting = WIFI:T:WPA;S:video;P:InTheRoom;;
+
+# Per-site BLE nickname advertised over BitChat. Every bridge built from
+# bigsony's tree currently defaults to "bigsony-bridge" (compiled into
+# bitchat-jsonl). Set this to distinguish sites on the mesh:
+#     video-c   -> nickname = video-c-bridge
+#     zmc1      -> nickname = zmc1-bridge
+#     bigsony   -> nickname = bigsony-bridge
+#     gateway3  -> nickname = gateway3-bridge
+# The supervisor exports it as $ENV{BITCHAT_NICK} before spawning the
+# helper — no rebuild required. Leave commented out to keep the helper's
+# compiled-in default.
+#nickname = bigsony-bridge

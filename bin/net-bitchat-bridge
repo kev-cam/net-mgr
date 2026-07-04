@@ -92,6 +92,20 @@ my $greeting = $per_feat_cfg->{bitchat_bridge}{greeting}
             // $bridge_cfg->{greeting}
             // '';
 
+# Per-site BLE nickname. The Rust helper (bitchat-jsonl) reads
+# $ENV{BITCHAT_NICK} at startup and falls back to its compiled-in
+# default ("bigsony-bridge") when unset — so every bridge built from
+# bigsony's tree announces the same nickname unless we override here.
+# We inject via env because it needs no helper rebuild or CLI-flag work.
+# Absent / empty = keep the helper default (no override).
+my $nickname = $per_feat_cfg->{bitchat_bridge}{nickname}
+            // $bridge_cfg->{nickname}
+            // '';
+if (length $nickname) {
+    $ENV{BITCHAT_NICK} = $nickname;
+    warn "[bridge] using nickname $nickname\n";
+}
+
 # Helper-targeted env vars from the optional per-feature file
 # (anything in [helper] starting env_ becomes $ENV{...}).
 for my $k (sort keys %{ $per_feat_cfg->{helper} // {} }) {
