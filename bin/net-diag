@@ -28,10 +28,15 @@
 # --watch mode is a resident diagnostic. Each 5s tick (see --interval):
 #   - looks up the default v4 gateway (ip -4 route show default),
 #   - pings gateway + 8.8.8.8,
-#   - runs a fresh DNS lookup (dig +time=2 +tries=1 against the gateway
-#     for a random-labeled probe under example.invalid) so caches
-#     never mask a broken resolver — same discipline as clevo's
-#     watcher,
+#   - runs TWO fresh DNS probes for a random-labeled probe under
+#     example.invalid (so caches never mask a broken resolver):
+#         dns_gw = dig +time=2 +tries=1 aimed straight at the gateway
+#                  (isolates gateway/upstream resolver health)
+#         dns_os = getent hosts through /etc/resolv.conf (exercises
+#                  the OS resolver chain; catches resolv.conf-path
+#                  failures like clevo's fe80:: link-local nameserver
+#                  going NUD-STALE, where every OS-level lookup
+#                  stalls while ICMP + gateway-direct DNS look fine),
 #   - captures wifi bssid / signal / nmcli state when the default
 #     iface is wifi,
 #   - assigns a verdict (ok | degraded | down) from those samples.
@@ -566,14 +571,21 @@ sub _watch_tick {
 
     my $gw_probe   = _watch_ping($gw_ip);
     my $inet_probe = _watch_ping('8.8.8.8');
-    my $dns_probe  = _watch_dns($gw_ip);
+    my $dns_gw     = _watch_dns_gw($gw_ip);
+    my $dns_os     = _watch_dns_os();
 
     $t{gw_rtt_ms}   = $gw_probe->{rtt_ms};
     $t{gw_ok}       = $gw_probe->{ok};
     $t{inet_rtt_ms} = $inet_probe->{rtt_ms};
     $t{inet_ok}     = $inet_probe->{ok};
-    $t{dns_ms}      = $dns_probe->{rtt_ms};
-    $t{dns_ok}      = $dns_probe->{ok};
+    $t{dns_gw_ms}   = $dns_gw->{rtt_ms};
+    $t{dns_gw_ok}   = $dns_gw->{ok};
+    $t{dns_os_ms}   = $dns_os->{rtt_ms};
+    $t{dns_os_ok}   = $dns_os->{ok};
+    # Aggregate for downstream consumers that just want a single
+    # answer: dns_ok is only true if BOTH probes worked. Either
+    # failing counts as dns=FAIL.
+    $t{dns_ok}      = ($dns_gw->{ok} && $dns_os->{ok}) ? 1 : 0;
 
     if (defined $gw_iface && defined $iface_kind && $iface_kind eq 'wifi') {
         my $w = _watch_wifi_info($gw_iface);
@@ -583,21 +595,26 @@ sub _watch_tick {
     $t{nm_state} = _watch_nm_state();
 
     # Verdict:
-    #   down     if gateway ping loses, internet ping loses, OR DNS query
-    #            fails. Any one of the three is treated as fatal. DNS
-    #            especially: the clevo pattern (ICMP-to-IP fine but the
-    #            fe80:: link-local resolver's NUD entry goes STALE and every
-    #            lookup stalls) used to keep verdict at 'degraded' forever
-    #            because it was only one of three probes — the box "had
-    #            connectivity" but nothing resolved and --repair never
-    #            fired. Escalating a pure dns=FAIL to 'down' fixes that.
-    #   degraded if all probes ok but one of the RTTs / DNS time is elevated
+    #   down     if gateway ping loses, internet ping loses, OR either
+    #            DNS probe (dns_gw / dns_os) fails. Any one of the four
+    #            is treated as fatal. DNS especially: the clevo pattern
+    #            (ICMP-to-IP fine but the fe80:: link-local resolver's
+    #            NUD entry goes STALE and every /etc/resolv.conf lookup
+    #            stalls) is exactly why we run BOTH dns_gw (dig aimed
+    #            straight at the gateway, bypasses resolv.conf) and
+    #            dns_os (getent through resolv.conf) — the fe80:: STALE
+    #            case only shows up on dns_os; dns_gw still succeeds.
+    #            Escalating either dns=FAIL to 'down' arms the multi-
+    #            stage repair ladder.
+    #   degraded if all probes ok but one of the RTTs / DNS times is elevated
     #   ok       otherwise
-    if (!$gw_probe->{ok} || !$inet_probe->{ok} || !$dns_probe->{ok}) {
+    if (!$gw_probe->{ok} || !$inet_probe->{ok}
+        || !$dns_gw->{ok} || !$dns_os->{ok}) {
         $t{verdict} = 'down';
     } elsif ((defined $t{gw_rtt_ms}   && $t{gw_rtt_ms}   > WATCH_RTT_DEGRADED_MS)
           || (defined $t{inet_rtt_ms} && $t{inet_rtt_ms} > WATCH_RTT_DEGRADED_MS)
-          || (defined $t{dns_ms}      && $t{dns_ms}      > WATCH_DNS_DEGRADED_MS)) {
+          || (defined $t{dns_gw_ms}   && $t{dns_gw_ms}   > WATCH_DNS_DEGRADED_MS)
+          || (defined $t{dns_os_ms}   && $t{dns_os_ms}   > WATCH_DNS_DEGRADED_MS)) {
         $t{verdict} = 'degraded';
     } else {
         $t{verdict} = 'ok';
@@ -615,7 +632,8 @@ sub _watch_format_line {
     push @bits, "gw="   . ($t->{gw_ip} // '?')
               . "=" . _watch_fmt_rtt($t->{gw_ok},   $t->{gw_rtt_ms});
     push @bits, "inet=" . _watch_fmt_rtt($t->{inet_ok}, $t->{inet_rtt_ms});
-    push @bits, "dns="  . _watch_fmt_rtt($t->{dns_ok},  $t->{dns_ms});
+    push @bits, "dns_gw=" . _watch_fmt_rtt($t->{dns_gw_ok}, $t->{dns_gw_ms});
+    push @bits, "dns_os=" . _watch_fmt_rtt($t->{dns_os_ok}, $t->{dns_os_ms});
     if (defined $t->{wifi_bssid} || defined $t->{wifi_signal}) {
         my $w = "wifi=" . ($t->{wifi_bssid} // '?');
         $w .= "/" . $t->{wifi_signal} if defined $t->{wifi_signal};
@@ -663,11 +681,23 @@ sub _watch_ping {
     return { ok => 0, rtt_ms => undef };
 }
 
-# Fresh DNS lookup against the gateway. Uses a random label under
-# example.invalid so no resolver ever answers from cache — same
-# discipline as clevo's watcher.  A NXDOMAIN answer counts as a
-# working resolver (we care about the round-trip, not the record).
-sub _watch_dns {
+# Fresh DNS lookups on a random label under example.invalid so no
+# resolver ever answers from cache — same discipline as clevo's
+# watcher. NXDOMAIN counts as a working resolver (we care about
+# whether the chain responds at all, not the record). Two probes
+# per tick:
+#
+#   _watch_dns_gw — dig aimed straight at the gateway with @gw,
+#                   bypassing /etc/resolv.conf. Isolates the
+#                   gateway/upstream resolver from local nameserver
+#                   configuration.
+#   _watch_dns_os — getent hosts through /etc/resolv.conf +
+#                   nsswitch. Exercises the exact codepath every
+#                   OS-level lookup on the box takes, so it catches
+#                   the clevo failure (fe80:: link-local nameserver's
+#                   NUD entry goes STALE → every resolv.conf query
+#                   hangs) even though dns_gw is still healthy.
+sub _watch_dns_gw {
     my ($gw) = @_;
     return { ok => 0, rtt_ms => undef, note => 'no gw' }
         unless defined $gw && length $gw;
@@ -684,6 +714,29 @@ sub _watch_dns {
     if ($rc == 0) {
         my $q = ($out =~ /Query time:\s*(\d+)\s*msec/) ? $1 + 0 : $elapsed_ms;
         return { ok => 1, rtt_ms => $q };
+    }
+    return { ok => 0, rtt_ms => undef };
+}
+
+# OS-resolver probe. getent honors /etc/resolv.conf and nsswitch's
+# 'hosts:' line exactly the way every other program on the box
+# does, so this is the codepath that stalls on clevo when a listed
+# nameserver goes silent. getent itself has no built-in timeout, so
+# wrap it in timeout(1) with the same WATCH_DNS_TIMEOUT_S budget as
+# the gateway probe — both windows match.
+sub _watch_dns_os {
+    my $rand = sprintf("probe-%08x", int(rand(0xffffffff)));
+    my $label = "$rand.example.invalid";
+    my $tout  = WATCH_DNS_TIMEOUT_S;
+    my $t0    = time();
+    my $out   = `timeout $tout getent hosts $label 2>&1`;
+    my $rc    = $? >> 8;
+    my $elapsed_ms = (time() - $t0) * 1000;
+    # getent exit 0 = resolved, 2 = key not found (NXDOMAIN) — both
+    # mean the chain responded. 124 = timeout(1) killed getent
+    # (this is the clevo stall case). Anything else = failure.
+    if ($rc == 0 || $rc == 2) {
+        return { ok => 1, rtt_ms => $elapsed_ms };
     }
     return { ok => 0, rtt_ms => undef };
 }
