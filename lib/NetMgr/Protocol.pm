@@ -85,6 +85,19 @@ package NetMgr::Protocol;
 #                                              prohibit_<action> in the
 #                                              daemon's config (default:
 #                                              allow all).
+#   TRACEROUTE target=<HOST_OR_IP> [max_hops=15] [timeout_s=2] [src_iface=IF]
+#                                            -- default-allow diagnostic. The
+#                                              daemon runs traceroute -n on the
+#                                              caller's behalf and ships back a
+#                                              per-hop summary (base64 TSV in
+#                                              hops_b64) plus reached/count/
+#                                              duration_ms. Admission mirrors
+#                                              REPAIR: [diag] prohibit_remote /
+#                                              prohibit_unauth / prohibit_all /
+#                                              prohibit_traceroute all default
+#                                              off, so any caller reaches the
+#                                              runner unless the operator
+#                                              tightens the gate.
 #   BYE
 #
 # Replies (server → client):
@@ -162,6 +175,9 @@ sub parse_line {
     # Loopback-only host maintenance (link/DHCP cycle, nmcli conn up/down).
     # Client side is bin/net-diag under --repair when running non-root.
     elsif ($verb eq 'REPAIR')     { $cmd->{kv} = _parse_kv_only(\@toks) }
+    # Default-allow read-only diagnostic (traceroute today; mtr/dig later).
+    # Same [diag] gate template as REPAIR — kv-only body.
+    elsif ($verb eq 'TRACEROUTE') { $cmd->{kv} = _parse_kv_only(\@toks) }
     # net-chat file transfer (data= is base64).
     elsif ($verb eq 'CHAT_PUT')       { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'CHAT_GET')       { $cmd->{kv} = _parse_kv_only(\@toks) }

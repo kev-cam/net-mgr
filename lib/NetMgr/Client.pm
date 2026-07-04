@@ -510,6 +510,56 @@ sub repair {
     return $r;
 }
 
+# TRACEROUTE — default-allow diagnostic. Daemon runs `traceroute -n` on
+# the caller's behalf and returns a per-hop TSV summary as base64 in
+# `hops_b64`, alongside high-level counters (count, reached, duration_ms).
+# Admission mirrors REPAIR: default open; operators tighten via [diag]
+# prohibit_* keys.
+#
+# Args:   target => HOST_OR_IP   (required)
+#         max_hops => N (1..30)  (default 15)
+#         timeout_s => S (1..10) (default 2)
+#         src_iface => IFACE     (optional)
+# Returns a hashref: { target, count, reached, duration_ms,
+#                      hops => [ { n, rtt_ms, addr }, ... ] }
+# Croaks on ERR.
+sub traceroute {
+    my ($self, %a) = @_;
+    croak "traceroute needs target=<host_or_ip>"
+        unless defined $a{target} && length $a{target};
+    my %kv = (target => $a{target});
+    for my $k (qw(max_hops timeout_s src_iface)) {
+        $kv{$k} = $a{$k} if defined $a{$k} && length $a{$k};
+    }
+    my $r = $self->send_recv("TRACEROUTE " . format_kv(%kv));
+    croak "TRACEROUTE: no reply from daemon" unless defined $r;
+    my $cmd = parse_line($r);
+    croak "TRACEROUTE: $cmd->{msg}" if $cmd->{verb} eq 'ERR';
+    croak "TRACEROUTE: unexpected reply '$r'" unless $cmd->{verb} eq 'OK';
+    my $okv = $cmd->{kv} || {};
+    my @hops;
+    if (defined(my $b64 = $okv->{hops_b64})) {
+        require MIME::Base64;
+        my $tsv = MIME::Base64::decode_base64($b64);
+        for my $line (split /\n/, $tsv) {
+            next unless length $line;
+            my ($n, $rtt, $addr) = split /\t/, $line, 3;
+            push @hops, {
+                n      => (defined $n    ? $n + 0                       : 0),
+                rtt_ms => (defined $rtt && $rtt ne '-' ? ($rtt + 0) : undef),
+                addr   => (defined $addr && $addr ne '-' ? $addr    : undef),
+            };
+        }
+    }
+    return {
+        target      => $okv->{target}      // $a{target},
+        count       => ($okv->{count}       // 0) + 0,
+        reached     => ($okv->{reached}     // 0) + 0,
+        duration_ms => ($okv->{duration_ms} // 0) + 0,
+        hops        => \@hops,
+    };
+}
+
 sub bye {
     my ($self) = @_;
     $self->send_line("BYE");

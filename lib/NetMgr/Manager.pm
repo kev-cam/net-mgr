@@ -1512,6 +1512,7 @@ sub _handle_line {
     elsif ($verb eq 'BITCHAT_PEER_UPSERT') { $self->_handle_bitchat_peer_upsert($cli, $cmd) }
     elsif ($verb eq 'BITCHAT_PACKET_RELAY') { $self->_handle_bitchat_packet_relay($cli, $cmd) }
     elsif ($verb eq 'REPAIR')     { $self->_handle_repair($cli, $cmd) }
+    elsif ($verb eq 'TRACEROUTE') { $self->_handle_traceroute($cli, $cmd) }
     elsif ($verb eq 'CHAT_PUT')       { $self->_handle_chat_put($cli, $cmd) }
     elsif ($verb eq 'CHAT_GET')       { $self->_handle_chat_get($cli, $cmd) }
     elsif ($verb eq 'CHAT_LS')        { $self->_handle_chat_ls($cli, $cmd) }
@@ -6456,6 +6457,210 @@ sub _repair_have {
         return 1 if length $d && -x "$d/$prog";
     }
     return 0;
+}
+
+# ---- TRACEROUTE (default-allow, [diag] gates) --------------------------
+#
+# Read-only diagnostic. The daemon runs `traceroute -n` on the caller's
+# behalf and returns the per-hop summary. Modeled directly on REPAIR
+# (default ALLOW; operators tighten via [diag] prohibit_* keys). [diag]
+# is intentionally distinct from [debug] (POLL's gate): POLL's whitelisted
+# scripts are debug probes; TRACEROUTE is a first-class diagnostic verb
+# with its own admission model and its own audit-line prefix.
+#
+# Admission:
+#
+#   [diag]
+#   prohibit_traceroute = true   ; per-probe kill switch
+#   prohibit_remote     = true   ; refuse non-loopback callers (default false)
+#   prohibit_unauth     = true   ; refuse remote callers who did not AUTH
+#                                ; (default false; ignored on loopback)
+#   prohibit_all        = true   ; kill switch, refuses every diag verb
+#
+# Wire format:
+#   TRACEROUTE target=<HOST_OR_IP> [max_hops=15] [timeout_s=2] [src_iface=IF]
+#
+# Reply (base64-in-kv, mirrors POLL's structured/large-output pattern):
+#   OK target=X count=K reached=0|1 duration_ms=N hops_b64=<base64(TSV)>
+# where the decoded TSV is one line per hop:
+#   <n>\t<rtt_ms>\t<addr>
+# with '-' for missing rtt / unreachable hops.
+sub _handle_traceroute {
+    my ($self, $cli, $cmd) = @_;
+    my $dcfg = ($self->{config}{diag} ||= {});
+    my $is_lb = _peer_is_loopback($cli);
+    if (!$is_lb && _repair_is_true($dcfg->{prohibit_remote})) {
+        return $self->_send($cli, format_err(
+            "TRACEROUTE: remote callers refused by [diag] prohibit_remote"));
+    }
+    if (!$is_lb && _repair_is_true($dcfg->{prohibit_unauth})
+                && !($cli->{auth} && $cli->{auth}{verified})) {
+        return $self->_send($cli, format_err(
+            "TRACEROUTE: unauthenticated remote callers refused by"
+          . " [diag] prohibit_unauth"));
+    }
+    if (_repair_is_true($dcfg->{prohibit_all})) {
+        return $self->_send($cli, format_err(
+            "TRACEROUTE: all diagnostics prohibited by [diag] prohibit_all"));
+    }
+    if (_repair_is_true($dcfg->{prohibit_traceroute})) {
+        return $self->_send($cli, format_err(
+            "TRACEROUTE: prohibited by [diag] prohibit_traceroute"));
+    }
+
+    my $kv = $cmd->{kv} || {};
+    my $target = $kv->{target} // '';
+    unless (_traceroute_valid_target($target)) {
+        return $self->_send($cli, format_err(
+            "TRACEROUTE: missing or invalid target= (v4/v6/hostname, 1..255"
+          . " chars, [a-zA-Z0-9._:-])"));
+    }
+    my $max_hops = _traceroute_int($kv->{max_hops},  15, 1, 30);
+    my $timeout  = _traceroute_int($kv->{timeout_s},  2, 1, 10);
+    my $src_iface = $kv->{src_iface};
+    if (defined $src_iface && length $src_iface) {
+        unless (_repair_valid_iface($src_iface)) {
+            return $self->_send($cli, format_err(
+                "TRACEROUTE: invalid src_iface= (want [a-zA-Z0-9_-]{1,32})"));
+        }
+    } else {
+        $src_iface = undef;
+    }
+
+    # Pick binary: traceroute6 if target is a v6 literal or contains ':',
+    # else plain traceroute. Both accept the same -n/-w/-m/-i argv.
+    my $bin = ($target =~ /:/) ? 'traceroute6' : 'traceroute';
+    unless (_repair_have($bin)) {
+        return $self->_send($cli, format_err(
+            "TRACEROUTE: '$bin' not on PATH"));
+    }
+
+    my @argv = ($bin, '-n', '-w', $timeout, '-m', $max_hops);
+    push @argv, '-i', $src_iface if defined $src_iface;
+    push @argv, $target;
+
+    my $t0 = Time::HiRes::time();
+    $self->_log("TRACEROUTE run: @argv");
+    my $output = '';
+    my $exec_err;
+    eval {
+        # argv-form open(-|) — no /bin/sh, no word-splitting on $target.
+        # 2>&1 needs a shell, so we manually redirect via a child that
+        # dup2s stderr onto stdout before exec.
+        my $pid = open(my $fh, '-|');
+        if (!defined $pid) { die "fork: $!\n" }
+        if ($pid == 0) {
+            # child
+            open(STDERR, '>&', \*STDOUT) or exit 127;
+            exec { $argv[0] } @argv;
+            exit 127;
+        }
+        local $/;
+        $output = <$fh> // '';
+        close $fh;
+    };
+    if ($@) {
+        my $e = $@; chomp $e;
+        $exec_err = $e;
+    }
+    my $duration_ms = int((Time::HiRes::time() - $t0) * 1000);
+
+    if (defined $exec_err) {
+        $self->_log("TRACEROUTE target=$target exec err: $exec_err");
+        return $self->_send($cli, format_err(
+            "TRACEROUTE: $exec_err"));
+    }
+
+    # Cap raw text at 4096 bytes before parsing to keep pathological
+    # output from ballooning the reply frame.
+    if (length($output) > 4096) {
+        $output = substr($output, 0, 4096);
+    }
+
+    my ($hops_tsv, $count, $reached) = _traceroute_parse($output, $target);
+
+    require MIME::Base64;
+    my $b64 = MIME::Base64::encode_base64($hops_tsv, '');   # no newlines
+
+    $self->_log("TRACEROUTE target=$target count=$count reached=$reached"
+              . " duration_ms=$duration_ms");
+    return $self->_send($cli, format_ok(
+        target      => $target,
+        count       => $count,
+        reached     => $reached,
+        duration_ms => $duration_ms,
+        hops_b64    => $b64,
+    ));
+}
+
+# Target sanity: reject shell metas / leading dash / control chars, accept
+# v4 dotted, v6 colon-hex, or DNS names. Length-capped at 255 (RFC 1035).
+sub _traceroute_valid_target {
+    my ($v) = @_;
+    return 0 unless defined $v && length $v;
+    return 0 if length($v) > 255;
+    return 0 if $v =~ /\A-/;                          # no leading dash
+    return 0 unless $v =~ /\A[a-zA-Z0-9._:\-]+\z/;    # metaset only
+    return 1;
+}
+
+# Clamp a caller-supplied integer to [$lo,$hi] with $default on missing /
+# non-numeric input. Mirrors the "sanitize then pass to argv" pattern used
+# by _repair_valid_iface for iface names.
+sub _traceroute_int {
+    my ($v, $default, $lo, $hi) = @_;
+    return $default unless defined $v && length $v && $v =~ /\A\d+\z/;
+    my $n = $v + 0;
+    $n = $lo if $n < $lo;
+    $n = $hi if $n > $hi;
+    return $n;
+}
+
+# Turn raw `traceroute -n` output into a TSV summary + counters. Each
+# input hop line looks like one of:
+#     " 1  192.168.1.1  0.383 ms  0.421 ms  0.478 ms"
+#     " 3  * * *"
+# We emit one TSV row per hop: "<n>\t<rtt_ms>\t<addr>\n", with '-' where
+# either field is unknown. `reached` is 1 iff the last hop's address
+# matches the requested target (v4 numeric compare; v6 / hostname just
+# string-match — traceroute prints `-n` numeric so the target is what
+# came out of DNS resolution in the header).
+sub _traceroute_parse {
+    my ($raw, $target) = @_;
+    my @tsv;
+    my $last_addr = '';
+    my $count = 0;
+    for my $line (split /\n/, $raw) {
+        # Match a hop line: leading digits followed by space.
+        next unless $line =~ /\A\s*(\d+)\s+(.*)\z/;
+        my ($n, $rest) = ($1, $2);
+        my ($addr, $rtt);
+        if ($rest =~ /\A\*/) {
+            # e.g. "* * *" — unreachable hop
+            $addr = '-';
+            $rtt  = '-';
+        }
+        elsif ($rest =~ /\A(\S+)\s+(.*)\z/) {
+            $addr = $1;
+            my $tail = $2;
+            # First "X.Y ms" (or "X ms") in the tail is the reported rtt.
+            if ($tail =~ /(\d+(?:\.\d+)?)\s*ms/) {
+                $rtt = $1;
+            } else {
+                $rtt = '-';
+            }
+        }
+        else {
+            $addr = '-';
+            $rtt  = '-';
+        }
+        push @tsv, "$n\t$rtt\t$addr";
+        $last_addr = $addr if $addr ne '-';
+        $count++;
+    }
+    my $reached = ($last_addr ne '' && $last_addr eq $target) ? 1 : 0;
+    my $out = @tsv ? (join("\n", @tsv) . "\n") : '';
+    return ($out, $count, $reached);
 }
 
 1;

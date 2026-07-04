@@ -228,3 +228,29 @@ domain   = grfx.com
 # prohibit_dhcp_cycle     = false
 # prohibit_conn_up        = false
 # prohibit_conn_down      = false
+
+# Read-only network diagnostics (traceroute today; mtr/dig later). The
+# daemon runs the probe on the caller's behalf and returns a structured
+# summary. [diag] is intentionally distinct from [debug] (POLL's gate):
+# POLL's whitelisted scripts are debug probes, whereas TRACEROUTE is a
+# first-class diagnostic verb with its own admission model and its own
+# audit-line prefix. Grow this section by adding one `prohibit_<probe>`
+# key per future probe (no new verb needed).
+#
+# ADMISSION MODEL: default ALLOW, same shape as [repair]. Truthy tokens:
+# on | yes | true | 1 (case-insensitive). Absent / off / no / false / 0
+# = allowed.
+#
+# Admission gates:
+#   prohibit_remote      — refuse non-loopback callers entirely
+#   prohibit_unauth      — refuse remote callers that did NOT AUTH
+#                          (loopback callers ignore this)
+#
+# Per-probe kill switches (any one refuses just that probe):
+#   prohibit_all         — master switch, refuses every diagnostic
+#   prohibit_traceroute  — refuse the TRACEROUTE verb
+[diag]
+# prohibit_remote      = false
+# prohibit_unauth      = false
+# prohibit_all         = false
+# prohibit_traceroute  = false

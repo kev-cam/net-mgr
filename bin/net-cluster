@@ -153,6 +153,7 @@ elsif ($cmd eq 'poll')     { $rc = cmd_poll($multi) }
 elsif ($cmd eq 'put')      { $rc = cmd_put($multi) }
 elsif ($cmd eq 'master')   { $rc = cmd_master($multi) }
 elsif ($cmd eq 'repair')   { $rc = cmd_repair($multi) }
+elsif ($cmd eq 'traceroute'){ $rc = cmd_traceroute($multi) }
 else { warn "net-cluster: unknown command '$cmd'\n"; usage(2) }
 
 $multi->bye_all;
@@ -392,6 +393,61 @@ sub cmd_repair {
     return $any_err ? 1 : 0;
 }
 
+sub cmd_traceroute {
+    my ($m) = @_;
+    my %kv = _parse_kv(@ARGV) or do {
+        warn "traceroute: need target=<host_or_ip> "
+           . "[max_hops=N] [timeout_s=S] [src_iface=IF]\n";
+        return 2;
+    };
+    unless (defined $kv{target} && length $kv{target}) {
+        warn "traceroute: need target=<host_or_ip>\n";
+        return 2;
+    }
+    my (%out, $any_err);
+    for my $p ($m->peers) {
+        unless ($p->{client}) {
+            $out{$p->{name}} = { error => ($p->{error} // 'not connected') };
+            $any_err = 1; next;
+        }
+        my $res = eval { $p->{client}->traceroute(%kv) };
+        if ($@ || !$res) {
+            my $e = $@ // 'no reply'; chomp $e if $e;
+            $e =~ s/ at \S+ line \d+\.?\s*$// if $e;   # drop croak location
+            $out{$p->{name}} = { error => ($e || 'no reply') };
+            $any_err = 1; next;
+        }
+        $out{$p->{name}} = $res;
+    }
+    if ($json) {
+        require JSON::PP;
+        print JSON::PP->new->canonical(1)->pretty->encode(\%out);
+        return $any_err ? 1 : 0;
+    }
+    for my $p ($m->peers) {
+        my $r = $out{ $p->{name} } or next;
+        print "── $p->{name} ──\n";
+        if ($r->{error}) { print "  ERR $r->{error}\n"; next; }
+        printf "  target=%s count=%d reached=%s duration_ms=%d\n",
+            ($r->{target} // '?'),
+            ($r->{count}       // 0),
+            ($r->{reached} ? 'yes' : 'no'),
+            ($r->{duration_ms} // 0);
+        my $hops = $r->{hops} || [];
+        if (!@$hops) {
+            print "  (no hops)\n";
+            next;
+        }
+        for my $h (@$hops) {
+            printf "  %3d  %-40s  %s\n",
+                ($h->{n} // 0),
+                (defined $h->{addr}   ? $h->{addr}   : '*'),
+                (defined $h->{rtt_ms} ? "$h->{rtt_ms} ms" : '(no reply)');
+        }
+    }
+    return $any_err ? 1 : 0;
+}
+
 sub cmd_put {
     my ($m) = @_;
     my $local = shift @ARGV
@@ -529,6 +585,13 @@ Usage:
                                          /etc/net-mgr/allowed_repairers, so
                                          signs by default; per-action kill
                                          switch via [repair] prohibit_<action>)
+  net-cluster traceroute target=HOST [max_hops=15] [timeout_s=2] [src_iface=IF]
+                                        (default-allow diagnostic — every peer
+                                         runs `traceroute -n` to HOST and
+                                         returns a per-hop TSV summary;
+                                         [diag] prohibit_traceroute /
+                                         prohibit_remote / prohibit_unauth
+                                         tighten admission if wanted)
 
 Common flags:
   --listen HOST:PORT     local seed daemon for discovery (127.0.0.1:7531)
