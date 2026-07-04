@@ -299,6 +299,13 @@ sub run_once {
     # session is bitchat-bridge.
     my $PEER_POLL_S = 30;
     my $last_peer_poll = time - $PEER_POLL_S + 5;   # first poll ~5s in
+    # Helper-liveness watchdog: if we don't see a cmd_reply for our peers
+    # poll within 2x the poll interval, the helper's bluer/dbus worker is
+    # almost certainly wedged (that failure mode is minutes-long, not a
+    # sub-second hiccup). SIGTERM the helper; the outer supervisor
+    # while(1) at the top of the file respawns after backoff. Seeded to
+    # now so a fresh startup gets one full grace window before we'd kick.
+    my $last_peer_reply_ts = time;
     my $peer_cli;
     unless ($opt{'dry-run'}) {
         $peer_cli = NetMgr::Client->new(listen => $listen, timeout => 6);
@@ -310,6 +317,19 @@ sub run_once {
         # Peer poll tick — fire only when the helper's stdin is still open
         # so we don't stall on a dead pipe during helper respawn.
         if ($wh && time - $last_peer_poll >= $PEER_POLL_S) {
+            # Watchdog check runs BEFORE we send another peers poll, so
+            # a wedged helper doesn't accumulate an outbox of unanswered
+            # queries.
+            if (time - $last_peer_reply_ts > 2 * $PEER_POLL_S) {
+                warn "[bridge/watchdog] no peers reply for "
+                   . (time - $last_peer_reply_ts) . "s (> 2x "
+                   . "$PEER_POLL_S s); kicking helper pid=$pid\n";
+                kill 'TERM', $pid if $pid;
+                $last_peer_reply_ts = time;  # avoid a kick storm while it dies
+                # run_once returns naturally when the helper's stdout EOFs,
+                # and the outer retry loop respawns with backoff.
+                next OUTER;  # skip THIS tick's poll — we just killed the helper
+            }
             my $ok = eval { print $wh encode_json({ cmd => 'peers' }), "\n"; 1 };
             warn "[bridge] peer poll tick "
                . ($ok ? "sent" : "FAILED: $@") . "\n";
@@ -571,6 +591,14 @@ sub run_once {
                     # cmd_reply for our {"cmd":"peers"} poll — upsert each
                     # peer into bitchat_peers via loopback. Any other
                     # cmd_reply (e.g. send ok/err) just gets logged.
+                    if (($ev->{cmd} // '') eq 'peers') {
+                        # Helper-liveness watchdog: ANY peers reply — even
+                        # a zero-length peer list, or one arriving in
+                        # dry-run mode with no $peer_cli — proves the
+                        # helper is still responsive. Stamp before the
+                        # ARRAY/$peer_cli gate below.
+                        $last_peer_reply_ts = time;
+                    }
                     if (($ev->{cmd} // '') eq 'peers'
                         && ref $ev->{peers} eq 'ARRAY'
                         && $peer_cli)
