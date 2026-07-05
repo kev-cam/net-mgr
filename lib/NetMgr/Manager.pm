@@ -1358,10 +1358,19 @@ sub _accept {
     my $cli = $listener->accept or return;
     $cli->blocking(0);
     my $peer = sprintf "%s:%d", $cli->peerhost // '?', $cli->peerport // 0;
+    # Which of our bound listeners took this connection? Useful for tracing
+    # loopback-vs-LAN divergence in HELLO / auth / disconnect flows — the
+    # daemon binds distinct sockets per address (V6Only on v6), so sockhost
+    # here is the local bind address the peer actually dialed. Cheap to
+    # capture at accept; noisy to reconstruct after the fact.
+    my $via = sprintf "%s:%d",
+        $cli->sockhost // ($listener->sockhost // '?'),
+        $cli->sockport // ($listener->sockport // 0);
     my $fd   = fileno($cli);
     $self->{clients}{$fd} = {
         sock     => $cli,
         peer     => $peer,
+        via      => $via,     # local bind addr:port that accepted this conn
         buffer   => '',
         kind     => undef,    # 'producer' | 'consumer'
         ident    => undef,    # source=... or consumer=...
@@ -1371,7 +1380,7 @@ sub _accept {
                               # { key_id, verified=>1 } once verified
     };
     $self->{select}->add($cli);
-    $self->_log("connect $peer fd=$fd");
+    $self->_log("connect $peer via=$via fd=$fd");
 }
 
 sub _handle_readable {
@@ -1426,7 +1435,13 @@ sub _drop_client {
     }
     $self->{select}->remove($cli->{sock});
     eval { $cli->{sock}->close };
-    $self->_log("disconnect $cli->{peer} fd=$fd ($why)");
+    # Include via= so a HELLO-then-close on one listener is distinguishable
+    # from a HELLO-then-close on another. Defensive: HELLO itself never
+    # drops the client, so if this log fires right after a hello line the
+    # cause is upstream (peer eof, write error) — the via tag makes that
+    # visible without re-running an investigation.
+    my $via = $cli->{via} // '?';
+    $self->_log("disconnect $cli->{peer} via=$via fd=$fd ($why)");
 }
 
 sub _send {
@@ -1962,7 +1977,13 @@ sub _handle_hello {
     # hop=N marks a forwarded request — block transitive FORWARD_TO.
     # Mesh is single-hop by design.
     $cli->{hop} = ($kv->{hop} // 0) + 0;
-    $self->_log("hello $cli->{peer} $cli->{kind}=$cli->{ident}"
+    # via= is the local bind addr the peer dialed. This is the ONLY
+    # per-listener attribute the daemon has after accept, and downstream
+    # auth (loopback = full scope) turns on it, so log it here explicitly
+    # — a HELLO that ends up looking rejected on one listener but not
+    # another leaves a paper trail without needing to re-instrument.
+    my $via = $cli->{via} // '?';
+    $self->_log("hello $cli->{peer} via=$via $cli->{kind}=$cli->{ident}"
               . ($cli->{hop} ? " hop=$cli->{hop}" : ''));
     $self->_send($cli, format_ok());
 }
