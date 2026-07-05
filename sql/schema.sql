@@ -807,3 +807,43 @@ CREATE TABLE IF NOT EXISTS wan_service_health (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 INSERT IGNORE INTO schema_version (version) VALUES (34);
+
+-- Schema v35: public_dns_servers. Longitudinal catalog of upstream public
+-- resolvers we probe (ICMP + dig) and can wire into NetworkManager as
+-- additive fallback DNS. Cluster-replicated (replicated_from) so every
+-- site probes the same catalog and win_count aggregates to the master
+-- per the v21 convention. Seeded with the canonical set (Cloudflare,
+-- Google, Quad9) — operators toggle rows via `enabled` rather than
+-- deleting them so history survives.
+CREATE TABLE IF NOT EXISTS public_dns_servers (
+    addr            VARCHAR(45)  NOT NULL PRIMARY KEY,
+    provider        VARCHAR(64)  NULL,
+    family          TINYINT      NOT NULL,
+    enabled         TINYINT      NOT NULL DEFAULT 1,
+    last_probed     DATETIME     NULL,
+    last_ping_ms    FLOAT        NULL,
+    last_dns_ms     FLOAT        NULL,
+    last_status     VARCHAR(16)  NULL,
+    probe_count     INT          NOT NULL DEFAULT 0,
+    ok_count        INT          NOT NULL DEFAULT 0,
+    win_count       INT          NOT NULL DEFAULT 0,
+    notes           TEXT         NULL,
+    updated_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                 ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from VARCHAR(64)  NULL,
+    KEY idx_pds_provider   (provider),
+    KEY idx_pds_family     (family),
+    KEY idx_pds_replicated (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO public_dns_servers (addr, provider, family) VALUES
+    ('1.1.1.1',              'cloudflare', 4),
+    ('1.0.0.1',              'cloudflare', 4),
+    ('8.8.8.8',              'google',     4),
+    ('8.8.4.4',              'google',     4),
+    ('9.9.9.9',              'quad9',      4),
+    ('2606:4700:4700::1111', 'cloudflare', 6),
+    ('2001:4860:4860::8888', 'google',     6),
+    ('2620:fe::fe',          'quad9',      6);
+
+INSERT IGNORE INTO schema_version (version) VALUES (35);

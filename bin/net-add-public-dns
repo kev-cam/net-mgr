@@ -1,0 +1,261 @@
+#!/usr/bin/perl
+# net-add-public-dns — attach public fallback DNS servers to the active-
+# default NetworkManager profile.
+#
+# What it does:
+#   1. Reads the public_dns_servers catalog (schema v35) — Cloudflare,
+#      Google, Quad9 by default; extend via `--add ADDR:PROVIDER`.
+#   2. Probes each candidate with `dig` (pass/fail + RTT) and `ping`
+#      (latency baseline). Persists results into the DB: bumps
+#      probe_count / ok_count / last_status / last_ping_ms / last_dns_ms
+#      and, for the fastest reachable candidate in the batch, win_count.
+#   3. Nudges NetworkManager: `nmcli con modify PROFILE +ipv4.dns ADDR`
+#      for the top-K survivors, then `nmcli device reapply DEV` to push
+#      the change into /etc/resolv.conf without a link blip or a new
+#      DHCP handshake.
+#
+# The `+ipv4.dns` form is ADDITIVE — the existing DHCP-supplied resolver
+# stays first, the public ones are appended as fallback. Bare
+# `ipv4.dns "..."` would REPLACE the list; we never use that form.
+#
+# Usage:
+#   net-add-public-dns                    probe + add top-K to active-default
+#   net-add-public-dns --list             sorted table, no DB / NM changes
+#   net-add-public-dns --probe            probe + update DB; no NM changes
+#   net-add-public-dns --k N              top-K survivors (default 3)
+#   net-add-public-dns --profile NAME     override active-default target
+#   net-add-public-dns --iface IF         override active-default target
+#   net-add-public-dns --ipv6             family=6 (default: family=4)
+#   net-add-public-dns --add ADDR:PROV    register a new catalog row
+#   net-add-public-dns --revert           remove catalog addrs from profile
+#
+# When the caller is not root, delegates to the loopback daemon's REPAIR
+# add_public_dns verb — same behavior, server-side. Non-loopback modes
+# ride --auth (SSH signing) automatically.
+#
+# Exit codes:
+#   0  success
+#   1  probe/apply reported failure
+#   2  bad arguments
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+use NetMgr::Client;
+use NetMgr::DB;
+use NetMgr::Config;
+use NetMgr::Protocol qw(parse_line);
+
+my $listen  = '127.0.0.1:7531';
+my $do_list;
+my $do_probe;
+my $k       = 3;
+my $profile;
+my $iface;
+my $ipv6;
+my $add_spec;
+my $revert;
+my $help;
+
+GetOptions(
+    'listen=s'  => \$listen,
+    'list'      => \$do_list,
+    'probe'     => \$do_probe,
+    'k=i'       => \$k,
+    'profile=s' => \$profile,
+    'iface=s'   => \$iface,
+    'ipv6'      => \$ipv6,
+    'add=s'     => \$add_spec,
+    'revert'    => \$revert,
+    'help|h'    => \$help,
+) or usage(2);
+usage(0) if $help;
+
+# --list: read-only, direct DB. Runs without a daemon so it works during
+# recovery when net-mgr.service is wedged.
+if ($do_list) {
+    exit(cmd_list());
+}
+
+# --add: register a new candidate. Uses OBSERVE-style DB write (goes via
+# the daemon when we're not root, else falls back to a direct DB write
+# so it works on hosts where the daemon isn't yet up).
+if (defined $add_spec) {
+    exit(cmd_add($add_spec));
+}
+
+# Everything else (probe / apply / revert) — root can shell out directly
+# via the daemon's REPAIR verb, non-root MUST delegate to the daemon.
+exit(cmd_repair());
+
+# ---- commands --------------------------------------------------------
+
+sub cmd_list {
+    my $db = _db_connect() or return 1;
+    my $family = $ipv6 ? 6 : undef;   # undef = both families
+    my $rows = $db->list_public_dns_servers(
+        (defined $family ? (family => $family) : ()),
+    );
+    unless ($rows && @$rows) {
+        print "(no public_dns_servers rows — schema v35 required)\n";
+        return 0;
+    }
+    # Sort by win_count DESC, last_dns_ms ASC (undef last), addr.
+    my @sorted = sort {
+           ($b->{win_count} // 0) <=> ($a->{win_count} // 0)
+        ||
+           (defined $a->{last_dns_ms} ? $a->{last_dns_ms} : 999_999)
+       <=> (defined $b->{last_dns_ms} ? $b->{last_dns_ms} : 999_999)
+        || ($a->{addr} cmp $b->{addr})
+    } @$rows;
+    printf "%-24s %-12s %-3s %-3s %-8s %-8s %-6s %-6s %-6s %-8s %s\n",
+        'ADDR', 'PROVIDER', 'FAM', 'EN', 'STATUS', 'DNS_MS',
+        'PROBE', 'OK', 'WIN', 'PING_MS', 'LAST_PROBED';
+    for my $r (@sorted) {
+        printf "%-24s %-12s %-3d %-3d %-8s %-8s %-6d %-6d %-6d %-8s %s\n",
+            $r->{addr},
+            ($r->{provider}    // ''),
+            $r->{family},
+            $r->{enabled},
+            ($r->{last_status} // '-'),
+            (defined $r->{last_dns_ms}  ? sprintf('%.1f', $r->{last_dns_ms}) : '-'),
+            ($r->{probe_count} // 0),
+            ($r->{ok_count}    // 0),
+            ($r->{win_count}   // 0),
+            (defined $r->{last_ping_ms} ? sprintf('%.1f', $r->{last_ping_ms}) : '-'),
+            ($r->{last_probed} // '-');
+    }
+    return 0;
+}
+
+sub cmd_add {
+    my ($spec) = @_;
+    my ($addr, $provider) = split /:/, $spec, 2;
+    unless (defined $addr && length $addr) {
+        warn "net-add-public-dns: --add expects ADDR[:PROVIDER]\n";
+        return 2;
+    }
+    require Socket;
+    my $family = defined Socket::inet_pton(Socket::AF_INET(),  $addr) ? 4
+              : defined Socket::inet_pton(Socket::AF_INET6(), $addr) ? 6
+              : undef;
+    unless (defined $family) {
+        warn "net-add-public-dns: --add: '$addr' is not a valid IP literal\n";
+        return 2;
+    }
+    my $db = _db_connect() or return 1;
+    my $r = $db->upsert_public_dns_server(
+        addr     => $addr,
+        provider => (defined $provider && length $provider) ? $provider : undef,
+        family   => $family,
+    );
+    if ($r && $r->{now}) {
+        printf "%s: %s addr=%s provider=%s family=v%d\n",
+            'net-add-public-dns', $r->{op}, $addr,
+            ($provider // '-'), $family;
+        return 0;
+    }
+    warn "net-add-public-dns: --add: DB write returned no row\n";
+    return 1;
+}
+
+sub cmd_repair {
+    my %kv = (action => 'add_public_dns', k => $k);
+    $kv{ipv6}   = 1        if $ipv6;
+    $kv{probe}  = 1        if $do_probe;
+    $kv{revert} = 1        if $revert;
+    $kv{iface}  = $iface   if defined $iface && length $iface;
+    # --profile: no server-side handle for a bare name (the server picks
+    # the profile from iface). If both are given, iface wins; if only
+    # profile, we resolve it locally to its device and pass iface=.
+    if (!$kv{iface} && defined $profile && length $profile) {
+        my $dev = _dev_of_profile($profile);
+        if (defined $dev) {
+            $kv{iface} = $dev;
+        } else {
+            warn "net-add-public-dns: profile '$profile' not active\n";
+            return 1;
+        }
+    }
+    my $cli = eval { NetMgr::Client->new(listen => $listen, timeout => 30) };
+    if ($@ || !$cli) {
+        my $e = $@ // 'connect failed'; chomp $e;
+        warn "net-add-public-dns: daemon connect: $e\n";
+        return 1;
+    }
+    my $rc = 0;
+    my $ok = eval {
+        $cli->hello(consumer => "net-add-public-dns.$$");
+        my $reply = $cli->repair(%kv);
+        print "$reply\n";
+        1;
+    };
+    my $err = $@;
+    eval { $cli->bye };
+    if (!$ok) {
+        chomp $err;
+        warn "net-add-public-dns: REPAIR failed: $err\n";
+        $rc = 1;
+    }
+    return $rc;
+}
+
+# ---- helpers ---------------------------------------------------------
+
+sub _db_connect {
+    my $defaults = eval { NetMgr::Config->mysql_defaults_file }
+                // '/etc/net-mgr/root.conf';
+    unless (-r $defaults) {
+        warn "net-add-public-dns: DB credentials '$defaults' not readable "
+           . "(need root or a --list run against the daemon socket)\n";
+        return undef;
+    }
+    my $db = NetMgr::DB->new(defaults_file => $defaults);
+    eval { $db->connect };
+    if ($@) {
+        my $e = $@; chomp $e;
+        warn "net-add-public-dns: DB connect: $e\n";
+        return undef;
+    }
+    return $db;
+}
+
+sub _dev_of_profile {
+    my ($name) = @_;
+    my $act = `nmcli -t -f NAME,DEVICE con show --active 2>/dev/null` // '';
+    for my $l (split /\n/, $act) {
+        my @parts = split /(?<!\\):/, $l;
+        next unless @parts >= 2;
+        my $n = $parts[0]; $n =~ s/\\:/:/g;
+        return $parts[1] if $n eq $name;
+    }
+    return undef;
+}
+
+sub usage {
+    my ($code) = @_;
+    print <<'USAGE';
+net-add-public-dns — probe public resolvers, attach top-K as NM fallback DNS.
+
+Usage:
+  net-add-public-dns                       probe + attach top-K to active-default
+  net-add-public-dns --list                sorted table (no DB/NM writes)
+  net-add-public-dns --probe               probe + update DB, no NM change
+  net-add-public-dns --k N                 top-K survivors (default 3)
+  net-add-public-dns --profile NAME        override active-default target
+  net-add-public-dns --iface IF            override active-default target
+  net-add-public-dns --ipv6                family=6 (default: v4)
+  net-add-public-dns --add ADDR[:PROV]     register a new catalog row
+  net-add-public-dns --revert              remove catalog addrs from profile
+
+Flags:
+  --listen HOST:PORT     daemon (default 127.0.0.1:7531)
+
+Non-root callers delegate to the loopback daemon's REPAIR add_public_dns
+verb. Root callers use the same path (the daemon runs the nmcli commands).
+USAGE
+    exit($code // 0);
+}

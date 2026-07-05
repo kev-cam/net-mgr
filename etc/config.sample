@@ -219,15 +219,24 @@ domain   = grfx.com
 #   prohibit_dhcp_cycle       dhclient -r + dhclient (else dhcpcd)
 #   prohibit_conn_up          nmcli connection up NAME
 #   prohibit_conn_down        nmcli connection down NAME
+#   prohibit_add_public_dns   probe public_dns_servers catalog and attach
+#                             top-K reachable to the active-default NM
+#                             profile as additive fallback DNS (nmcli
+#                             +ipv4.dns / +ipv6.dns + device reapply).
+#                             RECOMMEND setting this ON on gateway boxes
+#                             (nas3) — DNS on the WAN gateway is
+#                             authoritative and shouldn't be rewritten by
+#                             a remote REPAIR. Leaf laptops leave off.
 [repair]
-# prohibit_remote         = false
-# prohibit_unauth         = false
-# prohibit_all            = false
-# prohibit_wifi_cycle     = false
-# prohibit_ethernet_cycle = false
-# prohibit_dhcp_cycle     = false
-# prohibit_conn_up        = false
-# prohibit_conn_down      = false
+# prohibit_remote          = false
+# prohibit_unauth          = false
+# prohibit_all             = false
+# prohibit_wifi_cycle      = false
+# prohibit_ethernet_cycle  = false
+# prohibit_dhcp_cycle      = false
+# prohibit_conn_up         = false
+# prohibit_conn_down       = false
+# prohibit_add_public_dns  = false
 
 # Read-only network diagnostics (traceroute today; mtr/dig later). The
 # daemon runs the probe on the caller's behalf and returns a structured

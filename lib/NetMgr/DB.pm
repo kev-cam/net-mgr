@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 34;
+our $SCHEMA_VERSION = 35;
 
 sub new {
     my ($class, %args) = @_;
@@ -857,6 +857,51 @@ CREATE TABLE IF NOT EXISTS wan_service_health (
     KEY idx_wsh_svc (service_name),
     KEY idx_wsh_replicated (replicated_from)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
+    if ($v == 35) {
+        # public_dns_servers: longitudinal catalog of the public resolvers
+        # net-add-public-dns / REPAIR add_public_dns probe (ICMP + dig) and
+        # can wire into NetworkManager as additive fallback DNS. Seeded with
+        # the canonical Cloudflare/Google/Quad9 set so a fresh install has
+        # something to probe on day one. Cluster-replicated so all sites
+        # probe the same catalog and win_count aggregates to the master
+        # (v21 replicated_from convention). Column docs live in
+        # sql/schema.sql. Re-run safe (CREATE TABLE IF NOT EXISTS +
+        # INSERT IGNORE).
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS public_dns_servers (
+    addr            VARCHAR(45)  NOT NULL PRIMARY KEY,
+    provider        VARCHAR(64)  NULL,
+    family          TINYINT      NOT NULL,
+    enabled         TINYINT      NOT NULL DEFAULT 1,
+    last_probed     DATETIME     NULL,
+    last_ping_ms    FLOAT        NULL,
+    last_dns_ms     FLOAT        NULL,
+    last_status     VARCHAR(16)  NULL,
+    probe_count     INT          NOT NULL DEFAULT 0,
+    ok_count        INT          NOT NULL DEFAULT 0,
+    win_count       INT          NOT NULL DEFAULT 0,
+    notes           TEXT         NULL,
+    updated_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                 ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from VARCHAR(64)  NULL,
+    KEY idx_pds_provider   (provider),
+    KEY idx_pds_family     (family),
+    KEY idx_pds_replicated (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        $self->{dbh}->do(<<'SQL');
+INSERT IGNORE INTO public_dns_servers (addr, provider, family) VALUES
+    ('1.1.1.1',              'cloudflare', 4),
+    ('1.0.0.1',              'cloudflare', 4),
+    ('8.8.8.8',              'google',     4),
+    ('8.8.4.4',              'google',     4),
+    ('9.9.9.9',              'quad9',      4),
+    ('2606:4700:4700::1111', 'cloudflare', 6),
+    ('2001:4860:4860::8888', 'google',     6),
+    ('2620:fe::fe',          'quad9',      6)
 SQL
         return;
     }
@@ -2105,6 +2150,93 @@ sub upsert_wifi_scan_result {
     );
 }
 
+# ---- public_dns_servers -----------------------------------------------
+#
+# Catalog of upstream public resolvers we probe (ICMP + dig) and can
+# wire into NetworkManager as additive fallback DNS. Cluster-replicated
+# so all sites share the same candidate list; win_count aggregates
+# fastest-of-batch across the mesh (v21 replicated_from convention).
+
+# Return every catalog row, optionally filtered by family (4|6) and
+# enabled=1. Sorted deterministically (family, provider, addr) so
+# net-add-public-dns --list output doesn't jitter.
+sub list_public_dns_servers {
+    my ($self, %f) = @_;
+    my @where;
+    my @bind;
+    if (defined $f{family}) {
+        push @where, "family = ?";
+        push @bind, $f{family};
+    }
+    if ($f{enabled_only}) {
+        push @where, "enabled = 1";
+    }
+    my $sql = "SELECT * FROM public_dns_servers";
+    $sql .= " WHERE " . join(' AND ', @where) if @where;
+    $sql .= " ORDER BY family, provider, addr";
+    return $self->{dbh}->selectall_arrayref($sql, { Slice => {} }, @bind);
+}
+
+sub get_public_dns_server {
+    my ($self, $addr) = @_;
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM public_dns_servers WHERE addr = ?", undef, $addr);
+}
+
+# Insert a new candidate row. Returns { op, now } like the other
+# upsert_* helpers so _upsert()/_emit_change() can stream it to
+# subscribers.
+sub upsert_public_dns_server {
+    my ($self, %f) = @_;
+    my $addr = $f{addr} or croak "upsert_public_dns_server: addr required";
+    croak "upsert_public_dns_server: family (4|6) required"
+        unless defined $f{family} && ($f{family} == 4 || $f{family} == 6);
+    my $existed = $self->get_public_dns_server($addr);
+    $self->{dbh}->do(
+        "INSERT INTO public_dns_servers
+            (addr, provider, family, enabled, notes, replicated_from)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            provider        = COALESCE(VALUES(provider),        provider),
+            family          = VALUES(family),
+            enabled         = COALESCE(VALUES(enabled),         enabled),
+            notes           = COALESCE(VALUES(notes),           notes),
+            replicated_from = COALESCE(VALUES(replicated_from), replicated_from)",
+        undef,
+        $addr, $f{provider}, $f{family},
+        (defined $f{enabled} ? $f{enabled} : 1),
+        $f{notes}, $f{replicated_from},
+    );
+    my $now = $self->get_public_dns_server($addr);
+    return { op => ($existed ? 'update' : 'insert'), now => $now };
+}
+
+# Record a probe result: bumps probe_count, ok_count (when status='ok'),
+# and rewrites last_* columns. Optional win=>1 also bumps win_count.
+# Returns { op => 'update', now => <row> } for _emit_change plumbing.
+sub record_public_dns_probe {
+    my ($self, %f) = @_;
+    my $addr = $f{addr} or croak "record_public_dns_probe: addr required";
+    my $status  = defined $f{status}  ? $f{status}  : 'unknown';
+    my $ping_ms = $f{ping_ms};
+    my $dns_ms  = $f{dns_ms};
+    my $win     = $f{win} ? 1 : 0;
+    my $ok      = ($status eq 'ok') ? 1 : 0;
+    $self->{dbh}->do(
+        "UPDATE public_dns_servers
+            SET last_probed  = NOW(),
+                last_ping_ms = ?,
+                last_dns_ms  = ?,
+                last_status  = ?,
+                probe_count  = probe_count + 1,
+                ok_count     = ok_count    + ?,
+                win_count    = win_count   + ?
+          WHERE addr = ?",
+        undef, $ping_ms, $dns_ms, $status, $ok, $win, $addr);
+    my $now = $self->get_public_dns_server($addr);
+    return { op => 'update', now => $now };
+}
+
 # ---- net-chat ---------------------------------------------------------
 #
 # Session control + message log + ephemeral presence. The UPSERT-style
@@ -2594,6 +2726,7 @@ sub query_table {
         host_keys dhcp_ranges dhcp_reservations
         mesh_tunnels node_capabilities bitchat_peers
         wan_services wan_service_candidates wan_service_health
+        public_dns_servers
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};

@@ -84,6 +84,8 @@ $peers_opt = '127.0.0.1' if $cmd eq 'deploy' && !$peers_opt;
 # any non-loopback peer refuses. Callers can still --peers 127.0.0.1 to hit the
 # local daemon unsigned, same as deploy.
 $auth = 1 if $cmd eq 'repair' && !$auth;
+# `add_public_dns` rides the REPAIR verb — same auth model.
+$auth = 1 if ($cmd eq 'add_public_dns' || $cmd eq 'add-public-dns') && !$auth;
 
 # Build the Multi. Auth is wired as an empty hash so NetMgr::Client
 # falls back to its default key_id / key_file detection.
@@ -153,6 +155,10 @@ elsif ($cmd eq 'poll')     { $rc = cmd_poll($multi) }
 elsif ($cmd eq 'put')      { $rc = cmd_put($multi) }
 elsif ($cmd eq 'master')   { $rc = cmd_master($multi) }
 elsif ($cmd eq 'repair')   { $rc = cmd_repair($multi) }
+elsif ($cmd eq 'add_public_dns' || $cmd eq 'add-public-dns') {
+    # Convenience alias: forward everything to REPAIR add_public_dns.
+    unshift @ARGV, 'action=add_public_dns'; $rc = cmd_repair($multi)
+}
 elsif ($cmd eq 'traceroute'){ $rc = cmd_traceroute($multi) }
 else { warn "net-cluster: unknown command '$cmd'\n"; usage(2) }
 
@@ -580,11 +586,19 @@ Usage:
                                          auth-gated same as update)
   net-cluster repair action=A k=v ...   (host-maintenance REPAIR fanout:
                                          wifi_cycle/ethernet_cycle/dhcp_cycle
-                                         iface=IF, conn_up/conn_down name=CONN;
+                                         iface=IF, conn_up/conn_down name=CONN,
+                                         add_public_dns [iface=IF] [k=N]
+                                         [ipv6=on] [probe=on] [revert=on];
                                          daemon admits loopback or a key on
                                          /etc/net-mgr/allowed_repairers, so
                                          signs by default; per-action kill
                                          switch via [repair] prohibit_<action>)
+  net-cluster add_public_dns [k=N] [ipv6=on] [probe=on] [revert=on]
+                                        (alias for `repair action=add_public_dns …`:
+                                         probes public_dns_servers on each peer,
+                                         attaches top-K reachable as fallback DNS
+                                         on the active-default NM profile;
+                                         auth-gated same as repair)
   net-cluster traceroute target=HOST [max_hops=15] [timeout_s=2] [src_iface=IF]
                                         (default-allow diagnostic — every peer
                                          runs `traceroute -n` to HOST and

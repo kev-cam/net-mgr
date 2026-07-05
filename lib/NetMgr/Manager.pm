@@ -46,6 +46,7 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
     mesh_tunnels node_capabilities bitchat_peers
     bitchat_relay_packets
     wan_services wan_service_candidates wan_service_health
+    public_dns_servers
 );
 
 # Tables whose contents are sensitive (credentials etc.); SUBSCRIBE
@@ -6264,11 +6265,26 @@ sub _bitchat_relay_fanout {
 #   dhcp_cycle      iface=IF        dhclient -r + dhclient (else dhcpcd -k + dhcpcd)
 #   conn_up         name=CONN       nmcli connection up CONN
 #   conn_down       name=CONN       nmcli connection down CONN
+#   add_public_dns  [iface=IF] [k=N] [ipv6=on] [probe=on] [revert=on]
+#                                   probe the public_dns_servers catalog,
+#                                   record ping/dig RTTs into the DB, and
+#                                   attach the top-K reachable to the active-
+#                                   default NM profile as additive fallback
+#                                   DNS (nmcli con modify +ipv4.dns / +ipv6.dns
+#                                   + nmcli device reapply — non-disruptive,
+#                                   no link blip, no new DHCP handshake).
+#                                   probe=on records probe results without
+#                                   touching NM. revert=on removes every
+#                                   catalog address currently in the profile.
 #
 # Iface names must match /^[a-zA-Z0-9_-]{1,32}$/. Connection names may be
 # more free-form (nmcli con names allow spaces / punctuation) but shell
 # metacharacters are rejected up front; system(LIST) below never invokes a
 # shell so validated args are passed through as argv without word-splitting.
+#
+# Site policy: gateway boxes should set `[repair] prohibit_add_public_dns=on`
+# — DNS on the WAN gateway is authoritative and shouldn't be rewritten by a
+# remote REPAIR. Leaf laptops leave it default-allow.
 sub _handle_repair {
     my ($self, $cli, $cmd) = @_;
     my $rcfg = ($self->{config}{repair} ||= {});
@@ -6296,6 +6312,7 @@ sub _handle_repair {
         dhcp_cycle     => \&_repair_dhcp_cycle,
         conn_up        => \&_repair_conn_up,
         conn_down      => \&_repair_conn_down,
+        add_public_dns => \&_repair_add_public_dns,
     );
     unless (exists $HANDLERS{$action}) {
         return $self->_send($cli,
@@ -6457,6 +6474,293 @@ sub _repair_have {
         return 1 if length $d && -x "$d/$prog";
     }
     return 0;
+}
+
+# IP-literal validators for _repair_add_public_dns. inet_pton is stricter
+# than a regex (rejects 300.0.0.0, 8.8.8, etc.), and we don't want to
+# reuse _repair_valid_conn_name here — that's shell-safety, not IP
+# validity.
+sub _repair_valid_ipv4 {
+    my ($v) = @_;
+    return 0 unless defined $v && length $v;
+    require Socket;
+    return defined Socket::inet_pton(Socket::AF_INET(), $v) ? 1 : 0;
+}
+sub _repair_valid_ipv6 {
+    my ($v) = @_;
+    return 0 unless defined $v && length $v;
+    require Socket;
+    return defined Socket::inet_pton(Socket::AF_INET6(), $v) ? 1 : 0;
+}
+
+# Discover the active-default NM profile. Cross-references
+# `ip -4 route show default` (or -6) against `nmcli con show --active`.
+# Returns ($profile_name, $device) or (undef, undef) if nothing looks
+# like a default route.
+sub _repair_active_default_profile {
+    my ($self, $family) = @_;
+    my $flag = ($family && $family == 6) ? '-6' : '-4';
+    my $rt   = `ip $flag route show default 2>/dev/null` // '';
+    my @lines = grep { length } split /\n/, $rt;
+    return (undef, undef) unless @lines;
+    # Sort by metric (10th col in `ip route` output is "metric NN"). Fall
+    # back to first line if metrics can't be parsed.
+    my ($best) = sort {
+        my ($ma) = ($a =~ /metric\s+(\d+)/);
+        my ($mb) = ($b =~ /metric\s+(\d+)/);
+        ($ma // 0) <=> ($mb // 0);
+    } @lines;
+    my ($dev) = ($best =~ /\bdev\s+(\S+)/);
+    return (undef, undef) unless $dev;
+    my $act = `nmcli -t -f NAME,DEVICE con show --active 2>/dev/null` // '';
+    for my $l (split /\n/, $act) {
+        # nmcli -t escapes ':' in names as '\:'; split with negative-look
+        # to preserve those.
+        my @parts = split /(?<!\\):/, $l;
+        next unless @parts >= 2;
+        my $name = $parts[0]; $name =~ s/\\:/:/g;
+        my $d    = $parts[1];
+        return ($name, $dev) if defined $d && $d eq $dev;
+    }
+    return (undef, $dev);
+}
+
+# One-shot reachability check for a single candidate. Returns a hashref
+# { status, ping_ms, dns_ms }. status is 'ok' if dig answered; otherwise
+# 'timeout'/'unreachable' (best-effort — dig's exit code is the pass/fail
+# signal, ping is latency only for those that reply).
+sub _repair_probe_dns_server {
+    my ($self, $addr) = @_;
+    my %r = (status => 'unknown', ping_ms => undef, dns_ms => undef);
+
+    # dig: pass/fail signal + RTT via wall-clock (dig doesn't print RTT
+    # in +short mode). Timing is host-side and includes fork overhead;
+    # good enough for ranking a batch of ~10 servers.
+    if (_repair_have('dig')) {
+        require Time::HiRes;
+        my $t0  = Time::HiRes::time();
+        my $out = `dig +time=2 +tries=1 \@$addr dns.google A +short 2>/dev/null`;
+        my $rc  = $? >> 8;
+        my $ms  = int((Time::HiRes::time() - $t0) * 1000 + 0.5);
+        if ($rc == 0 && defined $out && length $out) {
+            $r{status} = 'ok';
+            $r{dns_ms} = $ms;
+        } else {
+            $r{status} = 'timeout';
+        }
+    } else {
+        # No dig — fall back to a TCP:53 connect check as pass/fail.
+        require IO::Socket::INET;
+        my $s = IO::Socket::INET->new(
+            PeerAddr => $addr, PeerPort => 53,
+            Proto    => 'tcp', Timeout  => 2);
+        $r{status} = $s ? 'ok' : 'unreachable';
+        close $s if $s;
+    }
+
+    # Latency (best-effort). Some resolvers drop ICMP (some Quad9
+    # variants, some corporate); NULL is fine.
+    if (_repair_have('ping')) {
+        my $v6 = ($addr =~ /:/) ? '-6' : '-4';
+        my $out = `ping $v6 -c 1 -W 2 -q $addr 2>/dev/null`;
+        if (defined $out && $out =~ m{= [0-9.]+/([0-9.]+)/}) {
+            $r{ping_ms} = $1 + 0;
+        }
+    }
+    return \%r;
+}
+
+# Read the current fallback DNS list from the profile so revert=on can
+# remove exactly the addresses this handler previously added. Returns
+# arrayref of addr strings currently in `ipv4.dns` / `ipv6.dns`.
+# argv-form open() rather than backticks — NM profile names can contain
+# spaces ("Wired connection 1") and shell-quoting them safely is a
+# footgun.
+sub _repair_profile_dns {
+    my ($self, $profile, $family) = @_;
+    my $prop = ($family == 6) ? 'ipv6.dns' : 'ipv4.dns';
+    my @argv = ('nmcli', '-g', $prop, 'con', 'show', $profile);
+    my $pid = open(my $fh, '-|');
+    return [] unless defined $pid;
+    if ($pid == 0) {
+        open(STDERR, '>', '/dev/null');
+        exec { $argv[0] } @argv;
+        exit 127;
+    }
+    my $out = do { local $/; <$fh> };
+    close $fh;
+    return [] unless defined $out;
+    chomp $out;
+    return [] unless length $out;
+    # nmcli -g output uses ':' as the field separator between properties,
+    # but within a list-valued property the addresses are separated by
+    # ',' (or by ' ' on some older NM builds). Handle both.
+    my @a = grep { length } split /[,\s]+/, $out;
+    return \@a;
+}
+
+# The workhorse. Args from kv:
+#   iface=<if>      optional; else discover active-default profile
+#   k=<N>           default 3; number of top-K survivors to attach
+#   ipv6=on|1       include family=6 candidates (default: family=4 only)
+#   probe=on|1      record probe results only; do NOT touch NM
+#   revert=on|1     remove every catalog addr currently in the profile
+#                   (single-shot rollback; ignores k)
+sub _repair_add_public_dns {
+    my ($self, $kv) = @_;
+    my $k = defined $kv->{k} ? ($kv->{k} + 0) : 3;
+    $k = 1 if $k < 1;
+    $k = 8 if $k > 8;
+    my $want_ipv6 = _repair_is_true($kv->{ipv6});
+    my $probe_only = _repair_is_true($kv->{probe});
+    my $revert     = _repair_is_true($kv->{revert});
+    my $family     = $want_ipv6 ? 6 : 4;
+
+    # Optional iface override — if the caller pinned an iface, find the
+    # profile bound to it. Otherwise walk from the default route.
+    my ($profile, $dev);
+    if (defined $kv->{iface} && length $kv->{iface}) {
+        die "add_public_dns: bad iface '$kv->{iface}'\n"
+            unless _repair_valid_iface($kv->{iface});
+        $dev = $kv->{iface};
+        my $act = `nmcli -t -f NAME,DEVICE con show --active 2>/dev/null` // '';
+        for my $l (split /\n/, $act) {
+            my @parts = split /(?<!\\):/, $l;
+            next unless @parts >= 2;
+            my $n = $parts[0]; $n =~ s/\\:/:/g;
+            if ($parts[1] eq $dev) { $profile = $n; last }
+        }
+        die "add_public_dns: no active profile on iface $dev\n"
+            unless defined $profile;
+    } else {
+        ($profile, $dev) = $self->_repair_active_default_profile($family);
+        die "add_public_dns: no active-default route on family v$family\n"
+            unless defined $profile && defined $dev;
+    }
+
+    # Catalog rows (family-filtered, enabled=1 only).
+    my $rows = $self->{db}->list_public_dns_servers(
+        family => $family, enabled_only => 1);
+    my @candidates = @{ $rows || [] };
+    die "add_public_dns: no enabled family=v$family rows in "
+      . "public_dns_servers\n" unless @candidates;
+
+    # REVERT: remove every catalog addr currently in the profile's
+    # ipv4.dns / ipv6.dns list. Non-disruptive (nmcli device reapply).
+    if ($revert) {
+        my $prop = ($family == 6) ? 'ipv6.dns' : 'ipv4.dns';
+        my %in_catalog = map { $_->{addr} => 1 } @candidates;
+        my $cur = $self->_repair_profile_dns($profile, $family);
+        my @drop = grep { $in_catalog{$_} } @$cur;
+        return (0, undef, "revert: none of catalog in profile=$profile")
+            unless @drop;
+        for my $a (@drop) {
+            my ($rc, $err) = $self->_repair_run(
+                'nmcli', 'con', 'modify', $profile, "-$prop", $a);
+            return ($rc, ($err // "nmcli -$prop failed"),
+                    "profile=$profile addr=$a") if $rc != 0;
+        }
+        my ($rc, $err) = $self->_repair_run('nmcli', 'device', 'reapply', $dev);
+        return ($rc, ($err // 'nmcli reapply failed'),
+                "profile=$profile dev=$dev") if $rc != 0;
+        return (0, undef,
+            "revert profile=$profile removed=" . scalar(@drop));
+    }
+
+    # Probe every candidate; rank by dns_ms ASC; fastest wins the batch.
+    my @ranked;
+    for my $row (@candidates) {
+        my $addr = $row->{addr};
+        # Belt-and-suspenders IP validation — catch a bogus DB row before
+        # it lands on the nmcli argv.
+        my $ok_ip = ($family == 6) ? _repair_valid_ipv6($addr)
+                                   : _repair_valid_ipv4($addr);
+        next unless $ok_ip;
+        my $r = $self->_repair_probe_dns_server($addr);
+        push @ranked, { %$row, %$r };
+    }
+    # Order: reachable first, then by dns_ms ASC. Undef dns_ms sorts last.
+    @ranked = sort {
+        my $ao = ($a->{status} eq 'ok') ? 0 : 1;
+        my $bo = ($b->{status} eq 'ok') ? 0 : 1;
+        return $ao <=> $bo if $ao != $bo;
+        my $ad = defined $a->{dns_ms} ? $a->{dns_ms} : 999_999;
+        my $bd = defined $b->{dns_ms} ? $b->{dns_ms} : 999_999;
+        $ad <=> $bd;
+    } @ranked;
+
+    # Winner: the fastest that answered.
+    my ($winner) = grep { $_->{status} eq 'ok' } @ranked;
+
+    # Record probe results in the DB (both ok and non-ok). Emits change
+    # events so subscribers see the update.
+    for my $r (@ranked) {
+        my $is_win = ($winner && $r->{addr} eq $winner->{addr}) ? 1 : 0;
+        my $rec = $self->{db}->record_public_dns_probe(
+            addr    => $r->{addr},
+            status  => $r->{status},
+            ping_ms => $r->{ping_ms},
+            dns_ms  => $r->{dns_ms},
+            win     => $is_win,
+        );
+        $self->_emit_change(table => 'public_dns_servers',
+                            op    => 'update',
+                            row   => $rec->{now}) if $rec && $rec->{now};
+    }
+
+    if ($probe_only) {
+        my $ok_n = scalar grep { $_->{status} eq 'ok' } @ranked;
+        return (0, undef,
+            "probe profile=$profile family=v$family "
+          . "ok=$ok_n/" . scalar(@ranked)
+          . (defined $winner ? " winner=$winner->{addr}" : ''));
+    }
+
+    # Attach top-K reachable to the profile as additive fallback DNS.
+    # Additive semantics require ignore-auto-dns=no (default, but assert
+    # explicitly — the memory pin warns it can silently be flipped
+    # elsewhere).
+    my @top = grep { $_->{status} eq 'ok' } @ranked;
+    $#top = $k - 1 if @top > $k;
+    return (0, undef, "no reachable candidates on profile=$profile family=v$family")
+        unless @top;
+
+    my $prop = ($family == 6) ? 'ipv6.dns' : 'ipv4.dns';
+    my $auto_flag = ($family == 6) ? 'ipv6.ignore-auto-dns'
+                                    : 'ipv4.ignore-auto-dns';
+    my ($rc, $err) = $self->_repair_run(
+        'nmcli', 'con', 'modify', $profile, $auto_flag, 'no');
+    return ($rc, ($err // "nmcli $auto_flag failed"),
+            "profile=$profile") if $rc != 0;
+
+    # Skip addresses already present so re-runs are idempotent.
+    my %have = map { $_ => 1 } @{ $self->_repair_profile_dns($profile, $family) };
+    my @added;
+    for my $r (@top) {
+        if ($have{ $r->{addr} }) {
+            next;
+        }
+        ($rc, $err) = $self->_repair_run(
+            'nmcli', 'con', 'modify', $profile, "+$prop", $r->{addr});
+        return ($rc, ($err // "nmcli +$prop failed"),
+                "profile=$profile addr=$r->{addr}") if $rc != 0;
+        push @added, $r->{addr};
+    }
+
+    # nmcli device reapply — non-disruptive; pushes the profile change
+    # into resolv.conf without a link blip / new DHCP handshake. Only
+    # reapply if we actually changed anything (avoid spurious log noise
+    # on a pure-noop re-run).
+    if (@added) {
+        ($rc, $err) = $self->_repair_run('nmcli', 'device', 'reapply', $dev);
+        return ($rc, ($err // 'nmcli reapply failed'),
+                "profile=$profile dev=$dev added=" . join(',', @added))
+            if $rc != 0;
+    }
+    return (0, undef,
+        "profile=$profile dev=$dev family=v$family "
+      . "added=" . (scalar @added)
+      . " (top=" . join(',', @added) . ')');
 }
 
 # ---- TRACEROUTE (default-allow, [diag] gates) --------------------------
