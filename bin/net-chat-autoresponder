@@ -881,7 +881,7 @@ our $listen;
 our $file;
 our %S;
 our @KNOWN_SESSIONS;
-our $save_btn;
+our ($save_btn, $post_btn);
 our %SHARED_WIFI;
 our @SHARED_WIFI_LABELS;
 our %DISPLAY_TO_LABEL;
@@ -1052,8 +1052,17 @@ sub run {
     $test_text->tagConfigure('resolved', -foreground => '#005');
 
     # --- Action bar -----------------------------------------------------
-    $save_btn = $action_bar->Button(-text => 'Save rule',
+    $save_btn = $action_bar->Button(-text => 'Save',
                                     -command => \&do_save_rule)
+                           ->pack(-side => 'left', -padx => 4);
+    update_save_state();
+    # Post: send the current body to the target session as a one-off
+    # chat_post, bypassing the rule engine. Useful for "does anyone see
+    # this?" pokes and for testing a body without waiting for the next
+    # periodic fire. Only meaningful for channel=chat_post rules
+    # (target is a session name); disabled otherwise.
+    $post_btn = $action_bar->Button(-text => 'Post',
+                                    -command => \&do_post_now)
                            ->pack(-side => 'left', -padx => 4);
     update_save_state();
     $action_bar->Button(-text => 'Reload from disk',
@@ -2277,8 +2286,61 @@ sub update_save_state {
     return unless defined $save_btn;
     my $trig = $E{fields}{trigger} // '';
     my $chan = $E{fields}{channel} // '';
-    my $state = (length $trig && length $chan) ? 'normal' : 'disabled';
-    $save_btn->configure(-state => $state);
+    my $save_state = (length $trig && length $chan) ? 'normal' : 'disabled';
+    $save_btn->configure(-state => $save_state);
+    # Post is only meaningful for chat_post rules (target = session name);
+    # for bitchat_dm the target is a peer_id which requires the bridge
+    # to relay, and noop rules have no wire effect. Enable based on the
+    # Channel Optionmenu only — body/target emptiness is caught inside
+    # do_post_now, since those fields don't drive update_save_state
+    # from every keystroke.
+    if (defined $post_btn) {
+        my $post_state = $chan eq 'chat_post' ? 'normal' : 'disabled';
+        $post_btn->configure(-state => $post_state);
+    }
+}
+
+# One-off chat_post that bypasses the rule engine: use the editor's
+# current target (session) + body and post now via a fresh NetMgr::Client
+# on $listen. as=global.as so the daemon attributes it to the responder
+# process even though this is a hand-driven poke. Any ${…} tokens in
+# the body are passed through verbatim — this is a raw post, not a rule
+# fire, so there is no context to resolve them from.
+sub do_post_now {
+    my $chan = $E{fields}{channel} // '';
+    my $tgt  = $E{fields}{target}  // '';
+    my $body = $E{fields}{body}    // '';
+    return _msg('Post', 'Post only works on channel=chat_post rules.')
+        if $chan ne 'chat_post';
+    return _msg('Post', 'Target and Body are required.')
+        unless length $tgt && length $body;
+    my $as = $S{global}{as} // 'net-chat-autoresponder';
+    my $ok = eval {
+        require NetMgr::Client;
+        my $c = NetMgr::Client->new(listen => $listen, timeout => 6);
+        $c->hello(consumer => "autoresponder.gui.$$");
+        eval { $c->chat_open(name => $tgt); };  # idempotent; ignore ERR:exists
+        $c->chat_post(session => $tgt, body => $body, as => $as);
+        eval { $c->bye };
+        1;
+    };
+    if ($ok) {
+        $status_lbl->configure(-text => "posted to $tgt")
+            if defined $status_lbl;
+    } else {
+        my $err = $@; chomp $err;
+        _msg('Post failed', $err);
+    }
+}
+
+# _msg — tiny wrapper around Tk's messageBox so error dialogs match
+# the rest of the GUI's popups. Kept minimal on purpose; the daemon
+# path never touches it.
+sub _msg {
+    my ($title, $body) = @_;
+    return unless defined $mw;
+    $mw->messageBox(-type => 'ok', -icon => 'info',
+                    -title => $title, -message => $body);
 }
 
 sub _snapshot {
