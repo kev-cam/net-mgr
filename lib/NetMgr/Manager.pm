@@ -336,6 +336,11 @@ sub start_listener {
     }
     croak "no listeners could be bound from '$spec'" unless %{ $self->{listeners} };
     $self->_start_mesh;
+    # One-shot: propagate reservation-time names of hosts that predate the
+    # OBSERVE→machines/hostnames wiring into the identity tables. Runs after
+    # _start_mesh so replication is up, but before the main loop begins
+    # serving OBSERVE traffic. Opt-out via [manager] backfill_reservation_machines=false.
+    $self->_backfill_reservation_machines;
     return [ map { $_->{sock} } values %{ $self->{listeners} } ];
 }
 
@@ -4513,8 +4518,102 @@ sub _obs_dhcp_reservation {
         updated_by  => $who,
     );
     $self->_log("dhcp reservation $ip -> $mac by $who");
+    # A reservation with a name is authoritative name evidence for this MAC:
+    # the operator has typed the label and the daemon has just written it into
+    # dnsmasq. Mirror it into machines + hostnames so net-lookup / net-name /
+    # net-diag <name> resolve without a separate registration step. Pattern
+    # copied from _apply_self_inventory (above): upsert the machine directly
+    # (keyed by primary_name), then $self->_upsert the hostname so subscribers
+    # see the row via replication.
+    $self->_register_reservation_machine($mac, $name, "reserved by $who")
+        if defined $name && length $name;
     $self->_broadcast_regen_dnsmasq;
     return ();
+}
+
+# Bind $name to a machine row + hostname row, driven by a dhcp_reservation
+# OBSERVE (or the startup backfill). Idempotent — safe to re-run; every
+# write is via find-or-create. Returns the machine id used, or undef when
+# no id could be established. $note lands in machines.notes on first
+# insert only (upsert_machine won't overwrite an existing notes column
+# when we omit the arg on a repeat).
+sub _register_reservation_machine {
+    my ($self, $mac, $name, $note) = @_;
+    my $db = $self->{db} or return undef;
+    # Find or create the machine keyed by primary_name = $name. Same
+    # convention as _apply_self_inventory (one machine per primary_name).
+    my ($mid) = $db->dbh->selectrow_array(
+        "SELECT id FROM machines WHERE primary_name = ?", undef, $name);
+    if (!$mid) {
+        my $r = $db->upsert_machine(
+            primary_name => $name,
+            online       => 1,
+            (defined $note && length $note ? (notes => $note) : ()),
+        );
+        $mid = $r->{now}{id} if $r && $r->{now};
+    }
+    return undef unless $mid;
+    # Route through _upsert so subscribers (followers' net-mgr-relay) actually
+    # receive the hostname row via the replication stream — same reasoning as
+    # the comment in _apply_self_inventory. source='reservation' distinguishes
+    # this attestation from 'self', 'dhcp', 'dhcp.master', 'ap', 'ssh-hostkey'.
+    $self->_upsert('hostnames', 'upsert_hostname',
+        machine_id => $mid, name => $name, source => 'reservation');
+    return $mid;
+}
+
+# One-shot startup backfill: for every dhcp_reservations row with a
+# non-empty name, ensure there's a machines row keyed by primary_name and
+# a hostnames row (source='reservation') pointing at it. Retroactively
+# fixes hosts whose reservation was created before the OBSERVE handler
+# started propagating identity — e.g. p620a on nas3 — without needing the
+# operator to re-issue `net-reserve reserve`. Guarded by the config knob
+# [manager] backfill_reservation_machines (default: true) so operators
+# can opt out. Called once from start_listener.
+sub _backfill_reservation_machines {
+    my ($self) = @_;
+    my $db = $self->{db} or return;
+    my $enabled = $self->{config}{manager}{backfill_reservation_machines};
+    $enabled = 1 unless defined $enabled;
+    return unless $enabled;
+    my $rows = eval {
+        $db->dbh->selectall_arrayref(
+            "SELECT ip, mac, name FROM dhcp_reservations
+              WHERE name IS NOT NULL AND name <> ''",
+            { Slice => {} });
+    };
+    if ($@) {
+        $self->_log("[backfill] reservation scan failed: $@");
+        return;
+    }
+    my $registered = 0;
+    for my $r (@{ $rows || [] }) {
+        my ($name, $mac, $ip) = ($r->{name}, $r->{mac}, $r->{ip});
+        next unless defined $name && length $name;
+        next unless defined $mac  && length $mac;
+        # Only register when the name isn't already known as a primary_name.
+        # This lets us report the actual registrations we performed rather
+        # than a noisy line per already-correlated reservation.
+        my ($mid) = eval {
+            $db->dbh->selectrow_array(
+                "SELECT id FROM machines WHERE primary_name = ?",
+                undef, $name);
+        };
+        next if $mid;
+        my $new_mid = eval {
+            $self->_register_reservation_machine(
+                $mac, $name, 'created by dhcp_reservations backfill');
+        };
+        if ($@) {
+            $self->_log("[backfill] $name ($mac at $ip) failed: $@");
+            next;
+        }
+        next unless $new_mid;
+        $registered++;
+        $self->_log("[backfill] registered $name (mac $mac) from dhcp_reservations");
+    }
+    $self->_log("[backfill] dhcp_reservations: $registered new machine(s) registered")
+        if $registered;
 }
 
 # OBSERVE kind=dhcp_reservation_delete ip=..
