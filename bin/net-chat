@@ -202,20 +202,15 @@ if ($askpass) { cmd_askpass(@ARGV); exit 0 }
 
 my $cmd = shift @ARGV;
 
-# Server resolution: an explicit --listen address wins; otherwise --server
-# names an entry in the [servers] config (see NetMgr::Config), then
-# $NET_MGR_LISTEN, then the configured default server, then loopback.
-if (!defined $listen) {
-    if (defined $server) {
-        $listen = NetMgr::Config->resolve_server($server)
-            or die "net-chat: unknown server '$server' (configure it in "
-                 . (NetMgr::Config->user_path // '~/.config/net-mgr/config')
-                 . " [servers])\n";
-    } else {
-        $listen = $ENV{NET_MGR_LISTEN}
-               // NetMgr::Config->resolve_server(undef)
-               // '127.0.0.1:7531';
-    }
+# Server resolution: --listen / --server pin an explicit target; bare
+# invocation flows into NetMgr::Client's discover ladder ($NET_MGR_LISTEN,
+# [servers] default, loopback, ~/.cache/net-mgr/last-daemon, other
+# [servers] entries, LAN /24 probe). Works out of the box with no config.
+if (!defined $listen && defined $server) {
+    $listen = NetMgr::Config->resolve_server($server)
+        or die "net-chat: unknown server '$server' (configure it in "
+             . (NetMgr::Config->user_path // '~/.config/net-mgr/config')
+             . " [servers])\n";
 }
 $as //= $ENV{NET_CHAT_AS} // $ENV{USER} // 'local';
 
@@ -296,12 +291,22 @@ sub connect_client {
             }
         }
     }
-    my $cli = eval { NetMgr::Client->new(listen => $listen, timeout => 10,
-                                         as => $as,
-                                         (defined $as_pubkey
-                                          ? (as_pubkey => $as_pubkey) : ())) }
-        or die "net-chat: cannot reach daemon at $listen: $@";
+    my $cli = eval {
+        my %common = (
+            timeout => 10,
+            as      => $as,
+            (defined $as_pubkey ? (as_pubkey => $as_pubkey) : ()),
+        );
+        defined $listen
+            ? NetMgr::Client->new(listen => $listen, %common)
+            : NetMgr::Client->new(discover => 1,
+                                  consumer => "net-chat.$$", %common);
+    } or die "net-chat: cannot reach daemon"
+           . (defined $listen ? " at $listen" : '') . ": $@";
 
+    # Remember the address discover picked so the loopback AUTH-skip check
+    # below sees the actual winner, not the initial (undef) $listen.
+    $listen //= $cli->{listen};
     my ($host) = NetMgr::Client::split_hostport($listen); $host //= '';
     my $is_loopback = $host =~ /^(?:127\.\d+\.\d+\.\d+|::1|localhost)$/;
 

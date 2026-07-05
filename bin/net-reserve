@@ -103,17 +103,13 @@ if ($describe) {
 
 my $cmd = shift @ARGV;
 
-# Server resolution mirrors net-chat: --listen wins, then --server (config
-# [servers]), then $NET_MGR_LISTEN, then the configured default, then loopback.
-if (!defined $listen) {
-    if (defined $server) {
-        $listen = NetMgr::Config->resolve_server($server)
-            or die "net-reserve: unknown server '$server'\n";
-    } else {
-        $listen = $ENV{NET_MGR_LISTEN}
-               // NetMgr::Config->resolve_server(undef)
-               // '127.0.0.1:7531';
-    }
+# Server resolution: --listen / --server pin an explicit target; bare
+# invocation defers to NetMgr::Client's discover ladder ($NET_MGR_LISTEN,
+# [servers] default, loopback, ~/.cache/net-mgr/last-daemon, other
+# [servers] entries, LAN /24 probe). No config needed for the common case.
+if (!defined $listen && defined $server) {
+    $listen = NetMgr::Config->resolve_server($server)
+        or die "net-reserve: unknown server '$server'\n";
 }
 
 # With the --gui flag, the subnet is the leftover positional, already shifted
@@ -149,8 +145,17 @@ exit 0;
 
 sub connect_client {
     my %opt = @_;
-    my $cli = eval { NetMgr::Client->new(listen => $listen, timeout => 10) }
-        or die "net-reserve: cannot reach daemon at $listen: $@";
+    my $cli = eval {
+        defined $listen
+            ? NetMgr::Client->new(listen => $listen, timeout => 10)
+            : NetMgr::Client->new(discover => 1,
+                                  consumer => "net-reserve.$$",
+                                  timeout => 10);
+    } or die "net-reserve: cannot reach daemon"
+          . (defined $listen ? " at $listen" : '') . ": $@";
+    # Discover mode picks the winner; snapshot it back into $listen so the
+    # loopback AUTH-skip check below sees the actual endpoint.
+    $listen //= $cli->{listen};
     my ($host) = NetMgr::Client::split_hostport($listen); $host //= '';
     my $is_loopback = $host =~ /^(?:127\.\d+\.\d+\.\d+|::1|localhost)$/;
     my $do_auth = $force_auth || (!$is_loopback && !$no_auth);

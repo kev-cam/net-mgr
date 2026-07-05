@@ -50,17 +50,13 @@ if ($describe) {
     exit 0;
 }
 
-# Server resolution mirrors net-reserve: --listen wins, then --server, then
-# $NET_MGR_LISTEN, then the configured default, then loopback.
-if (!defined $listen) {
-    if (defined $server) {
-        $listen = NetMgr::Config->resolve_server($server)
-            or die "net-mac: unknown server '$server'\n";
-    } else {
-        $listen = $ENV{NET_MGR_LISTEN}
-               // NetMgr::Config->resolve_server(undef)
-               // '127.0.0.1:7531';
-    }
+# Server resolution: --listen / --server pin an explicit target; otherwise
+# NetMgr::Client's discover ladder ($NET_MGR_LISTEN, [servers] default,
+# loopback, ~/.cache/net-mgr/last-daemon, other [servers] entries, LAN /24
+# probe) picks whichever daemon is actually up.
+if (!defined $listen && defined $server) {
+    $listen = NetMgr::Config->resolve_server($server)
+        or die "net-mac: unknown server '$server'\n";
 }
 
 my $cmd = shift @ARGV;
@@ -76,8 +72,16 @@ exit 0;
 # ---- connection ------------------------------------------------------
 
 sub connect_client {
-    my $cli = eval { NetMgr::Client->new(listen => $listen, timeout => 10) }
-        or die "net-mac: cannot reach daemon at $listen: $@";
+    my $cli = eval {
+        defined $listen
+            ? NetMgr::Client->new(listen => $listen, timeout => 10)
+            : NetMgr::Client->new(discover => 1, consumer => "net-mac.$$",
+                                  timeout => 10);
+    } or die "net-mac: cannot reach daemon: $@";
+    # Discover mode may pick a remote peer; remember it so the loopback
+    # AUTH-skip check below evaluates the actual winner, not the (undef)
+    # placeholder we started with.
+    $listen //= $cli->{listen};
     my ($host) = NetMgr::Client::split_hostport($listen); $host //= '';
     my $is_loopback = $host =~ /^(?:127\.\d+\.\d+\.\d+|::1|localhost)$/;
     my $do_auth = $force_auth || (!$is_loopback && !$no_auth);

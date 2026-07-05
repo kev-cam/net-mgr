@@ -77,20 +77,16 @@ GetOptions(
 ) or usage(2);
 usage(0) if $help;
 
-# Server resolution mirrors net-chat: --listen wins, else --server names a
-# [servers] entry, else $NET_MGR_LISTEN, else the configured default, else
-# loopback. (~/.config/net-mgr/config — see NetMgr::Config.)
-if (!defined $listen) {
-    if (defined $server) {
-        $listen = NetMgr::Config->resolve_server($server)
-            or die "net-lookup: unknown server '$server' (configure it in "
-                 . (NetMgr::Config->user_path // '~/.config/net-mgr/config')
-                 . " [servers])\n";
-    } else {
-        $listen = $ENV{NET_MGR_LISTEN}
-               // NetMgr::Config->resolve_server(undef)
-               // '127.0.0.1:7531';
-    }
+# Server resolution: --listen pins one daemon, --server names a [servers]
+# entry (also pinned). Bare invocation falls through to NetMgr::Client's
+# auto-discovery ladder ($NET_MGR_LISTEN → [servers] default → loopback →
+# ~/.cache/net-mgr/last-daemon → other [servers] entries → LAN /24 probe),
+# so the tool works out-of-the-box even when the local daemon is asleep.
+if (!defined $listen && defined $server) {
+    $listen = NetMgr::Config->resolve_server($server)
+        or die "net-lookup: unknown server '$server' (configure it in "
+             . (NetMgr::Config->user_path // '~/.config/net-mgr/config')
+             . " [servers])\n";
 }
 # --record-key <ip>: keyscan the IP and record its SSH host key(s) to the
 # daemon (kind=ssh_host_key), optionally against --keyname NAME. net-ssh uses
@@ -142,7 +138,15 @@ for my $line (`ip -br -4 addr show 2>/dev/null`) {
 }
 
 # --- snapshot the tables we need ------------------------------------
-my $cli = NetMgr::Client->new(listen => $listen, timeout => 5);
+# When --listen / --server pinned a target, use it verbatim. Otherwise let
+# NetMgr::Client walk its discover ladder; remember the winning host:port
+# in $listen so downstream side connections (record_host_keys, resolve_ip,
+# probes) reuse the same daemon.
+my $cli = defined $listen
+    ? NetMgr::Client->new(listen => $listen, timeout => 5)
+    : NetMgr::Client->new(discover => 1, consumer => "net-lookup.$$",
+                          timeout => 5);
+$listen //= $cli->{listen};
 $cli->hello(consumer => "net-lookup.$$");
 my $machines  = $cli->snapshot(1, 'machines');
 my $hostnames = $cli->snapshot(2, 'hostnames');

@@ -15,6 +15,15 @@ use NetMgr::Addr qw(split_hostport join_hostport);
 
 sub new {
     my ($class, %args) = @_;
+    # Auto-discovery: caller opted in with discover=>1 and did not pin an
+    # explicit listen=. Walk a candidate ladder ($NET_MGR_LISTEN, the
+    # [servers] default, loopback, the on-disk cache, the rest of [servers],
+    # then a bounded LAN probe) and return the first daemon we can HELLO.
+    # Tools should prefer this over hard-coding '127.0.0.1:7531' so they
+    # keep working when the local daemon is asleep but a peer is live.
+    if ($args{discover} && !defined $args{listen}) {
+        return _discover_new($class, %args);
+    }
     my $listen = $args{listen} // $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
     # Default port to 7531 so '--listen zmc1' / '--listen zmc1.grfx.com' /
     # '--listen [fd00::1]' all work without spelling out the port. IPv6
@@ -38,6 +47,360 @@ sub new {
     return bless { sock => $sock, buf => '', listen => join_hostport($host, $port),
                    as => $args{as}, as_pubkey => $args{as_pubkey},
                    timeout => $timeout }, $class;
+}
+
+# --------------------------------------------------------------------------
+# Auto-discovery ladder (see new(discover=>1)).
+#
+# The goal: net-mgr client tools should work out of the box on a fresh box
+# without a per-user config. Anyone who's ever reached the cluster gets the
+# cheap path (loopback → cached winner). Anyone brand new falls off the
+# end onto a bounded LAN probe.
+#
+# Ladder, first success wins:
+#   1. $NET_MGR_LISTEN                    (operator override — highest)
+#   2. [servers] default from the config  (--server without an argument)
+#   3. 127.0.0.1:7531                     (loopback fast path)
+#   4. cached last-successful daemon      (~/.cache/net-mgr/last-daemon)
+#   5. every other [servers] entry        (dial each in file order)
+#   6. LAN /24 probe on port 7531         (bounded, non-blocking; last resort)
+#
+# Per-candidate: TCP connect within a short probe timeout, then HELLO.
+# Folding HELLO into the probe means a socket that accepts but never
+# answers doesn't count as "working". First OK wins, we cache and return.
+#
+# On success past the loopback fast path we print a friendly one-liner to
+# stderr ("[net-mgr] discover: using nas3 …") so the operator knows why
+# the tool talked to a remote daemon instead of the local one.
+sub _discover_new {
+    my ($class, %args) = @_;
+    my $long_timeout  = $args{timeout} // 10;
+    # Short per-candidate probe to keep worst-case ladder walk bounded.
+    # Callers who need per-candidate control override with
+    # discover_probe_timeout=; default 2s covers a dead host on the LAN.
+    my $probe_timeout = $args{discover_probe_timeout} // 2;
+    my $consumer      = $args{consumer};
+    my @cands         = _build_candidates();
+    my @errors;
+    for my $i (0 .. $#cands) {
+        my $c = $cands[$i];
+        my ($cli, $err) = _probe_endpoint(
+            $class,
+            host          => $c->{host},
+            port          => $c->{port},
+            probe_timeout => $probe_timeout,
+            timeout       => $long_timeout,
+            consumer      => $consumer,
+            as            => $args{as},
+            as_pubkey     => $args{as_pubkey},
+        );
+        if ($cli) {
+            _cache_write($c->{host}, $c->{port});
+            # Only chirp when we fell past the loopback. Silence on
+            # "loopback worked" / "$NET_MGR_LISTEN worked" (the operator
+            # already told us to use it).
+            if ($c->{noisy}) {
+                warn sprintf("[net-mgr] discover: using %s (%s)\n",
+                             $c->{label}, join_hostport($c->{host}, $c->{port}));
+            }
+            return $cli;
+        }
+        push @errors,
+            sprintf('%s (%s): %s',
+                    $c->{label}, join_hostport($c->{host}, $c->{port}), $err);
+    }
+    # Step 6: LAN probe. Cheap enough (~2s total, non-blocking connects)
+    # that we run it unconditionally when the ladder ran dry. Skip only
+    # if the caller explicitly turned it off (discover_lan_probe=>0).
+    if ($args{discover_lan_probe} // 1) {
+        my $winner = _lan_probe(
+            budget => $args{discover_lan_budget} // 2.0,
+        );
+        if ($winner) {
+            my ($cli, $err) = _probe_endpoint(
+                $class,
+                host          => $winner->{host},
+                port          => $winner->{port},
+                probe_timeout => $probe_timeout,
+                timeout       => $long_timeout,
+                consumer      => $consumer,
+                as            => $args{as},
+                as_pubkey     => $args{as_pubkey},
+            );
+            if ($cli) {
+                _cache_write($winner->{host}, $winner->{port});
+                warn sprintf("[net-mgr] discover: LAN probe found %s\n",
+                             join_hostport($winner->{host}, $winner->{port}));
+                return $cli;
+            }
+            push @errors,
+                sprintf('LAN probe (%s): %s',
+                        join_hostport($winner->{host}, $winner->{port}), $err);
+        }
+    }
+    croak "connect: no reachable net-mgr daemon (tried "
+        . join('; ', @errors) . ")";
+}
+
+# Attempt one host:port. Returns ($blessed_client, undef) on full HELLO
+# success or (undef, $err_string) on any failure. Uses probe_timeout for
+# the connect (short) and timeout for the returned client's I/O budget.
+sub _probe_endpoint {
+    my ($class, %args) = @_;
+    my $host = $args{host};
+    my $port = $args{port};
+    my $sock = IO::Socket::IP->new(
+        PeerHost => $host,
+        PeerPort => $port,
+        Proto    => 'tcp',
+        Timeout  => $args{probe_timeout},
+    );
+    unless ($sock) {
+        return (undef, "connect: $!");
+    }
+    my $self = bless {
+        sock    => $sock,
+        buf     => '',
+        listen  => join_hostport($host, $port),
+        as      => $args{as},
+        as_pubkey => $args{as_pubkey},
+        # Bound the HELLO wait by the probe timeout so a wedged peer
+        # doesn't burn our whole ladder budget; restore the caller's
+        # requested I/O timeout on success.
+        timeout => $args{probe_timeout},
+    }, $class;
+    my $probe_consumer = $args{consumer} // "discover.$$";
+    my $ok = eval { $self->hello(consumer => $probe_consumer); 1 };
+    if (!$ok) {
+        my $err = $@ || 'HELLO failed';
+        chomp $err; $err =~ s/ at \S+ line \d+\.?\z//;
+        eval { close $sock };
+        return (undef, $err);
+    }
+    # Restore the caller's steady-state timeout for subsequent verbs.
+    $self->{timeout} = $args{timeout};
+    return ($self, undef);
+}
+
+# Build the ordered candidate list. Deduped by "host:port".
+# noisy=>1 means "warn on stderr if this candidate wins" — reserved for
+# non-loopback wins so `net-lookup` staying on 127.0.0.1 is silent, but
+# a fallover to nas3 is visible.
+sub _build_candidates {
+    my @cands;
+    my %seen;
+    my $add = sub {
+        my ($label, $addr, %opts) = @_;
+        return unless defined $addr && length $addr;
+        my ($h, $p) = split_hostport($addr);
+        $h = '127.0.0.1' unless defined $h && length $h;
+        $p = 7531        unless defined $p && length $p;
+        my $key = "$h:$p";
+        return if $seen{$key}++;
+        push @cands, { label => $label, host => $h, port => $p + 0, %opts };
+    };
+    # 1. env override (noisy so a stale env var is obvious).
+    $add->('$NET_MGR_LISTEN', $ENV{NET_MGR_LISTEN}, noisy => 1);
+    # 2. [servers] default. May resolve either a symbolic name or a
+    # literal host:port. Not noisy: it's the operator-declared preferred
+    # daemon, so hitting it is expected.
+    my $config_default = eval {
+        require NetMgr::Config;
+        NetMgr::Config->resolve_server(undef);
+    };
+    $add->('config default', $config_default);
+    # 3. loopback. Silent on win — the boring common case.
+    $add->('loopback', '127.0.0.1:7531');
+    # 4. cache. Noisy: falling back onto a cached remote means the local
+    # daemon is dead, worth surfacing.
+    my $cached = _cache_read();
+    if ($cached) {
+        my $addr = join_hostport($cached->{host}, $cached->{port});
+        $add->('cached', $addr, noisy => 1);
+    }
+    # 5. every other [servers] entry (in name order). Noisy on win.
+    my %srv;
+    eval {
+        require NetMgr::Config;
+        my ($srv) = NetMgr::Config->servers;
+        %srv = %{ $srv || {} };
+    };
+    for my $name (sort keys %srv) {
+        $add->("[servers] $name", $srv{$name}, noisy => 1);
+    }
+    return @cands;
+}
+
+# ---- discovery cache: ~/.cache/net-mgr/last-daemon -----------------------
+# Small state file storing the most recent successful winner so the next
+# invocation goes straight to it. JSON so we can grow ts/name/etc without
+# reflowing parsers. Written on every successful discovery (including
+# loopback); read on step 4 of the ladder.
+sub _cache_path {
+    my $base = $ENV{XDG_CACHE_HOME};
+    $base ||= "$ENV{HOME}/.cache"
+        if defined $ENV{HOME} && length $ENV{HOME};
+    return undef unless defined $base && length $base;
+    return "$base/net-mgr/last-daemon";
+}
+
+sub _cache_read {
+    my $p = _cache_path() or return undef;
+    return undef unless -r $p;
+    open my $fh, '<', $p or return undef;
+    local $/;
+    my $body = <$fh>;
+    close $fh;
+    return undef unless defined $body && length $body;
+    require JSON::PP;
+    my $d = eval { JSON::PP::decode_json($body) };
+    return undef if $@ || !$d || ref $d ne 'HASH';
+    return undef unless defined $d->{host} && length $d->{host}
+                     && defined $d->{port} && $d->{port} =~ /^\d+$/;
+    return { host => $d->{host}, port => $d->{port} + 0, ts => $d->{ts} };
+}
+
+sub _cache_write {
+    my ($host, $port) = @_;
+    return unless defined $host && length $host;
+    my $p = _cache_path() or return;
+    (my $dir = $p) =~ s{/[^/]+$}{};
+    if (length $dir && !-d $dir) {
+        require File::Path;
+        eval { File::Path::make_path($dir) };
+        return unless -d $dir;
+    }
+    require JSON::PP;
+    my $body = eval {
+        JSON::PP::encode_json({
+            host => $host, port => $port + 0, ts => time(),
+        });
+    } // return;
+    my $tmp = "$p.tmp.$$";
+    open my $fh, '>', $tmp or return;
+    print $fh $body, "\n";
+    close $fh;
+    rename $tmp, $p or unlink $tmp;
+}
+
+# ---- LAN probe (last-resort step 6) --------------------------------------
+# Non-blocking connect fan-out across every /24 the host is on. For each
+# host that finishes the TCP handshake within the budget we then send a
+# blocking HELLO and check for OK. First working peer wins. Returns
+# { host => STR, port => INT } or undef.
+#
+# The point is bootstrap: a brand-new box that has never contacted the
+# cluster and has no operator-supplied config. It's slower than the other
+# steps so it only runs after 1..5 all fail.
+sub _lan_probe {
+    my (%args) = @_;
+    my $budget = $args{budget} // 2.0;
+    my $port   = $args{port}   // 7531;
+    require IO::Select;
+    require Socket;
+    require Time::HiRes;
+    my $end = Time::HiRes::time() + $budget;
+
+    # Enumerate this host's /24 (or narrower) IPv4 nets. We only probe
+    # inside a /24 — /16 would be 65k IPs and pointless for our purposes.
+    my @nets;
+    if (open my $fh, '-|', 'ip', '-o', '-4', 'addr', 'show') {
+        while (<$fh>) {
+            next unless /\binet\s+(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)/;
+            my ($a, $b, $c, $d, $pl) = ($1, $2, $3, $4, $5);
+            next if $a == 127 || ($a == 169 && $b == 254);
+            next if $pl < 24;   # skip /25+ hosts (still fine), reject /16 etc
+            push @nets, ["$a.$b.$c", "$a.$b.$c.$d"];
+        }
+        close $fh;
+    }
+    return undef unless @nets;
+
+    for my $n (@nets) {
+        my ($prefix, $selfip) = @$n;
+        my $sel = IO::Select->new;
+        my %ipof;
+        # Fire off 254 non-blocking connects. The kernel queues them; we
+        # then wait for writability (== connect completion) with a budget.
+        for my $h (1 .. 254) {
+            last if Time::HiRes::time() >= $end;
+            my $ip = "$prefix.$h";
+            next if $ip eq $selfip;
+            my $sock = IO::Socket::IP->new(
+                PeerHost => $ip,
+                PeerPort => $port,
+                Proto    => 'tcp',
+                Blocking => 0,
+            );
+            next unless $sock;
+            $sel->add($sock);
+            $ipof{fileno($sock)} = $ip;
+        }
+        my @connected;
+        while ($sel->count && Time::HiRes::time() < $end) {
+            my $left = $end - Time::HiRes::time();
+            last if $left <= 0;
+            my $wait = $left > 0.5 ? 0.5 : $left;
+            my @ok = $sel->can_write($wait);
+            last unless @ok;
+            for my $s (@ok) {
+                $sel->remove($s);
+                # SO_ERROR = 0 confirms the async connect succeeded (a
+                # writable non-blocking socket after a connect() call is
+                # ambiguous otherwise: it may just mean "connect finished
+                # with an error").
+                my $err_pkt = getsockopt($s, Socket::SOL_SOCKET(),
+                                            Socket::SO_ERROR());
+                my $err = defined $err_pkt ? unpack('l', $err_pkt) : -1;
+                if ($err == 0) {
+                    push @connected, [ $ipof{fileno($s)}, $s ];
+                } else {
+                    close $s;
+                }
+            }
+        }
+        # Discard any pending non-connected sockets so we don't leak fds.
+        for my $s ($sel->handles) { close $s; }
+
+        # HELLO-verify candidates until first success. This filters out
+        # random port-7531 responders that aren't net-mgr daemons.
+        for my $c (@connected) {
+            my ($ip, $sock) = @$c;
+            eval { $sock->blocking(1); };
+            local $\; local $,;
+            print { $sock } "HELLO consumer=discover-lan.$$\n";
+            my $line = _read_line_bounded($sock, 0.5);
+            close $sock;
+            if (defined $line && $line =~ /^OK\b/) {
+                return { host => $ip, port => $port };
+            }
+        }
+    }
+    return undef;
+}
+
+# Read one \n-terminated line from $sock, bounded by $timeout seconds.
+# Returns the line (sans trailing \n) on success, undef on timeout /
+# error / EOF. Used only by _lan_probe — the mainline recv_line owns the
+# post-connect stream.
+sub _read_line_bounded {
+    my ($sock, $timeout) = @_;
+    require IO::Select;
+    require Time::HiRes;
+    my $sel = IO::Select->new($sock);
+    my $end = Time::HiRes::time() + $timeout;
+    my $buf = '';
+    while (index($buf, "\n") < 0) {
+        my $left = $end - Time::HiRes::time();
+        return undef if $left <= 0;
+        my @r = $sel->can_read($left);
+        return undef unless @r;
+        my $n = sysread($sock, my $chunk, 4096);
+        return undef unless $n;
+        $buf .= $chunk;
+    }
+    $buf =~ s/\n.*//s;
+    return $buf;
 }
 
 sub send_line {
