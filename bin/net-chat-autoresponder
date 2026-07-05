@@ -904,6 +904,13 @@ our $HOST_CACHED;
 # invocation (from Load / operator-driven change / do_add_rule) rebuilds.
 our $BUILDING_FORM = 0;
 
+# NM keyfile enum state — declared at package scope so row_shared_wifi
+# (called from build_editor_form during initial render) can read them
+# before _enum_nm_profiles runs. Actual values set by _enum_nm_profiles
+# after load_shared_wifi walks /etc/NetworkManager/system-connections/.
+our $_NM_KEYFILE_WARNED = 0;
+our $_NM_UNREADABLE     = 0;
+
 # --- entry point ----------------------------------------------------------
 sub run {
     my ($opt) = @_;
@@ -963,7 +970,7 @@ sub run {
                               ->pack(-side => 'left', -fill => 'both',
                                      -expand => 1, -padx => 2);
 
-    $left_frame->Label(-text => 'Rules',
+    $left_frame->Label(-text => 'Rules  (Space or double-click to toggle on/off)',
                        -font => '{Helvetica} 9 bold')
                ->pack(-side => 'top', -anchor => 'w', -padx => 4, -pady => 2);
     $rules_list = $left_frame->Scrolled('Listbox',
@@ -1467,8 +1474,19 @@ sub row_shared_wifi {
             $be->insert('end', $disp);
         }
     } else {
-        $be->insert('end',
-            '(no shared-wifi.conf — see etc/shared-wifi.conf.sample)');
+        # Nothing to offer. Distinguish the "nothing configured" case
+        # from the more common "unprivileged operator, NM keyfiles
+        # readable only by root" case — the latter has an obvious next
+        # step (relaunch under sudo) while the former needs a config
+        # file authored.
+        if ($_NM_UNREADABLE) {
+            $be->insert('end',
+                '(NM saved connections need sudo — relaunch: '
+              . 'sudo net-chat-autoresponder --gui)');
+        } else {
+            $be->insert('end',
+                '(no shared-wifi.conf — see etc/shared-wifi.conf.sample)');
+        }
     }
     $row->Button(-text => 'Insert',
                  -command => sub { _wifi_insert_from_pick(0) })
@@ -1606,11 +1624,9 @@ sub load_shared_wifi {
     }
 }
 
-# One-shot warn gate for _enum_nm_profiles(): we only want the
-# "keyfiles unreadable, run as root" hint once per process, and we
-# don't want to pull in `use feature 'state'` just for this — a
-# package scalar is plenty.
-our $_NM_KEYFILE_WARNED = 0;
+# (Both $_NM_KEYFILE_WARNED and $_NM_UNREADABLE are declared at the top
+# of the package next to the other GUI-state 'our' vars, so
+# row_shared_wifi can consult them without a forward-declare issue.)
 
 # Enumerate /etc/NetworkManager/system-connections/*.nmconnection and
 # turn each wifi profile into a shared-wifi entry hashref. Keyfiles
@@ -1717,6 +1733,7 @@ sub _enum_nm_profiles {
         };
     }
 
+    $_NM_UNREADABLE = 1 if $unreadable && !%out;
     if ($unreadable && !$_NM_KEYFILE_WARNED) {
         $_NM_KEYFILE_WARNED = 1;
         warn "[gui] NM keyfiles unreadable, skipping auto-populate "
@@ -2015,11 +2032,14 @@ sub write_file_atomic {
 sub refresh_rules_list {
     $rules_list->delete(0, 'end');
     for my $r (@{ $S{rules} }) {
-        my $mark = $r->{enabled} ? '[x]' : '[ ]';
+        # 'on' / 'off' beats '[x]' / '[ ]' for legibility in a monospace
+        # column — no confusion with regex character classes or the
+        # optional-arg convention.
+        my $mark = $r->{enabled} ? 'on ' : 'off';
         my $src  = basename( $r->{source} );
         my $trig = $r->{kv}{trigger} // '?';
         $rules_list->insert('end',
-            sprintf("%s %-20s %-24s %s", $mark, $r->{name}, $trig, $src));
+            sprintf("%s  %-20s %-24s %s", $mark, $r->{name}, $trig, $src));
     }
 }
 
