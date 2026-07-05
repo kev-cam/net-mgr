@@ -699,8 +699,15 @@ sub _load {
     while (<$fh>) {
         chomp;
         next unless length;
-        my ($k, $t) = split /\t/, $_, 2;
-        next unless defined $k && defined $t && $t =~ /^\d+$/;
+        # Parse from the RIGHT: last tab is the ts delimiter, everything
+        # before it is the (possibly multi-tab) key. Keys such as
+        # 'wifi-broadcast\tacked\tPID_HEX16' would otherwise be split at
+        # the first tab and silently dropped by the /^\d+$/ guard.
+        my $idx = rindex($_, "\t");
+        next if $idx < 0;
+        my $k = substr($_, 0, $idx);
+        my $t = substr($_, $idx + 1);
+        next unless $t =~ /^\d+$/;
         # Later record wins on duplicate keys.
         $self->{mem}{$k} = $t + 0;
     }
@@ -752,8 +759,12 @@ sub prune {
     my %latest;
     while (<$fh>) {
         chomp;
-        my ($k, $t) = split /\t/, $_, 2;
-        next unless defined $k && defined $t && $t =~ /^\d+$/;
+        # Parse from the RIGHT (see _load): multi-tab keys must survive.
+        my $idx = rindex($_, "\t");
+        next if $idx < 0;
+        my $k = substr($_, 0, $idx);
+        my $t = substr($_, $idx + 1);
+        next unless $t =~ /^\d+$/;
         $latest{$k} = $t + 0;
     }
     close $fh;
