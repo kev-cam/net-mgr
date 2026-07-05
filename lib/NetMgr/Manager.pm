@@ -4640,13 +4640,72 @@ sub _register_reservation_machine {
 # physical host.
 sub _merge_machines {
     my ($self, $from_id, $to_id, $new_name) = @_;
-    my $db = $self->{db};
-    $db->dbh->do("UPDATE hostnames SET machine_id = ? WHERE machine_id = ?",
-                 undef, $to_id, $from_id);
-    $db->dbh->do("UPDATE interfaces SET machine_id = ? WHERE machine_id = ?",
-                 undef, $to_id, $from_id);
-    $db->dbh->do("DELETE FROM machines WHERE id = ?", undef, $from_id);
-    $db->upsert_machine(id => $to_id, primary_name => $new_name, online => 1);
+    my $db  = $self->{db};
+    my $dbh = $db->dbh;
+
+    # Every mutation must reach subscribers (net-watch, follower relays)
+    # via the existing _upsert / _emit_change pipeline. Raw dbh->do calls
+    # are invisible to that pipeline, so followers would silently keep the
+    # from-machine's hostnames/interfaces (and the machines row itself).
+    # Route through the same helpers used elsewhere for cross-machine
+    # rebinds (see _associate_machine's rebind arm and _obs_isp_link_delete).
+
+    # (1) Reparent hostnames. upsert_hostname is keyed on
+    # (machine_id, name, source), so a machine_id change is inherently
+    # delete+insert. Snapshot distinct names on $from_id, drop each via
+    # delete_hostname (which returns every row it deleted so the caller
+    # can emit), then re-upsert each row on $to_id with its original
+    # source. If the survivor already carries an identical (name,source)
+    # row, upsert_hostname reports 'noop' and _upsert skips emit — which
+    # is fine, followers already have that row.
+    my $names = $dbh->selectall_arrayref(
+        "SELECT DISTINCT name FROM hostnames WHERE machine_id = ?",
+        { Slice => {} }, $from_id) || [];
+    for my $nr (@$names) {
+        my $name = $nr->{name};
+        for my $deleted ($db->delete_hostname($from_id, $name)) {
+            $self->_emit_change(table => 'hostnames', op => 'delete',
+                                row => $deleted);
+            $self->_upsert('hostnames', 'upsert_hostname',
+                machine_id => $to_id,
+                name       => $deleted->{name},
+                source     => $deleted->{source});
+        }
+    }
+
+    # (2) Reparent interfaces. upsert_interface accepts a machine_id
+    # change on an existing (mac) row and returns op=update, which
+    # _upsert forwards as an emit. Idempotent: if a follower has already
+    # seen the rebind, the second application is a noop and no event
+    # fires.
+    my $ifaces = $dbh->selectall_arrayref(
+        "SELECT mac FROM interfaces WHERE machine_id = ?",
+        { Slice => {} }, $from_id) || [];
+    for my $ir (@$ifaces) {
+        $self->_upsert('interfaces', 'upsert_interface',
+            mac => $ir->{mac}, machine_id => $to_id);
+    }
+
+    # (3) Delete the now-orphan machines row. There is no delete_machine
+    # DB helper, so snapshot-then-delete-then-emit by hand, matching the
+    # dhcp_reservation_delete / isp_link_delete pattern. Hostnames on
+    # $from_id have already been reparented above, so the FK's
+    # ON DELETE CASCADE has nothing left to sweep. If $from_id is
+    # somehow already gone (e.g. a partially-replayed merge on restart),
+    # the SELECT returns undef and we skip the emit — DELETE of a
+    # missing row is a benign no-op.
+    my $was = $dbh->selectrow_hashref(
+        "SELECT * FROM machines WHERE id = ?", undef, $from_id);
+    $dbh->do("DELETE FROM machines WHERE id = ?", undef, $from_id);
+    $self->_emit_change(table => 'machines', op => 'delete', row => $was)
+        if $was;
+
+    # (4) Rename the survivor. Route through _upsert so the primary_name
+    # change replicates. Bare $db->upsert_machine(...) mutates the row
+    # without emitting.
+    $self->_upsert('machines', 'upsert_machine',
+        id => $to_id, primary_name => $new_name, online => 1);
+
     $self->_log("machines: merged id=$from_id into id=$to_id, renamed to '$new_name'");
 }
 
