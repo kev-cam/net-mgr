@@ -4738,15 +4738,13 @@ sub _backfill_reservation_machines {
         my ($name, $mac, $ip) = ($r->{name}, $r->{mac}, $r->{ip});
         next unless defined $name && length $name;
         next unless defined $mac  && length $mac;
-        # Only register when the name isn't already known as a primary_name.
-        # This lets us report the actual registrations we performed rather
-        # than a noisy line per already-correlated reservation.
-        my ($mid) = eval {
-            $db->dbh->selectrow_array(
-                "SELECT id FROM machines WHERE primary_name = ?",
-                undef, $name);
-        };
-        next if $mid;
+        # Let every named reservation flow through the mac-first merge
+        # helper. _register_reservation_machine is idempotent: it no-ops
+        # when nothing needs to change, merges when the mac and name
+        # point at different machines, renames when the interface's
+        # machine is still unnamed, and creates only when neither side
+        # exists. Short-circuiting on primary_name would prevent those
+        # convergent updates from ever running on subsequent backfills.
         my $new_mid = eval {
             $self->_register_reservation_machine(
                 $mac, $name, 'created by dhcp_reservations backfill');
