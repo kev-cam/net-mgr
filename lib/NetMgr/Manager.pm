@@ -4532,19 +4532,67 @@ sub _obs_dhcp_reservation {
 }
 
 # Bind $name to a machine row + hostname row, driven by a dhcp_reservation
-# OBSERVE (or the startup backfill). Idempotent — safe to re-run; every
-# write is via find-or-create. Returns the machine id used, or undef when
-# no id could be established. $note lands in machines.notes on first
-# insert only (upsert_machine won't overwrite an existing notes column
-# when we omit the arg on a repeat).
+# OBSERVE (or the startup backfill). Idempotent — safe to re-run.
+#
+# MAC-first resolution: a reservation names an EXISTING physical device
+# (identified by MAC), not a fresh one. Consulting primary_name alone
+# would silently create a duplicate machine row every time an operator
+# renames a reserved host, leaving the mac-bound machine stuck under
+# its old auto-discovered name (e.g. p620a orphaned while
+# DESKTOP-3SRS8MD kept the interface). We now:
+#
+#   1. Look up the machine bound to this MAC via the interfaces table.
+#   2. Look up any machine already carrying primary_name = $name.
+#   3. If both exist and disagree, MERGE the name-side row into the
+#      mac-side row (hostnames + interfaces reparented, orphan deleted),
+#      then rename to $name.
+#   4. If only the interface exists, rename that machine to $name.
+#   5. If only a same-name machine exists, reuse it.
+#   6. Otherwise create a fresh machine.
+#
+# $note lands in machines.notes on first insert only (upsert_machine
+# won't overwrite an existing notes column when we omit the arg on a
+# repeat). Returns the machine id used, or undef if none could be
+# established.
 sub _register_reservation_machine {
     my ($self, $mac, $name, $note) = @_;
     my $db = $self->{db} or return undef;
-    # Find or create the machine keyed by primary_name = $name. Same
-    # convention as _apply_self_inventory (one machine per primary_name).
-    my ($mid) = $db->dbh->selectrow_array(
+
+    # Step 1: find machine via interface for this MAC — that's the
+    # machine already correlated with real-world traffic.
+    my $iface_mid;
+    if (defined $mac && length $mac) {
+        ($iface_mid) = $db->dbh->selectrow_array(
+            "SELECT machine_id FROM interfaces
+              WHERE mac = ? AND machine_id IS NOT NULL",
+            undef, $mac);
+    }
+
+    # Step 2: also look up any pre-existing machine with primary_name = $name
+    # (from a prior reservation attempt on a different MAC, or an
+    # earlier backfill run against the old code).
+    my ($name_mid) = $db->dbh->selectrow_array(
         "SELECT id FROM machines WHERE primary_name = ?", undef, $name);
-    if (!$mid) {
+
+    my $mid;
+    if ($iface_mid && $name_mid && $iface_mid != $name_mid) {
+        # BOTH exist and disagree. Prefer the mac-linked one, MERGE
+        # $name_mid into it: rename $iface_mid to $name, move
+        # hostnames from $name_mid to $iface_mid, delete $name_mid.
+        $mid = $iface_mid;
+        $self->_merge_machines($name_mid, $iface_mid, $name);
+    }
+    elsif ($iface_mid) {
+        # Interface's machine gets renamed to reservation name.
+        $mid = $iface_mid;
+        $db->upsert_machine(id => $mid, primary_name => $name, online => 1);
+    }
+    elsif ($name_mid) {
+        # No interface but a same-name machine exists — reuse it.
+        $mid = $name_mid;
+    }
+    else {
+        # No prior evidence — create fresh.
         my $r = $db->upsert_machine(
             primary_name => $name,
             online       => 1,
@@ -4553,6 +4601,7 @@ sub _register_reservation_machine {
         $mid = $r->{now}{id} if $r && $r->{now};
     }
     return undef unless $mid;
+
     # Route through _upsert so subscribers (followers' net-mgr-relay) actually
     # receive the hostname row via the replication stream — same reasoning as
     # the comment in _apply_self_inventory. source='reservation' distinguishes
@@ -4560,6 +4609,24 @@ sub _register_reservation_machine {
     $self->_upsert('hostnames', 'upsert_hostname',
         machine_id => $mid, name => $name, source => 'reservation');
     return $mid;
+}
+
+# Fold one machine row into another. Reparents hostnames + interfaces
+# (both keyed on machine_id) from $from_id onto $to_id, drops the now-
+# orphan machine row, and renames the survivor to $new_name. Used by
+# _register_reservation_machine when the mac-bound machine and a
+# same-primary_name machine turn out to be duplicates of the same
+# physical host.
+sub _merge_machines {
+    my ($self, $from_id, $to_id, $new_name) = @_;
+    my $db = $self->{db};
+    $db->dbh->do("UPDATE hostnames SET machine_id = ? WHERE machine_id = ?",
+                 undef, $to_id, $from_id);
+    $db->dbh->do("UPDATE interfaces SET machine_id = ? WHERE machine_id = ?",
+                 undef, $to_id, $from_id);
+    $db->dbh->do("DELETE FROM machines WHERE id = ?", undef, $from_id);
+    $db->upsert_machine(id => $to_id, primary_name => $new_name, online => 1);
+    $self->_log("machines: merged id=$from_id into id=$to_id, renamed to '$new_name'");
 }
 
 # One-shot startup backfill: for every dhcp_reservations row with a
