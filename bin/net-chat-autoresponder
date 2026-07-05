@@ -1449,6 +1449,12 @@ sub row_shared_wifi {
             my $entry = $SHARED_WIFI{$label} or next;
             my $ssid  = $entry->{ssid} // '?';
             my $disp  = "$label ($ssid)";
+            # NM-sourced entries get a " [NM]" suffix so the operator
+            # can tell auto-populated picks from curated ones at a
+            # glance. Must match the DISPLAY_TO_LABEL key produced in
+            # load_shared_wifi() exactly, or _wifi_insert_from_pick
+            # won't resolve the pick back to a label.
+            $disp .= ' [NM]' if ($entry->{source} // '') eq 'nm';
             $be->insert('end', $disp);
         }
     } else {
@@ -1523,8 +1529,15 @@ sub _wifi_esc {
 # daemon uses for its own overlays, so operators only learn one story.
 # Section names are lowercased by the loader, so LABEL casing is folded
 # — that's fine, labels are just picker keys. Missing file / parse
-# failure is non-fatal: we leave %SHARED_WIFI empty and the picker will
-# render the "no shared-wifi.conf" hint.
+# failure is non-fatal: we still fall through to the NetworkManager
+# keyfile enumeration below; only if BOTH sources come up empty does
+# the picker render the "no shared-wifi.conf" hint.
+#
+# Curated entries carry source => 'shared-wifi.conf'; NM-discovered
+# entries carry source => 'nm' and win the display suffix " [NM]" so
+# operators can tell at a glance whether a pick came from operator
+# intent or from a saved system connection. On label collision the
+# curated entry wins — operator intent trumps whatever nmcli stored.
 sub load_shared_wifi {
     %SHARED_WIFI       = ();
     @SHARED_WIFI_LABELS = ();
@@ -1537,32 +1550,170 @@ sub load_shared_wifi {
         closedir $dh;
         $has_overlay = scalar @f;
     }
-    return unless $has_primary || $has_overlay;
 
-    my $cfg = eval { NetMgr::Config->load($SHARED_WIFI_CONF) };
-    if ($@ || !$cfg) {
-        my $err = $@ || 'unknown';
-        chomp $err;
-        warn "[shared-wifi] parse failed: $err\n";
-        return;
+    if ($has_primary || $has_overlay) {
+        my $cfg = eval { NetMgr::Config->load($SHARED_WIFI_CONF) };
+        if ($@ || !$cfg) {
+            my $err = $@ || 'unknown';
+            chomp $err;
+            warn "[shared-wifi] parse failed: $err\n";
+        } else {
+            for my $section (sort keys %$cfg) {
+                next unless $section =~ /^wifi\.(.+)$/;
+                my $label = $1;
+                my $entry = $cfg->{$section};
+                next unless ref $entry eq 'HASH';
+                next unless defined $entry->{ssid} && length $entry->{ssid};
+                $SHARED_WIFI{$label} = {
+                    ssid     => $entry->{ssid},
+                    auth     => $entry->{auth}     // 'WPA',
+                    password => $entry->{password} // '',
+                    hidden   => $entry->{hidden}   // '',
+                    note     => $entry->{note}     // '',
+                    source   => 'shared-wifi.conf',
+                };
+                push @SHARED_WIFI_LABELS, $label;
+                my $disp = "$label ($entry->{ssid})";
+                $DISPLAY_TO_LABEL{$disp} = $label;
+            }
+        }
     }
-    for my $section (sort keys %$cfg) {
-        next unless $section =~ /^wifi\.(.+)$/;
-        my $label = $1;
-        my $entry = $cfg->{$section};
-        next unless ref $entry eq 'HASH';
-        next unless defined $entry->{ssid} && length $entry->{ssid};
-        $SHARED_WIFI{$label} = {
-            ssid     => $entry->{ssid},
-            auth     => $entry->{auth}     // 'WPA',
-            password => $entry->{password} // '',
-            hidden   => $entry->{hidden}   // '',
-            note     => $entry->{note}     // '',
-        };
+
+    # Merge NM-discovered profiles. Curated labels already registered
+    # above are left untouched — the collision-loser is skipped with a
+    # debug-level warn so an operator wondering why their favourite
+    # nmcli connection didn't show up has a breadcrumb.
+    my %nm = _enum_nm_profiles();
+    for my $label (sort keys %nm) {
+        if (exists $SHARED_WIFI{$label}) {
+            warn "[shared-wifi] NM label '$label' collides with curated — keeping curated\n";
+            next;
+        }
+        $SHARED_WIFI{$label} = $nm{$label};
         push @SHARED_WIFI_LABELS, $label;
-        my $disp = "$label ($entry->{ssid})";
+        my $ssid = $nm{$label}{ssid};
+        my $disp = "$label ($ssid) [NM]";
         $DISPLAY_TO_LABEL{$disp} = $label;
     }
+}
+
+# One-shot warn gate for _enum_nm_profiles(): we only want the
+# "keyfiles unreadable, run as root" hint once per process, and we
+# don't want to pull in `use feature 'state'` just for this — a
+# package scalar is plenty.
+our $_NM_KEYFILE_WARNED = 0;
+
+# Enumerate /etc/NetworkManager/system-connections/*.nmconnection and
+# turn each wifi profile into a shared-wifi entry hashref. Keyfiles
+# are 0600 root:root, so an unprivileged GUI process just gets ENOENT
+# / EACCES and quietly returns nothing (with a one-shot stderr hint,
+# so an operator running as their own uid has a breadcrumb to explain
+# the empty picker).
+#
+# Grammar is the NetworkManager INI dialect: [section]s with
+# key=value lines, blanks/comments allowed. We hand-parse rather than
+# reuse NetMgr::Config because its overlay/lowercasing semantics are
+# unwanted here and each keyfile is a single flat file.
+#
+# Returned entries wear source => 'nm' so the picker can suffix the
+# display string with " [NM]" and load_shared_wifi() can distinguish
+# them from curated entries when applying the collision policy.
+sub _enum_nm_profiles {
+    my $dir = '/etc/NetworkManager/system-connections';
+    my $dh;
+    if (!opendir($dh, $dir)) {
+        # Directory itself unreadable (or missing) — nothing to do.
+        # Not worth warning: this fires on every non-NM host too.
+        return ();
+    }
+    my @files = sort grep { /\.nmconnection\z/ } readdir $dh;
+    closedir $dh;
+
+    my %out;
+    my $unreadable = 0;
+    for my $name (@files) {
+        my $path = "$dir/$name";
+        my $fh;
+        if (!open($fh, '<', $path)) {
+            # Individual file unreadable — almost always EACCES because
+            # we're not root. Count it so we can warn once at the end.
+            $unreadable++;
+            next;
+        }
+        my %ini;
+        my $sect = '';
+        while (my $ln = <$fh>) {
+            $ln =~ s/\r?\n\z//;
+            $ln =~ s/^\s+//;
+            next if $ln eq '' || $ln =~ /^[#;]/;
+            if ($ln =~ /^\[([^\]]+)\]\s*$/) {
+                $sect = lc $1;
+                next;
+            }
+            next unless length $sect;
+            if ($ln =~ /^([^=]+?)\s*=\s*(.*)$/) {
+                my ($k, $v) = (lc $1, $2);
+                $ini{$sect}{$k} = $v;
+            }
+        }
+        close $fh;
+
+        next unless ($ini{connection}{type} // '') eq 'wifi';
+        my $ssid = $ini{wifi}{ssid};
+        next unless defined $ssid && length $ssid;
+
+        # NetworkManager key-mgmt vocabulary → WIFI: URI auth token.
+        # Missing/empty section means an open network (no security).
+        my $km   = lc($ini{'wifi-security'}{'key-mgmt'} // '');
+        my $psk  = $ini{'wifi-security'}{psk} // '';
+        my $auth;
+        if ($km eq '' || $km eq 'none') {
+            $auth = 'NOPASS';
+        } elsif ($km eq 'wep') {
+            $auth = 'WEP';
+        } else {
+            # wpa-psk, sae, wpa-eap, ... — treat as WPA family. WPA-EAP
+            # won't actually work as a QR handoff but we don't have a
+            # better token for it and refusing would surprise the user.
+            $auth = 'WPA';
+        }
+        # A PSK-guarded profile with no stored PSK is useless as a
+        # QR handoff (nothing to hand off) — skip it.
+        next if $auth ne 'NOPASS' && !length $psk;
+
+        # Prefer [connection].id (what nmcli prints) over the filename
+        # stem; fall back to stem if id is missing.
+        my $id = $ini{connection}{id};
+        if (!defined $id || !length $id) {
+            ($id = $name) =~ s/\.nmconnection\z//;
+        }
+        my $label = $id;
+        $label =~ s/[^A-Za-z0-9._-]/-/g;
+        # De-dup labels within the NM set (two profiles with names
+        # that sanitize to the same string): suffix -1, -2, ...
+        my $base = $label;
+        my $n = 1;
+        while (exists $out{$label}) {
+            $label = "$base-$n";
+            $n++;
+        }
+        $out{$label} = {
+            ssid     => $ssid,
+            auth     => $auth,
+            password => $psk,
+            hidden   => (($ini{wifi}{hidden} // '') =~ /^(1|true|yes)$/i
+                        ? 'true' : ''),
+            note     => '',
+            source   => 'nm',
+        };
+    }
+
+    if ($unreadable && !$_NM_KEYFILE_WARNED) {
+        $_NM_KEYFILE_WARNED = 1;
+        warn "[gui] NM keyfiles unreadable, skipping auto-populate "
+           . "(run as root to see saved connections)\n";
+    }
+    return %out;
 }
 
 sub load_editor_from_rule {
