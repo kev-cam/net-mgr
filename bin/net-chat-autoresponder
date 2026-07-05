@@ -907,6 +907,13 @@ our $BUILDING_FORM = 0;
 # --- entry point ----------------------------------------------------------
 sub run {
     my ($opt) = @_;
+    # Package-scope `our $X = VAL` initializations never ran because the
+    # main script short-circuited via `if ($opt{gui}) { cmd_gui; exit }`
+    # before Perl reached this package's top-level code. Set the defaults
+    # here so run() is the single source of truth for GUI-side state.
+    $SHARED_WIFI_CONF //= '/etc/net-mgr/shared-wifi.conf';
+    $BUILDING_FORM   //= 0;
+    $sample_n        //= 50;
     $listen = $opt->{listen} // $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
     # `--file` is the historical GUI name for the primary config; `--config`
     # is the daemon name. Both work here so operators can pass whichever
@@ -1017,7 +1024,11 @@ sub run {
                ->pack(-side => 'right', -padx => 4);
 
     do_load();
-    MainLoop();
+    # Tk::MainLoop is exported by `use Tk` into the package where the
+    # `use` statement ran — that's main::, not NetChatAutoresponderGui::.
+    # Call fully-qualified so the sub is found no matter which package
+    # ran the require.
+    Tk::MainLoop();
     return;
 }
 
