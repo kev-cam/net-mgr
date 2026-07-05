@@ -1,0 +1,1178 @@
+#!/usr/bin/perl
+# net-find — dispatcher for the network-discovery sub-commands.
+#
+# Sub-commands:
+#   lost         sweep vendor-default subnets for stray hardware on local L2
+#   peers        discover other net-mgr instances via TCP/7531 probes
+#   rogue-dhcp   broadcast DHCP DISCOVER on each iface, report responders
+#
+# Usage:
+#   net-find lost [opts]
+#   net-find peers [opts]
+#   net-find rogue-dhcp [opts]
+#   net-find --help                    # list sub-commands
+#
+# The first positional arg selects the sub-command; the remaining argv is
+# passed through unchanged.
+#
+# Backward compatibility: when invoked as one of the historical script
+# names (net-find-lost / net-find-peers / net-find-rogue-dhcp), the
+# corresponding sub-command is auto-selected and a soft-deprecation
+# warning is emitted on stderr. The Makefile installs symlinks with
+# those names pointing at this script.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use File::Basename qw(basename);
+
+# The dispatcher block lives at the bottom of this file — that way all
+# the file-scope `my` initializers (like $LOST_RECOVERY_DIR) have run
+# before any cmd_* sub is called.
+
+sub _dispatcher_help {
+    print <<'H';
+net-find — dispatch to a network-discovery scan.
+
+Usage:
+  net-find lost [opts]         probe vendor-default subnets for stray hardware
+  net-find peers [opts]        discover other net-mgr instances on the LAN
+  net-find rogue-dhcp [opts]   broadcast DHCP DISCOVER, report responders
+  net-find --help              this text
+  net-find SUBCMD --help       usage for a specific sub-command
+
+Backward-compat aliases (soft-deprecated; installed as symlinks):
+  net-find-lost, net-find-peers, net-find-rogue-dhcp
+H
+}
+
+# ==================================================================
+# cmd_lost — was bin/net-find-lost
+# ==================================================================
+#
+# For each candidate /24:
+#   1. Skip if the subnet overlaps an existing route on this host.
+#   2. Add a temporary IP alias on the chosen interface(s).
+#   3. Send an ARP sweep (nmap -sn -PR), then read the kernel ARP cache
+#      to capture MACs (works regardless of nmap's privileges).
+#   4. Remove the alias.
+#
+# Findings are printed: ip, mac, vendor (OUI lookup), and — if the
+# net-mgr daemon is reachable — whether we already know that MAC.
+#
+# --recover hands a hit off to the matching recovery script. Bare
+# --recover or --recover=all means "any matching device".
+# --recover=AA:BB:CC:DD:EE:FF means "only this MAC". --quiet suppresses
+# per-subnet headers when nothing was found, so a cron-driven
+# 'net-find lost --recover --quiet' stays silent until a stray device
+# actually shows up. --list prints the registered recovery scripts.
+#
+# Recovery scripts live off PATH (default $LOST_RECOVERY_DIR below;
+# override with $NET_MGR_RECOVERY_DIR). Two flavours:
+#
+#  1. Scripts that support --describe, emitting one 'key: value' per
+#     line. Recognised keys:
+#       name         - short label
+#       description  - one-line summary
+#       on_subnet    - CIDR this handler applies to (e.g. 192.168.0.0/24)
+#       on_ip        - specific IP that triggers it (e.g. factory mgmt IP)
+#       oui_prefix   - MAC OUI prefix (e.g. 14:cc:20)
+#       match_mac    - exact MAC this handler is for
+#     A script matches a hit if every present on_*/oui_*/match_mac key
+#     matches.
+#
+#  2. Scrappy scripts named net-recover-<MAC> (12 hex chars, optionally
+#     dash-separated). The MAC is taken from the filename and the script
+#     is invoked whenever that exact MAC turns up — no --describe
+#     required.
+#
+# When dispatching, scripts are called as:
+#     <script> --iface <iface>
+# with NET_MGR_AUTOMATED=1 set in the environment so they can suppress
+# interactive bits (browser launch, prompts, etc.).
+#
+# Each hit is also recorded (best-effort) in the lost_devices DB table.
+
+# Per-row: cidr, alias_ip (must be in cidr), label
+my @LOST_CANDIDATES = (
+    [ '192.168.0.0/24',   '192.168.0.99',  'TP-Link / D-Link / Tenda' ],
+    [ '192.168.1.0/24',   '192.168.1.99',  'Netgear / Linksys / Asus / Cisco' ],
+    [ '192.168.2.0/24',   '192.168.2.99',  'Belkin' ],
+    [ '192.168.4.0/24',   '192.168.4.99',  'ESP softAP / IoT' ],
+    [ '192.168.10.0/24',  '192.168.10.99', 'Edimax / misc IoT' ],
+    [ '192.168.11.0/24',  '192.168.11.99', 'Buffalo' ],
+    [ '192.168.50.0/24',  '192.168.50.99', 'Asus AiMesh' ],
+    [ '192.168.100.0/24', '192.168.100.99','cable modem / printer' ],
+    [ '10.0.0.0/24',      '10.0.0.99',     'misc' ],
+    [ '10.0.1.0/24',      '10.0.1.99',     'Apple AirPort' ],
+);
+
+# Where recovery scripts live (off PATH). The Makefile rewrites this
+# string at install time to the absolute install location; here it
+# defaults to the dev-tree sibling dir so source-checkout runs work.
+my $LOST_RECOVERY_DIR = $ENV{NET_MGR_RECOVERY_DIR}
+                     // "$FindBin::Bin/../recovery";
+
+# GetOptions targets + shared runtime state for cmd_lost + helpers.
+my (@LOST_IFACES, @LOST_ONLY_CIDRS, $LOST_DRY_RUN, $LOST_RECOVER,
+    $LOST_QUIET, $LOST_LIST_FLAG, $LOST_HELP, $LOST_RECOVER_MAC, $LOST_DB);
+
+# Discovered-recovery cache (populated on first _lost_discover_recovery call).
+my (@_LOST_DISCOVERED, $_LOST_DISCOVERED_FLAG);
+
+# OUI cache, lazy-loaded the same way the web CGI does it.
+my (%LOST_OUI, $LOST_OUI_LOADED);
+
+sub cmd_lost {
+    local @ARGV = @_;
+    require Getopt::Long;
+    Getopt::Long->import(qw(GetOptions));
+    Getopt::Long::Configure('no_ignore_case', 'bundling');
+
+    # cmd_lost is invoked at most once per process (dispatched from the
+    # bottom of the file), so no explicit state reset is needed — the
+    # file-scope `my` decls give us undef/empty defaults.
+
+    GetOptions(
+        'iface|i=s'        => \@LOST_IFACES,
+        'cidr|subnet|c=s'  => \@LOST_ONLY_CIDRS,
+        'dry-run|n'        => \$LOST_DRY_RUN,
+        'recover:s'        => \$LOST_RECOVER,
+        'quiet|q'          => \$LOST_QUIET,
+        'list'             => \$LOST_LIST_FLAG,
+        'help|h'           => \$LOST_HELP,
+    ) or _lost_usage();
+    _lost_usage() if $LOST_HELP;
+
+    # Build the working candidate list. With no --cidr/--subnet, scan the
+    # full @LOST_CANDIDATES registry. With one or more, use just those —
+    # taking the registered entry when it matches a known /24, otherwise
+    # synthesizing one with .99 as the alias IP.
+    my @candidates_to_scan;
+    if (@LOST_ONLY_CIDRS) {
+        my %by_cidr = map { $_->[0] => $_ } @LOST_CANDIDATES;
+        for my $c (@LOST_ONLY_CIDRS) {
+            if (my $known = $by_cidr{$c}) {
+                push @candidates_to_scan, $known;
+                next;
+            }
+            my ($net, $pl) = split '/', $c, 2;
+            die "invalid CIDR '$c' (expected dotted-quad/prefix)\n"
+                unless defined $pl && $net =~ /^\d+\.\d+\.\d+\.\d+$/;
+            die "--cidr only supports /24 subnets (got $c)\n" unless $pl eq '24';
+            (my $alias = $net) =~ s/\.\d+$/.99/;
+            push @candidates_to_scan, [ $c, $alias, '(user-specified)' ];
+        }
+    }
+    else {
+        @candidates_to_scan = @LOST_CANDIDATES;
+    }
+
+    if ($LOST_LIST_FLAG) {
+        _lost_print_recovery_list();
+        return;
+    }
+
+    # Normalize --recover: bare flag or =all means "every match". Otherwise
+    # treat it as a MAC filter (lowercased).
+    if (defined $LOST_RECOVER) {
+        if ($LOST_RECOVER eq '' || lc $LOST_RECOVER eq 'all') {
+            $LOST_RECOVER_MAC = '';
+        } else {
+            ($LOST_RECOVER_MAC = lc $LOST_RECOVER) =~ tr/-/:/;
+            die "--recover MAC '$LOST_RECOVER' isn't a valid MAC\n"
+                unless $LOST_RECOVER_MAC =~ /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/;
+        }
+    }
+
+    if (!@LOST_IFACES) {
+        chomp(my @up = `ip -br link | awk '\$2=="UP" && \$1!="lo" {print \$1}'`);
+        @LOST_IFACES = @up;
+    }
+    die "no UP interfaces found\n" unless @LOST_IFACES;
+    die "must run as root (need 'ip addr add/del')\n"
+        if !$LOST_DRY_RUN && $> != 0;
+
+    # Existing routes on this host — skip any candidate that overlaps.
+    my @routes;
+    for my $line (`ip -br route`) {
+        my ($dest) = split ' ', $line;
+        push @routes, $dest if $dest =~ m{/};
+    }
+
+    # Best-effort MAC → known-machine lookup.
+    my $known_mac = _lost_load_known_macs();
+
+    # Best-effort DB handle for lost_devices upserts. If the DB isn't
+    # reachable (no config, no creds, daemon offline), we just skip the
+    # write — find-lost still works as a CLI.
+    $LOST_DB = _lost_open_db();
+
+CANDIDATE: for my $c (@candidates_to_scan) {
+        my ($cidr, $alias_ip, $label) = @$c;
+
+        for my $r (@routes) {
+            next CANDIDATE if _lost_cidrs_overlap($r, $cidr);
+        }
+
+        print "[$cidr] $label\n" unless $LOST_QUIET;
+        if ($LOST_DRY_RUN) {
+            printf "  (dry-run) would alias %s on %s\n",
+                $alias_ip, join(',', @LOST_IFACES) unless $LOST_QUIET;
+            next;
+        }
+
+        my %hits;   # ip => { mac, iface }
+        for my $iface (@LOST_IFACES) {
+            my $alias = "$alias_ip/24";
+            my $rc = system('ip', 'addr', 'add', $alias, 'dev', $iface);
+            if ($rc != 0) {
+                warn "  alias add failed on $iface (already present?)\n";
+                next;
+            }
+
+            # ARP sweep. Parse nmap's stdout directly — when run as root,
+            # nmap uses raw sockets and the kernel ARP cache is never
+            # populated, so reading 'ip neigh' after the fact finds
+            # nothing.
+            my $cur_ip;
+            if (open my $fh, '-|', 'nmap', '-sn', '-PR', '-e', $iface,
+                                      '--max-retries', '1', '-T4', $cidr) {
+                while (my $line = <$fh>) {
+                    if ($line =~ /^Nmap scan report for/
+                            && $line =~ /(\d+\.\d+\.\d+\.\d+)/) {
+                        $cur_ip = $1;
+                    }
+                    elsif ($line =~ /^MAC Address:\s+([0-9A-Fa-f:]{17})/) {
+                        my $mac = lc $1;
+                        next unless $cur_ip && _lost_ip_in_cidr($cur_ip, $cidr);
+                        next if $cur_ip eq $alias_ip;
+                        $hits{$cur_ip} //= { mac => $mac, iface => $iface };
+                        $cur_ip = undef;
+                    }
+                }
+                close $fh;
+            }
+            else {
+                warn "  could not run nmap: $!\n";
+            }
+
+            system('ip', 'addr', 'del', $alias, 'dev', $iface);
+        }
+
+        if (!keys %hits) {
+            print "  nothing found\n" unless $LOST_QUIET;
+            next;
+        }
+        # If we suppressed the header in --quiet mode, emit it now that
+        # we actually have something to show.
+        print "[$cidr] $label\n" if $LOST_QUIET;
+
+        for my $ip (sort { _lost_ip_sort($a) cmp _lost_ip_sort($b) } keys %hits) {
+            my $h = $hits{$ip};
+            my $vendor = _lost_oui_vendor($h->{mac}) // '';
+            my $known  = $known_mac->{ $h->{mac} };
+            my $tag    = $known ? " [known: $known]" : ' [unknown to net-mgr]';
+            printf "  %-15s  %s  %-30s  via %s%s\n",
+                $ip, $h->{mac}, $vendor, $h->{iface}, $tag;
+
+            my $handler = _lost_match_recovery($cidr, $ip, $h->{mac});
+            my $status  = $handler
+                        ? (defined $LOST_RECOVER ? 'attempted' : 'pending')
+                        : 'no-handler';
+            my $skip_for_filter = defined $LOST_RECOVER
+                                  && $LOST_RECOVER_MAC ne ''
+                                  && $LOST_RECOVER_MAC ne $h->{mac};
+
+            if (!defined $LOST_RECOVER) {
+                # Just detection — record and move on.
+                _lost_record_lost($cidr, $ip, $h, $vendor, $handler, $status);
+                next;
+            }
+            if (!$handler || $skip_for_filter) {
+                _lost_record_lost($cidr, $ip, $h, $vendor, $handler, $status);
+                next;
+            }
+
+            print "    -> running $handler->{name} recovery: "
+                . "$handler->{script} --iface $h->{iface}\n";
+            local $ENV{NET_MGR_AUTOMATED} = 1;
+            my @cmd = ($handler->{script}, '--iface', $h->{iface});
+            my $rc = system(@cmd);
+            if ($rc != 0) {
+                warn "    recovery script exited with status "
+                   . ($rc >> 8) . "\n";
+                $status = 'failed';
+            }
+            _lost_record_lost($cidr, $ip, $h, $vendor, $handler, $status,
+                              attempted_now => 1);
+        }
+    }
+}
+
+# --- cmd_lost helpers ----------------------------------------------
+
+# Discover recovery scripts in $LOST_RECOVERY_DIR. Two paths:
+#   1. Filenames matching net-recover-<MAC> auto-register for that MAC,
+#      no --describe required.
+#   2. Other executables are invoked with --describe and their
+#      key:value output is parsed.
+# Returns a list of hashrefs (each contains 'script' = full path).
+# Cached after first call.
+sub _lost_discover_recovery {
+    return @_LOST_DISCOVERED if $_LOST_DISCOVERED_FLAG;
+    $_LOST_DISCOVERED_FLAG = 1;
+    return () unless -d $LOST_RECOVERY_DIR;
+    opendir my $dh, $LOST_RECOVERY_DIR or return ();
+    my @files = sort grep { !/^\./ } readdir $dh;
+    closedir $dh;
+    for my $f (@files) {
+        my $path = "$LOST_RECOVERY_DIR/$f";
+        next unless -f $path && -x $path;
+        my %meta = (script => $path);
+
+        # Filename-based MAC: net-recover-aabbccddeeff or
+        # net-recover-aa-bb-cc-dd-ee-ff (case insensitive).
+        if ($f =~ /^net-recover-([0-9a-fA-F]{2}([:-]?)(?:[0-9a-fA-F]{2}\2){4}[0-9a-fA-F]{2})$/) {
+            (my $mac = lc $1) =~ tr/-/:/;
+            $mac = join ':', unpack '(A2)*', $mac if $mac !~ /:/;
+            $meta{match_mac}   = $mac;
+            $meta{name}      //= "MAC $mac";
+            $meta{description} //= '(filename-discovered)';
+        }
+
+        # Optional --describe (overrides / supplements filename guess).
+        for my $line (`$path --describe 2>/dev/null`) {
+            chomp $line;
+            next unless $line =~ /^([a-z_]+)\s*:\s*(.*\S)/;
+            $meta{$1} = $2;
+        }
+        next unless $meta{name};
+        $meta{match_mac} = lc $meta{match_mac} if $meta{match_mac};
+        push @_LOST_DISCOVERED, \%meta;
+    }
+    return @_LOST_DISCOVERED;
+}
+
+# First registered handler whose constraints all match the hit. Each
+# of subnet / IP / OUI prefix / exact MAC is checked only if set.
+sub _lost_match_recovery {
+    my ($cidr, $ip, $mac) = @_;
+    for my $h (_lost_discover_recovery()) {
+        next if $h->{on_subnet}  && $h->{on_subnet}  ne $cidr;
+        next if $h->{on_ip}      && $h->{on_ip}      ne $ip;
+        next if $h->{oui_prefix} && lc(substr($mac, 0, length $h->{oui_prefix}))
+                                    ne lc $h->{oui_prefix};
+        next if $h->{match_mac}  && lc $h->{match_mac} ne lc $mac;
+        return $h;
+    }
+    return undef;
+}
+
+sub _lost_print_recovery_list {
+    my @r = _lost_discover_recovery();
+    if (!@r) {
+        print "no recovery scripts found in $LOST_RECOVERY_DIR\n";
+        return;
+    }
+    print "recovery scripts in $LOST_RECOVERY_DIR:\n\n";
+    for my $h (@r) {
+        printf "  %s\n", $h->{name};
+        printf "    script:      %s\n", $h->{script};
+        printf "    description: %s\n", $h->{description} if $h->{description};
+        my @trig;
+        push @trig, "subnet $h->{on_subnet}" if $h->{on_subnet};
+        push @trig, "IP $h->{on_ip}"         if $h->{on_ip};
+        push @trig, "OUI $h->{oui_prefix}"   if $h->{oui_prefix};
+        push @trig, "MAC $h->{match_mac}"    if $h->{match_mac};
+        printf "    triggers on: %s\n", join(', ', @trig) if @trig;
+        print "\n";
+    }
+}
+
+sub _lost_ip_to_int {
+    my ($ip) = @_;
+    return undef unless $ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+    return ($1 << 24) | ($2 << 16) | ($3 << 8) | $4;
+}
+
+sub _lost_cidrs_overlap {
+    my ($a, $b) = @_;
+    my ($an, $ap) = split '/', $a, 2;
+    my ($bn, $bp) = split '/', $b, 2;
+    return 0 unless defined $ap && defined $bp;
+    my $pl = $ap < $bp ? $ap : $bp;
+    my $mask = $pl == 0 ? 0 : ((0xffffffff << (32 - $pl)) & 0xffffffff);
+    my $ai = _lost_ip_to_int($an); return 0 unless defined $ai;
+    my $bi = _lost_ip_to_int($bn); return 0 unless defined $bi;
+    return ($ai & $mask) == ($bi & $mask);
+}
+
+sub _lost_ip_in_cidr {
+    my ($ip, $cidr) = @_;
+    my ($net, $pl) = split '/', $cidr, 2;
+    return 0 unless defined $pl;
+    my $mask = $pl == 0 ? 0 : ((0xffffffff << (32 - $pl)) & 0xffffffff);
+    my $ipi  = _lost_ip_to_int($ip);  return 0 unless defined $ipi;
+    my $neti = _lost_ip_to_int($net); return 0 unless defined $neti;
+    return ($ipi & $mask) == ($neti & $mask);
+}
+
+sub _lost_ip_sort {
+    my ($ip) = @_;
+    return '999.999.999.999' unless $ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+    return sprintf "%03d.%03d.%03d.%03d", $1, $2, $3, $4;
+}
+
+sub _lost_oui_vendor {
+    my ($mac) = @_;
+    return undef unless $mac && $mac =~ /^([0-9a-f]{2}):([0-9a-f]{2}):([0-9a-f]{2}):/i;
+    my $oui = uc "$1$2$3";
+    if (!$LOST_OUI_LOADED) {
+        $LOST_OUI_LOADED = 1;
+        my $f = '/var/lib/ieee-data/oui.csv';
+        if (open my $fh, '<', $f) {
+            while (<$fh>) {
+                next unless /^MA-L,([0-9A-F]{6}),"?([^",]+)/;
+                $LOST_OUI{$1} = $2;
+            }
+            close $fh;
+        }
+    }
+    return $LOST_OUI{$oui};
+}
+
+# Open NetMgr::DB best-effort. Returns undef if config or creds aren't
+# available — the caller treats undef as "skip the upsert" and find-lost
+# carries on as a stand-alone CLI.
+sub _lost_open_db {
+    my $h = eval {
+        require NetMgr::Config;
+        require NetMgr::DB;
+        my $cfg = NetMgr::Config::load(
+            $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
+        my $mycnf = (-r "$ENV{HOME}/.my.cnf") ? "$ENV{HOME}/.my.cnf"
+                  : NetMgr::Config->mysql_defaults_file($cfg);
+        return undef unless -r $mycnf;
+        my $db = NetMgr::DB->new(
+            defaults_file => $mycnf,
+            section       => $cfg->{mysql}{section},
+            db            => $cfg->{mysql}{db},
+        );
+        $db->connect;
+        $db;
+    };
+    return $h;  # undef on any failure
+}
+
+sub _lost_record_lost {
+    my ($cidr, $ip, $h, $vendor, $handler, $status, %opts) = @_;
+    return unless $LOST_DB;
+    eval {
+        $LOST_DB->upsert_lost_device(
+            iface   => $h->{iface},
+            subnet  => $cidr,
+            ip      => $ip,
+            mac     => $h->{mac},
+            vendor  => $vendor,
+            handler => $handler ? $handler->{name} : undef,
+            status  => $status,
+            ($opts{attempted_now}
+                ? (last_attempt => _lost_sql_now())
+                : ()),
+        );
+    };
+    warn "    DB upsert failed: $@" if $@;
+}
+
+sub _lost_sql_now {
+    my @t = localtime;
+    return sprintf '%04d-%02d-%02d %02d:%02d:%02d',
+        $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0];
+}
+
+sub _lost_load_known_macs {
+    my $cli = eval {
+        require NetMgr::Client;
+        NetMgr::Client->new(listen => '127.0.0.1:7531');
+    };
+    return {} unless $cli;
+    eval { $cli->hello(consumer => "find-lost.$$") };
+    return {} if $@;
+    my $ifaces    = eval { $cli->snapshot(1, 'interfaces')     } || [];
+    my $machines  = eval { $cli->snapshot(2, 'machines')       } || [];
+    my $friendly  = eval { $cli->snapshot(3, 'friendly_names') } || [];
+    eval { $cli->bye };
+    my %m = map { $_->{id} => ($_->{primary_name} // '') } @$machines;
+    $m{ $_->{machine_id} } = $_->{name} for @$friendly;
+    my %out;
+    for my $i (@$ifaces) {
+        my $name = ($i->{machine_id} && $m{ $i->{machine_id} })
+                 ? $m{ $i->{machine_id} }
+                 : '(unaffiliated)';
+        $out{ $i->{mac} } = $name;
+    }
+    return \%out;
+}
+
+sub _lost_usage {
+    print <<USAGE;
+net-find-lost — probe vendor-default subnets for stray devices on local L2.
+
+Usage:
+  net-find-lost [--iface NAME]... [--cidr CIDR]... [--dry-run]
+                [--recover[=MAC|all]] [--quiet]
+  net-find-lost --list
+
+Options:
+  --iface, -i NAME   Interface to add temporary aliases on (repeatable;
+                     default: every UP non-loopback interface).
+  --cidr, --subnet, -c CIDR
+                     Only probe this /24 (repeatable; default: every
+                     entry in the candidate list below). A CIDR not in
+                     the list is accepted too — its alias IP defaults
+                     to <network>.99.
+  --dry-run, -n      List candidates and what we'd do, no changes.
+  --recover[=ARG]    On a hit, run the matching recovery script. Bare
+                     --recover or --recover=all triggers on every match;
+                     --recover=AA:BB:... only triggers for that MAC.
+                     Recovery scripts are discovered from $LOST_RECOVERY_DIR.
+  --quiet, -q        Suppress per-subnet output unless something was
+                     found (cron-friendly).
+  --list             List the recovery scripts found in $LOST_RECOVERY_DIR
+                     (each script's --describe output) and exit.
+  --help, -h         Print this help.
+
+Recovery script directory: $LOST_RECOVERY_DIR
+  (override with NET_MGR_RECOVERY_DIR=... in the environment)
+
+  Scripts there can either implement --describe, or be named
+  net-recover-<MAC> (12 hex chars, optionally dash-separated) to be
+  auto-registered for that exact MAC with no contract.
+
+Default candidate subnets:
+USAGE
+    for my $c (@LOST_CANDIDATES) {
+        printf "  %-18s %s\n", $c->[0], $c->[2];
+    }
+    exit 1;
+}
+
+# ==================================================================
+# cmd_peers — was bin/net-find-peers
+# ==================================================================
+#
+# Discover other net-mgr instances on the LAN by probing TCP/7531 on
+# every IP that the local daemon already knows has port 22 open
+# (heuristic: net-mgr lives on Linux/server hosts). Each successful
+# STATUS reply is recorded in the `peers` DB table so the web UI's
+# view=peers page can list discovered peers alongside manually-
+# configured ones.
+#
+# Cron-friendly: --quiet suppresses per-IP lines and only reports new
+# discoveries (existing peers get refreshed silently).
+
+# cmd_peers uses only sub-local `my` state, so no file-scope vars are
+# needed here — the sub owns everything it touches.
+
+sub cmd_peers {
+    local @ARGV = @_;
+    require Getopt::Long;
+    Getopt::Long->import(qw(GetOptions));
+    Getopt::Long::Configure('no_ignore_case', 'bundling');
+    require Time::HiRes;
+
+    require NetMgr::Config;
+    require NetMgr::DB;
+    require NetMgr::Client;
+
+    my $listen      = $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
+    my $port        = 7531;
+    my $timeout     = 2;
+    my $quiet;
+    my $print_only;
+    my $bootstrap;
+    my $help;
+
+    GetOptions(
+        'listen=s'   => \$listen,
+        'port=i'     => \$port,
+        'timeout=f'  => \$timeout,
+        'quiet|q'    => \$quiet,
+        'print|n'    => \$print_only,
+        'bootstrap'  => \$bootstrap,
+        'help|h'     => \$help,
+    ) or _peers_usage();
+    _peers_usage() if $help;
+    # Cold-start sweeps a whole /24; keep each probe short unless overridden.
+    $timeout = 0.5 if $bootstrap && $timeout == 2;
+
+    # Local daemon — for snapshots + identifying our own addresses so we
+    # don't probe ourselves.
+    my $cli = NetMgr::Client->new(listen => $listen, timeout => 5);
+    $cli->hello(consumer => "find-peers.$$");
+
+    my $self_status   = eval { $cli->status } || {};
+    my %self_listeners;
+    for my $hp (split /,/, ($self_status->{listeners} // '')) {
+        my ($h) = split /:/, $hp, 2;
+        $self_listeners{$h} = 1 if defined $h;
+    }
+
+    # Candidate hosts: every IP whose MAC is on a port-22-open interface.
+    my $ports_rows = $cli->snapshot(101, 'ports',
+                                    where => "port = 22 AND proto = 'tcp'");
+    my %mac22 = map { $_->{mac} => 1 } @$ports_rows;
+    my $addr_rows  = $cli->snapshot(102, 'addresses', where => "family = 'v4'");
+    my %candidate;   # ip => 1
+    for my $a (@$addr_rows) {
+        next unless $mac22{ $a->{mac} };
+        next if $a->{addr} =~ /^127\./;
+        next if $self_listeners{ $a->{addr} };
+        $candidate{ $a->{addr} } = 1;
+    }
+    $cli->bye;
+
+    my @ips = sort { _peers_ipkey($a) cmp _peers_ipkey($b) } keys %candidate;
+    warn scalar(@ips), " candidate IPs (port-22 open, excluding self)\n"
+        unless $quiet;
+
+    # DB handle for upserts (skipped in --print mode).
+    my $db;
+    unless ($print_only) {
+        my $cfg = NetMgr::Config->load(
+            $ENV{NET_MGR_CONF} // '/etc/net-mgr/config');
+        # The broker daemon forks us without HOME set; guard $ENV{HOME}
+        # so the "Use of uninitialized value" warning doesn't clutter
+        # every run.
+        my $home = $ENV{HOME} // '';
+        my $mycnf = (length $home && -r "$home/.my.cnf") ? "$home/.my.cnf"
+                  : NetMgr::Config->mysql_defaults_file($cfg);
+        $db = NetMgr::DB->new(
+            defaults_file => $mycnf,
+            section       => $cfg->{mysql}{section},
+            db            => $cfg->{mysql}{db},
+        );
+        $db->connect;
+    }
+
+    # Pull existing peers so we can announce *new* ones in --quiet mode.
+    # Stale rows (last_seen older than $stale_age) DON'T count as "known"
+    # for the bootstrap gate below — a follower whose cluster info aged
+    # out (idle / down for a while) needs the /24 sweep again or it stays
+    # orphaned forever.
+    my $stale_age = 3600;        # seconds
+    my $now_epoch = time();
+    my %known;
+    my $fresh_known = 0;
+    if ($db) {
+        require Time::Piece;
+        for my $row (@{ $db->query_table('peers') }) {
+            $known{"$row->{host}:$row->{port}"} = 1;
+            # last_seen is "YYYY-MM-DD HH:MM:SS" in local time
+            # (MySQL DATETIME).
+            my $age;
+            eval {
+                my $tp = Time::Piece->strptime($row->{last_seen},
+                                               '%Y-%m-%d %H:%M:%S');
+                $age = $now_epoch - $tp->epoch;
+            };
+            $fresh_known++ if defined $age && $age < $stale_age;
+        }
+    }
+
+    # Cold-start bootstrap (--bootstrap): the normal candidate list comes
+    # from already-known addresses (port-22 hosts in the DB). A fresh
+    # cluster follower has none — its DB is empty until it relays — so
+    # auto-discovery can never find the master. When we have no peers
+    # recorded yet (or in --print mode), sweep the host's own IPv4 /24s
+    # directly for port-7531 responders. That's enough to find the master;
+    # once it's in the peers table this guard switches the sweep back off
+    # and the cheap address-based scan takes over.
+    if ($bootstrap && ($print_only || !$fresh_known)) {
+        my %have = map { $_ => 1 } @ips;
+        my @boot = grep { !$have{$_} && !$self_listeners{$_} }
+                        _peers_local_subnet_hosts();
+        if (@boot) {
+            warn scalar(@boot), " bootstrap IPs from local /24(s)"
+               . (%known && !$fresh_known ? " (peers stale — re-sweeping)" : "")
+               . "\n" unless $quiet;
+            push @ips, @boot;
+            @ips = sort { _peers_ipkey($a) cmp _peers_ipkey($b) } @ips;
+        }
+    }
+
+    # Local cluster roster — peers discovered with a cluster_member
+    # that ISN'T in this list get logged as 'unconfigured peer found'
+    # events so an operator can decide whether to add them.
+    my %roster_member;
+    if (my $cm = NetMgr::Config->load(
+            $ENV{NET_MGR_CONF} // '/etc/net-mgr/config')->{cluster}{members}) {
+        for my $m (split /[,\s]+/, $cm) {
+            next unless length $m;
+            $roster_member{$m} = 1;
+        }
+    }
+
+    # Emit-event helper. Opens a fresh control connection (this script
+    # already used $cli; reusing it for OBSERVE post-bye would need a
+    # reconnect anyway). Best-effort: if the local daemon's down, skip.
+    my $event_cli;
+    my $emit_unconfigured_peer = sub {
+        my ($ip, $member) = @_;
+        unless ($event_cli) {
+            $event_cli = eval {
+                NetMgr::Client->new(listen => $listen, timeout => 3);
+            } or return;
+            eval { $event_cli->hello(consumer => "find-peers-event.$$") };
+        }
+        eval {
+            $event_cli->observe(
+                kind    => 'event',
+                type    => 'unconfigured_peer_found',
+                addr    => $ip,
+                details => qq({"member":"$member"}),
+            );
+        };
+    };
+
+    my $found = 0;
+    my $new   = 0;
+    for my $ip (@ips) {
+        my $t0 = [Time::HiRes::gettimeofday()];
+        my $peer_cli = eval {
+            NetMgr::Client->new(listen => "$ip:$port", timeout => $timeout);
+        };
+        next unless $peer_cli;
+
+        eval { $peer_cli->hello(consumer => "find-peers-probe.$$") };
+        if ($@) {
+            eval { $peer_cli->bye };
+            next;
+        }
+        my $st = eval { $peer_cli->status };
+        eval { $peer_cli->bye };
+        next unless $st && ref $st eq 'HASH' && $st->{started_at};
+
+        my $rtt = Time::HiRes::tv_interval($t0) * 1000;
+        $found++;
+        my $is_new = !$known{"$ip:$port"};
+        $new++ if $is_new;
+
+        my $started_iso = _peers_iso_time($st->{started_at});
+        if (!$quiet || $is_new) {
+            printf "%s%-15s  port=%d  rtt=%.1fms  schema=v%s  up since %s\n",
+                ($is_new ? '+ ' : '  '),
+                $ip, $port, $rtt,
+                ($st->{schema_version} // '?'),
+                $started_iso;
+        }
+
+        next if $print_only;
+        $db->upsert_peer(
+            host           => $ip,
+            port           => $port,
+            last_status    => 'reachable',
+            schema_version => ($st->{schema_version} // undef),
+            started_at     => $started_iso,
+            rtt_ms         => $rtt,
+            # Store the peer's self-name so AutoDiscover doesn't have to
+            # JOIN to machines+interfaces+addresses (empty on a fresh
+            # follower) or fall back to PTR (often misconfigured).
+            # Critical for the chicken-and-egg: without it, gateway3
+            # elects itself master because reverse DNS for nas3 isn't
+            # set up.
+            cluster_member => ($st->{cluster_member} // undef),
+        );
+
+        # If the peer reports a cluster_member name that isn't in our
+        # roster, surface it once per discovery. We only emit when the
+        # peer is new in the peers table (so the operator isn't spammed
+        # every find-peers tick).
+        if ($is_new && $st->{cluster_member}
+            && %roster_member
+            && !$roster_member{ $st->{cluster_member} }) {
+            $emit_unconfigured_peer->($ip, $st->{cluster_member});
+            warn "  unconfigured peer: $st->{cluster_member} at $ip "
+               . "(not in [cluster] members)\n" unless $quiet;
+        }
+    }
+
+    eval { $event_cli->bye } if $event_cli;
+
+    warn "found $found peer(s); $new new\n" if !$quiet || $new;
+    return;
+}
+
+# --- cmd_peers helpers ---------------------------------------------
+
+sub _peers_ipkey {
+    my $ip = shift // '';
+    return '999.999.999.999' unless $ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+    return sprintf "%03d.%03d.%03d.%03d", $1, $2, $3, $4;
+}
+
+sub _peers_iso_time {
+    my ($ts) = @_;
+    return undef unless $ts;
+    my @t = localtime($ts);
+    return sprintf '%04d-%02d-%02d %02d:%02d:%02d',
+        $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0];
+}
+
+# Every host address in each local IPv4 /24 (cold-start bootstrap
+# targets). Bounded to the /24 containing each interface address — the
+# master is normally on the same LAN segment, and 254 probes stays
+# cheap — even when the interface carries a wider prefix. Excludes
+# loopback, link-local, and our own addresses.
+sub _peers_local_subnet_hosts {
+    my (@nets, %self_ip, %seen_net, @hosts);
+    open my $fh, '-|', 'ip', '-o', '-4', 'addr', 'show' or return ();
+    while (<$fh>) {
+        next unless /\binet\s+(\d+)\.(\d+)\.(\d+)\.(\d+)\/\d+/;
+        my ($a, $b, $c, $d) = ($1, $2, $3, $4);
+        next if $a == 127 || ($a == 169 && $b == 254);
+        $self_ip{"$a.$b.$c.$d"} = 1;
+        push @nets, "$a.$b.$c";
+    }
+    close $fh;
+    for my $net (@nets) {
+        next if $seen_net{$net}++;
+        push @hosts, grep { !$self_ip{$_} } map { "$net.$_" } 1 .. 254;
+    }
+    return @hosts;
+}
+
+sub _peers_usage {
+    print <<USAGE;
+net-find-peers — discover other net-mgr instances on the LAN.
+
+Usage:
+  net-find-peers [--port 7531] [--timeout 2] [--quiet] [--print] [--bootstrap]
+  net-find-peers --listen HOST:PORT      # override local daemon
+
+Probes TCP/--port on every IP the local daemon knows has port 22 open
+(excluding our own listen addresses) and asks each candidate for its
+STATUS. Successful replies are upserted into the peers DB table.
+
+  --quiet, -q   only report newly-discovered peers (cron-friendly)
+  --print, -n   don't write to the DB, just print findings
+  --bootstrap   cold start: if the peers table is empty (or with --print),
+                also sweep the host's own /24(s) directly, so a fresh
+                cluster follower can find the master before its DB fills.
+                Uses a 0.5s probe timeout unless --timeout is given.
+USAGE
+    exit 1;
+}
+
+# ==================================================================
+# cmd_rogue_dhcp — was bin/net-find-rogue-dhcp
+# ==================================================================
+#
+# Broadcast a DHCP DISCOVER on each LAN interface and report every
+# server that answered, grouped by responder.
+#
+# An AP that's been flipped from bridge mode into router/gateway mode
+# will hand out leases on its Ethernet side and advertise itself as the
+# default router. Clients that accept the lease then route everything
+# through the AP — extra hop, NAT, halved throughput. This script makes
+# those visible by listing all DHCP responders per interface and
+# cross-referencing each one against the net-mgr `aps` table.
+#
+# Default interfaces: every UP non-loopback iface with a 192.168.*.*
+# address (mirrors manager.listen=auto). Needs root for raw-socket DHCP.
+#
+# Exit (from cmd_rogue_dhcp, propagated via die/exit):
+#   0 = nothing answered or only known non-APs answered.
+#   1 = at least one responder is in the `aps` table (rogue).
+#   2 = usage / runtime error.
+
+# File-scope state that _rogue_load_netmgr_context needs to read.
+my $ROGUE_LISTEN;
+my $ROGUE_QUIET;
+
+sub cmd_rogue_dhcp {
+    local @ARGV = @_;
+    require Getopt::Long;
+    Getopt::Long->import(qw(GetOptions));
+    Getopt::Long::Configure('no_ignore_case', 'bundling');
+
+    my @ifaces;
+    my $help;
+    $ROGUE_LISTEN = undef;
+    $ROGUE_QUIET  = undef;
+
+    GetOptions(
+        'iface|i=s' => \@ifaces,
+        'listen=s'  => \$ROGUE_LISTEN,
+        'quiet|q'   => \$ROGUE_QUIET,
+        'help|h'    => \$help,
+    ) or _rogue_usage(2);
+    _rogue_usage(0) if $help;
+
+    if ($> != 0) {
+        die "net-find rogue-dhcp: must run as root "
+          . "(raw-socket DHCP DISCOVER)\n";
+    }
+
+    @ifaces = _rogue_discover_ifaces() unless @ifaces;
+    unless (@ifaces) {
+        print STDERR "no candidate interfaces "
+                   . "(need UP iface with 192.168.*.* addr)\n";
+        exit 2;
+    }
+
+    # Best-effort lookup of MAC→AP-membership and MAC→hostname from the
+    # daemon. If the daemon isn't reachable we still produce useful
+    # output, just without the AP / hostname annotations.
+    my ($ap_macs, $mac_to_name) = _rogue_load_netmgr_context();
+
+    # server_ip => {
+    #   ifaces   => { iface => 1 },
+    #   routers  => { router_ip => 1 },
+    #   offered  => [ ip, ip, ... ],
+    #   mac      => '..:..:..',  # filled later
+    # }
+    my %by_server;
+
+    for my $if (@ifaces) {
+        my @offers = _rogue_scan_iface($if);
+        for my $o (@offers) {
+            my $sid = $o->{server} or next;
+            my $r = $by_server{$sid} ||= {
+                ifaces  => {}, routers => {}, offered => [],
+            };
+            $r->{ifaces}{$if} = 1;
+            $r->{routers}{ $o->{router} } = 1 if defined $o->{router};
+            push @{ $r->{offered} }, $o->{offered} if defined $o->{offered};
+        }
+    }
+
+    # Resolve each server IP → MAC. ARP cache is populated as a side-effect
+    # of the nmap scan if the host is on-link, but on-link DHCP servers
+    # may have only sent unicast OFFER → kernel ARP not always populated.
+    # A single ping primes it.
+    for my $sid (keys %by_server) {
+        my @ifs = sort keys %{ $by_server{$sid}{ifaces} };
+        $by_server{$sid}{mac} = _rogue_resolve_mac($sid, \@ifs);
+    }
+
+    unless (%by_server) {
+        print "no DHCP responses on @ifaces\n" unless $ROGUE_QUIET;
+        exit 0;
+    }
+
+    my $rogue = 0;
+    my $first = 1;
+    for my $sid (sort _rogue_by_ip keys %by_server) {
+        my $r = $by_server{$sid};
+        my $mac = $r->{mac} // '?';
+        my $is_ap = $mac ne '?' && $ap_macs->{ lc $mac };
+        my $host  = $mac ne '?' ? $mac_to_name->{ lc $mac } : undef;
+        my @routers  = sort _rogue_by_ip keys %{ $r->{routers} };
+        my @ifs      = sort keys %{ $r->{ifaces} };
+        my @offered  = _rogue_uniq(@{ $r->{offered} });
+
+        my $tag = $is_ap ? 'AP — ROGUE' : 'not in `aps`';
+        my $host_label = defined $host ? sprintf('%-15s %-20s', $sid, $host)
+                                       : sprintf('%-15s %-20s', $sid, '');
+
+        print "\n" unless $first; $first = 0;
+        printf "Server %s  %s  [%s]\n", $host_label, $mac, $tag;
+        printf "  answered on:    %s\n", join(', ', @ifs);
+        if (@routers) {
+            my @ann = map {
+                my $self = $_ eq $sid;
+                my $note = $self ? '(self)' : '';
+                $note ? "$_ $note" : $_;
+            } @routers;
+            printf "  offered router: %s\n", join(', ', @ann);
+        }
+        printf "  offered IPs:    %s\n", join(', ', @offered) if @offered;
+
+        $rogue = 1 if $is_ap;
+    }
+
+    exit($rogue ? 1 : 0);
+}
+
+# --- cmd_rogue_dhcp helpers ----------------------------------------
+
+sub _rogue_usage {
+    my ($rc) = @_;
+    print STDERR <<'EOF';
+Usage: net-find-rogue-dhcp [--iface IF]... [--listen HOST[:PORT]] [--quiet]
+
+Sends a DHCP DISCOVER on each given (or autodetected) interface and
+reports every server that answered, grouped by responder. APs that
+appear in the responder list are flagged as rogue (exit 1).
+EOF
+    exit($rc // 2);
+}
+
+sub _rogue_discover_ifaces {
+    my @out;
+    open my $fh, '-|', 'ip', '-br', '-4', 'addr', 'show'
+        or die "ip addr: $!\n";
+    while (<$fh>) {
+        my @f = split ' ', $_;
+        next unless @f >= 3;
+        next if $f[0] eq 'lo';
+        next unless $f[1] eq 'UP';
+        next unless $f[2] =~ m{^192\.168\.\d+\.\d+/};
+        push @out, $f[0];
+    }
+    close $fh;
+    return @out;
+}
+
+sub _rogue_scan_iface {
+    my ($if) = @_;
+    my @offers;
+    print STDERR "scanning $if ...\n" unless $ROGUE_QUIET;
+    # nmap emits 'WARNING: No targets were specified' to stdout — that's
+    # fine, we asked for a pre-scan script. Stderr is junk we don't want.
+    my $pid = open my $fh, '-|';
+    defined $pid or do { warn "fork: $!\n"; return; };
+    if ($pid == 0) {
+        open STDERR, '>', '/dev/null';
+        exec 'nmap', '--script', 'broadcast-dhcp-discover', '-e', $if;
+        die "exec nmap: $!";
+    }
+    my %cur;
+    my $in_offer = 0;
+    while (<$fh>) {
+        if (/^\|\s*Response \d+ of \d+:/) {
+            push @offers, { %cur } if $in_offer && $cur{server};
+            %cur = (); $in_offer = 1;
+            next;
+        }
+        next unless $in_offer;
+        if (/^\|\s*Server Identifier:\s*(\S+)/)         { $cur{server}  = $1 }
+        elsif (/^\|\s*Router:\s*(\S+)/)                  { $cur{router}  = $1 }
+        elsif (/^\|\s*IP Offered:\s*(\S+)/)              { $cur{offered} = $1 }
+        elsif (/^\|_?\s*$/)                              { } # blank
+        elsif (/^[^|]/)                                  {
+            # left the script-output block (no leading pipe)
+            push @offers, { %cur } if $cur{server};
+            %cur = (); $in_offer = 0;
+        }
+    }
+    close $fh;
+    push @offers, { %cur } if $in_offer && $cur{server};
+    return @offers;
+}
+
+sub _rogue_resolve_mac {
+    my ($ip, $ifs) = @_;
+    # Prime ARP for each candidate iface (DHCP server may be on-link
+    # but not yet in the cache).
+    for my $if (@$ifs) {
+        # Discard ping output — we only want the ARP entry as a side-effect.
+        my $pid = fork // next;
+        if ($pid == 0) {
+            open STDOUT, '>', '/dev/null';
+            open STDERR, '>', '/dev/null';
+            exec 'ping', '-c', '1', '-W', '1', '-I', $if, $ip;
+            exit 1;
+        }
+        waitpid $pid, 0;
+    }
+    open my $fh, '-|', 'ip', 'neigh', 'show', $ip or return undef;
+    while (<$fh>) {
+        return lc $1 if /lladdr\s+([0-9a-f:]{17})/i;
+    }
+    return undef;
+}
+
+sub _rogue_load_netmgr_context {
+    my (%aps, %mac_to_name);
+    eval {
+        require NetMgr::Client;
+        my %args;
+        $args{listen} = $ROGUE_LISTEN if defined $ROGUE_LISTEN;
+        my $c = NetMgr::Client->new(%args);
+        $c->hello(consumer => 'net-find-rogue-dhcp');
+        for my $row (@{ $c->snapshot('rdhcp1', 'aps') || [] }) {
+            $aps{ lc $row->{mac} } = 1 if $row->{mac};
+        }
+        # Chain mac → machine_id → primary_name so we can label each
+        # responder with its hostname on the Server line.
+        my %mac_to_mid;
+        for my $row (@{ $c->snapshot('rdhcp2', 'interfaces') || [] }) {
+            next unless $row->{mac} && defined $row->{machine_id}
+                                    && length $row->{machine_id};
+            $mac_to_mid{ lc $row->{mac} } = $row->{machine_id};
+        }
+        my %mid_to_name;
+        for my $row (@{ $c->snapshot('rdhcp3', 'machines') || [] }) {
+            next unless defined $row->{id}
+                     && defined $row->{primary_name}
+                     && length $row->{primary_name};
+            $mid_to_name{ $row->{id} } = $row->{primary_name};
+        }
+        for my $mac (keys %mac_to_mid) {
+            my $n = $mid_to_name{ $mac_to_mid{$mac} };
+            $mac_to_name{$mac} = $n if defined $n;
+        }
+        $c->bye;
+    };
+    if ($@ && !$ROGUE_QUIET) {
+        my $msg = $@; $msg =~ s/\s+at\s.*//s;
+        print STDERR "warn: net-mgr lookup failed ($msg) "
+                   . "— AP names unavailable\n";
+    }
+    return (\%aps, \%mac_to_name);
+}
+
+sub _rogue_by_ip {
+    my @a = split /\./, $a;
+    my @b = split /\./, $b;
+    for (0..3) { return $a[$_] <=> $b[$_] if $a[$_] != $b[$_] }
+    return 0;
+}
+
+sub _rogue_uniq { my %s; grep { !$s{$_}++ } @_ }
+
+# ==================================================================
+# Dispatcher (runs last, after all file-scope initializers)
+# ==================================================================
+
+my %CMD = (
+    'lost'       => \&cmd_lost,
+    'peers'      => \&cmd_peers,
+    'rogue-dhcp' => \&cmd_rogue_dhcp,
+);
+
+# basename-based alias: net-find-lost / net-find-peers / net-find-rogue-dhcp.
+# Emit a soft-deprecation warning; carry on with the mapped sub-command.
+my %ALIAS = (
+    'net-find-lost'        => 'lost',
+    'net-find-peers'       => 'peers',
+    'net-find-rogue-dhcp'  => 'rogue-dhcp',
+);
+
+my $self_name = basename($0);
+my $sub;
+if (my $mapped = $ALIAS{$self_name}) {
+    warn "[$self_name] this alias will be removed in a future release "
+       . "— use 'net-find $mapped'\n";
+    $sub = $mapped;
+}
+else {
+    if (!@ARGV) { _dispatcher_help(); exit 1 }
+    if ($ARGV[0] eq '--help' || $ARGV[0] eq '-h') {
+        _dispatcher_help(); exit 0;
+    }
+    $sub = shift @ARGV;
+}
+
+my $handler = $CMD{$sub};
+unless ($handler) {
+    print STDERR "net-find: unknown sub-command '$sub'\n\n";
+    _dispatcher_help();
+    exit 2;
+}
+$handler->(@ARGV);
+exit 0;

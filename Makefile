@@ -23,14 +23,20 @@ CGIDIR     ?= /usr/lib/cgi-bin
 APACHE_CONF_DIR ?= $(SYSCONFDIR)/apache2/conf-available
 DESTDIR    ?=
 
-BINS  = net-add-public-dns net-alias net-bitchat-bridge net-bitchat-helper-wrap net-mgr-bitchat-setup net-chat net-chat-askpass net-chat-autoresponder net-poll-ap net-audit net-audit-aps net-cluster net-cluster-gui net-config-gui net-connect net-ddns net-dhcp-cycle net-diag net-discover net-find-lost net-find-peers net-find-rogue-dhcp net-fw net-gen-apache-conf net-gen-dnsmasq net-import-dhcp net-import-dnsmasq net-import-ssh-forwards net-fix net-ipv6 net-isp net-link-stats net-lookup net-mac net-name net-peer net-ping net-purge net-vlan net-kill-rogue-dhcp net-reserve net-roam net-router net-run-app net-scan net-report net-set net-show net-tp-scan net-tunnel net-uplink-probe net-var net-watch net-wifi-survey net-zones
+BINS  = net-add-public-dns net-alias net-bitchat-bridge net-bitchat-helper-wrap net-mgr-bitchat-setup net-chat net-chat-askpass net-chat-autoresponder net-poll-ap net-audit net-audit-aps net-cluster net-cluster-gui net-config-gui net-connect net-ddns net-dhcp-cycle net-diag net-discover net-find net-fw net-gen-apache-conf net-gen-dnsmasq net-import-dhcp net-import-dnsmasq net-import-ssh-forwards net-fix net-ipv6 net-isp net-link-stats net-lookup net-mac net-name net-peer net-ping net-purge net-vlan net-kill-rogue-dhcp net-reserve net-roam net-router net-run-app net-scan net-report net-set net-show net-tp-scan net-tunnel net-uplink-probe net-var net-watch net-wifi-survey net-zones
 
 # Symlinks installed pointing at net-run-app — each link picks its
 # behavior from basename($0) so adding a new wrapper is a one-line
 # entry in net-run-app's %SPEC + a name here.
 RUN_APP_LINKS = net-ssh net-mosh net-sftp net-scp net-rsync net-vnc
+
+# Symlinks installed pointing at net-find — each historical script name
+# maps to a sub-command inside net-find (basename dispatch). Kept for
+# backward compat; net-find emits a soft-deprecation warning when
+# invoked via one of these names.
+FIND_LINKS    = net-find-lost net-find-peers net-find-rogue-dhcp
 SBINS = net-mgr net-mgr-setup net-dns net-mgr-relay net-mgr-self-update net-mgr-deploy net-mgr-netif-hook net-mgr-reset-ble net-mgr-dnsmasq-switch
-# Recovery scripts live off PATH so net-find-lost can enumerate them
+# Recovery scripts live off PATH so net-find can enumerate them
 # without polluting BINDIR. Each script must support --describe.
 RECOVERYS = net-recover-tlsg2424
 UNITS = net-mgr.service net-dns.service net-mgr-relay.service net-bitchat-bridge.service net-chat-autoresponder.service
@@ -232,6 +238,10 @@ install: .version
 	@for l in $(RUN_APP_LINKS); do \
 	  echo "  symlink $(DESTDIR)$(BINDIR)/$$l → net-run-app"; \
 	  ln -sf net-run-app $(DESTDIR)$(BINDIR)/$$l; \
+	done
+	@for l in $(FIND_LINKS); do \
+	  echo "  symlink $(DESTDIR)$(BINDIR)/$$l → net-find"; \
+	  ln -sf net-find $(DESTDIR)$(BINDIR)/$$l; \
 	done
 	@for f in $(RECOVERYS); do \
 	  echo "  recovery/$$f → $(DESTDIR)$(RECOVERYDIR)/$$f"; \
