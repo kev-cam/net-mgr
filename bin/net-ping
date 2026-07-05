@@ -2,9 +2,17 @@
 # net-ping — manual fping-and-publish-RTT producer for debug.
 #
 # Usage:
-#   net-ping IP [IP ...]        Ping these IPs and push kind=ping observations.
+#   net-ping NAME|IP [...]      Ping these targets and push kind=ping
+#                                observations. NAME is any regex that
+#                                net-lookup would match against
+#                                machines.primary_name / hostnames /
+#                                friendly_names / aliases; '=' expands
+#                                to '.*' the same way. A name that
+#                                resolves to several addresses pings
+#                                all of them (mirrors --auto's fan-out).
 #   net-ping --auto             Ping every known v4 address.
-#   net-ping --reset IP [IP...] Clear min_rtt_ms / last_rtt_ms for these
+#   net-ping --reset NAME|IP [...]
+#                                Clear min_rtt_ms / last_rtt_ms for these
 #                                addresses (so a bogus baseline can be re-learned).
 #   net-ping --reset --all      Clear them everywhere.
 #   net-ping --listen H:P ...   Override manager address.
@@ -17,6 +25,7 @@ use warnings;
 use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
+use Socket qw(inet_pton AF_INET AF_INET6);
 use NetMgr::Client;
 use NetMgr::Producer::Scan;
 
@@ -43,8 +52,9 @@ if ($reset) {
         $cli->bye;
         exit 0;
     }
-    @ARGV or die "--reset needs IPs (or --all)\n";
-    for my $ip (@ARGV) {
+    @ARGV or die "--reset needs targets (name or IP), or --all\n";
+    my @targets = resolve_args_to_ips($cli, @ARGV);
+    for my $ip (@targets) {
         my $r = $cli->trigger('reset-rtt', wait => 1, addr => $ip);
         warn "reset-rtt $ip: $r\n";
     }
@@ -58,8 +68,8 @@ if ($auto) {
     my %seen;
     @ips = grep { !$seen{$_}++ } map { $_->{addr} } @$rows;
 }
-push @ips, @ARGV;
-@ips or die "usage: $0 [--auto] [--reset [--all]] [IP ...]\n";
+push @ips, resolve_args_to_ips($cli, @ARGV);
+@ips or die "usage: $0 [--auto] [--reset [--all]] [NAME|IP ...]\n";
 
 # Need the addr→[mac,...] map to attach the ping observation to the
 # right interface row(s).
@@ -97,3 +107,90 @@ for my $ip (sort keys %{ $res->{alive} }) {
 }
 
 $cli->bye;
+
+# Turn @args (a mix of IP literals and NAME regexes) into a flat list of
+# IPs to ping. Name matching mirrors net-lookup's forward path: the arg
+# is wrapped as ^(?:...)$ with '=' → '.*', then compared against
+# machines.primary_name / hostnames / friendly_names / aliases. Every
+# address owned by every matched machine comes back (no scoring / picking
+# a "best" — the caller is ping, and pinging the fan-out is the point).
+# Args that already parse as v4/v6 addresses pass through untouched, so
+# `net-ping 192.168.15.1 nas3=` works. Unresolvable names warn and skip
+# so a typo doesn't take out the whole run.
+sub resolve_args_to_ips {
+    my ($cli, @args) = @_;
+    my (@out, @names);
+    for my $a (@args) {
+        if (inet_pton(AF_INET, $a) || inet_pton(AF_INET6, $a)) {
+            push @out, $a;
+        } else {
+            push @names, $a;
+        }
+    }
+    return @out unless @names;
+
+    # Snapshot only when there's a name to resolve — a pure IP list
+    # shouldn't pay for six extra queries. Sub-ids picked above the
+    # ping path's 1 and 2 to avoid collision.
+    my $machines  = $cli->snapshot(21, 'machines');
+    my $hostnames = $cli->snapshot(22, 'hostnames');
+    my $friendly  = $cli->snapshot(23, 'friendly_names');
+    my $aliases   = $cli->snapshot(24, 'aliases');
+    my $ifaces    = $cli->snapshot(25, 'interfaces');
+    my $addresses = $cli->snapshot(26, 'addresses', where => "family = 'v4'");
+
+    my %name2mids;
+    for my $m (@$machines) {
+        push @{ $name2mids{ $m->{primary_name} } }, $m->{id}
+            if defined $m->{primary_name} && length $m->{primary_name};
+    }
+    for my $row (@$hostnames, @$friendly, @$aliases) {
+        next unless defined $row->{name} && length $row->{name}
+                 && defined $row->{machine_id} && length $row->{machine_id};
+        push @{ $name2mids{ $row->{name} } }, $row->{machine_id};
+    }
+
+    my %macs_by_mid;
+    for my $i (@$ifaces) {
+        next unless defined $i->{mac} && defined $i->{machine_id}
+                                      && length $i->{machine_id};
+        push @{ $macs_by_mid{ $i->{machine_id} } }, $i->{mac};
+    }
+
+    my %addrs_by_mac;
+    for my $a (@$addresses) {
+        next unless defined $a->{addr} && defined $a->{mac};
+        push @{ $addrs_by_mac{ $a->{mac} } }, $a->{addr};
+    }
+
+    for my $name (@names) {
+        (my $rx_src = $name) =~ s/=/.*/g;
+        my $rx = eval { qr/^(?:$rx_src)$/ };
+        if ($@) {
+            warn "net-ping: bad name regex '$name': $@";
+            next;
+        }
+        my %hit;
+        for my $key (keys %name2mids) {
+            next unless $key =~ $rx;
+            for my $mid (@{ $name2mids{$key} }) {
+                for my $mac (@{ $macs_by_mid{$mid} || [] }) {
+                    for my $ip (@{ $addrs_by_mac{$mac} || [] }) {
+                        $hit{$ip} = 1;
+                    }
+                }
+            }
+        }
+        my @ips = sort keys %hit;
+        if (!@ips) {
+            warn "net-ping: '$name' didn't resolve to any IP\n";
+            next;
+        }
+        # Give the operator a hint when one name fanned out — otherwise
+        # `net-ping nas3=` produces a flurry of ping results with no
+        # obvious tie back to the arg that spawned them.
+        warn "net-ping: $name -> " . join(', ', @ips) . "\n" if @ips > 1;
+        push @out, @ips;
+    }
+    return @out;
+}
