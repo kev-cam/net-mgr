@@ -412,7 +412,17 @@ sub build_editor_shell {
 # in $E{fields}{<key>} so save can serialize them without asking the
 # widgets. Unset $E{fields} at build time so a trigger flip drops keys
 # that don't belong to the new trigger.
+# Re-entry guard: Tk::Optionmenu fires its -command during construction
+# when -variable is initially set to match one of its options, and our
+# on_change closures for Trigger/Channel both call build_editor_form,
+# which would recurse infinitely as each rebuilt Optionmenu fires again.
+# The guard turns those nested calls into no-ops; only the outermost
+# invocation (from Load / operator-driven change / do_add_rule) rebuilds.
+our $BUILDING_FORM = 0;
+
 sub build_editor_form {
+    return if $BUILDING_FORM;
+    local $BUILDING_FORM = 1;
     $_->destroy for $editor_frame->children;
     $E{fields} //= {};
     # Empty trigger means "unpicked" — trigger-specific rows are not
