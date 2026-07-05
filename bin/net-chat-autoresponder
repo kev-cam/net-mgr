@@ -972,8 +972,47 @@ sub run {
         -height     => 20,
         -font       => '{Monospace} 10',
         -selectmode => 'browse',
+        -takefocus  => 1,
     )->pack(-side => 'top', -fill => 'y', -expand => 1, -padx => 4, -pady => 2);
     $rules_list->bind('<<ListboxSelect>>', \&on_rule_pick);
+    # Double-click a rule or hit space with a rule selected to flip its
+    # enabled bit. Arrow keys move the selection (Tk::Listbox defaults)
+    # and the on_rule_pick handler refreshes the editor pane.
+    my $lb = $rules_list->Subwidget('scrolled');
+    $lb->bind('<Double-Button-1>',
+              sub { do_toggle_enabled(); Tk->break });
+    $lb->bind('<space>',
+              sub { do_toggle_enabled(); Tk->break });
+    # Arrow-key movement also refreshes the right pane. Tk::Listbox's
+    # default bindings move -active but don't always fire ListboxSelect,
+    # so handle the keys explicitly: compute the target index, sync
+    # selection + active + visible-window, then call on_rule_pick.
+    my @keys = (
+        ['<Up>',    sub { my ($c,$s) = @_; $c - 1 } ],
+        ['<Down>',  sub { my ($c,$s) = @_; $c + 1 } ],
+        ['<Home>',  sub { 0 } ],
+        ['<End>',   sub { my ($c,$s) = @_; $s - 1 } ],
+        ['<Prior>', sub { my ($c,$s) = @_; $c - 10 } ],
+        ['<Next>',  sub { my ($c,$s) = @_; $c + 10 } ],
+    );
+    for my $spec (@keys) {
+        my ($key, $calc) = @$spec;
+        $lb->bind($key, sub {
+            my $l   = shift;
+            my $sz  = $l->size;
+            return unless $sz > 0;
+            my $cur = ($l->curselection)[0] // 0;
+            my $new = $calc->($cur, $sz);
+            $new = 0        if $new < 0;
+            $new = $sz - 1  if $new >= $sz;
+            $l->selectionClear(0, 'end');
+            $l->selectionSet($new);
+            $l->activate($new);
+            $l->see($new);
+            on_rule_pick();
+            Tk->break;
+        });
+    }
 
     $left_btns = $left_frame->Frame->pack(-side => 'top', -fill => 'x', -pady => 2);
     $left_btns->Button(-text => '+ Add',    -command => \&do_add_rule)
