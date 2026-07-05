@@ -1,0 +1,69 @@
+# /etc/net-mgr/shared-wifi.conf
+# ==========================================================================
+# Shared WiFi credentials for the net-autoresponder-gui rule editor's
+# "Share WiFi" picker. When the operator picks a label the GUI generates a
+# WIFI: URI (the QR-code format iOS/Android camera readers parse) and
+# inserts it into the rule body at the cursor — so operators don't type
+# the escaping by hand.
+#
+# INI format, one [wifi.LABEL] section per network. LABEL is what the
+# picker shows (as "LABEL (SSID)").
+#
+#   [wifi.LABEL]                             ; LABEL: [A-Za-z0-9_.-]+
+#   ssid     = TXT                           ; required
+#   auth     = WPA | WPA2 | WEP | nopass     ; optional; default WPA
+#   password = TXT                           ; required unless auth=nopass
+#   hidden   = true | false                  ; optional; default false
+#   note     = TXT                           ; optional; appended after the
+#                                            ; URI when the operator picks
+#                                            ; via "Insert w/ note"
+#
+# Key names mirror the [wifi_response] section in
+# etc/bitchat-bridge.conf.sample so operators don't learn two formats.
+#
+# Overlays: /etc/net-mgr/shared-wifi.d/*.conf are loaded AFTER this file in
+# filename-sort order (same overlay mechanism NetMgr::Config uses for the
+# main /etc/net-mgr/config). A duplicate [wifi.LABEL] REPLACES the earlier
+# one — the merge is PER-SECTION, so a site overlay swaps a whole entry
+# rather than half-overwriting individual keys.
+#
+# SECURITY
+#   The password field is stored CLEARTEXT — the WIFI: URI format has no
+#   hash mode, so any tool that hands out the credential needs the plain
+#   PSK. Recommended file modes:
+#
+#       /etc/net-mgr/shared-wifi.conf       0640 root:net-mgr
+#       /etc/net-mgr/shared-wifi.d/         0750 root:net-mgr
+#       /etc/net-mgr/shared-wifi.d/*.conf   0640 root:net-mgr
+#
+# DEFAULT (empty) STATE
+#   This is a .sample — the example entries below are all commented out,
+#   so a fresh install ships with no shareable networks. The GUI dropdown
+#   shows a single hint item and inserts nothing on click.
+# ==========================================================================
+
+# The site's primary WPA network — same credentials the bitchat-bridge
+# [wifi_response] section and the wifi-fanout autoresponder rule already
+# use. Uncomment + edit for your site.
+;[wifi.video]
+;ssid     = video
+;auth     = WPA
+;password = InTheRoom
+;note     = presentation-room WiFi (primary)
+
+# An open guest AP (captive portal). When auth = nopass the generated
+# WIFI: URI omits the P: field entirely, which is what QR readers expect
+# for open networks.
+;[wifi.guest]
+;ssid     = guest-open
+;auth     = nopass
+;note     = open guest AP (captive portal — accept ToS)
+
+# A hidden SSID example. hidden=true adds ;H:true; to the URI so the
+# camera app tells the OS to search for a non-broadcast network.
+;[wifi.backhaul]
+;ssid     = mgmt-hidden
+;auth     = WPA2
+;password = REPLACE-ME
+;hidden   = true
+;note     = ops backhaul (hidden SSID)

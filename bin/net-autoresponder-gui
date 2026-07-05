@@ -59,6 +59,7 @@ use Tk::Optionmenu;
 use Tk::BrowseEntry;
 
 use NetMgr::Client;
+use NetMgr::Config;
 
 my $listen = $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
 my $file   = '/etc/net-mgr/net-chat-autoresponder.conf';
@@ -95,6 +96,20 @@ my @KNOWN_SESSIONS;   # arrayref of hashrefs { name, status, topic, ... }
 # toggled by update_save_state() based on whether trigger + channel
 # are both set to a non-blank value.
 my $save_btn;
+
+# Shared-WiFi picker state, populated by load_shared_wifi() at Load
+# time from /etc/net-mgr/shared-wifi.conf (+ shared-wifi.d/*.conf
+# overlays via NetMgr::Config's built-in overlay path). Keys of
+# %SHARED_WIFI are labels; each value is a hashref with
+# { ssid, auth, password, hidden, note }. @SHARED_WIFI_LABELS
+# preserves discovery order for a stable dropdown listing.
+# %DISPLAY_TO_LABEL maps the "LABEL (SSID)" dropdown string back to
+# its label — the BrowseEntry variable holds the DISPLAY string, but
+# the URI generator needs the label to look up credentials.
+my %SHARED_WIFI;
+my @SHARED_WIFI_LABELS;
+my %DISPLAY_TO_LABEL;
+my $SHARED_WIFI_CONF = '/etc/net-mgr/shared-wifi.conf';
 
 # --- Tk skeleton (net-cluster-gui:139-150 layout) --------------------
 my $mw = MainWindow->new(-title => "net-autoresponder-gui ($file)");
@@ -214,6 +229,11 @@ sub do_load {
     # current sessions. Failure is non-fatal — dropdown is just empty
     # and the operator can still type any name.
     @KNOWN_SESSIONS = fetch_chat_sessions();
+
+    # Refresh the shared-WiFi picker cache. Missing file / parse
+    # error is fine — the dropdown shows a hint item instead and
+    # the operator can still type the WIFI: URI by hand.
+    load_shared_wifi();
 
     my @paths = overlay_paths($file);
     unless (@paths) {
@@ -431,6 +451,13 @@ sub build_editor_form {
     } else {
         row_entry( $editor_frame, 'Target:', 'target', 48 );
     }
+    # Shared-WiFi picker sits ABOVE the body field so an operator
+    # composing a rule.wifi-fanout style greeting can pick a
+    # credential set and drop the WIFI: URI into the body without
+    # typing the escaping by hand. The generated URI shape matches
+    # net-bitchat-bridge:531-534 (same escape set) so QR readers
+    # parse the greeting identically whichever surface produced it.
+    row_shared_wifi($editor_frame);
     row_multi( $editor_frame, 'Body:',      'body' );
     row_entry( $editor_frame, 'Dedup TTL:', 'dedup_ttl', 12 );
 
@@ -539,6 +566,145 @@ sub row_browse_entry {
     }
 }
 
+# Shared-WiFi picker row. BrowseEntry lists every [wifi.LABEL] section
+# discovered by load_shared_wifi() as "LABEL (SSID)"; two buttons handle
+# insert-URI and insert-URI-plus-note into the body Text widget at the
+# cursor (or replacing the current selection). When no shared-wifi.conf
+# is present the dropdown carries a single hint item and the buttons
+# silently no-op — a bare empty picker looked confusingly broken.
+sub row_shared_wifi {
+    my ($parent) = @_;
+    my $row = $parent->Frame->pack(-side => 'top', -fill => 'x', -pady => 1);
+    $row->Label(-text => 'Share WiFi:', -width => 12, -anchor => 'w')
+        ->pack(-side => 'left');
+    $E{fields}{_wifi_pick} //= '';
+    my $be = $row->BrowseEntry(
+        -variable  => \$E{fields}{_wifi_pick},
+        -width     => 32,
+        -listwidth => 48,
+        -browsecmd => sub { _wifi_insert_from_pick(0) },
+    )->pack(-side => 'left', -padx => 2);
+    if (@SHARED_WIFI_LABELS) {
+        for my $label (@SHARED_WIFI_LABELS) {
+            my $entry = $SHARED_WIFI{$label} or next;
+            my $ssid  = $entry->{ssid} // '?';
+            my $disp  = "$label ($ssid)";
+            $be->insert('end', $disp);
+        }
+    } else {
+        $be->insert('end',
+            '(no shared-wifi.conf — see etc/shared-wifi.conf.sample)');
+    }
+    $row->Button(-text => 'Insert',
+                 -command => sub { _wifi_insert_from_pick(0) })
+        ->pack(-side => 'left', -padx => 2);
+    $row->Button(-text => 'Insert w/ note',
+                 -command => sub { _wifi_insert_from_pick(1) })
+        ->pack(-side => 'left', -padx => 2);
+}
+
+# Look up the pick variable, resolve display → label, generate URI, and
+# insert into the body Text at the cursor (or replace selection). No-op
+# when the pick is the "(no shared-wifi.conf...)" hint or empty.
+sub _wifi_insert_from_pick {
+    my ($with_note) = @_;
+    my $disp  = $E{fields}{_wifi_pick} // '';
+    return unless length $disp;
+    my $label = $DISPLAY_TO_LABEL{$disp};
+    return unless defined $label;      # hint item / stale display string
+    my $entry = $SHARED_WIFI{$label} or return;
+    my $text  = _wifi_uri($entry);
+    if ($with_note && length($entry->{note} // '')) {
+        $text .= "\n" . $entry->{note};
+    }
+    my $t = $E{_multi}{body} or return;
+    my @sel = $t->tagRanges('sel');
+    if (@sel) {
+        $t->delete($sel[0], $sel[1]);
+        $t->insert($sel[0], $text);
+    } else {
+        $t->insert('insert', $text);
+    }
+    # Sync scalar so save picks it up without waiting for a KeyRelease.
+    $E{fields}{body} = $t->get('1.0', 'end-1c');
+    $t->focus;
+}
+
+# Build a WIFI: QR-code URI from a shared-wifi entry hashref. Field order
+# and escape set match net-bitchat-bridge:531-534 so QR readers parse a
+# GUI-inserted URI identically to the wifi-onramp DM. auth values other
+# than nopass emit ;P:<pass>; auth=nopass omits P: entirely — what QR
+# readers expect for open networks. hidden=true adds ;H:true;.
+sub _wifi_uri {
+    my ($entry) = @_;
+    my $ssid   = $entry->{ssid}     // '';
+    my $auth   = uc($entry->{auth}  // 'WPA');
+    my $pass   = $entry->{password} // '';
+    my $hidden = ($entry->{hidden}  // '') =~ /^(1|true|yes)$/i;
+    my $uri = 'WIFI:T:' . $auth
+            . ';S:' . _wifi_esc($ssid);
+    $uri .= ';P:' . _wifi_esc($pass) if $auth ne 'NOPASS';
+    $uri .= ';H:true' if $hidden;
+    $uri .= ';;';
+    return $uri;
+}
+
+# Escape the five WIFI: URI reserved characters, matching the closure at
+# net-bitchat-bridge:531-533 exactly so operators can't tell whether a
+# body came from the bridge onramp or the GUI picker.
+sub _wifi_esc {
+    my $s = shift // '';
+    $s =~ s/([\\;,"'])/\\$1/g;
+    return $s;
+}
+
+# Slurp /etc/net-mgr/shared-wifi.conf (+ shared-wifi.d/*.conf overlays)
+# via NetMgr::Config's built-in overlay loader — same code path the main
+# daemon uses for its own overlays, so operators only learn one story.
+# Section names are lowercased by the loader, so LABEL casing is folded
+# — that's fine, labels are just picker keys. Missing file / parse
+# failure is non-fatal: we leave %SHARED_WIFI empty and the picker will
+# render the "no shared-wifi.conf" hint.
+sub load_shared_wifi {
+    %SHARED_WIFI       = ();
+    @SHARED_WIFI_LABELS = ();
+    %DISPLAY_TO_LABEL   = ();
+    my $has_primary = -e $SHARED_WIFI_CONF;
+    (my $dotd = $SHARED_WIFI_CONF) =~ s/\.conf$/.d/;
+    my $has_overlay = 0;
+    if (-d $dotd && opendir(my $dh, $dotd)) {
+        my @f = grep { /\.conf$/ } readdir $dh;
+        closedir $dh;
+        $has_overlay = scalar @f;
+    }
+    return unless $has_primary || $has_overlay;
+
+    my $cfg = eval { NetMgr::Config->load($SHARED_WIFI_CONF) };
+    if ($@ || !$cfg) {
+        my $err = $@ || 'unknown';
+        chomp $err;
+        warn "[shared-wifi] parse failed: $err\n";
+        return;
+    }
+    for my $section (sort keys %$cfg) {
+        next unless $section =~ /^wifi\.(.+)$/;
+        my $label = $1;
+        my $entry = $cfg->{$section};
+        next unless ref $entry eq 'HASH';
+        next unless defined $entry->{ssid} && length $entry->{ssid};
+        $SHARED_WIFI{$label} = {
+            ssid     => $entry->{ssid},
+            auth     => $entry->{auth}     // 'WPA',
+            password => $entry->{password} // '',
+            hidden   => $entry->{hidden}   // '',
+            note     => $entry->{note}     // '',
+        };
+        push @SHARED_WIFI_LABELS, $label;
+        my $disp = "$label ($entry->{ssid})";
+        $DISPLAY_TO_LABEL{$disp} = $label;
+    }
+}
+
 sub load_editor_from_rule {
     my ($r) = @_;
     # Reset field storage; take trigger from the rule so build_editor_form
@@ -591,6 +757,10 @@ sub editor_kv_dump {
     }
     for my $k (keys %{ $E{fields} }) {
         next if $k eq 'name';
+        # UI-only scratch fields (underscore-prefixed) never make it
+        # into a rule kv — e.g. the Share-WiFi picker's _wifi_pick
+        # holds the display string, not something the daemon reads.
+        next if $k =~ /^_/;
         my $v = $E{fields}{$k};
         next unless defined $v && length $v;
         $kv{$k} = $v;

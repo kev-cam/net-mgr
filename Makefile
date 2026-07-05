@@ -307,6 +307,13 @@ install: .version
 	             $(DESTDIR)$(SYSCONFDIR)/net-mgr/net-chat-autoresponder.conf; \
 	fi
 	@$(INSTALL) -d $(DESTDIR)$(SYSCONFDIR)/net-mgr/net-chat-autoresponder.d
+	@if [ -f etc/shared-wifi.conf.sample ] \
+	     && [ ! -f $(DESTDIR)$(SYSCONFDIR)/net-mgr/shared-wifi.conf ]; then \
+	  echo "  etc/shared-wifi.conf.sample → $(DESTDIR)$(SYSCONFDIR)/net-mgr/shared-wifi.conf"; \
+	  $(INSTALL) -m 644 etc/shared-wifi.conf.sample \
+	             $(DESTDIR)$(SYSCONFDIR)/net-mgr/shared-wifi.conf; \
+	fi
+	@$(INSTALL) -d $(DESTDIR)$(SYSCONFDIR)/net-mgr/shared-wifi.d
 	@CFG=$(DESTDIR)$(SYSCONFDIR)/net-mgr/config; \
 	  perl -Ilib -MNetMgr::Config -e 'my @d = NetMgr::Config::dead_keys($$ARGV[0]); exit unless @d; print STDERR "\nWARN: $$ARGV[0] has keys no longer read by the daemon:\n"; print STDERR "  $$_\n" for @d; print STDERR "(harmless, but you can delete them.)\n"' "$$CFG"
 	@echo
