@@ -1580,8 +1580,8 @@ sub row_shared_wifi {
     $E{fields}{_wifi_pick} //= '';
     my $be = $row->BrowseEntry(
         -variable  => \$E{fields}{_wifi_pick},
-        -width     => 32,
-        -listwidth => 48,
+        -width     => 56,
+        -listwidth => 80,
         -browsecmd => sub { _wifi_insert_from_pick(0) },
     )->pack(-side => 'left', -padx => 2);
     if (@SHARED_WIFI_LABELS) {
@@ -1635,6 +1635,145 @@ sub row_shared_wifi {
     $row->Button(-text => 'Refresh',
                  -command => sub { load_shared_wifi(); build_editor_form(); })
         ->pack(-side => 'left', -padx => 2);
+    # Sudo-elevated PSK fetch. Only meaningful when we already know
+    # the current uid can't read the NM keyfiles ($_NM_UNREADABLE
+    # gets set by _enum_nm_profiles when the dir is present but
+    # individual .nmconnection files are 0600 root:root). Uses
+    # pkexec so a polkit agent renders the auth prompt over X —
+    # sudo would need a TTY we can't offer from Tk.
+    if ($_NM_UNREADABLE) {
+        $row->Button(-text => 'Fetch PSKs (sudo)',
+                     -command => \&_pkexec_fetch_psks)
+            ->pack(-side => 'left', -padx => 2);
+    }
+}
+
+# Elevate via pkexec to read NM keyfiles as root, extract PSKs, and
+# fold them into %SHARED_WIFI. Ends with a build_editor_form() so
+# the picker rebuilds with PSK-bearing entries (source flips from
+# nm-nopsk → nm and the `[NM no PSK]` marker becomes plain `[NM]`).
+sub _pkexec_fetch_psks {
+    my $pkexec = -x '/usr/bin/pkexec' ? '/usr/bin/pkexec'
+               : -x '/usr/local/bin/pkexec' ? '/usr/local/bin/pkexec'
+               : undef;
+    if (!$pkexec) {
+        _msg('pkexec not found',
+             "Install polkit (dnf install polkit / apt install policykit-1)\n"
+           . "or relaunch: sudo net-chat-autoresponder --gui");
+        return;
+    }
+    # One shell invocation dumps every .nmconnection with a marker so
+    # a single polkit prompt covers the whole set. `sh -c` because
+    # pkexec doesn't do shell globbing on its own argv.
+    my $reader = q{
+        for f in /etc/NetworkManager/system-connections/*.nmconnection; do
+            [ -f "$f" ] || continue
+            echo "===FILE=== $(basename "$f")"
+            cat "$f"
+            echo "===END==="
+        done
+    };
+    my $pid = open(my $ph, '-|');
+    if (!defined $pid) {
+        _msg('fork failed', "Could not spawn pkexec: $!");
+        return;
+    }
+    if ($pid == 0) {
+        open STDERR, '>&', \*STDOUT;   # so polkit-refused shows in $out
+        { exec { $pkexec } $pkexec, '/bin/sh', '-c', $reader };
+        POSIX::_exit(127);
+    }
+    local $/ = undef;
+    my $out = <$ph>;
+    close $ph;
+    my $rc = $? >> 8;
+    if ($rc != 0) {
+        _msg('pkexec fetch failed',
+             "pkexec exited $rc.\n"
+           . "Auth was cancelled, or polkit isn't configured to allow\n"
+           . "this action. Relaunch with sudo instead:\n"
+           . "  sudo net-chat-autoresponder --gui\n\n"
+           . ($out // ''));
+        return;
+    }
+    # Parse the marker-delimited dump into a sequence of {file, ini}
+    # blocks and reuse the same wifi-type/psk extraction as
+    # _enum_nm_profiles's inner loop. Building a fresh %nm here rather
+    # than delegating keeps the pkexec dependency contained to this sub.
+    my $merged = 0;
+    my $cur_name = '';
+    my (%ini, $sect);
+    my $flush = sub {
+        return unless length $cur_name;
+        return unless ($ini{connection}{type} // '') eq 'wifi';
+        my $ssid = $ini{wifi}{ssid};
+        return unless defined $ssid && length $ssid;
+        my $km   = lc($ini{'wifi-security'}{'key-mgmt'} // '');
+        my $psk  = $ini{'wifi-security'}{psk} // '';
+        my $auth = ($km eq '' || $km eq 'none') ? 'NOPASS'
+                 : $km eq 'wep'                 ? 'WEP'
+                 :                                'WPA';
+        return if $auth ne 'NOPASS' && !length $psk;
+        my $id = $ini{connection}{id};
+        if (!defined $id || !length $id) {
+            ($id = $cur_name) =~ s/\.nmconnection\z//;
+        }
+        my $label = $id;
+        $label =~ s/[^A-Za-z0-9._-]/-/g;
+        # Overwrite whatever we had for this label — the pkexec pass
+        # is authoritative (it has PSKs).
+        $SHARED_WIFI{$label} = {
+            ssid     => $ssid,
+            auth     => $auth,
+            password => $psk,
+            hidden   => (($ini{wifi}{hidden} // '') =~ /^(1|true|yes)$/i
+                        ? 'true' : ''),
+            note     => '',
+            source   => 'nm',
+        };
+        push @SHARED_WIFI_LABELS, $label
+            unless grep { $_ eq $label } @SHARED_WIFI_LABELS;
+        $merged++;
+    };
+    for my $ln (split /\n/, ($out // '')) {
+        if ($ln =~ /^===FILE=== (.+?)\s*$/) {
+            $flush->();
+            $cur_name = $1;
+            %ini = ();
+            $sect = '';
+            next;
+        }
+        next if $ln =~ /^===END===/;
+        $ln =~ s/^\s+//;
+        next if $ln eq '' || $ln =~ /^[#;]/;
+        if ($ln =~ /^\[([^\]]+)\]\s*$/) {
+            $sect = lc $1;
+            next;
+        }
+        next unless length $sect;
+        if ($ln =~ /^([^=]+?)\s*=\s*(.*)$/) {
+            $ini{$sect}{lc $1} = $2;
+        }
+    }
+    $flush->();
+    # Rebuild %DISPLAY_TO_LABEL from scratch — labels' source may
+    # have flipped (nm-nopsk → nm) and the marker in the display
+    # string tracks source.
+    %DISPLAY_TO_LABEL = ();
+    for my $label (@SHARED_WIFI_LABELS) {
+        my $entry = $SHARED_WIFI{$label} or next;
+        my $ssid  = $entry->{ssid} // '?';
+        my $src   = $entry->{source} // '';
+        my $disp  = "$label ($ssid)";
+        $disp .= ' [NM]'         if $src eq 'nm';
+        $disp .= ' [NM no PSK]'  if $src eq 'nm-nopsk';
+        $DISPLAY_TO_LABEL{$disp} = $label;
+    }
+    # After a successful fetch we're no longer in the "unreadable"
+    # state — the Fetch button hides itself on the next rebuild.
+    $_NM_UNREADABLE = 0;
+    build_editor_form();
+    _msg('Fetch complete', "Merged $merged NM profiles with PSKs.");
 }
 
 # Fork+exec nm-connection-editor so it survives past the GUI. If the
