@@ -68,11 +68,23 @@ $ignore{ $GLOBAL->{as} } = 1 if defined $GLOBAL->{as} && length $GLOBAL->{as};
 my $SEEN = SeenFile->open($GLOBAL->{state_file}
                           // '/var/lib/net-mgr/net-chat-autoresponder.seen');
 
-my @ble_rules      = grep { $_->{trigger} eq 'bitchat_peer_first_seen' } @RULES;
-my @chat_rules     = grep { $_->{trigger} eq 'chat_message' }            @RULES;
-my @periodic_rules = grep { $_->{trigger} eq 'periodic' }                @RULES;
+# trigger= is a comma-separated list of triggers this rule reacts to
+# (see _compile_rule); a rule appears in every bucket its trigger list
+# includes, and the per-callsite ctx builders (on_peer_row, on_chat_row,
+# fire_periodic_rules) each stage the substitution slots appropriate
+# for whichever surface fired them. Single-value rules land in exactly
+# one bucket — full backward compatibility with the pre-multi-trigger
+# INI grammar.
+my @ble_rules      = grep { _rule_has_trigger($_, 'bitchat_peer_first_seen') } @RULES;
+my @chat_rules     = grep { _rule_has_trigger($_, 'chat_message') }            @RULES;
+my @periodic_rules = grep { _rule_has_trigger($_, 'periodic') }                @RULES;
 my %chat_sessions;
 $chat_sessions{$_->{session}}++ for @chat_rules;
+
+sub _rule_has_trigger {
+    my ($r, $t) = @_;
+    return scalar grep { $_ eq $t } @{ $r->{triggers} // [] };
+}
 
 # Peer identity map — updated on every bitchat_peers ROW. Enables:
 #   - periodic fanout rules (mode=fanout_bitchat_peers) to iterate live
@@ -105,10 +117,15 @@ my %PEER_LAST_SEEN; # peer_id  => epoch (last bitchat_peers ROW time)
     }
 }
 
+my $multi_trigger_rules = grep { @{ $_->{triggers} || [] } > 1 } @RULES;
 warn "[autoresponder] loaded " . scalar(@RULES) . " rule(s) from $opt{config}"
    . " ("      . scalar(@ble_rules)      . " bitchat_peer_first_seen"
    . ", "      . scalar(@chat_rules)     . " chat_message"
-   . ", "      . scalar(@periodic_rules) . " periodic)\n";
+   . ", "      . scalar(@periodic_rules) . " periodic"
+   . ($multi_trigger_rules
+      ? "; $multi_trigger_rules multi-trigger rule(s) counted in >1 bucket"
+      : '')
+   . ")\n";
 
 # ---- 2. Two connections -----------------------------------------------------
 my $R = NetMgr::Client->new(listen => $GLOBAL->{listen}, timeout => 6);
@@ -511,14 +528,31 @@ sub load_config {
 }
 
 # Fills $r->{_re}, $r->{dedup_ttl} (seconds), validates required keys.
+# Parses $r->{trigger} as a comma-separated list of triggers into
+# $r->{triggers} = [@list]; single-value rules still work unchanged
+# (they parse to a one-element list). $r->{trigger} is rewritten to
+# the first element for the log line and any legacy scalar readers.
 sub _compile_rule {
     my ($r) = @_;
-    my $trigger = $r->{trigger}
-        or die "no trigger=";
-    die "bad trigger '$trigger'"
-        unless $trigger eq 'bitchat_peer_first_seen'
-            || $trigger eq 'chat_message'
-            || $trigger eq 'periodic';
+    my $raw_trigger = $r->{trigger};
+    die "no trigger="
+        unless defined $raw_trigger && length $raw_trigger;
+    my @triggers = grep { length }
+                   map  { s/^\s+|\s+$//gr }
+                   split /,/, $raw_trigger;
+    die "no trigger=" unless @triggers;
+    # Dedupe (preserve order) — 'periodic, periodic' is silly but valid.
+    my %seen_t;
+    @triggers = grep { !$seen_t{$_}++ } @triggers;
+    my %legal = (bitchat_peer_first_seen => 1,
+                 chat_message            => 1,
+                 periodic                => 1);
+    for my $t (@triggers) {
+        die "bad trigger '$t'" unless $legal{$t};
+    }
+    $r->{triggers} = \@triggers;
+    $r->{trigger}  = $triggers[0];   # legacy scalar slot: first entry
+    my %has = map { $_ => 1 } @triggers;
 
     my $ch = $r->{channel} or die "no channel=";
     die "bad channel '$ch'"
@@ -545,8 +579,13 @@ sub _compile_rule {
 
     # Compile regex under a 2s alarm — pathological patterns fail rule-load
     # rather than crashing the reactor mid-flight.
+    # match= is legal when ANY trigger in the list uses it (chat_message,
+    # bitchat_peer_first_seen). Periodic-only rules still reject match=
+    # (silently ignoring it would confuse readers); mixed rules with
+    # periodic + chat_message | first-seen accept it — the periodic
+    # firings just don't consult the regex.
     my $match = $r->{match};
-    if ($trigger eq 'chat_message') {
+    if ($has{chat_message}) {
         die "chat_message trigger needs match=" unless defined $match;
         my $sess = $r->{session};
         die "chat_message trigger needs session="
@@ -568,7 +607,7 @@ sub _compile_rule {
                 unless $ch eq 'noop';
         }
     }
-    if ($trigger eq 'periodic') {
+    if ($has{periodic}) {
         # `every` REQUIRED. Enforce a 5s floor so a typo like `every=0.5s`
         # (which _parse_duration would treat as 0 -> fire-every-tick) can't
         # spam the mesh. No dedup, no regex, no session for periodic.
@@ -578,10 +617,14 @@ sub _compile_rule {
         die "periodic every='$every' must be >= 5s (got ${secs}s)"
             if $secs < 5;
         $r->{_every_secs} = $secs;
-        # `match` on a periodic rule would be silently ignored, which
-        # confuses readers of the config. Fail load instead.
+        # `match` on an exclusively-periodic rule would be silently
+        # ignored, which confuses readers of the config. Fail load in
+        # that case only — mixed rules that ALSO include chat_message
+        # or bitchat_peer_first_seen legitimately need match=.
         die "periodic trigger does not accept match="
-            if defined $r->{match};
+            if defined $r->{match}
+            && !$has{chat_message}
+            && !$has{bitchat_peer_first_seen};
 
         # mode=fanout_bitchat_peers: iterate live BLE peers and DM each
         # one whose peer_id hasn't been marked ack'd within acked_ttl.
@@ -611,12 +654,21 @@ sub _compile_rule {
     my $re = _compile_re($match);
     $r->{_re} = $re;
 
-    # Duration parse. Default 30d for BLE first-seen; 0 for chat_message.
-    # Periodic ignores dedup entirely — the `every` interval IS the
-    # rate limit; forcing dedup_ttl=0 keeps every fire unconditional
-    # even if someone copies a dedup_ttl= from a first-seen rule.
-    my $default_ttl = $trigger eq 'bitchat_peer_first_seen' ? '30d' : '0';
-    my $ttl = $trigger eq 'periodic' ? '0' : ($r->{dedup_ttl} // $default_ttl);
+    # Duration parse. Default 30d for BLE first-seen; 0 otherwise.
+    # Periodic firings never consult dedup — fire_periodic_rules doesn't
+    # touch SEEN except in the fanout ack path. For a mixed rule that
+    # ALSO fires on first-seen or chat_message, the non-periodic paths
+    # still honour dedup_ttl, so we use the first-seen default when
+    # first-seen is one of the triggers.
+    my $default_ttl = $has{bitchat_peer_first_seen} ? '30d' : '0';
+    # Exclusively-periodic rules force dedup_ttl=0 to preserve historic
+    # semantics; any mix that includes a non-periodic trigger uses the
+    # authored value (or default).
+    my $ttl = ($has{periodic}
+               && !$has{bitchat_peer_first_seen}
+               && !$has{chat_message})
+              ? '0'
+              : ($r->{dedup_ttl} // $default_ttl);
     $r->{dedup_ttl} = _parse_duration($ttl);
     return 1;
 }
@@ -1149,30 +1201,35 @@ sub on_rule_pick {
 sub do_add_rule {
     my $dlg = $mw->DialogBox(-title => 'New rule',
                              -buttons => ['OK', 'Cancel']);
-    # Seed trigger empty so the operator is FORCED to pick one — no
-    # accidental "chat_message with defaults" rule from a blind OK.
-    my %v = (name => '', trigger => '');
+    my %v = (name => '');
+    # Triple-checkbox picker: the operator picks one or more triggers
+    # up front so the editor's per-trigger rows appear immediately.
+    my %picks = (bitchat_peer_first_seen => 0,
+                 chat_message            => 0,
+                 periodic                => 0);
     $dlg->add('Label', -text => 'Rule name ([A-Za-z][A-Za-z0-9._-]{0,31}):')
         ->pack(-anchor => 'w', -padx => 8, -pady => 2);
     my $e = $dlg->add('Entry', -textvariable => \$v{name}, -width => 32)
                 ->pack(-padx => 8, -pady => 2);
     $e->focus;
-    $dlg->add('Label', -text => 'Trigger:')
+    $dlg->add('Label', -text => 'Triggers (check one or more):')
         ->pack(-anchor => 'w', -padx => 8, -pady => 2);
-    $dlg->add('Optionmenu',
-              -options  => [ [ '(pick one)'              => '' ],
-                             [ 'chat_message'            => 'chat_message' ],
-                             [ 'bitchat_peer_first_seen' => 'bitchat_peer_first_seen' ],
-                             [ 'periodic'                => 'periodic' ] ],
-              -variable => \$v{trigger},
-    )->pack(-anchor => 'w', -padx => 8, -pady => 2);
+    for my $t (qw(bitchat_peer_first_seen chat_message periodic)) {
+        $dlg->add('Checkbutton',
+                  -text     => $t,
+                  -variable => \$picks{$t},
+                  -anchor   => 'w',
+        )->pack(-anchor => 'w', -padx => 16, -pady => 1);
+    }
     my $ans = $dlg->Show // 'Cancel';
     return unless $ans eq 'OK' || $ans eq 'Ok';
     $v{name} =~ s/^\s+|\s+$//g;
     return msg('Bad name', 'Rule name must match [A-Za-z][A-Za-z0-9._-]{0,31}.')
         unless $v{name} =~ /^[A-Za-z][A-Za-z0-9._-]{0,31}$/;
-    return msg('No trigger', 'Pick a trigger before creating the rule.')
-        unless length $v{trigger};
+    my @picked = grep { $picks{$_} }
+                     qw(bitchat_peer_first_seen chat_message periodic);
+    return msg('No trigger', 'Check at least one trigger before creating the rule.')
+        unless @picked;
     for my $r (@{$S{rules}}) {
         return msg('Duplicate', "A rule named '$v{name}' already exists in "
                               . $r->{source} . ".")
@@ -1187,7 +1244,7 @@ sub do_add_rule {
     }
     # Don't seed channel/target/body/session — the operator must fill
     # them in explicitly. Save stays disabled until channel is picked.
-    my $starter_kv = { trigger => $v{trigger} };
+    my $starter_kv = { trigger => join(', ', @picked) };
     my $new = {
         name    => $v{name},
         enabled => 1,
@@ -1291,22 +1348,17 @@ sub build_editor_form {
     local $BUILDING_FORM = 1;
     $_->destroy for $editor_frame->children;
     $E{fields} //= {};
-    # Empty trigger means "unpicked" — trigger-specific rows are not
-    # rendered until the operator picks a real trigger.
-    my $trig = $E{trigger} // '';
+    $E{trigger_set} //= { map { $_ => 0 }
+                              qw(bitchat_peer_first_seen chat_message periodic) };
     my $chan = $E{fields}{channel} // '';
 
     row_entry( $editor_frame, 'Name:',    'name',    32 );
-    row_option($editor_frame, 'Trigger:', 'trigger',
-        [ [ '(pick one)'                => '' ],
-          [ 'chat_message'              => 'chat_message' ],
-          [ 'bitchat_peer_first_seen'   => 'bitchat_peer_first_seen' ],
-          [ 'periodic'                  => 'periodic' ] ],
-        sub {
-            $E{trigger} = $E{fields}{trigger};
-            build_editor_form();
-        },
-    );
+    # Trigger picker is now a triple Checkbutton — a rule can react to
+    # any combination of chat_message / bitchat_peer_first_seen /
+    # periodic. The trigger-specific rows below are rendered per
+    # checked trigger; toggling a box rebuilds the form so the
+    # per-trigger rows appear/disappear immediately.
+    row_trigger_checkboxes($editor_frame);
     row_option($editor_frame, 'Channel:', 'channel',
         [ [ '(pick one)' => '' ],
           [ 'bitchat_dm' => 'bitchat_dm' ],
@@ -1337,14 +1389,30 @@ sub build_editor_form {
     row_multi( $editor_frame, 'Body:',      'body' );
     row_entry( $editor_frame, 'Dedup TTL:', 'dedup_ttl', 12 );
 
-    if ($trig eq 'bitchat_peer_first_seen') {
-        row_entry( $editor_frame, 'Match:', 'match', 48 );
-    } elsif ($trig eq 'chat_message') {
+    # Per-trigger field sections. Rendered in a fixed order so the
+    # layout is stable across edits. Match is a shared field on
+    # chat_message + bitchat_peer_first_seen; render it only in the
+    # first section that owns it.
+    my $set = $E{trigger_set};
+    my $rendered_match = 0;
+    if ($set->{chat_message}) {
+        _editor_section_label($editor_frame, '[chat_message]');
         row_browse_entry($editor_frame, 'Session:', 'session', 32, \@KNOWN_SESSIONS);
         row_entry( $editor_frame, 'Match:',      'match',      48 );
+        $rendered_match = 1;
         row_entry( $editor_frame, 'From:',       'from',       32 );
         row_entry( $editor_frame, 'Ack target:', 'ack_target', 32 );
-    } elsif ($trig eq 'periodic') {
+    }
+    if ($set->{bitchat_peer_first_seen}) {
+        my $suffix = $rendered_match ? '  (Match shared with chat_message above)' : '';
+        _editor_section_label($editor_frame, "[bitchat_peer_first_seen]$suffix");
+        if (!$rendered_match) {
+            row_entry( $editor_frame, 'Match:', 'match', 48 );
+            $rendered_match = 1;
+        }
+    }
+    if ($set->{periodic}) {
+        _editor_section_label($editor_frame, '[periodic]');
         row_entry( $editor_frame, 'Every:',      'every',      12 );
         row_option($editor_frame, 'Mode:',       'mode',
             [ [ '(single-fire)' => '' ],
@@ -1396,6 +1464,54 @@ sub row_multi {
         $E{fields}{$key} = $t->get('1.0', 'end-1c');
     });
     $E{fields}{$key} = $init;
+}
+
+sub row_trigger_checkboxes {
+    my ($parent) = @_;
+    my $row = $parent->Frame->pack(-side => 'top', -fill => 'x', -pady => 1);
+    $row->Label(-text => 'Triggers:', -width => 12, -anchor => 'w')
+        ->pack(-side => 'left');
+    $E{trigger_set} //= { map { $_ => 0 }
+                              qw(bitchat_peer_first_seen chat_message periodic) };
+    for my $t (qw(bitchat_peer_first_seen chat_message periodic)) {
+        $E{trigger_set}{$t} //= 0;
+        $row->Checkbutton(
+            -text     => $t,
+            -variable => \$E{trigger_set}{$t},
+            -anchor   => 'w',
+            -command  => sub {
+                # Sync the joined-string form the daemon reads out of
+                # $E{fields}{trigger}, then rebuild so per-trigger rows
+                # come and go with the checkbox.
+                _sync_trigger_field();
+                build_editor_form();
+            },
+        )->pack(-side => 'left', -padx => 4);
+    }
+    _sync_trigger_field();
+}
+
+# Derive $E{fields}{trigger} (the comma-joined string that reaches the
+# INI writer) from the checkbox state. Order is fixed so a rule that
+# round-trips through the editor without changing its trigger set
+# writes back the same string it was loaded from.
+sub _sync_trigger_field {
+    my @picked = grep { $E{trigger_set}{$_} }
+                     qw(bitchat_peer_first_seen chat_message periodic);
+    $E{fields}{trigger} = join(', ', @picked);
+    # $E{trigger} is legacy — a couple of callsites (clear_editor and
+    # the old on_change closure) still touch it. Keep it aligned to
+    # the first checked trigger for backward compat inside the GUI.
+    $E{trigger} = $picked[0] // '';
+}
+
+sub _editor_section_label {
+    my ($parent, $text) = @_;
+    $parent->Label(-text => $text,
+                   -font => '{Helvetica} 9 bold',
+                   -foreground => '#004',
+                   -anchor => 'w')
+           ->pack(-side => 'top', -fill => 'x', -pady => 2);
 }
 
 sub row_option {
@@ -1744,15 +1860,28 @@ sub _enum_nm_profiles {
 
 sub load_editor_from_rule {
     my ($r) = @_;
-    # Reset field storage; take trigger from the rule so build_editor_form
-    # knows which trigger-specific rows to render.
+    # Reset field storage; parse the (possibly comma-separated) trigger
+    # string from the rule into $E{trigger_set} so build_editor_form
+    # renders the right per-trigger sections. A legacy single-value
+    # rule like `trigger = periodic` parses to a one-element set.
     $E{fields} = {};
-    $E{trigger} = $r->{kv}{trigger} // '';
+    $E{trigger_set} = { map { $_ => 0 }
+                            qw(bitchat_peer_first_seen chat_message periodic) };
+    my $raw_trigger = $r->{kv}{trigger} // '';
+    for my $t (grep { length }
+               map  { s/^\s+|\s+$//gr }
+               split /,/, $raw_trigger)
+    {
+        $E{trigger_set}{$t} = 1 if exists $E{trigger_set}{$t};
+    }
     # Pre-seed channel so build_editor_form picks the right Target
     # widget shape (BrowseEntry when chat_post, plain Entry otherwise)
     # before the post-build population loop runs.
     $E{fields}{channel} = $r->{kv}{channel} if defined $r->{kv}{channel};
     build_editor_form();
+    # Re-sync $E{fields}{trigger} in case the load parsed to something
+    # slightly different than the raw INI value (whitespace, order).
+    _sync_trigger_field();
     # After build, populate every field from $r->{kv} (unknown keys are
     # silently discarded when the trigger changes and their widget goes
     # away — that's fine, save only serialises known keys).
@@ -1782,6 +1911,8 @@ sub load_editor_from_rule {
 sub clear_editor {
     $E{fields} = {};
     $E{trigger} = '';
+    $E{trigger_set} = { map { $_ => 0 }
+                            qw(bitchat_peer_first_seen chat_message periodic) };
     build_editor_form();
 }
 
@@ -1792,6 +1923,9 @@ sub editor_kv_dump {
     if (my $t = $E{_multi}{body}) {
         $E{fields}{body} = $t->get('1.0', 'end-1c');
     }
+    # Re-derive $E{fields}{trigger} from the checkbox state — no widget
+    # KeyRelease drives this, so we sync unconditionally at dump time.
+    _sync_trigger_field();
     for my $k (keys %{ $E{fields} }) {
         next if $k eq 'name';
         # UI-only scratch fields (underscore-prefixed) never make it
@@ -2031,6 +2165,13 @@ sub write_file_atomic {
 
 sub refresh_rules_list {
     $rules_list->delete(0, 'end');
+    # Compact display forms — the full trigger names are 15-23 chars
+    # each and multi-trigger rules blow past the 24-char column budget
+    # instantly. The abbreviations still round-trip through the editor
+    # unchanged because the underlying kv trigger= is the raw INI string.
+    my %short = (bitchat_peer_first_seen => 'ble',
+                 chat_message            => 'chat',
+                 periodic                => 'periodic');
     for my $r (@{ $S{rules} }) {
         # 'on' / 'off' beats '[x]' / '[ ]' for legibility in a monospace
         # column — no confusion with regex character classes or the
@@ -2038,8 +2179,14 @@ sub refresh_rules_list {
         my $mark = $r->{enabled} ? 'on ' : 'off';
         my $src  = basename( $r->{source} );
         my $trig = $r->{kv}{trigger} // '?';
+        my @tlist = grep { length }
+                    map  { s/^\s+|\s+$//gr }
+                    split /,/, $trig;
+        my $trig_disp = @tlist
+                      ? join(',', map { $short{$_} // $_ } @tlist)
+                      : '?';
         $rules_list->insert('end',
-            sprintf("%s  %-20s %-24s %s", $mark, $r->{name}, $trig, $src));
+            sprintf("%s  %-20s %-24s %s", $mark, $r->{name}, $trig_disp, $src));
     }
 }
 
@@ -2056,10 +2203,16 @@ sub reselect_current {
 
 sub validate_kv {
     my ($kv) = @_;
-    my $trig = $kv->{trigger} // '';
-    return "trigger= required" unless length $trig;
-    return "bad trigger '$trig'"
-        unless $trig =~ /^(bitchat_peer_first_seen|chat_message|periodic)$/;
+    my $trig_raw = $kv->{trigger} // '';
+    my @trigs = grep { length }
+                map  { s/^\s+|\s+$//gr }
+                split /,/, $trig_raw;
+    return "trigger= required" unless @trigs;
+    my %valid = map { $_ => 1 } qw(bitchat_peer_first_seen chat_message periodic);
+    for my $t (@trigs) {
+        return "bad trigger '$t'" unless $valid{$t};
+    }
+    my %has = map { $_ => 1 } @trigs;
     my $ch = $kv->{channel} // '';
     return "channel= required" unless length $ch;
     return "bad channel '$ch'"
@@ -2077,7 +2230,7 @@ sub validate_kv {
     {
         return "channel=bitchat_dm target must be 16 lowercase hex (got '$kv->{target}')";
     }
-    if ($trig eq 'chat_message') {
+    if ($has{chat_message}) {
         return "chat_message: session= required"
             unless defined $kv->{session} && length $kv->{session};
         return "chat_message: session has forbidden chars"
@@ -2091,11 +2244,16 @@ sub validate_kv {
                 unless $kv->{ack_target} =~ /^[A-Za-z][A-Za-z0-9._-]{0,31}$/;
         }
     }
-    if ($trig eq 'periodic') {
+    if ($has{periodic}) {
         return "periodic: every= required"
             unless defined $kv->{every} && length $kv->{every};
-        return "periodic does not accept match="
-            if defined $kv->{match} && length $kv->{match};
+        # match= is only illegal on exclusively-periodic rules; a
+        # mixed rule that ALSO fires on chat_message or first-seen
+        # legitimately needs match= for those paths.
+        if (!$has{chat_message} && !$has{bitchat_peer_first_seen}) {
+            return "periodic does not accept match="
+                if defined $kv->{match} && length $kv->{match};
+        }
         my $mode = $kv->{mode} // '';
         if (length $mode && $mode ne 'fanout_bitchat_peers') {
             return "unknown mode '$mode'";
@@ -2150,14 +2308,20 @@ sub do_test {
         _test_line("cannot test: $err\n", 'err');
         return;
     }
-    my $trig = $kv->{trigger};
+    my $trig_raw = $kv->{trigger} // '';
+    my @trigs = grep { length }
+                map  { s/^\s+|\s+$//gr }
+                split /,/, $trig_raw;
     _test_clear();
-    _test_line("Testing rule '$name' (trigger=$trig, channel=$kv->{channel})\n", 'bold');
+    _test_line("Testing rule '$name' (trigger=$trig_raw, channel=$kv->{channel})\n",
+               'bold');
     _test_line(" listen=$listen_var  N=$sample_n\n");
-
-    if    ($trig eq 'bitchat_peer_first_seen') { _test_ble($name, $kv) }
-    elsif ($trig eq 'chat_message')            { _test_chat($name, $kv) }
-    elsif ($trig eq 'periodic')                { _test_periodic($name, $kv) }
+    for my $trig (@trigs) {
+        _test_line("\n-- as $trig --\n", 'bold');
+        if    ($trig eq 'bitchat_peer_first_seen') { _test_ble($name, $kv) }
+        elsif ($trig eq 'chat_message')            { _test_chat($name, $kv) }
+        elsif ($trig eq 'periodic')                { _test_periodic($name, $kv) }
+    }
     set_status("Test complete.");
 }
 
@@ -2304,9 +2468,18 @@ sub fetch_chat_sessions {
 # setup, before the action bar has been created.
 sub update_save_state {
     return unless defined $save_btn;
-    my $trig = $E{fields}{trigger} // '';
+    # Any checked trigger + any picked channel enables Save. The
+    # trigger_set hashref may be undef during the very first widget
+    # setup (before build_editor_form has run once), so treat that as
+    # "no triggers picked yet".
+    my $any_trig = 0;
+    if (ref $E{trigger_set} eq 'HASH') {
+        for my $t (qw(bitchat_peer_first_seen chat_message periodic)) {
+            $any_trig = 1, last if $E{trigger_set}{$t};
+        }
+    }
     my $chan = $E{fields}{channel} // '';
-    my $save_state = (length $trig && length $chan) ? 'normal' : 'disabled';
+    my $save_state = ($any_trig && length $chan) ? 'normal' : 'disabled';
     $save_btn->configure(-state => $save_state);
     # Post is only meaningful for chat_post rules (target = session name);
     # for bitchat_dm the target is a peer_id which requires the bridge

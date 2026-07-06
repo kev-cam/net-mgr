@@ -66,7 +66,15 @@ state_file   = /var/lib/net-mgr/net-chat-autoresponder.seen
 ;   BLE DM to the peer — BitChat clients render WIFI: URIs as click-to-join.
 ;
 ; Keys:
-;   trigger    — REQUIRED — one of bitchat_peer_first_seen | chat_message
+;   trigger    — REQUIRED — one or more of
+;                  bitchat_peer_first_seen | chat_message | periodic,
+;                comma-separated (whitespace around commas ignored).
+;                A single value is the trivial case; a multi-trigger
+;                rule appears in every dispatch bucket its list names
+;                and must satisfy the per-trigger required-key rules
+;                for each element (see chat_message keys below and
+;                the periodic block further down). Values are written
+;                back raw — commas are unreserved, no quoting needed.
 ;   match      — optional Perl regex on bitchat_peers.nickname (default '.*').
 ;                Named captures land in ${cap.NAME} for target/body.
 ;   dedup_ttl  — window during which a repeat first-seen for the same
@@ -162,11 +170,17 @@ body       = hi ${sender} — net-chat-autoresponder alive
 ; production replacement.
 ;
 ; PERIODIC-RULE GRAMMAR (in addition to channel/target/body above):
-;   trigger    — REQUIRED — 'periodic'
+;   trigger    — REQUIRED — must include 'periodic' (a rule can list
+;                other triggers alongside, comma-separated; see rule 7
+;                below for a chat_message+periodic example).
 ;   every      — REQUIRED — DURATION (s|m|h|d|w suffix); MUST be >= 5s
 ;                (parser floor — prevents typos like `every=0.5s` from
 ;                collapsing to fire-every-tick).
-;   match      — MUST NOT be set (periodic has no regex — fails load).
+;   match      — on an exclusively-periodic rule: MUST NOT be set
+;                (periodic has no regex — fails load). On a mixed
+;                rule that also lists chat_message or first-seen,
+;                match= is legal and applies to those paths only —
+;                the periodic firings still ignore it.
 ;   dedup_ttl  — forced to 0 internally; every interval fires
 ;                unconditionally.
 ;   mode       — optional — 'fanout_bitchat_peers' turns the rule into
@@ -321,3 +335,31 @@ session    = bitchat-bridge
 match      = ^\[(?<nick>[^@\]/]+)(?:/[^@\]]+)?@bitchat[^\]]*\]\s+(?i)(y|yes|ok)\s*$
 ack_target = wifi-broadcast
 channel    = noop
+
+; --------------------------------------------------------------------------
+; Rule 7 (disabled example) — multi-trigger status responder.
+;
+; A single rule can react to more than one trigger by listing them
+; comma-separated. Here `!status` in the ops session gets a live reply
+; AND the same body is posted on a 15-minute heartbeat so a fresh
+; observer joining the session sees the last status within one cycle.
+;
+; Each trigger element must satisfy its own required-key rules —
+; chat_message needs session= and match=, periodic needs every=. The
+; per-fire ctx is prepared per-trigger callsite, so ${sender} is the
+; typing user for the chat_message path and empty for the periodic
+; path (empty ${…} tokens fall through to '' — see subst()).
+;
+; This rule is commented out; uncomment to try it. Its dedup_ttl only
+; applies to the chat_message path (periodic firings never consult
+; dedup); we set it to 30s so a burst of !status doesn't spam back.
+; --------------------------------------------------------------------------
+; [rule.status-multi]
+; trigger    = chat_message, periodic
+; session    = ops
+; match      = (?i)^!status\b
+; every      = 15m
+; dedup_ttl  = 30s
+; channel    = chat_post
+; target     = ops
+; body       = ${host} @ ${now} — net-chat-autoresponder alive
