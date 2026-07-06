@@ -484,10 +484,48 @@ sub _token_val {
 
 # ---- config -----------------------------------------------------------------
 
+# INI value escape/unescape so multi-line values (e.g. a body= carrying a
+# UTF8 QR block + trailing SSID/password) survive the single-line-per-key
+# INI grammar. Encoding rules:
+#   * backslash -> "\\"  (escape the escape)
+#   * newline   -> "\n"  (two chars, backslash + n)
+# Decoded pass is a state machine over the input so `\\n` decodes to `\n`
+# (two chars) rather than newline — leftmost win, no ambiguity. All
+# other backslash sequences pass through unchanged (an operator's `\d`
+# regex-fragment in a match= isn't damaged).
+sub _ini_encode {
+    my ($v) = @_;
+    return $v unless defined $v;
+    $v =~ s/\\/\\\\/g;
+    $v =~ s/\n/\\n/g;
+    return $v;
+}
+sub _ini_decode {
+    my ($v) = @_;
+    return $v unless defined $v;
+    return $v unless index($v, '\\') >= 0;   # fast path: no escapes
+    my $out = '';
+    my $len = length $v;
+    my $i = 0;
+    while ($i < $len) {
+        my $c = substr($v, $i, 1);
+        if ($c eq '\\' && $i + 1 < $len) {
+            my $n = substr($v, $i + 1, 1);
+            if    ($n eq '\\') { $out .= '\\'; $i += 2; next }
+            elsif ($n eq 'n')  { $out .= "\n"; $i += 2; next }
+        }
+        $out .= $c;
+        $i++;
+    }
+    return $out;
+}
+
 # Parse an INI file into { section => { key => value } }. Config::Tiny if
 # available (matches the rest of the tree); otherwise a hand parser that
 # understands [section], key=value, and ';'/'#' comments. Sections may
-# repeat (later value wins per key). Unknown/unused characters passed
+# repeat (later value wins per key). Values are _ini_decode'd on read so
+# encoded multi-line values (body= with a QR block) restore to their
+# real form for dispatch. Unknown/unused characters otherwise pass
 # through — no shell substitution.
 sub _load_ini {
     my ($path) = @_;
@@ -495,8 +533,14 @@ sub _load_ini {
     if (eval { require Config::Tiny; 1 }) {
         my $t = Config::Tiny->read($path)
             or die "$path: " . Config::Tiny->errstr . "\n";
-        # Config::Tiny returns a plain hash with section names; _ is root.
-        return { %$t };
+        # Config::Tiny returns { section => { key => value } }; decode
+        # every value one level deep.
+        my %out;
+        for my $sect (keys %$t) {
+            my $body = $t->{$sect};
+            $out{$sect} = { map { $_ => _ini_decode($body->{$_}) } keys %$body };
+        }
+        return \%out;
     }
     open my $fh, '<', $path or die "$path: $!\n";
     my %cfg;
@@ -505,7 +549,7 @@ sub _load_ini {
         s/^\s+|\s+$//g;
         next if !length || /^[;#]/;
         if (/^\[(.+?)\]\s*$/) { $section = $1; next }
-        if (/^([\w.-]+)\s*=\s*(.*)$/) { $cfg{$section}{$1} = $2 }
+        if (/^([\w.-]+)\s*=\s*(.*)$/) { $cfg{$section}{$1} = _ini_decode($2) }
     }
     close $fh;
     return \%cfg;
@@ -2765,13 +2809,15 @@ sub parse_rules_from {
         next unless $cur;
         # Body kv accumulation. Disabled rules have every line prefixed
         # with '; ' by our writer, so match that shape for kv extraction.
+        # Values are _ini_decode'd so encoded multi-line body= survives
+        # the round-trip through the editor.
         if ($cur->{enabled}) {
             if ($line =~ /^\s*([\w.-]+)\s*=\s*(.*?)\s*$/) {
-                $cur->{kv}{$1} = $2;
+                $cur->{kv}{$1} = main::_ini_decode($2);
             }
         } else {
             if ($line =~ /^\s*[;#]\s*([\w.-]+)\s*=\s*(.*?)\s*$/) {
-                $cur->{kv}{$1} //= $2;
+                $cur->{kv}{$1} //= main::_ini_decode($2);
             }
         }
     }
@@ -2809,13 +2855,16 @@ sub render_rule {
         my $v = $kv->{$k};
         next unless defined $v && length $v;
         $seen{$k} = 1;
-        push @out, "$prefix$k = $v";
+        # _ini_encode turns any embedded newlines into `\n` literal so
+        # multi-line values (e.g. Insert QR body) survive INI round-trip.
+        # Decoder is _ini_decode in _load_ini + parse_rules_from.
+        push @out, "$prefix$k = " . main::_ini_encode($v);
     }
     for my $k (sort keys %$kv) {
         next if $seen{$k};
         my $v = $kv->{$k};
         next unless defined $v && length $v;
-        push @out, "$prefix$k = $v";
+        push @out, "$prefix$k = " . main::_ini_encode($v);
     }
     return @out;
 }
