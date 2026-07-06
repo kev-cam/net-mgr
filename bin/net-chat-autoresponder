@@ -1610,6 +1610,58 @@ sub row_shared_wifi {
     $row->Button(-text => 'Insert w/ note',
                  -command => sub { _wifi_insert_from_pick(1) })
         ->pack(-side => 'left', -padx => 2);
+    # Launcher for nm-connection-editor. Some remoting stacks (RDP)
+    # don't paint the system-tray NM applet; letting the operator open
+    # the editor directly from here sidesteps that. Detached so
+    # closing the GUI doesn't take the editor with it.
+    $row->Button(-text => 'Edit Connections...',
+                 -command => \&_launch_nm_connection_editor)
+        ->pack(-side => 'left', -padx => 2);
+    # Manual re-enum after the operator adds a WiFi in NM. We don't
+    # try to poll the editor's exit — spawning detached means we
+    # can't easily know when it's done. One click is cheap.
+    $row->Button(-text => 'Refresh',
+                 -command => sub { load_shared_wifi(); build_editor_form(); })
+        ->pack(-side => 'left', -padx => 2);
+}
+
+# Fork+exec nm-connection-editor so it survives past the GUI. If the
+# binary isn't installed, show a messageBox pointing at the package.
+sub _launch_nm_connection_editor {
+    my $bin;
+    for my $cand (qw(/usr/bin/nm-connection-editor
+                     /usr/local/bin/nm-connection-editor)) {
+        if (-x $cand) { $bin = $cand; last }
+    }
+    if (!$bin) {
+        chomp(my $path = `command -v nm-connection-editor 2>/dev/null`);
+        $bin = $path if length $path && -x $path;
+    }
+    if (!$bin) {
+        _msg('nm-connection-editor not found',
+             "Install it with: sudo dnf install nm-connection-editor\n"
+           . "(or apt install network-manager-gnome)");
+        return;
+    }
+    my $pid = fork();
+    if (!defined $pid) {
+        _msg('fork failed', "Could not launch $bin: $!");
+        return;
+    }
+    if ($pid == 0) {
+        # Child: detach from GUI's controlling tty and exec.
+        POSIX::setsid();
+        open STDIN,  '<', '/dev/null';
+        open STDOUT, '>', '/dev/null';
+        open STDERR, '>', '/dev/null';
+        { exec { $bin } $bin };
+        POSIX::_exit(127);
+    }
+    # Parent: reap the immediate double-forked descendant so we don't
+    # accumulate a zombie. nm-connection-editor itself re-daemonizes,
+    # so waitpid returns quickly once the setsid child has exec'd and
+    # the editor forks off. Non-blocking so we never hang the GUI.
+    $mw->after(500, sub { waitpid($pid, POSIX::WNOHANG()) });
 }
 
 # Look up the pick variable, resolve display → label, generate URI, and
