@@ -304,6 +304,19 @@ sub on_chat_row {
     return if $ignore{$sender};
     my $sess = $kv->{session} // '';
     my $body = $kv->{body}    // '';
+    # Reset command: a whole-body "reset" (case-insensitive, tolerant
+    # of leading/trailing whitespace) clears this sender's SEEN
+    # history so subsequent rule matches re-fire as if we'd never
+    # heard from them. Lets an operator retest a greeting flow
+    # without wiping the whole SEEN log or restarting the daemon.
+    # Pre-empts rule dispatch: no autoresponder rule can match
+    # "reset" (this is a reserved word). The reset also skips this
+    # tick's normal rules to avoid the "reset then immediately
+    # re-fire the greeting on the same message" double-response.
+    if ($body =~ /^\s*reset\s*\z/i) {
+        _handle_reset($sender);
+        return;
+    }
     for my $r (@chat_rules) {
         next unless $r->{session} eq $sess;
         next if defined $r->{from} && $r->{from} ne $sender;
@@ -345,6 +358,34 @@ sub on_chat_row {
         next if $r->{dedup_ttl} > 0 && $SEEN->check($key, $r->{dedup_ttl});
         $SEEN->record($key) if dispatch($r, $ctx) && $r->{dedup_ttl} > 0;
     }
+}
+
+# Clear the SEEN entries that track a specific sender + their
+# resolved peer_id, so the next matching event fires as if we'd
+# never seen them. Called by the "reset" reserved-word handler in
+# on_chat_row. Also drops in-memory NICK -> PID mapping so a stale
+# BitChat handle re-registers on the next bitchat_peers ROW rather
+# than sticking around with an old peer_id.
+sub _handle_reset {
+    my ($sender) = @_;
+    my ($nick) = $sender =~ /^([^\@]+)/;
+    my $pid = length($nick // '') ? ($NICK_TO_PID{$nick} // '') : '';
+    my $cleared = $SEEN->forget_matching(sub {
+        my $k = shift;
+        return 1 if $k =~ /\t\Q$sender\E\z/;
+        return 1 if length $pid && $k =~ /\t\Q$pid\E\z/;
+        return 0;
+    });
+    # Drop the reactor's in-memory client-status for this peer so a
+    # subsequent bitchat_peers ROW re-registers them from scratch.
+    if (length $pid) {
+        delete $PEER_LAST_SEEN{$pid};
+        delete $NICK_TO_PID{$nick} if length($nick // '')
+                                   && ($NICK_TO_PID{$nick} // '') eq $pid;
+    }
+    warn "[autoresponder] reset from $sender (pid="
+       . (length $pid ? $pid : '?')
+       . "): cleared $cleared SEEN entries, dropped in-memory peer status\n";
 }
 
 sub dispatch {
@@ -849,6 +890,43 @@ sub record {
     my $now = time;
     $self->{mem}{$key} = $now;
     $self->_append($key, $now);
+}
+
+# Delete every mem key for which $pred->($k) is true, then rewrite
+# the on-disk log so the deletion survives a daemon restart (the
+# append-only log format can't express "deleted"). Returns the
+# count of removed keys. Called by the "reset" reserved-word
+# handler in on_chat_row.
+sub forget_matching {
+    my ($self, $pred) = @_;
+    my $n = 0;
+    for my $k (keys %{ $self->{mem} }) {
+        if ($pred->($k)) {
+            delete $self->{mem}{$k};
+            $n++;
+        }
+    }
+    $self->_rewrite if $n;
+    return $n;
+}
+
+# Overwrite the on-disk log with %mem's current state. Atomic via
+# tmp+rename so a crash mid-write leaves the prior log intact.
+sub _rewrite {
+    my ($self) = @_;
+    my $tmp = "$self->{path}.tmp.$$";
+    my $fh;
+    unless (CORE::open $fh, '>', $tmp) {
+        warn "[autoresponder] rewrite $tmp: $!\n";
+        return;
+    }
+    for my $k (sort keys %{ $self->{mem} }) {
+        print $fh "$k\t$self->{mem}{$k}\n";
+    }
+    close $fh;
+    rename $tmp, $self->{path}
+        or warn "[autoresponder] rename $tmp -> $self->{path}: $!\n";
+    $self->{dirty} = 0;
 }
 
 sub _append {
