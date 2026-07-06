@@ -1591,10 +1591,14 @@ sub row_shared_wifi {
             my $disp  = "$label ($ssid)";
             # NM-sourced entries get a " [NM]" suffix so the operator
             # can tell auto-populated picks from curated ones at a
-            # glance. Must match the DISPLAY_TO_LABEL key produced in
-            # load_shared_wifi() exactly, or _wifi_insert_from_pick
-            # won't resolve the pick back to a label.
-            $disp .= ' [NM]' if ($entry->{source} // '') eq 'nm';
+            # glance; nmcli-fallback entries add " (no PSK)" so it's
+            # visible without opening a tooltip. MUST match the
+            # DISPLAY_TO_LABEL key produced in load_shared_wifi()
+            # exactly, or _wifi_insert_from_pick can't resolve the
+            # pick back to a label and the buttons silently no-op.
+            my $src = $entry->{source} // '';
+            $disp .= ' [NM]'         if $src eq 'nm';
+            $disp .= ' [NM no PSK]'  if $src eq 'nm-nopsk';
             $be->insert('end', $disp);
         }
     } else {
@@ -1806,7 +1810,10 @@ sub load_shared_wifi {
         $SHARED_WIFI{$label} = $nm{$label};
         push @SHARED_WIFI_LABELS, $label;
         my $ssid = $nm{$label}{ssid};
-        my $disp = "$label ($ssid) [NM]";
+        my $src  = $nm{$label}{source} // 'nm';
+        my $disp = "$label ($ssid)";
+        $disp .= ' [NM]'         if $src eq 'nm';
+        $disp .= ' [NM no PSK]'  if $src eq 'nm-nopsk';
         $DISPLAY_TO_LABEL{$disp} = $label;
     }
 }
@@ -1943,8 +1950,16 @@ sub _enum_nm_profiles {
                 or return %out;
             while (my $ln = <$ph>) {
                 chomp $ln;
-                my ($name, $type) = split /:/, $ln, 2;
-                next unless defined $type && $type =~ /wireless/;
+                # nmcli terse output escapes `:` in field values as `\:`.
+                # Split on unescaped `:` and undo the escape after.
+                my @f = split /(?<!\\):/, $ln, 2;
+                my ($name, $type) = @f;
+                for ($name, $type) { defined and s/\\:/:/g }
+                next unless defined $type;
+                # Type is `802-11-wireless` on older NM, plain `wifi` on
+                # newer versions. Match either. Skip ethernet, bridge,
+                # tun, vpn, gsm, etc.
+                next unless $type =~ /(?:wireless|^wifi\z)/i;
                 next unless length $name;
                 my $label = $name;
                 $label =~ s/[^A-Za-z0-9._-]/-/g;
