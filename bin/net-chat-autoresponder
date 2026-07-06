@@ -1825,16 +1825,22 @@ sub _wifi_insert_from_pick {
     my $label = $DISPLAY_TO_LABEL{$disp};
     return unless defined $label;      # hint item / stale display string
     my $entry = $SHARED_WIFI{$label} or return;
-    # nmcli-fallback entries have no PSK (polkit gates --show-secrets
-    # for unprivileged operators). Insert nothing and point at the
-    # relaunch-as-root path so the operator understands why.
+    # nmcli-fallback entries have no PSK — polkit gates --show-secrets
+    # at this uid. Auto-escalate via pkexec (one auth prompt covers
+    # the whole set), then re-resolve the entry. The fetch flips
+    # nm-nopsk -> nm and rewrites %DISPLAY_TO_LABEL, so the marker
+    # in $disp changes ("[NM no PSK]" -> "[NM]"); look the entry up
+    # by label, not by display string, after the fetch.
     if (($entry->{source} // '') eq 'nm-nopsk') {
-        _msg('PSK not readable',
-             "Cannot read the PSK for '$entry->{ssid}' at this uid.\n"
-           . "Relaunch as root to include the PSK:\n"
-           . "  sudo net-chat-autoresponder --gui\n"
-           . "Or use Edit Connections... to copy the PSK by hand.");
-        return;
+        _pkexec_fetch_psks();
+        $entry = $SHARED_WIFI{$label};
+        if (!$entry || ($entry->{source} // '') eq 'nm-nopsk'
+                    || !length($entry->{password} // '')) {
+            # pkexec was cancelled, missing, or the profile is
+            # genuinely PSK-less (open network shouldn't hit this,
+            # but WPA-EAP with cert-based auth would).
+            return;
+        }
     }
     my $text  = _wifi_uri($entry);
     if ($with_note && length($entry->{note} // '')) {
