@@ -1648,6 +1648,78 @@ sub row_shared_wifi {
     }
 }
 
+# Manual-entry fallback when pkexec was cancelled / unavailable /
+# the profile is genuinely PSK-less. Prompts for SSID + auth + PSK
+# and returns a %SHARED_WIFI-shaped hashref, or undef on Cancel.
+# The SSID prefills from the nmcli-known entry when we have one so
+# the operator only actually types the PSK.
+sub _prompt_wifi_credential {
+    my ($seed) = @_;
+    my $ssid = $seed && length($seed->{ssid} // '') ? $seed->{ssid} : '';
+    my $auth = 'WPA';
+    my $psk  = '';
+
+    my $dlg = $mw->Toplevel(-title => 'Enter WiFi credential');
+    $dlg->transient($mw);
+    $dlg->grab();
+
+    my $frm = $dlg->Frame->pack(-fill => 'x', -padx => 8, -pady => 6);
+    $frm->Label(-text => "PSK not readable — enter it manually.\n"
+                       . "The URI is built from these fields.",
+                -justify => 'left')
+        ->pack(-side => 'top', -anchor => 'w', -pady => 4);
+
+    my $mkrow = sub {
+        my ($label_text, $var_ref, $show) = @_;
+        my $r = $frm->Frame->pack(-side => 'top', -fill => 'x', -pady => 2);
+        $r->Label(-text => $label_text, -width => 10, -anchor => 'w')
+          ->pack(-side => 'left');
+        my $e = $r->Entry(-textvariable => $var_ref, -width => 32);
+        $e->configure(-show => '*') if $show;
+        $e->pack(-side => 'left', -fill => 'x', -expand => 1, -padx => 4);
+        return $e;
+    };
+    $mkrow->('SSID:',   \$ssid, 0);
+    my $auth_row = $frm->Frame->pack(-side => 'top', -fill => 'x', -pady => 2);
+    $auth_row->Label(-text => 'Auth:', -width => 10, -anchor => 'w')
+             ->pack(-side => 'left');
+    $auth_row->Optionmenu(
+        -variable => \$auth,
+        -options  => [ [ 'WPA'    => 'WPA' ],
+                       [ 'WPA2'   => 'WPA2' ],
+                       [ 'WEP'    => 'WEP' ],
+                       [ 'nopass' => 'NOPASS' ] ],
+    )->pack(-side => 'left');
+    my $psk_entry = $mkrow->('PSK:', \$psk, 1);
+    $psk_entry->focus();
+
+    my $ok = 0;
+    my $bar = $dlg->Frame->pack(-side => 'top', -fill => 'x', -pady => 6);
+    $bar->Button(-text => 'OK', -width => 8,
+                 -command => sub { $ok = 1; $dlg->destroy })
+        ->pack(-side => 'right', -padx => 4);
+    $bar->Button(-text => 'Cancel', -width => 8,
+                 -command => sub { $ok = 0; $dlg->destroy })
+        ->pack(-side => 'right', -padx => 4);
+    # Enter = OK, Escape = Cancel.
+    $dlg->bind('<Return>', sub { $ok = 1; $dlg->destroy });
+    $dlg->bind('<Escape>', sub { $ok = 0; $dlg->destroy });
+
+    $dlg->waitWindow;
+
+    return undef unless $ok;
+    return undef unless length $ssid;
+    return undef if $auth ne 'NOPASS' && !length $psk;
+    return {
+        ssid     => $ssid,
+        auth     => $auth,
+        password => $psk,
+        hidden   => '',
+        note     => '',
+        source   => 'manual',
+    };
+}
+
 # Elevate via pkexec to read NM keyfiles as root, extract PSKs, and
 # fold them into %SHARED_WIFI. Ends with a build_editor_form() so
 # the picker rebuilds with PSK-bearing entries (source flips from
@@ -1837,9 +1909,19 @@ sub _wifi_insert_from_pick {
         if (!$entry || ($entry->{source} // '') eq 'nm-nopsk'
                     || !length($entry->{password} // '')) {
             # pkexec was cancelled, missing, or the profile is
-            # genuinely PSK-less (open network shouldn't hit this,
-            # but WPA-EAP with cert-based auth would).
-            return;
+            # genuinely PSK-less. Fall back to prompting the
+            # operator for SSID/auth/PSK — the whole point of the
+            # picker is to avoid typing the URI escaping by hand,
+            # so let them fill in just the credential and we still
+            # produce the URI.
+            my $manual = _prompt_wifi_credential($entry);
+            return unless $manual;
+            $entry = $manual;
+            # Merge back so subsequent Insert clicks reuse the entry
+            # without re-prompting. Not persisted to disk — a fresh
+            # GUI launch will prompt again unless the operator
+            # writes shared-wifi.conf.
+            $SHARED_WIFI{$label} = $entry;
         }
     }
     my $text  = _wifi_uri($entry);
