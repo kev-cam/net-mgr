@@ -407,6 +407,22 @@ sub _handle_reset {
        . "): cleared $cleared SEEN entries, dropped in-memory peer status\n";
 }
 
+# One-line log preview of a body. Renders real newlines as literal
+# `\n` so a multi-line QR body doesn't disappear behind journalctl
+# truncation. When the body is longer than the 60-char budget, we
+# also stamp "(<bytes> B, <N> lines)" so an operator can see at a
+# glance whether the daemon actually loaded the escaped multi-line
+# form or is still holding the pre-encoding truncated single-line
+# value.
+sub _log_preview {
+    my ($body) = @_;
+    my $lines = 1 + ($body =~ tr/\n/\n/);
+    my $bytes = length $body;
+    (my $flat = $body) =~ s/\n/\\n/g;
+    my $trunc = length($flat) > 60 ? substr($flat, 0, 60) . '...' : $flat;
+    return $lines > 1 ? "$trunc  ($bytes B, $lines lines)" : $trunc;
+}
+
 sub dispatch {
     my ($r, $ctx) = @_;
     # channel=noop: pure state-mutation rule. Currently the ack-target
@@ -426,8 +442,7 @@ sub dispatch {
                . " '$target' — skip\n";
             return 0;
         }
-        my $preview = length($body) > 60
-                    ? substr($body, 0, 60) . '...' : $body;
+        my $preview = _log_preview($body);
         if ($opt{'dry-run'}) {
             warn "[autoresponder dry-run $r->{name}] DM $target: $preview\n";
             return 1;
@@ -445,8 +460,7 @@ sub dispatch {
         warn "[autoresponder $r->{name}] DM $target: $preview\n";
         return 1;
     } elsif ($r->{channel} eq 'chat_post') {
-        my $preview = length($body) > 60
-                    ? substr($body, 0, 60) . '...' : $body;
+        my $preview = _log_preview($body);
         if ($opt{'dry-run'}) {
             warn "[autoresponder dry-run $r->{name}] post $target: $preview\n";
             return 1;
