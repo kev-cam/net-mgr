@@ -1727,8 +1727,31 @@ sub row_shared_wifi {
 # recipient without a scanner can still see the SSID/PSK). Requires
 # qrencode in PATH — shows a dnf/apt hint if absent.
 sub _show_qr_from_pick {
-    my (undef, $entry) = _resolve_picked_wifi();
-    return unless $entry;
+    # Prefer whatever WIFI: URI the operator has actually put in
+    # the Body text — the picker is just one way to author one;
+    # hand-edits to the URI (fixing SSID/PSK to match reality) are
+    # the common case and the QR must reflect them. Fall through
+    # to the picker only when the body has no URI.
+    my $uri;
+    my $ssid_from_body;
+    if (my $t = $E{_multi}{body}) {
+        my $body = $t->get('1.0', 'end-1c');
+        if ($body =~ /(WIFI:.*?;;)/) {
+            $uri = $1;
+            ($ssid_from_body) = $uri =~ /S:([^;]*)/;
+        }
+    }
+    my $entry;
+    if (!defined $uri) {
+        (undef, $entry) = _resolve_picked_wifi();
+        return unless $entry;
+        $uri = _wifi_uri($entry);
+    } else {
+        # Synth a minimal entry for the Toplevel's SSID label + the
+        # temp-file lifetime path — no PSK involved on this branch.
+        $entry = { ssid => (length($ssid_from_body // '')
+                            ? $ssid_from_body : '(from body)') };
+    }
     my $qrencode;
     for my $cand (qw(/usr/bin/qrencode /usr/local/bin/qrencode)) {
         if (-x $cand) { $qrencode = $cand; last }
@@ -1744,7 +1767,6 @@ sub _show_qr_from_pick {
            . "  sudo apt install qrencode");
         return;
     }
-    my $uri = _wifi_uri($entry);
     require File::Temp;
     my ($fh, $png) = File::Temp::tempfile(
         'wifi-qr-XXXXXX', SUFFIX => '.png', TMPDIR => 1, UNLINK => 0);
