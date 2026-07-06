@@ -1348,6 +1348,15 @@ sub do_load {
     # error is fine — the dropdown shows a hint item instead and
     # the operator can still type the WIFI: URI by hand.
     load_shared_wifi();
+    # If the initial load couldn't reach the NM PSKs (unprivileged
+    # operator; keyfiles are 0600 root:root), try a SILENT sudo -n
+    # fetch before the picker renders — NOPASSWD sudo (installer's
+    # canonical case) means we get real PSKs with no dialog. Falls
+    # through quietly if sudo -n needs a password; the operator can
+    # still click "Fetch PSKs (sudo)" for the pkexec / dialog path.
+    if ($_NM_UNREADABLE) {
+        _try_sudo_n_psks();
+    }
 
     my @paths = overlay_paths($file);
     unless (@paths) {
@@ -2170,24 +2179,21 @@ sub _prompt_wifi_credential {
     };
 }
 
-# Elevate via pkexec to read NM keyfiles as root, extract PSKs, and
-# fold them into %SHARED_WIFI. Ends with a build_editor_form() so
-# the picker rebuilds with PSK-bearing entries (source flips from
-# nm-nopsk → nm and the `[NM no PSK]` marker becomes plain `[NM]`).
-sub _pkexec_fetch_psks {
-    my $pkexec = -x '/usr/bin/pkexec' ? '/usr/bin/pkexec'
-               : -x '/usr/local/bin/pkexec' ? '/usr/local/bin/pkexec'
-               : undef;
-    if (!$pkexec) {
-        _msg('pkexec not found',
-             "Install polkit (dnf install polkit / apt install policykit-1)\n"
-           . "or relaunch: sudo net-chat-autoresponder --gui");
-        return;
-    }
-    # One shell invocation dumps every .nmconnection with a marker so
-    # a single polkit prompt covers the whole set. `sh -c` because
-    # pkexec doesn't do shell globbing on its own argv.
-    my $reader = q{
+# Elevate to root to read NM keyfiles, extract PSKs, and fold them
+# into %SHARED_WIFI. Ends with a build_editor_form() so the picker
+# rebuilds with PSK-bearing entries (source flips from nm-nopsk →
+# nm and the `[NM no PSK]` marker becomes plain `[NM]`).
+#
+# Elevation precedence:
+#   1. sudo -n — non-interactive; succeeds silently for operators
+#      with NOPASSWD sudo (installer@video-c is the canonical case).
+#      No polkit dialog, no su prompt.
+#   2. pkexec — polkit dialog for operators who have polkit but not
+#      NOPASSWD sudo. Renders auth over X so it works on ssh -Y.
+#   3. Neither present → messageBox pointing at `sudo` relaunch.
+# NM keyfile reader shared by sudo -n and pkexec paths.
+sub _nm_keyfile_reader {
+    return q{
         for f in /etc/NetworkManager/system-connections/*.nmconnection; do
             [ -f "$f" ] || continue
             echo "===FILE=== $(basename "$f")"
@@ -2195,33 +2201,94 @@ sub _pkexec_fetch_psks {
             echo "===END==="
         done
     };
+}
+
+# Silent attempt: sudo -n only. Merges into %SHARED_WIFI when it
+# works, silently returns 0 otherwise. Called from do_load so the
+# picker is populated with PSKs before the operator ever sees the
+# "no PSK" markers.
+sub _try_sudo_n_psks {
+    my $sudo = -x '/usr/bin/sudo' ? '/usr/bin/sudo'
+             : -x '/usr/local/bin/sudo' ? '/usr/local/bin/sudo'
+             : undef;
+    return 0 unless $sudo;
+    my ($out, $rc) = _elevated_read($sudo, '-n', '/bin/sh', '-c',
+                                    _nm_keyfile_reader());
+    return 0 unless defined $out && $rc == 0 && $out =~ /===FILE===/;
+    return _parse_and_merge_nm_dump($out);
+}
+
+# Fork+exec-and-slurp helper. Returns (stdout, rc). Merges stderr into
+# stdout so elevation error messages surface in the returned string.
+sub _elevated_read {
+    my (@cmd) = @_;
     my $pid = open(my $ph, '-|');
-    if (!defined $pid) {
-        _msg('fork failed', "Could not spawn pkexec: $!");
-        return;
-    }
+    return (undef, 127) unless defined $pid;
     if ($pid == 0) {
-        open STDERR, '>&', \*STDOUT;   # so polkit-refused shows in $out
-        { exec { $pkexec } $pkexec, '/bin/sh', '-c', $reader };
+        open STDERR, '>&', \*STDOUT;
+        { exec { $cmd[0] } @cmd };
         POSIX::_exit(127);
     }
     local $/ = undef;
-    my $out = <$ph>;
+    my $o = <$ph>;
     close $ph;
-    my $rc = $? >> 8;
-    if ($rc != 0) {
-        _msg('pkexec fetch failed',
-             "pkexec exited $rc.\n"
-           . "Auth was cancelled, or polkit isn't configured to allow\n"
-           . "this action. Relaunch with sudo instead:\n"
-           . "  sudo net-chat-autoresponder --gui\n\n"
-           . ($out // ''));
+    return ($o, $? >> 8);
+}
+
+sub _pkexec_fetch_psks {
+    my $sudo = -x '/usr/bin/sudo' ? '/usr/bin/sudo'
+             : -x '/usr/local/bin/sudo' ? '/usr/local/bin/sudo'
+             : undef;
+    my $pkexec = -x '/usr/bin/pkexec' ? '/usr/bin/pkexec'
+               : -x '/usr/local/bin/pkexec' ? '/usr/local/bin/pkexec'
+               : undef;
+    if (!$sudo && !$pkexec) {
+        _msg('no elevation available',
+             "Neither sudo nor pkexec found.\n"
+           . "Relaunch: sudo net-chat-autoresponder --gui");
         return;
     }
-    # Parse the marker-delimited dump into a sequence of {file, ini}
-    # blocks and reuse the same wifi-type/psk extraction as
-    # _enum_nm_profiles's inner loop. Building a fresh %nm here rather
-    # than delegating keeps the pkexec dependency contained to this sub.
+    my $reader = _nm_keyfile_reader();
+    my ($out, $rc);
+    # Attempt 1: sudo -n. Fails FAST (exit 1) when NOPASSWD isn't
+    # configured, so this stays cheap. No dialog, no prompt.
+    if ($sudo) {
+        ($out, $rc) = _elevated_read($sudo, '-n', '/bin/sh', '-c', $reader);
+        if (defined $out && $rc == 0 && $out =~ /===FILE===/) {
+            goto PARSE;
+        }
+    }
+    # Attempt 2: pkexec. Pops the polkit dialog.
+    if ($pkexec) {
+        ($out, $rc) = _elevated_read($pkexec, '/bin/sh', '-c', $reader);
+        if (defined $out && $rc == 0 && $out =~ /===FILE===/) {
+            goto PARSE;
+        }
+    }
+    _msg('elevation failed',
+         "Could not read NM keyfiles at any of:\n"
+       . "  sudo -n  (needs NOPASSWD in /etc/sudoers)\n"
+       . "  pkexec   (needs polkit action configured)\n"
+       . "Last exit=$rc.\n"
+       . "Relaunch as root instead:\n"
+       . "  sudo net-chat-autoresponder --gui\n\n"
+       . ($out // ''));
+    return;
+    PARSE:
+    my $merged = _parse_and_merge_nm_dump($out);
+    build_editor_form();
+    _msg('Fetch complete', "Merged $merged NM profiles with PSKs.");
+}
+
+# Parse the marker-delimited NM keyfile dump (===FILE=== / ===END===)
+# and merge each wifi profile into %SHARED_WIFI + @SHARED_WIFI_LABELS
+# with source='nm' (overwriting any prior nm-nopsk entry). Rebuilds
+# %DISPLAY_TO_LABEL to reflect the new source and clears
+# $_NM_UNREADABLE when at least one profile merged. Returns count.
+# Shared by _try_sudo_n_psks (silent, no messagebox) and
+# _pkexec_fetch_psks (interactive).
+sub _parse_and_merge_nm_dump {
+    my ($out) = @_;
     my $merged = 0;
     my $cur_name = '';
     my (%ini, $sect);
@@ -2242,8 +2309,6 @@ sub _pkexec_fetch_psks {
         }
         my $label = $id;
         $label =~ s/[^A-Za-z0-9._-]/-/g;
-        # Overwrite whatever we had for this label — the pkexec pass
-        # is authoritative (it has PSKs).
         $SHARED_WIFI{$label} = {
             ssid     => $ssid,
             auth     => $auth,
@@ -2278,9 +2343,6 @@ sub _pkexec_fetch_psks {
         }
     }
     $flush->();
-    # Rebuild %DISPLAY_TO_LABEL from scratch — labels' source may
-    # have flipped (nm-nopsk → nm) and the marker in the display
-    # string tracks source.
     %DISPLAY_TO_LABEL = ();
     for my $label (@SHARED_WIFI_LABELS) {
         my $entry = $SHARED_WIFI{$label} or next;
@@ -2291,11 +2353,8 @@ sub _pkexec_fetch_psks {
         $disp .= ' [NM no PSK]'  if $src eq 'nm-nopsk';
         $DISPLAY_TO_LABEL{$disp} = $label;
     }
-    # After a successful fetch we're no longer in the "unreadable"
-    # state — the Fetch button hides itself on the next rebuild.
-    $_NM_UNREADABLE = 0;
-    build_editor_form();
-    _msg('Fetch complete', "Merged $merged NM profiles with PSKs.");
+    $_NM_UNREADABLE = 0 if $merged;
+    return $merged;
 }
 
 # Fork+exec nm-connection-editor so it survives past the GUI. If the
