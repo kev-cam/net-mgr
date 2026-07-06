@@ -1688,6 +1688,13 @@ sub row_shared_wifi {
     $row->Button(-text => 'Insert w/ note',
                  -command => sub { _wifi_insert_from_pick(1) })
         ->pack(-side => 'left', -padx => 2);
+    # QR pops a window with the WIFI: URI rendered as a QR code so
+    # the operator can hand off credentials by pointing a camera —
+    # skips the bridge / message-body path entirely. Requires
+    # qrencode (libqrencode). Degrades to a hint if missing.
+    $row->Button(-text => 'QR',
+                 -command => \&_show_qr_from_pick)
+        ->pack(-side => 'left', -padx => 2);
     # Launcher for nm-connection-editor. Some remoting stacks (RDP)
     # don't paint the system-tray NM applet; letting the operator open
     # the editor directly from here sidesteps that. Detached so
@@ -1712,6 +1719,117 @@ sub row_shared_wifi {
                      -command => \&_pkexec_fetch_psks)
             ->pack(-side => 'left', -padx => 2);
     }
+}
+
+# Resolve the picked entry, render its WIFI: URI as a QR code PNG
+# via qrencode, and pop a Toplevel showing the image + the raw URI
+# beneath it (so the operator can also copy the URI, and so a
+# recipient without a scanner can still see the SSID/PSK). Requires
+# qrencode in PATH — shows a dnf/apt hint if absent.
+sub _show_qr_from_pick {
+    my (undef, $entry) = _resolve_picked_wifi();
+    return unless $entry;
+    my $qrencode;
+    for my $cand (qw(/usr/bin/qrencode /usr/local/bin/qrencode)) {
+        if (-x $cand) { $qrencode = $cand; last }
+    }
+    if (!$qrencode) {
+        chomp(my $path = `command -v qrencode 2>/dev/null`);
+        $qrencode = $path if length $path && -x $path;
+    }
+    if (!$qrencode) {
+        _msg('qrencode not found',
+             "Install libqrencode's CLI:\n"
+           . "  sudo dnf install qrencode\n"
+           . "  sudo apt install qrencode");
+        return;
+    }
+    my $uri = _wifi_uri($entry);
+    require File::Temp;
+    my ($fh, $png) = File::Temp::tempfile(
+        'wifi-qr-XXXXXX', SUFFIX => '.png', TMPDIR => 1, UNLINK => 0);
+    close $fh;
+    # -s 8: pixel size per module — 8 gives a comfortably scannable
+    # ~300px block for typical SSID+PSK URIs. -m 4: quiet zone
+    # margin, spec-required for reliable decoding. -l M: medium ECC
+    # (balance of size and robustness against camera distortion).
+    my @cmd = ($qrencode, '-t', 'PNG', '-s', '8', '-m', '4',
+               '-l', 'M', '-o', $png, $uri);
+    my $rc = system { $cmd[0] } @cmd;
+    if ($rc != 0) {
+        _msg('qrencode failed',
+             "qrencode exited $rc.\nURI: $uri");
+        unlink $png;
+        return;
+    }
+    _show_qr_toplevel($png, $uri, $entry);
+}
+
+# Pop a Toplevel with the QR PNG at native size, the SSID label, and
+# the WIFI: URI in a read-only Entry (selectable / copy-able). Cleans
+# up the temp PNG on window destroy.
+sub _show_qr_toplevel {
+    my ($png, $uri, $entry) = @_;
+    my $ssid = $entry->{ssid} // '?';
+    my $dlg = $mw->Toplevel(-title => "QR: $ssid");
+    $dlg->transient($mw);
+    my $img;
+    eval {
+        # Tk::Photo needs the PNG image type. Modern perl-Tk (>=804)
+        # ships PNG support built-in; older builds may need Tk::PNG.
+        require Tk::PNG;
+        $img = $dlg->Photo(-file => $png, -format => 'png');
+        1;
+    } or do {
+        # If PNG loading fails at runtime, fall back to a text-mode
+        # QR via qrencode -t UTF8 so the operator can still get the
+        # code without the image widget.
+        $dlg->destroy;
+        _show_qr_text($uri, $entry);
+        unlink $png;
+        return;
+    };
+    $dlg->Label(-image => $img)->pack(-padx => 8, -pady => 8);
+    $dlg->Label(-text => "SSID: $ssid", -font => '{Helvetica} 10 bold')
+        ->pack(-anchor => 'w', -padx => 8);
+    my $urow = $dlg->Frame->pack(-fill => 'x', -padx => 8, -pady => 4);
+    $urow->Label(-text => 'URI:')->pack(-side => 'left');
+    my $ue = $urow->Entry(-width => 60, -readonlybackground => 'white');
+    $ue->pack(-side => 'left', -fill => 'x', -expand => 1, -padx => 4);
+    $ue->insert(0, $uri);
+    $ue->configure(-state => 'readonly');
+    my $bar = $dlg->Frame->pack(-fill => 'x', -pady => 6);
+    $bar->Button(-text => 'Close', -width => 8,
+                 -command => sub { $dlg->destroy })
+        ->pack(-side => 'right', -padx => 4);
+    $dlg->bind('<Escape>', sub { $dlg->destroy });
+    # Cleanup temp file when window closes. The image ref must be
+    # retained (via the Label) so we can unlink AFTER destroy.
+    $dlg->OnDestroy(sub { unlink $png });
+}
+
+# Fallback for hosts whose Tk::Photo can't render PNG: qrencode's
+# UTF8 output in a monospace ROText widget. Works over ssh -Y even
+# on ancient Tk builds.
+sub _show_qr_text {
+    my ($uri, $entry) = @_;
+    my $ssid = $entry->{ssid} // '?';
+    chomp(my $utf8 = `qrencode -t UTF8 -m 2 -l M -- \Q$uri\E 2>/dev/null`);
+    if (!length $utf8) {
+        _msg('QR render failed',
+             "qrencode -t UTF8 produced no output.\nURI: $uri");
+        return;
+    }
+    my $dlg = $mw->Toplevel(-title => "QR: $ssid");
+    $dlg->transient($mw);
+    my $t = $dlg->Scrolled('ROText',
+        -scrollbars => 'osoe', -font => '{Monospace} 9',
+        -width => 60, -height => 34)->pack(-fill => 'both', -expand => 1);
+    $t->insert('end', $utf8);
+    $dlg->Label(-text => "SSID: $ssid")->pack(-anchor => 'w', -padx => 8);
+    $dlg->Button(-text => 'Close', -command => sub { $dlg->destroy })
+        ->pack(-side => 'right', -padx => 6, -pady => 6);
+    $dlg->bind('<Escape>', sub { $dlg->destroy });
 }
 
 # Manual-entry fallback when pkexec was cancelled / unavailable /
@@ -1953,43 +2071,36 @@ sub _launch_nm_connection_editor {
     $mw->after(500, sub { waitpid($pid, POSIX::WNOHANG()) });
 }
 
-# Look up the pick variable, resolve display → label, generate URI, and
-# insert into the body Text at the cursor (or replace selection). No-op
-# when the pick is the "(no shared-wifi.conf...)" hint or empty.
-sub _wifi_insert_from_pick {
-    my ($with_note) = @_;
+# Resolve the current picker selection to a %SHARED_WIFI entry with a
+# usable PSK. Handles nm-nopsk -> pkexec -> manual-entry cascade.
+# Returns (label, entry) or () on abort / hint-item / empty pick.
+sub _resolve_picked_wifi {
     my $disp  = $E{fields}{_wifi_pick} // '';
-    return unless length $disp;
+    return () unless length $disp;
     my $label = $DISPLAY_TO_LABEL{$disp};
-    return unless defined $label;      # hint item / stale display string
-    my $entry = $SHARED_WIFI{$label} or return;
-    # nmcli-fallback entries have no PSK — polkit gates --show-secrets
-    # at this uid. Auto-escalate via pkexec (one auth prompt covers
-    # the whole set), then re-resolve the entry. The fetch flips
-    # nm-nopsk -> nm and rewrites %DISPLAY_TO_LABEL, so the marker
-    # in $disp changes ("[NM no PSK]" -> "[NM]"); look the entry up
-    # by label, not by display string, after the fetch.
+    return () unless defined $label;
+    my $entry = $SHARED_WIFI{$label} or return ();
     if (($entry->{source} // '') eq 'nm-nopsk') {
         _pkexec_fetch_psks();
         $entry = $SHARED_WIFI{$label};
         if (!$entry || ($entry->{source} // '') eq 'nm-nopsk'
                     || !length($entry->{password} // '')) {
-            # pkexec was cancelled, missing, or the profile is
-            # genuinely PSK-less. Fall back to prompting the
-            # operator for SSID/auth/PSK — the whole point of the
-            # picker is to avoid typing the URI escaping by hand,
-            # so let them fill in just the credential and we still
-            # produce the URI.
             my $manual = _prompt_wifi_credential($entry);
-            return unless $manual;
+            return () unless $manual;
             $entry = $manual;
-            # Merge back so subsequent Insert clicks reuse the entry
-            # without re-prompting. Not persisted to disk — a fresh
-            # GUI launch will prompt again unless the operator
-            # writes shared-wifi.conf.
             $SHARED_WIFI{$label} = $entry;
         }
     }
+    return ($label, $entry);
+}
+
+# Look up the pick variable, resolve display → label, generate URI, and
+# insert into the body Text at the cursor (or replace selection). No-op
+# when the pick is the "(no shared-wifi.conf...)" hint or empty.
+sub _wifi_insert_from_pick {
+    my ($with_note) = @_;
+    my (undef, $entry) = _resolve_picked_wifi();
+    return unless $entry;
     my $text  = _wifi_uri($entry);
     if ($with_note && length($entry->{note} // '')) {
         $text .= "\n" . $entry->{note};
