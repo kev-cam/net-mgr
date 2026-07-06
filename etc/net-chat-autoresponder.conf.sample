@@ -113,7 +113,7 @@ match      = .*
 dedup_ttl  = 15m
 channel    = bitchat_dm
 target     = ${peer_id}
-body       = WIFI:T:WPA;S:video;P:InTheRoom;;
+body       = WIFI:T:WPA;S:ssid;P:password;;
 
 ; --------------------------------------------------------------------------
 ; Rule 2 — reply with the same URI when anyone types 'wifi?' in the bridge
@@ -140,7 +140,7 @@ match      = ^\[[^\]]+@bitchat[^\]]*\]\s+(?i)wi-?fi\??\s*$
 dedup_ttl  = 5m
 channel    = chat_post
 target     = ${session}
-body       = WIFI:T:WPA;S:video;P:InTheRoom;;
+body       = WIFI:T:WPA;S:ssid;P:password;;
 
 ; --------------------------------------------------------------------------
 ; Rule 3 — ops-channel liveness probe. Someone types '!hello', we ack.
@@ -207,7 +207,7 @@ body       = hi ${sender} — net-chat-autoresponder alive
 ; every      = 60s
 ; channel    = chat_post
 ; target     = bitchat-bridge
-; body       = WIFI:T:WPA;S:video;P:InTheRoom;; — did you get this? reply "ok" if you did.
+; body       = WIFI:T:WPA;S:ssid;P:password;; — did you get this? reply "ok" if you did.
 
 ; --------------------------------------------------------------------------
 ; Rule 5 — per-peer DM fanout for the WiFi URI (production replacement
@@ -282,7 +282,7 @@ every      = 60s
 mode       = fanout_bitchat_peers
 channel    = bitchat_dm
 target     = ${peer_id}
-body       = WIFI:T:WPA;S:video;P:InTheRoom;;  Reply 'y' to stop these.
+body       = WIFI:T:WPA;S:ssid;P:password;;  Reply 'y' to stop these.
 ack_key    = wifi-broadcast
 acked_ttl  = 1h
 

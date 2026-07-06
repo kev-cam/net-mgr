@@ -1929,12 +1929,31 @@ sub _wifi_insert_from_pick {
         $text .= "\n" . $entry->{note};
     }
     my $t = $E{_multi}{body} or return;
-    my @sel = $t->tagRanges('sel');
-    if (@sel) {
-        $t->delete($sel[0], $sel[1]);
-        $t->insert($sel[0], $text);
+    # Precedence:
+    #   1. If the body already contains a `WIFI:...;;` URI (e.g. the
+    #      operator loaded a rule with the sample body or a stale
+    #      pick), REPLACE that URI in place. This is what "Insert
+    #      again with a different network" almost always means, and
+    #      it's what makes a fresh-out-of-the-sample rule work
+    #      without hand-deleting the placeholder URI.
+    #   2. Else if there's a selection, replace it.
+    #   3. Else insert at the cursor.
+    # WIFI: URIs terminate with `;;` per the QR spec — that's the
+    # anchor for the regex. Non-greedy so we don't slurp trailing
+    # notes on the same line.
+    my $body = $t->get('1.0', 'end-1c');
+    if ($body =~ /WIFI:.*?;;/) {
+        (my $new = $body) =~ s/WIFI:.*?;;/$text/;
+        $t->delete('1.0', 'end');
+        $t->insert('1.0', $new);
     } else {
-        $t->insert('insert', $text);
+        my @sel = $t->tagRanges('sel');
+        if (@sel) {
+            $t->delete($sel[0], $sel[1]);
+            $t->insert($sel[0], $text);
+        } else {
+            $t->insert('insert', $text);
+        }
     }
     # Sync scalar so save picks it up without waiting for a KeyRelease.
     $E{fields}{body} = $t->get('1.0', 'end-1c');
