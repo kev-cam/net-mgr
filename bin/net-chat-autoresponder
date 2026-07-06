@@ -992,14 +992,22 @@ sub run {
     $mw = MainWindow->new(-title => "net-autoresponder-gui ($file)");
     $mw->geometry('1100x760');
 
+    # Pack order matters: bottom siblings must be packed BEFORE the
+    # top+expand=1 siblings so they claim their slice of the cavity
+    # first. If action_bar packs after two expand=1 top frames, Tk
+    # gives it its natural height but the expanding frames can push
+    # it below the visible geometry on some window managers (RDP /
+    # xrdp geometry is the reproducer that surfaced this — the Save
+    # button was rendered off-screen).
     $top_bar    = $mw->Frame(-relief => 'groove', -bd => 1)
                      ->pack(-side => 'top', -fill => 'x');
+    $status_lbl = $mw->Label(-anchor => 'w', -relief => 'sunken')
+                     ->pack(-side => 'bottom', -fill => 'x');
+    $action_bar = $mw->Frame(-relief => 'raised', -bd => 1)
+                     ->pack(-side => 'bottom', -fill => 'x');
     $body_frame = $mw->Frame->pack(-side => 'top', -fill => 'both', -expand => 1);
     $test_frame = $mw->Frame(-relief => 'sunken', -bd => 1)
                      ->pack(-side => 'top', -fill => 'both', -expand => 1, -pady => 2);
-    $action_bar = $mw->Frame->pack(-side => 'bottom', -fill => 'x');
-    $status_lbl = $mw->Label(-anchor => 'w', -relief => 'sunken')
-                     ->pack(-side => 'bottom', -fill => 'x');
 
     # --- Top bar: daemon target + config file + Load ---------------------
     $top_bar->Label(-text => 'Target daemon:')->pack(-side => 'left', -padx => 4);
@@ -1674,6 +1682,17 @@ sub _wifi_insert_from_pick {
     my $label = $DISPLAY_TO_LABEL{$disp};
     return unless defined $label;      # hint item / stale display string
     my $entry = $SHARED_WIFI{$label} or return;
+    # nmcli-fallback entries have no PSK (polkit gates --show-secrets
+    # for unprivileged operators). Insert nothing and point at the
+    # relaunch-as-root path so the operator understands why.
+    if (($entry->{source} // '') eq 'nm-nopsk') {
+        _msg('PSK not readable',
+             "Cannot read the PSK for '$entry->{ssid}' at this uid.\n"
+           . "Relaunch as root to include the PSK:\n"
+           . "  sudo net-chat-autoresponder --gui\n"
+           . "Or use Edit Connections... to copy the PSK by hand.");
+        return;
+    }
     my $text  = _wifi_uri($entry);
     if ($with_note && length($entry->{note} // '')) {
         $text .= "\n" . $entry->{note};
@@ -1906,6 +1925,44 @@ sub _enum_nm_profiles {
         $_NM_KEYFILE_WARNED = 1;
         warn "[gui] NM keyfiles unreadable, skipping auto-populate "
            . "(run as root to see saved connections)\n";
+    }
+
+    # Fallback: even when keyfiles are unreadable at this uid, nmcli
+    # talks to NetworkManager over DBus and can enumerate connection
+    # NAMES + SSIDs (getting PSKs requires --show-secrets which polkit
+    # gates — omitted here). Names alone let the operator SEE their
+    # networks and know sudo would unlock the PSKs.
+    if (!%out) {
+        my $nmcli = -x '/usr/bin/nmcli' ? '/usr/bin/nmcli'
+                  : -x '/usr/local/bin/nmcli' ? '/usr/local/bin/nmcli'
+                  : undef;
+        if ($nmcli) {
+            # `-t` terse output, `:` field sep, `-e no` no escapes. We
+            # ask for name+type+uuid so we can filter to wifi rows.
+            open(my $ph, '-|', $nmcli, '-t', '-f', 'name,type', 'c', 'show')
+                or return %out;
+            while (my $ln = <$ph>) {
+                chomp $ln;
+                my ($name, $type) = split /:/, $ln, 2;
+                next unless defined $type && $type =~ /wireless/;
+                next unless length $name;
+                my $label = $name;
+                $label =~ s/[^A-Za-z0-9._-]/-/g;
+                # Dedup vs. self (unlikely — nmcli returns unique names).
+                my $base = $label; my $n = 1;
+                while (exists $out{$label}) { $label = "$base-$n"; $n++ }
+                $out{$label} = {
+                    ssid     => $name,
+                    auth     => 'WPA',
+                    password => '',      # placeholder — polkit blocks
+                    hidden   => '',
+                    note     => '(needs sudo for PSK)',
+                    source   => 'nm-nopsk',
+                };
+            }
+            close $ph;
+            $_NM_UNREADABLE = 1 if %out;
+        }
     }
     return %out;
 }
@@ -2520,19 +2577,12 @@ sub fetch_chat_sessions {
 # setup, before the action bar has been created.
 sub update_save_state {
     return unless defined $save_btn;
-    # Any checked trigger + any picked channel enables Save. The
-    # trigger_set hashref may be undef during the very first widget
-    # setup (before build_editor_form has run once), so treat that as
-    # "no triggers picked yet".
-    my $any_trig = 0;
-    if (ref $E{trigger_set} eq 'HASH') {
-        for my $t (qw(bitchat_peer_first_seen chat_message periodic)) {
-            $any_trig = 1, last if $E{trigger_set}{$t};
-        }
-    }
+    # Save is always ENABLED — validate_kv catches unfinished forms
+    # with a messageBox that names the missing field. Greying Save
+    # out on empty forms was too subtle: the operator saw "no Save
+    # button" instead of "I haven't picked a trigger yet".
+    $save_btn->configure(-state => 'normal');
     my $chan = $E{fields}{channel} // '';
-    my $save_state = ($any_trig && length $chan) ? 'normal' : 'disabled';
-    $save_btn->configure(-state => $save_state);
     # Post is only meaningful for chat_post rules (target = session name);
     # for bitchat_dm the target is a peer_id which requires the bridge
     # to relay, and noop rules have no wire effect. Enable based on the

@@ -42,14 +42,15 @@
 #   shows a single hint item and inserts nothing on click.
 # ==========================================================================
 
-# The site's primary WPA network — same credentials the bitchat-bridge
-# [wifi_response] section and the wifi-fanout autoresponder rule already
-# use. Uncomment + edit for your site.
-;[wifi.video]
-;ssid     = video
+# The site's primary WPA network. Uncomment + edit for your site.
+# The label under [wifi.LABEL] is what the picker displays; the
+# ssid= / password= values are the credential the WIFI: URI actually
+# hands out — set both.
+;[wifi.primary]
+;ssid     = ssid
 ;auth     = WPA
-;password = InTheRoom
-;note     = presentation-room WiFi (primary)
+;password = password
+;note     = primary WiFi
 
 # An open guest AP (captive portal). When auth = nopass the generated
 # WIFI: URI omits the P: field entirely, which is what QR readers expect
