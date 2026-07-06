@@ -2506,6 +2506,43 @@ sub render_rule {
     return @out;
 }
 
+# Copy-on-write remap for unprivileged Save: if the rule was loaded
+# from a system-scoped path we can't write, mirror it into the
+# user-scope equivalent so Save actually lands. Returns the (possibly
+# remapped) path and mutates $r->{source} + $S{files} so subsequent
+# operations stay in user scope.
+sub _cow_source_for_write {
+    my ($r) = @_;
+    my $path = $r->{source};
+    return $path if $> == 0;                             # root: keep /etc/
+    return $path unless $path =~ m{^/etc/net-mgr/(.+)$}; # already user or --config
+    my $tail = $1;
+    my $user_dir = NetMgr::Config->user_config_dir();
+    return $path unless defined $user_dir && length $user_dir;
+    my $new = "$user_dir/$tail";
+    # Mirror the parsed line list from the system-scope key so the
+    # user-scope file gets the whole file content on first COW save
+    # — otherwise we'd write out only the one edited rule and lose
+    # every other rule in the file.
+    if (exists $S{files}{$path} && !exists $S{files}{$new}) {
+        $S{files}{$new} = [ @{ $S{files}{$path} } ];
+    }
+    # Rewrite in-memory source pointers on every rule that came from
+    # this system path so their next Save also lands in user scope.
+    for my $rule (@{ $S{rules} }) {
+        $rule->{source} = $new if defined $rule->{source} && $rule->{source} eq $path;
+    }
+    # If this was the top-bar primary config file, retarget it too so
+    # "Reload from disk" reads the user-scope file we just wrote and
+    # the top-bar Entry reflects the actual authoritative path.
+    if (defined $S{primary} && $S{primary} eq $path) {
+        $S{primary} = $new;
+        $file_var   = $new if defined $file_var;
+    }
+    set_status("saved to $new (shadowing system rule; overrides /etc/)");
+    return $new;
+}
+
 # Replace an existing rule's line range (or append when start_ln
 # undefined) with freshly-rendered content, then rewrite the file.
 sub write_rule_back {
@@ -2517,7 +2554,7 @@ sub write_rule_back {
         $r->{name} = $E{fields}{name};
     }
     $r->{kv} = $kv;
-    my $path  = $r->{source};
+    my $path  = _cow_source_for_write($r);
     my $lines = $S{files}{$path} //= [];
     my @new_body = render_rule($r, $kv);
 
