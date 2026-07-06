@@ -462,6 +462,60 @@ sub user_path {
     return "$base/net-mgr/config";
 }
 
+# Per-user config BASE dir ($XDG_CONFIG_HOME/net-mgr, else ~/.config/net-mgr).
+# Sibling to user_path() — user_path() names the single [servers]/[net-chat]
+# key-store file inside this dir; user_config_dir() names the dir itself so
+# side-car config files (net-chat-autoresponder.conf, shared-wifi.conf, ...)
+# can live alongside it under one canonical location. Undef when HOME/XDG
+# are both unset — caller falls back to the system path in that case.
+sub user_config_dir {
+    my $base = $ENV{XDG_CONFIG_HOME};
+    $base ||= "$ENV{HOME}/.config" if defined $ENV{HOME} && length $ENV{HOME};
+    return undef unless defined $base && length $base;
+    return "$base/net-mgr";
+}
+
+# Per-user STATE base dir ($XDG_STATE_HOME/net-mgr, else ~/.local/state/net-mgr).
+# For files that would normally live under /var/lib/net-mgr/ on a root-owned
+# install — e.g. net-chat-autoresponder's SeenFile dedup log. Undef when
+# HOME/XDG are both unset.
+sub user_state_dir {
+    my $base = $ENV{XDG_STATE_HOME};
+    $base ||= "$ENV{HOME}/.local/state" if defined $ENV{HOME} && length $ENV{HOME};
+    return undef unless defined $base && length $base;
+    return "$base/net-mgr";
+}
+
+# Resolve a side-car config filename (e.g. 'net-chat-autoresponder.conf' or
+# 'shared-wifi.conf') to a full path per the per-euid policy:
+#
+#   * root (euid 0): ALWAYS the system path (/etc/net-mgr/$name). Preserves
+#     bit-for-bit behavior for the root-owned systemd daemon.
+#   * unprivileged, user-scope exists (or its .d/ overlay dir does): user path.
+#     Any existing content under $XDG_CONFIG_HOME/net-mgr/ takes priority so
+#     an operator's Save yesterday is the file we load today.
+#   * unprivileged, only system-scope exists: system path (legacy read-only
+#     view — a Save later flips the source of truth to user-scope).
+#   * unprivileged, neither exists: user path (fresh install — Save has to
+#     have a well-defined write target and system-scope is unwritable).
+#
+# NO CROSS-SCOPE MERGE. The whole file comes from one scope; the caller
+# reads whichever path this returns and their .d/ overlay dir sits next to
+# it (same base, .conf → .d suffix). Callers stay agnostic to which scope
+# they got; the returned path is authoritative for both load and save.
+sub resolve_config_file {
+    my ($class, $name) = @_;
+    croak "resolve_config_file: filename required" unless defined $name && length $name;
+    my $system = "/etc/net-mgr/$name";
+    return $system if $> == 0;                # root: system path, always
+    my $dir = $class->user_config_dir or return $system;
+    my $user = "$dir/$name";
+    (my $u_dotd = $user) =~ s/\.conf$/.d/;
+    return $user   if -e $user || -d $u_dotd; # user has content — user wins
+    return $system if -e $system;             # legacy: only /etc has content
+    return $user;                             # fresh: create in user scope
+}
+
 # Merged [servers] from the system config then the per-user config (user wins).
 # In list context returns (\%name_to_addr, $default_addr, $default_name);
 # %name_to_addr maps a short name to "host:port" and excludes the special

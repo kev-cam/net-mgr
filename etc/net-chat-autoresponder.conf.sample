@@ -1,4 +1,5 @@
-; /etc/net-mgr/net-chat-autoresponder.conf
+; /etc/net-mgr/net-chat-autoresponder.conf   (root-scoped, systemd path)
+; $XDG_CONFIG_HOME/net-mgr/net-chat-autoresponder.conf  (user-scoped)
 ; ==========================================================================
 ; net-chat-autoresponder rule set. INI format:
 ;
@@ -6,14 +7,29 @@
 ;   [global]                     ; optional; defaults shown below
 ;   [rule.NAME]                  ; one section per rule; NAME = [A-Za-z][A-Za-z0-9._-]{0,31}
 ;
+; Location: the daemon and GUI both default to a per-euid path. Root reads
+; /etc/net-mgr/net-chat-autoresponder.conf (unchanged; the systemd unit
+; passes this explicitly). An unprivileged operator (`net-chat-autoresponder
+; --gui` as e.g. installer@video-c) reads and writes
+; $XDG_CONFIG_HOME/net-mgr/net-chat-autoresponder.conf — defaulting to
+; ~/.config/net-mgr/net-chat-autoresponder.conf when XDG_CONFIG_HOME is
+; unset. If BOTH files exist, the user-scope file wins for that operator;
+; there is NO cross-scope merge. `--config <path>` always overrides both.
+; To promote a user-scope edit into the running systemd service, copy or
+; symlink it into /etc/net-mgr/net-chat-autoresponder.d/ and restart the
+; daemon. (The GUI's Restart-hint dialog explains this in situ.)
+;
 ; Overlays: /etc/net-mgr/net-chat-autoresponder.d/*.conf are loaded AFTER
 ; this file in filename-sort order. A duplicate [rule.NAME] REPLACES the
 ; earlier one (last-write-wins per rule name), so a site can override the
 ; wifi-greeting body by dropping ONE file into the .d/ directory without
-; editing the packaged default.
+; editing the packaged default. The same .d/ overlay pattern applies to
+; the user-scope path (~/.config/net-mgr/net-chat-autoresponder.d/*.conf).
 ;
-; State (dedup) file: /var/lib/net-mgr/net-chat-autoresponder.seen —
-; owned by the reactor, one line per dedup key ('key\tepoch\n', append-only,
+; State (dedup) file: /var/lib/net-mgr/net-chat-autoresponder.seen when
+; root, or $XDG_STATE_HOME/net-mgr/net-chat-autoresponder.seen (default
+; ~/.local/state/net-mgr/...) when unprivileged. Override in [global] via
+; state_file = <path>. One line per dedup key ('key\tepoch\n', append-only,
 ; lazy-pruned). Delete it to force every rule to fire again.
 ;
 ; See bin/net-chat-autoresponder --help for CLI. See project_bitchat-bridge

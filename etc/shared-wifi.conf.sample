@@ -1,10 +1,18 @@
-# /etc/net-mgr/shared-wifi.conf
+# /etc/net-mgr/shared-wifi.conf                 (root-scoped, /etc/net-mgr)
+# $XDG_CONFIG_HOME/net-mgr/shared-wifi.conf     (user-scoped, ~/.config/...)
 # ==========================================================================
 # Shared WiFi credentials for the net-autoresponder-gui rule editor's
 # "Share WiFi" picker. When the operator picks a label the GUI generates a
 # WIFI: URI (the QR-code format iOS/Android camera readers parse) and
 # inserts it into the rule body at the cursor — so operators don't type
 # the escaping by hand.
+#
+# Location: the GUI resolves this file per-euid via the same policy as
+# net-chat-autoresponder.conf. Root reads /etc/net-mgr/shared-wifi.conf;
+# an unprivileged operator reads and writes $XDG_CONFIG_HOME/net-mgr/
+# shared-wifi.conf (default ~/.config/net-mgr/shared-wifi.conf). If both
+# exist the user-scope file wins for that operator — no cross-scope
+# merge. The same .d/ overlay convention applies at both scopes.
 #
 # INI format, one [wifi.LABEL] section per network. LABEL is what the
 # picker shows (as "LABEL (SSID)").

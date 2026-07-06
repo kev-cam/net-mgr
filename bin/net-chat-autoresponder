@@ -33,12 +33,19 @@ use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
 use Fcntl qw(:flock O_RDWR O_CREAT O_APPEND);
 use NetMgr::Client;
+use NetMgr::Config;
 use NetMgr::Protocol qw(parse_line);
 
 $SIG{PIPE} = 'IGNORE';                      # net-chat:60 shape
 $| = 1;
 
-my %opt = (config => '/etc/net-mgr/net-chat-autoresponder.conf');
+# Default config path is euid-aware: root reads /etc/net-mgr/... (unchanged
+# from every prior release + what the systemd unit passes explicitly);
+# unprivileged runs (e.g. `net-chat-autoresponder --gui` as installer@video-c)
+# prefer $XDG_CONFIG_HOME/net-mgr/ so the GUI's Save has a writable target.
+# Explicit `--config <path>` always wins via Getopt::Long. See
+# NetMgr::Config::resolve_config_file for the full precedence rules.
+my %opt = (config => NetMgr::Config->resolve_config_file('net-chat-autoresponder.conf'));
 GetOptions(\%opt, 'gui', 'file=s', 'config=s', 'listen=s',
                   'once', 'dry-run', 'help')
     or usage(2);
@@ -508,7 +515,20 @@ sub load_config {
     # Defaults.
     $global{listen}       //= '127.0.0.1:7531';
     $global{as}           //= 'net-chat-autoresponder';
-    $global{state_file}   //= '/var/lib/net-mgr/net-chat-autoresponder.seen';
+    # SeenFile path is euid-aware for the same reason resolve_config_file is:
+    # /var/lib/net-mgr/ is created by systemd's StateDirectory=net-mgr (0755
+    # root:root) so an unprivileged operator cannot write there. Fall back
+    # to $XDG_STATE_HOME/net-mgr/ when not root; SeenFile->open mkdirs the
+    # parent, and if that fails dedup silently degrades (not fatal). An
+    # operator-supplied state_file overrides both branches unchanged.
+    $global{state_file}   //= do {
+        if ($> == 0) { '/var/lib/net-mgr/net-chat-autoresponder.seen' }
+        else {
+            my $d = NetMgr::Config->user_state_dir;
+            $d ? "$d/net-chat-autoresponder.seen"
+               : '/var/lib/net-mgr/net-chat-autoresponder.seen';
+        }
+    };
     $global{echo_ignore}  //= $global{as};
 
     # Compile / validate rules.
@@ -770,12 +790,22 @@ sub open {   ## no critic (Subroutines::ProhibitBuiltinHomonyms)
     my ($class, $path) = @_;
     # Ensure parent dir exists — systemd StateDirectory=net-mgr already
     # creates /var/lib/net-mgr/, but a hand-run smoke test off-service
-    # deserves a sensible error.
+    # deserves a sensible error. Under an unprivileged run the default
+    # is $XDG_STATE_HOME/net-mgr/ which may need TWO levels of dir
+    # creation (e.g. ~/.local/state/ + ~/.local/state/net-mgr/), so
+    # use File::Path::make_path rather than a single mkdir. Failure
+    # here is not fatal — SeenFile silently degrades to in-memory-only.
     (my $parent = $path) =~ s{/[^/]+$}{};
     if (length $parent && !-d $parent) {
-        mkdir $parent
-            or warn "[autoresponder] mkdir $parent: $! "
-                  . "(state persistence disabled)\n";
+        require File::Path;
+        my $err;
+        File::Path::make_path($parent, { error => \$err });
+        if (ref $err eq 'ARRAY' && @$err) {
+            my ($first) = @$err;
+            my ($k, $v) = %$first;
+            warn "[autoresponder] make_path $parent: $v "
+               . "(state persistence disabled)\n";
+        }
     }
     my $self = bless { path => $path, mem => {}, dirty => 0 }, $class;
     $self->_load;
@@ -937,7 +967,10 @@ our ($save_btn, $post_btn);
 our %SHARED_WIFI;
 our @SHARED_WIFI_LABELS;
 our %DISPLAY_TO_LABEL;
-our $SHARED_WIFI_CONF = '/etc/net-mgr/shared-wifi.conf';
+# Default is euid-aware via NetMgr::Config->resolve_config_file — see the
+# main script's %opt seed for the full story. Left assignable so a `--file`-
+# style CLI flag or an ad-hoc test can point the picker at a different file.
+our $SHARED_WIFI_CONF = NetMgr::Config->resolve_config_file('shared-wifi.conf');
 
 # Tk widget refs live at package scope so all handler subs can reach them.
 our ($mw, $top_bar, $body_frame, $test_frame, $action_bar, $status_lbl);
@@ -970,15 +1003,18 @@ sub run {
     # main script short-circuited via `if ($opt{gui}) { cmd_gui; exit }`
     # before Perl reached this package's top-level code. Set the defaults
     # here so run() is the single source of truth for GUI-side state.
-    $SHARED_WIFI_CONF //= '/etc/net-mgr/shared-wifi.conf';
+    $SHARED_WIFI_CONF //= NetMgr::Config->resolve_config_file('shared-wifi.conf');
     $BUILDING_FORM   //= 0;
     $sample_n        //= 50;
     $listen = $opt->{listen} // $ENV{NET_MGR_LISTEN} // '127.0.0.1:7531';
     # `--file` is the historical GUI name for the primary config; `--config`
     # is the daemon name. Both work here so operators can pass whichever
-    # they already have muscle memory for.
+    # they already have muscle memory for. When neither is given, defer to
+    # NetMgr::Config's per-euid resolver: root sees /etc/net-mgr/, an
+    # unprivileged operator sees $XDG_CONFIG_HOME/net-mgr/ (typically
+    # ~/.config/net-mgr/) so Save has a writable target.
     $file = $opt->{file} // $opt->{config}
-                        // '/etc/net-mgr/net-chat-autoresponder.conf';
+                        // NetMgr::Config->resolve_config_file('net-chat-autoresponder.conf');
 
     %S = (
         rules   => [],
@@ -1315,7 +1351,33 @@ sub do_save_rule {
 }
 
 sub show_restart_hint {
-    my $body = <<'MSG';
+    # Name the file the operator is currently editing so a user-scope
+    # Save doesn't leave the operator wondering why `systemctl restart`
+    # didn't pick up their change. The root-owned daemon only reads
+    # /etc/net-mgr/net-chat-autoresponder.conf (+ .d/); an installer
+    # editing under ~/.config/net-mgr/ needs to promote their file into
+    # /etc/net-mgr/net-chat-autoresponder.d/ for systemd to see it.
+    my $editing = $S{primary} // $file // '(unset)';
+    my $sys_path = '/etc/net-mgr/net-chat-autoresponder.conf';
+    my $note = '';
+    if (defined $editing && $editing ne $sys_path
+        && $editing !~ m{^\Q$sys_path\E\.d/})
+    {
+        (my $base = $editing) =~ s{.*/}{};
+        $note = <<"USER";
+
+NOTE: you are editing a USER-SCOPE file:
+
+  $editing
+
+The systemd service runs as root and reads only /etc/net-mgr/. To promote
+your edits into the running service, either copy or symlink this file
+into /etc/net-mgr/net-chat-autoresponder.d/ (e.g.
+`sudo install -m 0644 '$editing' /etc/net-mgr/net-chat-autoresponder.d/$base`)
+and THEN restart the daemon.
+USER
+    }
+    my $body = <<"MSG";
 net-chat-autoresponder reads its config once at startup.
 Apply saved changes with one of:
 
@@ -1325,7 +1387,7 @@ Or, for a smoke test without touching systemd:
 
   sudo -u root net-chat-autoresponder --once --dry-run
 
-There is no in-band SIGHUP / REPAIR action for this today.
+There is no in-band SIGHUP / REPAIR action for this today.$note
 MSG
     $mw->messageBox(-title => 'Restart the autoresponder',
                     -message => $body, -type => 'OK', -icon => 'info');
@@ -2514,8 +2576,18 @@ sub write_file_atomic {
     my ($path, $lines) = @_;
     my $dir = dirname($path);
     unless (-d $dir) {
-        # Mostly for the .d/ overlay directory on a fresh install.
-        mkdir $dir or return msg('mkdir failed', "mkdir $dir: $!");
+        # Two callers: a .d/ overlay dir on a fresh install (single level
+        # under an already-existing /etc/net-mgr/), and a user-scope Save
+        # into $XDG_CONFIG_HOME/net-mgr/ where BOTH the ~/.config/ tree
+        # and the net-mgr/ subdir may be absent. make_path handles either.
+        require File::Path;
+        my $err;
+        File::Path::make_path($dir, { error => \$err });
+        if (ref $err eq 'ARRAY' && @$err) {
+            my ($first) = @$err;
+            my (undef, $why) = %$first;
+            return msg('mkdir failed', "make_path $dir: $why");
+        }
     }
     my $tmp = "$path.tmp.$$";
     if (open my $fh, '>', $tmp) {
