@@ -1120,8 +1120,10 @@ sub run {
     $left_btns = $left_frame->Frame->pack(-side => 'top', -fill => 'x', -pady => 2);
     $left_btns->Button(-text => '+ Add',    -command => \&do_add_rule)
               ->pack(-side => 'left',  -padx => 2);
-    $left_btns->Button(-text => 'Toggle',   -command => \&do_toggle_enabled)
-              ->pack(-side => 'left',  -padx => 2);
+    # Toggle was here — the Space/double-click bindings on the
+    # rule list (documented in the pane label) already toggle
+    # enable state; a button labelled "Toggle" without context
+    # read as a mystery.
     $left_btns->Button(-text => 'Delete',   -command => \&do_delete_rule)
               ->pack(-side => 'left',  -padx => 2);
 
@@ -1678,9 +1680,11 @@ sub row_shared_wifi {
                 '(no shared-wifi.conf — see etc/shared-wifi.conf.sample)');
         }
     }
-    $row->Button(-text => 'Insert',
-                 -command => sub { _wifi_insert_from_pick(0) })
-        ->pack(-side => 'left', -padx => 2);
+    # Insert (no note) was here — the BrowseEntry's -browsecmd
+    # already fires _wifi_insert_from_pick(0) when the operator
+    # picks from the dropdown, so the button was redundant. The
+    # with-note variant stays because there's no other trigger
+    # for that flow.
     $row->Button(-text => 'Insert w/ note',
                  -command => sub { _wifi_insert_from_pick(1) })
         ->pack(-side => 'left', -padx => 2);
