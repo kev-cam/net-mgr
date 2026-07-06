@@ -1695,6 +1695,14 @@ sub row_shared_wifi {
     $row->Button(-text => 'QR',
                  -command => \&_show_qr_from_pick)
         ->pack(-side => 'left', -padx => 2);
+    # Insert the QR as UTF8 block art into the body. The recipient
+    # sees the QR itself in-line and can scan it off their screen —
+    # useful when the chat surface doesn't hyperlink WIFI: URIs the
+    # way BitChat does. Complements plain URI insert (browsecmd) and
+    # the Toplevel view (QR button).
+    $row->Button(-text => 'Insert QR',
+                 -command => \&_insert_qr_from_pick)
+        ->pack(-side => 'left', -padx => 2);
     # Launcher for nm-connection-editor. Some remoting stacks (RDP)
     # don't paint the system-tray NM applet; letting the operator open
     # the editor directly from here sidesteps that. Detached so
@@ -1726,12 +1734,11 @@ sub row_shared_wifi {
 # beneath it (so the operator can also copy the URI, and so a
 # recipient without a scanner can still see the SSID/PSK). Requires
 # qrencode in PATH — shows a dnf/apt hint if absent.
-sub _show_qr_from_pick {
-    # Prefer whatever WIFI: URI the operator has actually put in
-    # the Body text — the picker is just one way to author one;
-    # hand-edits to the URI (fixing SSID/PSK to match reality) are
-    # the common case and the QR must reflect them. Fall through
-    # to the picker only when the body has no URI.
+sub _resolve_wifi_uri_for_qr {
+    # Body-first, picker-fallback. Returns (uri, entry) or ().
+    # Entry is a full %SHARED_WIFI hash on the picker path and a
+    # minimal { ssid => ... } stub on the body path (no PSK is
+    # available or needed once we have the URI verbatim).
     my $uri;
     my $ssid_from_body;
     if (my $t = $E{_multi}{body}) {
@@ -1741,17 +1748,20 @@ sub _show_qr_from_pick {
             ($ssid_from_body) = $uri =~ /S:([^;]*)/;
         }
     }
-    my $entry;
     if (!defined $uri) {
-        (undef, $entry) = _resolve_picked_wifi();
-        return unless $entry;
-        $uri = _wifi_uri($entry);
-    } else {
-        # Synth a minimal entry for the Toplevel's SSID label + the
-        # temp-file lifetime path — no PSK involved on this branch.
-        $entry = { ssid => (length($ssid_from_body // '')
-                            ? $ssid_from_body : '(from body)') };
+        my (undef, $entry) = _resolve_picked_wifi();
+        return () unless $entry;
+        return (_wifi_uri($entry), $entry);
     }
+    return ($uri, {
+        ssid => (length($ssid_from_body // '')
+                 ? $ssid_from_body : '(from body)'),
+    });
+}
+
+sub _show_qr_from_pick {
+    my ($uri, $entry) = _resolve_wifi_uri_for_qr();
+    return unless defined $uri;
     my $qrencode;
     for my $cand (qw(/usr/bin/qrencode /usr/local/bin/qrencode)) {
         if (-x $cand) { $qrencode = $cand; last }
@@ -1785,6 +1795,99 @@ sub _show_qr_from_pick {
         return;
     }
     _show_qr_toplevel($png, $uri, $entry);
+}
+
+# Replace the body content with a UTF8 block-character QR of the
+# resolved URI. Recipient scans it off their screen — useful when
+# the chat surface doesn't render WIFI: URIs as click-to-join.
+# `qrencode -t UTF8` uses half-height block chars, so a typical
+# WPA URI comes out ~13 rows x ~25 cols — comfortable for a chat
+# message. `-m 2` gives a smaller quiet zone (2 modules) to keep
+# the message compact; scanners still decode reliably.
+sub _insert_qr_from_pick {
+    my ($uri) = _resolve_wifi_uri_for_qr();
+    return unless defined $uri;
+    my $qrencode;
+    for my $cand (qw(/usr/bin/qrencode /usr/local/bin/qrencode)) {
+        if (-x $cand) { $qrencode = $cand; last }
+    }
+    if (!$qrencode) {
+        chomp(my $path = `command -v qrencode 2>/dev/null`);
+        $qrencode = $path if length $path && -x $path;
+    }
+    if (!$qrencode) {
+        _msg('qrencode not found',
+             "Install libqrencode's CLI:\n"
+           . "  sudo dnf install qrencode\n"
+           . "  sudo apt install qrencode");
+        return;
+    }
+    # Piped-open with argv form so the URI is passed verbatim — no
+    # shell metachar issues from `;` in the URI.
+    my $qr = '';
+    if (open my $ph, '-|', $qrencode, '-t', 'UTF8', '-m', '2',
+                                       '-l', 'M', '--', $uri) {
+        local $/ = undef;
+        $qr = <$ph>;
+        close $ph;
+    }
+    if (!length $qr) {
+        _msg('QR render failed',
+             "qrencode -t UTF8 produced no output.\nURI: $uri");
+        return;
+    }
+    # Trim trailing newline so the block sits flush with what we
+    # append below.
+    $qr =~ s/\n\z//;
+    # Parse the WIFI: URI back into fields so we can append the
+    # cleartext SSID + password below the block — a recipient whose
+    # camera can't scan (or who's on a text-only surface) still gets
+    # a usable credential. Parser respects `\;` / `\\` escaping.
+    my (%kv);
+    if ($uri =~ /^WIFI:(.+);;\z/) {
+        my $inner = $1;
+        my ($cur, $esc) = ('', 0);
+        my @fields;
+        for my $c (split //, $inner) {
+            if ($esc)         { $cur .= $c; $esc = 0 }
+            elsif ($c eq '\\'){ $esc = 1 }
+            elsif ($c eq ';') { push @fields, $cur; $cur = '' }
+            else              { $cur .= $c }
+        }
+        push @fields, $cur if length $cur;
+        for my $f (@fields) {
+            if ($f =~ /^([A-Z]):(.*)\z/) { $kv{$1} = $2 }
+        }
+    }
+    my $ssid = $kv{S} // '';
+    my $pass = $kv{P} // '';
+    my @tail;
+    push @tail, "SSID: $ssid"     if length $ssid;
+    push @tail, "password: $pass" if length $pass;
+    my $insert = $qr;
+    $insert .= "\n" . join("\n", @tail) if @tail;
+    my $t = $E{_multi}{body} or return;
+    my $body = $t->get('1.0', 'end-1c');
+    # Same replace-in-place / selection-replace / cursor-insert
+    # precedence as _wifi_insert_from_pick. When the body already
+    # contains a WIFI: URI, swap it out — subsequent Insert-QR
+    # clicks re-insert at cursor (no cheap way to detect a prior
+    # QR block for replacement).
+    if ($body =~ /WIFI:.*?;;/) {
+        (my $new = $body) =~ s/WIFI:.*?;;/$insert/;
+        $t->delete('1.0', 'end');
+        $t->insert('1.0', $new);
+    } else {
+        my @sel = $t->tagRanges('sel');
+        if (@sel) {
+            $t->delete($sel[0], $sel[1]);
+            $t->insert($sel[0], $insert);
+        } else {
+            $t->insert('insert', $insert);
+        }
+    }
+    $E{fields}{body} = $t->get('1.0', 'end-1c');
+    $t->focus;
 }
 
 # Pop a Toplevel with the QR PNG at native size, the SSID label, and
