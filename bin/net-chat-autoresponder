@@ -236,7 +236,26 @@ sub fire_periodic_rules {
     my $now = time;
     for my $r (@$rules) {
         next if !defined $r->{_next_fire} || $r->{_next_fire} > $now;
-        if (($r->{mode} // '') eq 'fanout_bitchat_peers') {
+        # Fanout precedence (highest wins):
+        #   1. Explicit mode=fanout_bitchat_peers — dedicated fanout with
+        #      ack-skip bookkeeping (existing behaviour).
+        #   2. IMPLICIT fanout — a mixed-trigger rule with periodic AND
+        #      bitchat_peer_first_seen, whose target references ${peer_id}.
+        #      The operator's intent is "greet each peer on first sighting
+        #      AND re-greet everyone on a schedule"; without this
+        #      auto-fanout the periodic path would fire with empty peer_id
+        #      and log 'target not 16-hex' every minute. Skip when there
+        #      are no known peers rather than firing a broken single event.
+        #   3. Single-fire — periodic-only rule with no per-peer target;
+        #      ${nickname}/${sender} carry the global 'as' so a broadcast
+        #      rule can self-identify.
+        my $mode = $r->{mode} // '';
+        my $target_needs_peer =
+            defined $r->{target} && $r->{target} =~ /\$\{peer_id\}/;
+        if ($mode eq 'fanout_bitchat_peers'
+            || ($target_needs_peer
+                && grep { $_ eq 'bitchat_peer_first_seen' } @{ $r->{triggers} // [] }))
+        {
             _fire_fanout_bitchat_peers($r, $now);
         } else {
             # ${peer_id}/${session}/cap.* aren't meaningful for a wall-clock
