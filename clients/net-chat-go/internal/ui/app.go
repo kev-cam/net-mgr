@@ -38,8 +38,15 @@ import (
 
 	"github.com/skip2/go-qrcode"
 
+	"github.com/kev-cam/net-chat-go/internal/bitchat/mesh"
 	"github.com/kev-cam/net-chat-go/internal/netmgr"
 )
+
+// meshSession is the pseudo-session name used to route the UI's
+// message log to bitchat mesh AppEvents instead of net-mgr ROWs.
+// Selecting it in the picker swaps the source; posting on it goes
+// through mesh.Service.PostPublic / PostDM (@HEX:prefix routes DM).
+const meshSession = "bitchat-mesh"
 
 // wifiURIRe matches a WIFI:...;; URI anywhere in a message body. Same
 // non-greedy shape bin/net-chat-autoresponder uses.
@@ -97,18 +104,27 @@ func colorForSender(sender string) color.NRGBA {
 
 const bridgeSession = "bitchat-bridge"
 
-// Config is the wiring the caller (cmd/net-chat) hands us. Stream MUST
-// already be HELLO'd + AUTH'd because SUBSCRIBEs fire at startup.
-// CtrlDial is called LAZILY on the first Post/Upload/Files action —
-// deferring the second ssh-keygen sign avoids a launch-time hang when
-// the key needs a passphrase or ssh-agent. The dial+HELLO+AUTH cost
-// hits the operator once, at the moment they take an action, not
-// pre-emptively at window open.
+// Config is the wiring the caller (cmd/net-chat) hands us. The Stream
+// connection is dialed LAZILY on a background goroutine inside Run()
+// so the window opens even when the daemon is unreachable — Android
+// launches with no network, phone off-WiFi, whatever. Otherwise
+// main.go's synchronous Dial would keep the app on a blank screen
+// forever. Connection status is surfaced in the status bar; a
+// Connect… button opens a dialog for changing the address. CtrlDial
+// (also called with an address) fires on the first Post/Upload/Files
+// action, deferring its ssh-keygen sign.
 type Config struct {
-	Stream   *netmgr.Client // SUBSCRIBE + ROW/EOS traffic (readLoop owns Recv)
-	CtrlDial func() (*netmgr.Client, error)
-	Session  string
-	Title    string
+	StreamDial func(addr string) (*netmgr.Client, error)
+	CtrlDial   func(addr string) (*netmgr.Client, error)
+	Address    string // initial host:port; blank ⇒ don't auto-dial, show Connect dialog
+	Session    string
+	Title      string
+
+	// Mesh is the optional native BitChat mesh service. When set,
+	// the picker gains a "bitchat-mesh" session that drives from
+	// its AppEvents, and its peer roster augments the net-mgr
+	// bitchat_peers panel. When nil the UI behaves as before.
+	Mesh *mesh.Service
 }
 
 // peer holds the roster row we display in the right-side panel.
@@ -175,6 +191,11 @@ type state struct {
 
 	cancel context.CancelFunc // cancels the current readLoop
 
+	// Lazy stream connection. Redialed when the operator hits
+	// Connect… with a new address.
+	address string
+	stream  *netmgr.Client
+
 	// Lazy control connection. Established on the first Post /
 	// CHAT_* invocation, then reused for the window's lifetime.
 	// Guarded by ctrlOnce so a concurrent Send + Upload don't race.
@@ -186,16 +207,23 @@ type state struct {
 // getCtrl returns the memoized ctrl connection, dialing on first use.
 // Blocks until the ssh-keygen sign completes. Errors surface via the
 // caller (typically shown in a dialog).
-func (st *state) getCtrl(dial func() (*netmgr.Client, error)) (*netmgr.Client, error) {
+func (st *state) getCtrl(dial func(addr string) (*netmgr.Client, error)) (*netmgr.Client, error) {
 	st.ctrlOnce.Do(func() {
-		st.ctrl, st.ctrlErr = dial()
+		st.mu.Lock()
+		addr := st.address
+		st.mu.Unlock()
+		if addr == "" {
+			st.ctrlErr = errors.New("not connected — hit Connect… first")
+			return
+		}
+		st.ctrl, st.ctrlErr = dial(addr)
 	})
 	return st.ctrl, st.ctrlErr
 }
 
 // Run opens the main window and blocks until the operator closes it.
 func Run(cfg Config) error {
-	if cfg.Stream == nil || cfg.CtrlDial == nil {
+	if cfg.StreamDial == nil || cfg.CtrlDial == nil {
 		return errors.New("ui: nil stream or ctrl dial")
 	}
 	if cfg.Session == "" {
@@ -207,6 +235,7 @@ func Run(cfg Config) error {
 
 	st := &state{
 		session:  cfg.Session,
+		address:  cfg.Address,
 		peers:    make(map[string]*peer),
 		peerList: binding.NewStringList(),
 	}
@@ -313,6 +342,25 @@ func Run(cfg Config) error {
 		target := st.session
 		st.mu.Unlock()
 		entry.SetText("")
+
+		// bitchat-mesh routes: @HEX16: prefix → PostDM, else
+		// PostPublic. Fully bypasses net-mgr's Ctrl connection.
+		if target == meshSession && cfg.Mesh != nil {
+			go func() {
+				peerID, body, ok := extractMeshDMPrefix(text)
+				var err error
+				if ok {
+					err = cfg.Mesh.PostDM(peerID, body)
+				} else {
+					err = cfg.Mesh.PostPublic(text)
+				}
+				if err != nil {
+					fyne.Do(func() { dialog.ShowError(err, w) })
+				}
+			}()
+			return
+		}
+
 		go func() {
 			ctrl, err := st.getCtrl(cfg.CtrlDial)
 			if err != nil {
@@ -422,8 +470,12 @@ func Run(cfg Config) error {
 	peerPanel := container.NewBorder(peerHeader, nil, nil, nil, peerListW)
 
 	// --- Assembly ------------------------------------------------
+	// connectBtn is created further down (needs `connect` closure);
+	// placeholder Container swaps it in on first render.
+	topBarConnect := container.NewHBox()
 	topBar := container.NewBorder(nil, nil,
-		widget.NewLabel("Session:"), refreshBtn,
+		widget.NewLabel("Session:"),
+		container.NewHBox(refreshBtn, topBarConnect),
 		sessionSelect,
 	)
 	// File-transfer buttons sit to the LEFT of the compose entry so
@@ -452,8 +504,11 @@ func Run(cfg Config) error {
 		st.session = name
 		st.mu.Unlock()
 
-		if oldSub != "" {
-			_ = cfg.Stream.Unsubscribe(oldSub)
+		st.mu.Lock()
+		stream := st.stream
+		st.mu.Unlock()
+		if oldSub != "" && stream != nil {
+			_ = stream.Unsubscribe(oldSub)
 		}
 		st.mu.Lock()
 		st.msgs = nil
@@ -463,10 +518,21 @@ func Run(cfg Config) error {
 		msgList.ScrollToTop()
 		status.SetText(fmt.Sprintf("switching to %q…", name))
 
+		// bitchat-mesh is fed by cfg.Mesh's AppEvents in a separate
+		// goroutine (started in Run below). Don't fire a net-mgr
+		// SUBSCRIBE for it.
+		if name == meshSession {
+			status.SetText("bitchat mesh — live")
+			return
+		}
+
+		if stream == nil {
+			return // not connected yet — Connect… will re-subscribe
+		}
 		// Kick the SUBSCRIBE off a goroutine so a slow network I/O
 		// call doesn't freeze the UI thread that fired OnChanged.
 		go func() {
-			sub, err := cfg.Stream.SubscribeChat(name)
+			sub, err := stream.SubscribeChat(name)
 			fyne.Do(func() {
 				if err != nil {
 					status.SetText("subscribe: " + err.Error())
@@ -491,6 +557,9 @@ func Run(cfg Config) error {
 	seed := []string{cfg.Session}
 	if !contains(seed, bridgeSession) {
 		seed = append(seed, bridgeSession)
+	}
+	if cfg.Mesh != nil && !contains(seed, meshSession) {
+		seed = append(seed, meshSession)
 	}
 	sort.Strings(seed)
 	sessionSelect.Options = seed
@@ -542,35 +611,103 @@ func Run(cfg Config) error {
 	}
 	refreshBtn.OnTapped = func() { loadSessions(true) }
 
-	// --- Read loop wiring ----------------------------------------
-	// One goroutine drains Recv() for the lifetime of the window.
-	// It routes ROWs to the message list or the peer roster based
-	// on the table= field. The chat sub id changes on session
-	// switches; the peer sub id stays.
-	ctx, cancel := context.WithCancel(context.Background())
-	st.mu.Lock()
-	st.cancel = cancel
-	st.mu.Unlock()
-	go func() {
-		if err := readLoop(ctx, cfg.Stream, st, status, msgList); err != nil {
-			fyne.Do(func() { status.SetText("disconnected: " + err.Error()) })
+	// connect (re)dials the stream connection to addr, then kicks off
+	// the read loop + initial subscribes. Called on Run() startup with
+	// cfg.Address, and again whenever the operator confirms a new
+	// address in the Connect… dialog. Any prior connection + readLoop
+	// is torn down first.
+	var connect func(addr string)
+	connect = func(addr string) {
+		st.mu.Lock()
+		if st.cancel != nil {
+			st.cancel()
 		}
-	}()
+		if st.stream != nil {
+			_ = st.stream.Close()
+			st.stream = nil
+		}
+		st.chatSubID = ""
+		st.peerSubID = ""
+		st.address = addr
+		st.mu.Unlock()
 
-	// --- Startup subscribes --------------------------------------
-	// Peer sub first so the roster starts filling while we're still
-	// negotiating the chat sub. Not fatal if peers subscribe fails
-	// (daemon may not have the bridge feature enabled).
-	go func() {
-		if sub, err := cfg.Stream.SubscribeBitChatPeers(); err == nil {
-			st.mu.Lock()
-			st.peerSubID = sub
-			st.mu.Unlock()
-		} else {
-			fyne.Do(func() { status.SetText("peers: " + err.Error()) })
+		if addr == "" {
+			status.SetText("not connected — hit Connect…")
+			return
 		}
-		loadSessions(false)
-	}()
+		status.SetText("connecting to " + addr + "…")
+		go func() {
+			stream, err := cfg.StreamDial(addr)
+			if err != nil {
+				fyne.Do(func() {
+					status.SetText("connect: " + err.Error())
+					dialog.ShowError(err, w)
+				})
+				return
+			}
+			st.mu.Lock()
+			st.stream = stream
+			ctx, cancel := context.WithCancel(context.Background())
+			st.cancel = cancel
+			st.mu.Unlock()
+
+			// Read loop drains ROW/EOS/OK/ERR frames from this
+			// connection. Its lifetime is scoped to ctx; a
+			// subsequent connect() cancels + Close's this.
+			go func() {
+				if err := readLoop(ctx, stream, st, status, msgList); err != nil {
+					fyne.Do(func() { status.SetText("disconnected: " + err.Error()) })
+				}
+			}()
+			// Peer sub first so the roster fills while chat sub
+			// negotiates. Non-fatal on failure.
+			if sub, err := stream.SubscribeBitChatPeers(); err == nil {
+				st.mu.Lock()
+				st.peerSubID = sub
+				st.mu.Unlock()
+			} else {
+				fyne.Do(func() { status.SetText("peers: " + err.Error()) })
+			}
+			// Initial chat sub for the picker's current session.
+			st.mu.Lock()
+			sess := st.session
+			st.mu.Unlock()
+			if sub, err := stream.SubscribeChat(sess); err == nil {
+				st.mu.Lock()
+				st.chatSubID = sub
+				st.mu.Unlock()
+				fyne.Do(func() {
+					status.SetText(fmt.Sprintf("connected — %s (sub=%s)…", sess, sub))
+				})
+			} else {
+				fyne.Do(func() {
+					status.SetText("subscribe: " + err.Error())
+				})
+			}
+			loadSessions(false)
+		}()
+	}
+
+	// Connect… button opens a dialog for entering host:port. Populated
+	// with the current address so a re-connect is one Enter press.
+	connectBtn := widget.NewButton("Connect…", func() {
+		st.mu.Lock()
+		curr := st.address
+		st.mu.Unlock()
+		addrEntry := widget.NewEntry()
+		addrEntry.SetText(curr)
+		addrEntry.SetPlaceHolder("host:port (e.g. 192.168.15.104:7531)")
+		dialog.ShowForm("Connect", "Connect", "Cancel",
+			[]*widget.FormItem{
+				{Text: "Address", Widget: addrEntry},
+			},
+			func(ok bool) {
+				if !ok || strings.TrimSpace(addrEntry.Text) == "" {
+					return
+				}
+				connect(strings.TrimSpace(addrEntry.Text))
+			}, w)
+	})
 
 	// --- Close cleanup -------------------------------------------
 	w.SetOnClosed(func() {
@@ -578,22 +715,162 @@ func Run(cfg Config) error {
 		if st.cancel != nil {
 			st.cancel()
 		}
+		stream := st.stream
 		chatSub, peerSub := st.chatSubID, st.peerSubID
 		ctrl := st.ctrl
 		st.mu.Unlock()
-		for _, sub := range []string{chatSub, peerSub} {
-			if sub != "" {
-				_ = cfg.Stream.Unsubscribe(sub)
+		if stream != nil {
+			for _, sub := range []string{chatSub, peerSub} {
+				if sub != "" {
+					_ = stream.Unsubscribe(sub)
+				}
 			}
+			_ = stream.Close()
 		}
-		_ = cfg.Stream.Close()
 		if ctrl != nil {
 			_ = ctrl.Close()
 		}
 	})
 
+	topBarConnect.Add(connectBtn)
+	topBarConnect.Refresh()
+
+	// Kick off the initial dial. If cfg.Address is blank, connect()
+	// just parks in "not connected" state and waits for Connect….
+	go connect(cfg.Address)
+
+	// Start the bitchat mesh event loop when cfg.Mesh is provided.
+	// The mesh service must already be Started by the caller — we
+	// only consume its Events here.
+	if cfg.Mesh != nil {
+		go meshEventLoop(cfg.Mesh, st, msgList, status)
+	}
+
 	w.ShowAndRun()
 	return nil
+}
+
+// meshEventLoop drains cfg.Mesh.Events and translates AppMessage /
+// AppPeer / AppAdapter events into UI state changes. It runs for the
+// life of the window; when Mesh's Events channel closes (on Close())
+// the loop exits.
+func meshEventLoop(m *mesh.Service, st *state, msgList *widget.List, status *widget.Label) {
+	for ev := range m.Events() {
+		switch e := ev.(type) {
+		case mesh.AppMessage:
+			// Only display when the mesh session is currently
+			// selected. Otherwise skip — the mesh peer/handshake
+			// state is still updated in the mesh Service; only
+			// the message log is per-session.
+			st.mu.Lock()
+			showing := st.session == meshSession
+			st.mu.Unlock()
+			if !showing || e.Message == nil {
+				continue
+			}
+			entry := messageEntry{
+				sender: e.Message.Sender,
+				body:   e.Message.Content,
+			}
+			if entry.sender == "" {
+				entry.sender = e.FromID
+			}
+			st.mu.Lock()
+			entry.folded = false
+			st.msgs = append(st.msgs, entry)
+			last := len(st.msgs) - 1
+			st.mu.Unlock()
+			fyne.Do(func() {
+				msgList.Refresh()
+				msgList.ScrollTo(last)
+			})
+		case mesh.AppPeer:
+			// Merge mesh peers into the roster. Nickname empty on
+			// first sighting; second Announce fills it. Display
+			// suffix `[mesh]` so the UI can tell them apart from
+			// net-mgr bitchat_peers ROWs.
+			pid := e.PeerID
+			nick := e.Nickname
+			if nick == "" {
+				nick = "(no nick)"
+			}
+			marker := " "
+			if e.Connected {
+				marker = "●"
+			}
+			display := fmt.Sprintf("%s %s (%s) [mesh]", marker, nick, pid)
+			// Direct manipulation of st.peers is under st.mu.
+			st.mu.Lock()
+			if _, ok := st.peers[pid]; !ok {
+				st.peers[pid] = &peer{peerID: pid}
+				st.peerOrder = append(st.peerOrder, pid)
+			}
+			p := st.peers[pid]
+			p.connected = e.Connected
+			if e.Nickname != "" {
+				p.nickname = e.Nickname
+			}
+			// Re-render the display list.
+			out := make([]string, 0, len(st.peerOrder))
+			for _, id := range st.peerOrder {
+				pp := st.peers[id]
+				n := pp.nickname
+				if n == "" {
+					n = "(no nick)"
+				}
+				m := " "
+				if pp.connected {
+					m = "●"
+				}
+				out = append(out, fmt.Sprintf("%s %s (%s)", m, n, id))
+			}
+			st.mu.Unlock()
+			_ = display
+			fyne.Do(func() { _ = st.peerList.Set(out) })
+		case mesh.AppAdapter:
+			msg := "bitchat mesh: adapter " + boolOnOff(e.PoweredOn)
+			if e.Reason != "" {
+				msg += " (" + e.Reason + ")"
+			}
+			fyne.Do(func() { status.SetText(msg) })
+		}
+	}
+}
+
+func boolOnOff(v bool) string {
+	if v {
+		return "on"
+	}
+	return "off"
+}
+
+// extractMeshDMPrefix parses a "@<16hex>: <body>" leading prefix off
+// text. On a match returns (peer_id, body, true); else ("", text, false).
+// Same convention the autoresponder uses for BitChat DMs.
+func extractMeshDMPrefix(text string) (peerID, body string, ok bool) {
+	if !strings.HasPrefix(text, "@") {
+		return "", text, false
+	}
+	// Expect exactly 16 hex chars then ": ".
+	if len(text) < 1+16+2 {
+		return "", text, false
+	}
+	pid := text[1:17]
+	for i := 0; i < 16; i++ {
+		c := pid[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return "", text, false
+		}
+	}
+	if text[17] != ':' {
+		return "", text, false
+	}
+	// Skip ": " (colon + optional space).
+	rest := text[18:]
+	if strings.HasPrefix(rest, " ") {
+		rest = rest[1:]
+	}
+	return strings.ToLower(pid), rest, true
 }
 
 // readLoop drains the connection until ctx is cancelled or the socket

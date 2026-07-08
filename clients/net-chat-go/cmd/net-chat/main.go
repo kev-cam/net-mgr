@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -14,6 +15,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kev-cam/net-chat-go/internal/ble"
+	"github.com/kev-cam/net-chat-go/internal/bitchat/crypto"
+	"github.com/kev-cam/net-chat-go/internal/bitchat/mesh"
 	"github.com/kev-cam/net-chat-go/internal/netmgr"
 	"github.com/kev-cam/net-chat-go/internal/ui"
 )
@@ -43,6 +47,12 @@ func main() {
 		"send this text as one message to --session and exit (skips subscribe)")
 	gui := flag.Bool("gui", false,
 		"launch the Fyne desktop UI instead of the streaming CLI")
+	bitchat := flag.Bool("bitchat", false,
+		"enable BitChat mesh (BLE) — adds a bitchat-mesh session in "+
+			"the picker with a native peer roster. Requires a BLE "+
+			"adapter (BlueZ / CoreBluetooth / WinRT). Ignored without --gui.")
+	bitchatNick := flag.String("bitchat-nick", "",
+		"nickname advertised on the BitChat mesh (default = --as)")
 	flag.Parse()
 
 	if *keyID == "" {
@@ -59,12 +69,64 @@ func main() {
 		*as = *keyID
 	}
 
-	if err := run(*listen, *session, *keyID, *keyFile, *as, *post, *dialTimeout, *doAuth, *gui); err != nil {
+	if *bitchatNick == "" {
+		*bitchatNick = *as
+	}
+
+	if err := run(*listen, *session, *keyID, *keyFile, *as, *post, *dialTimeout, *doAuth, *gui, *bitchat, *bitchatNick); err != nil {
 		log.Fatalf("net-chat: %v", err)
 	}
 }
 
-func run(addr, session, keyID, keyFile, as, post string, dialTimeout time.Duration, doAuth, gui bool) error {
+func run(addr, session, keyID, keyFile, as, post string, dialTimeout time.Duration, doAuth, gui, bitchatEnable bool, bitchatNick string) error {
+	if gui {
+		// GUI path: don't dial synchronously — a blank Fyne window
+		// waiting on a Dial that will never resolve (Android with
+		// no nas3 route, phone off-WiFi, etc) is the whole reason
+		// for the lazy factory. Both dials go through the UI's
+		// connect / getCtrl paths.
+		dialWith := func(a string) (*netmgr.Client, error) {
+			c, err := netmgr.Dial(a, dialTimeout)
+			if err != nil {
+				return nil, fmt.Errorf("dial %s: %w", a, err)
+			}
+			c.SetAs(as)
+			if err := c.Hello(as); err != nil {
+				return nil, fmt.Errorf("HELLO: %w", err)
+			}
+			if doAuth {
+				if err := c.Auth(keyID, keyFile); err != nil {
+					return nil, fmt.Errorf("AUTH: %w", err)
+				}
+			}
+			return c, nil
+		}
+		cfg := ui.Config{
+			StreamDial: dialWith,
+			CtrlDial:   dialWith,
+			Address:    addr,
+			Session:    session,
+		}
+		if bitchatEnable {
+			id, source, err := crypto.LoadOrEphemeral()
+			if err != nil {
+				return fmt.Errorf("bitchat identity: %w", err)
+			}
+			if source {
+				fmt.Fprintf(os.Stderr, "bitchat: loaded seed from $BITCHAT_ID_FILE, peer_id=%s\n", id.PeerID)
+			} else {
+				fmt.Fprintf(os.Stderr, "bitchat: ephemeral seed, peer_id=%s (set BITCHAT_ID_FILE for stable identity)\n", id.PeerID)
+			}
+			m := mesh.NewService(id, bitchatNick, ble.New())
+			if err := m.Start(context.Background()); err != nil {
+				fmt.Fprintf(os.Stderr, "bitchat: start failed: %v (continuing without mesh)\n", err)
+			} else {
+				cfg.Mesh = m
+			}
+		}
+		return ui.Run(cfg)
+	}
+
 	c, err := netmgr.Dial(addr, dialTimeout)
 	if err != nil {
 		return err
@@ -91,31 +153,6 @@ func run(addr, session, keyID, keyFile, as, post string, dialTimeout time.Durati
 		}
 		fmt.Fprintf(os.Stderr, "posted to %q (reply=%v)\n", session, reply)
 		return nil
-	}
-
-	if gui {
-		// Ctrl connection is dialed LAZILY on first Post/CHAT_* —
-		// deferring the second ssh-keygen sign avoids a launch-
-		// time hang when the key needs a passphrase or ssh-agent.
-		// Two-connection model still matches Perl bin/net-chat's
-		// (stream + ctrl) pattern; just delayed.
-		ctrlDial := func() (*netmgr.Client, error) {
-			ctrl, err := netmgr.Dial(addr, dialTimeout)
-			if err != nil {
-				return nil, fmt.Errorf("dial ctrl: %w", err)
-			}
-			ctrl.SetAs(as)
-			if err := ctrl.Hello(as); err != nil {
-				return nil, fmt.Errorf("ctrl HELLO: %w", err)
-			}
-			if doAuth {
-				if err := ctrl.Auth(keyID, keyFile); err != nil {
-					return nil, fmt.Errorf("ctrl AUTH: %w", err)
-				}
-			}
-			return ctrl, nil
-		}
-		return ui.Run(ui.Config{Stream: c, CtrlDial: ctrlDial, Session: session})
 	}
 
 	sub, err := c.SubscribeChat(session)

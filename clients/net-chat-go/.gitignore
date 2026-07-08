@@ -1,1 +1,3 @@
 /bin/
+# Fyne-packaged APKs — 100+ MB each, always rebuilt from source.
+*.apk
