@@ -144,11 +144,14 @@ sub preflight {
     if (!defined $helper_path || !length $helper_path || !-x $helper_path) {
         my $h = $helper_path // '(unset)';
         warn "[bridge/preflight] skip: bitchat-jsonl helper not found "
-           . "('$h' is not executable). Build it from "
-           . "https://github.com/joshbtn/bitchat-rust + the in-tree "
-           . "src/bin/bitchat-jsonl.rs and install to /usr/local/bin, "
-           . "or set [bitchat_bridge] helper_path = /full/path in "
-           . "/etc/net-mgr/config.\n";
+           . "('$h' is not executable). Fix: run\n"
+           . "  net-mgr-bitchat-setup\n"
+           . "AS YOUR LOGIN USER (not root — Rust toolchain installs to "
+           . "\$HOME/.cargo/). It clones bitchat-rust, overlays the "
+           . "net-mgr-shipped delegate, builds, and — if it has sudo — "
+           . "restarts this service. Or install any bitchat-jsonl "
+           . "manually and set [bitchat_bridge] helper_path = /full/path "
+           . "in /etc/net-mgr/config.\n";
         return 1;
     }
     return 0;
