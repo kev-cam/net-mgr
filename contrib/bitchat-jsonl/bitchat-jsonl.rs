@@ -17,6 +17,7 @@ use bitchat_rust::protocol::Packet;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 struct JsonDelegate {
     nickname: RwLock<String>,
@@ -41,6 +42,13 @@ impl JsonDelegate {
         }
     }
     async fn set_mesh(&self, mesh: Arc<BluetoothMeshService>) {
+        // Sync our peer_id to whatever the mesh derived (SHA256(noise_pk)[:8]).
+        // packet_processor uses delegate.get_my_peer_id() for "is this packet
+        // from me?" checks — if it disagrees with the mesh's own peer_id our
+        // packets get treated as "not self" and echoed back, and mainline sees
+        // sender_id ≠ SHA256(noise_pk)[:8] and rejects us at Announce preflight.
+        let mesh_peer_id = mesh.get_peer_id_hex();
+        *self.peer_id.write().await = mesh_peer_id;
         *self.mesh.write().await = Some(mesh);
     }
     async fn with_mesh<F, Fut>(&self, scope: &str, f: F)
@@ -72,6 +80,21 @@ fn log(scope: &str, detail: &str) {
 
 #[async_trait]
 impl BluetoothMeshDelegate for JsonDelegate {
+    // Cross-site mesh relay: emit every raw wire packet the helper receives
+    // from BLE, BEFORE decode. The supervisor forwards these to peer bridge
+    // sites over IP; peer helpers inject them via inject_packet cmd. from
+    // is either a BLE MAC ("6A:44:FC:CE:A4:B5") or "relay:<peer_bridge>" for
+    // IP-injected packets — so a peer bridge can distinguish and NOT relay
+    // packets it received from another relay (breaks amplification loops).
+    async fn did_receive_raw_packet(&self, bytes: Vec<u8>, from_address: String) {
+        emit(json!({
+            "type": "packet_rx",
+            "hex":  hex::encode(&bytes),
+            "from": from_address,
+            "len":  bytes.len(),
+        }));
+    }
+
     async fn did_receive_message(&self, message: BitchatMessage) {
         // None = the default Mesh broadcast surface; Some(s) is a geohash
         // channel (Block/Neighborhood/City/...) which would have arrived via
@@ -81,14 +104,20 @@ impl BluetoothMeshDelegate for JsonDelegate {
             .channel
             .clone()
             .unwrap_or_else(|| "mesh".to_string());
+        // Include the sender's 16-hex peer_id so the supervisor can route
+        // an automated DM back to just that peer (e.g. the WiFi-onramp
+        // "WiFi?" auto-response). BitchatMessage carries it as
+        // Option<String>; empty string when absent so downstream JSON parsers
+        // don't have to distinguish null vs missing.
         emit(json!({
-            "type":    "msg",
-            "sender":  message.sender,
-            "body":    message.content,
-            "ts":      message.timestamp.timestamp(),
-            "channel": channel,
-            "is_dm":   message.is_private,
-            "id":      message.id,
+            "type":           "msg",
+            "sender":         message.sender,
+            "sender_peer_id": message.sender_peer_id.clone().unwrap_or_default(),
+            "body":           message.content,
+            "ts":             message.timestamp.timestamp(),
+            "channel":        channel,
+            "is_dm":          message.is_private,
+            "id":             message.id,
         }));
     }
 
@@ -101,11 +130,35 @@ impl BluetoothMeshDelegate for JsonDelegate {
     async fn did_update_peer_list(&self, peers: Vec<String>) {
         log("peers", &format!("{} active", peers.len()));
     }
-    async fn did_receive_noise_handshake_init(&self, peer_id: String, _p: Packet) {
+    async fn did_receive_noise_handshake_init(&self, peer_id: String, p: Packet) {
+        // The stock stub just logged and swallowed the packet — no
+        // responder ever ran, so foreign initiators (our Java Android
+        // client, third-party ports) got radio silence. Wire the
+        // mesh service's responder here, matching how main.rs bridges
+        // the same delegate event into `mesh_service.handle_noise_
+        // handshake_init(...)` via an AppEvent hop.
         log("noise/init", &peer_id);
+        let pid = peer_id.clone();
+        let pkt = p.clone();
+        self.with_mesh("noise/init", |mesh| async move {
+            mesh.handle_noise_handshake_init(pid, pkt).await
+                .map_err(|e| anyhow::anyhow!(e))
+        })
+        .await;
     }
-    async fn did_receive_noise_handshake_response(&self, peer_id: String, _p: Packet) {
+    async fn did_receive_noise_handshake_response(&self, peer_id: String, p: Packet) {
+        // Same fix as the init handler: forward to the mesh service so
+        // (a) as initiator we produce msg 3, (b) as responder we consume
+        // msg 3 and promote to transport. handle_noise_handshake_response
+        // dispatches internally on session state.
         log("noise/resp", &peer_id);
+        let pid = peer_id.clone();
+        let pkt = p.clone();
+        self.with_mesh("noise/resp", |mesh| async move {
+            mesh.handle_noise_handshake_response(pid, pkt).await
+                .map_err(|e| anyhow::anyhow!(e))
+        })
+        .await;
     }
     async fn did_receive_noise_identity_announce(&self, peer_id: String, _p: Packet) {
         log("noise/announce", &peer_id);
@@ -228,7 +281,7 @@ async fn main() -> Result<()> {
     let nickname = std::env::var("BITCHAT_NICK").unwrap_or_else(|_| "bigsony-bridge".to_string());
     eprintln!("[startup] nickname={}", nickname);
 
-    let delegate = Arc::new(JsonDelegate::new(nickname));
+    let delegate = Arc::new(JsonDelegate::new(nickname.clone()));
     let mesh = Arc::new(BluetoothMeshService::new(delegate.clone()).await?);
     // Plug the mesh handle back into the delegate so the should_* callbacks
     // can drive Noise handshakes. Without this the mesh service never
@@ -236,6 +289,149 @@ async fn main() -> Result<()> {
     delegate.set_mesh(mesh.clone()).await;
     mesh.start().await?;
     eprintln!("[startup] mesh service started; awaiting messages");
+
+    // Command reader: one JSON object per stdin line drives outbound mesh
+    // ops. Kept minimal — the Perl supervisor's job is to source these
+    // from net-chat subscriptions and pipe them in. Supported:
+    //   {"cmd":"peers"}                                — dump known peers
+    //   {"cmd":"send","body":"..."}                    — broadcast on mesh
+    //   {"cmd":"send","body":"...","to":"nickname"}    — private to a peer
+    // Results go to stdout as JSON lines (same channel as inbound msg
+    // events) tagged {"type":"cmd_reply","cmd":..., ...}. Errors are
+    // reported inline as {"type":"cmd_reply","ok":false,"err":"..."}.
+    let mesh_stdin = mesh.clone();
+    let my_nick = nickname.clone();
+    tokio::spawn(async move {
+        let stdin = tokio::io::stdin();
+        let mut lines = BufReader::new(stdin).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') { continue }
+                    let ev: serde_json::Value = match serde_json::from_str(line) {
+                        Ok(v)  => v,
+                        Err(e) => {
+                            println!("{}", json!({
+                                "type": "cmd_reply",
+                                "ok":   false,
+                                "err":  format!("bad json: {}", e),
+                            }));
+                            continue;
+                        }
+                    };
+                    let cmd = ev.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+                    match cmd {
+                        "peers" => {
+                            let peers = mesh_stdin.get_peer_manager().get_all_peers().await;
+                            let out: Vec<_> = peers.iter().map(|p| json!({
+                                "nickname":   p.nickname.clone().unwrap_or_default(),
+                                "peer_id":    p.id,
+                                "connected":  p.is_connected,
+                                "last_seen":  p.last_seen.to_rfc3339(),
+                            })).collect();
+                            println!("{}", json!({
+                                "type":  "cmd_reply",
+                                "cmd":   "peers",
+                                "ok":    true,
+                                "count": out.len(),
+                                "peers": out,
+                            }));
+                        }
+                        "send" => {
+                            let body = ev.get("body").and_then(|v| v.as_str())
+                                        .unwrap_or("").to_string();
+                            let to      = ev.get("to").and_then(|v| v.as_str())
+                                            .map(String::from);
+                            let to_peer = ev.get("to_peer").and_then(|v| v.as_str())
+                                            .map(String::from);
+                            if body.is_empty() {
+                                println!("{}", json!({
+                                    "type": "cmd_reply", "cmd": "send",
+                                    "ok": false, "err": "empty body",
+                                }));
+                                continue;
+                            }
+                            let msg = BitchatMessage::new(
+                                my_nick.clone(), body.clone(), chrono::Utc::now(),
+                            );
+                            // Priority: explicit hex peer_id > nickname > broadcast.
+                            // to_peer is 16 hex chars = 8 bytes. Useful when a
+                            // peer's stored nickname is garbled (old-format
+                            // announce senders) but we know the peer id.
+                            let (ok, err, path) = if let Some(hex_id) = to_peer.as_deref() {
+                                match hex::decode(hex_id) {
+                                    Ok(bytes) if bytes.len() == 8 => {
+                                        let mut rid = [0u8; 8];
+                                        rid.copy_from_slice(&bytes);
+                                        match mesh_stdin.send_private_message(msg, rid).await {
+                                            Ok(_)  => (true,  String::new(), format!("private:{}", hex_id)),
+                                            Err(e) => (false, format!("{}", e), format!("private:{}", hex_id)),
+                                        }
+                                    }
+                                    Ok(_)  => (false, "to_peer must decode to 8 bytes".into(), format!("private:{}", hex_id)),
+                                    Err(e) => (false, format!("bad hex: {}", e), format!("private:{}", hex_id)),
+                                }
+                            } else if let Some(nick) = to.as_deref() {
+                                match mesh_stdin.send_private_message_by_nickname(
+                                    msg, nick.to_string()).await
+                                {
+                                    Ok(_)  => (true,  String::new(), format!("private:{}", nick)),
+                                    Err(e) => (false, format!("{}", e), format!("private:{}", nick)),
+                                }
+                            } else {
+                                match mesh_stdin.send_message(msg).await {
+                                    Ok(_)  => (true,  String::new(), "broadcast".to_string()),
+                                    Err(e) => (false, format!("{}", e), "broadcast".to_string()),
+                                }
+                            };
+                            println!("{}", json!({
+                                "type": "cmd_reply", "cmd": "send",
+                                "ok":   ok,
+                                "path": path,
+                                "err":  err,
+                            }));
+                        }
+                        "inject_packet" => {
+                            // Cross-site mesh relay: replay raw wire bytes
+                            // that another bridge site captured via BLE and
+                            // forwarded to us over IP. hex = hex-encoded
+                            // full BitChat wire packet (padded, sig+all).
+                            // from = synthetic label like "relay:zmc1" — the
+                            // helper's packet_processor / bloom filter treats
+                            // it exactly like a BLE-received packet.
+                            let hex_str = ev.get("hex").and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                            let from = ev.get("from").and_then(|v| v.as_str())
+                                         .unwrap_or("relay:unknown").to_string();
+                            let (ok, err, len) = match hex::decode(hex_str) {
+                                Ok(bytes) => {
+                                    let n = bytes.len();
+                                    mesh_stdin.inject_raw_packet(bytes, from).await;
+                                    (true, String::new(), n)
+                                }
+                                Err(e) => (false, format!("bad hex: {}", e), 0),
+                            };
+                            println!("{}", json!({
+                                "type": "cmd_reply", "cmd": "inject_packet",
+                                "ok":   ok, "len":  len, "err":  err,
+                            }));
+                        }
+                        other => {
+                            println!("{}", json!({
+                                "type": "cmd_reply",
+                                "ok":   false,
+                                "err":  format!("unknown cmd '{}'", other),
+                            }));
+                        }
+                    }
+                }
+                Ok(None)  => break,   // EOF — supervisor closed stdin
+                Err(e)    => { eprintln!("[stdin] read error: {}", e); break }
+            }
+        }
+        eprintln!("[stdin] reader exited");
+    });
 
     // Run until interrupted. Helper exit lets the Perl supervisor respawn.
     tokio::signal::ctrl_c().await?;

@@ -93,8 +93,25 @@ echo "The net-bitchat-bridge supervisor's auto-discovery walks"
 echo "/home/*/src/bitchat-rust/target/release/, so it will find this"
 echo "without further configuration."
 echo
-echo "To activate:"
-echo "  sudo systemctl restart net-bitchat-bridge"
-echo "  sudo journalctl -u net-bitchat-bridge -b | tail -20"
+
+# Auto-restart the bridge when we CAN — passwordless sudo, or already
+# running as root. Otherwise print the reminder the operator's expecting.
+# We deliberately don't prompt for a password: the whole script's design
+# is "no sudo", so a password prompt HERE would be a surprise. Falling
+# back to a printed reminder keeps that contract.
+did_restart=0
+if [ "$(id -u)" = "0" ]; then
+  systemctl restart net-bitchat-bridge && did_restart=1 || true
+elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+  sudo -n systemctl restart net-bitchat-bridge && did_restart=1 || true
+fi
+if [ "$did_restart" = "1" ]; then
+  echo "==> net-bitchat-bridge restarted (picked up the new helper)."
+  echo "    sudo journalctl -u net-bitchat-bridge -b | tail -20"
+else
+  echo "To activate:"
+  echo "  sudo systemctl restart net-bitchat-bridge"
+  echo "  sudo journalctl -u net-bitchat-bridge -b | tail -20"
+fi
 echo
 echo "Done."
