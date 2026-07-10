@@ -115,6 +115,13 @@ my %DEFAULTS = (
         helper_path   => 'auto',
         session_name  => 'bitchat-bridge',
         adapter_index => 0,
+        # Read-only journal tail exposed as POLL bitchat-bridge-log — lets
+        # an operator (or the Android/iOS client author) inspect what
+        # bitchat-jsonl saw on a node they can't ssh to. On by default;
+        # set diag_journal = off to refuse the probe. diag_journal_lines
+        # clamps -n (default 500, capped at 5000).
+        diag_journal       => 'on',
+        diag_journal_lines => 500,
     },
     # Control-VLAN attachment. By default every node joins the "network_management"
     # control VLAN (net-mgr creates the 802.1Q sub-interface and addresses it) so
@@ -371,7 +378,7 @@ my %ACTIVE = (
     uplinks    => '*',                        # consumed by net-uplink-probe
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
     dnsmasq    => [qw(mode out_dir push_aps gateways)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
-    bitchat_bridge => [qw(mode helper_path session_name adapter_index)], # BLE bridge (bin/net-bitchat-bridge)
+    bitchat_bridge => [qw(mode helper_path session_name adapter_index diag_journal diag_journal_lines)], # BLE bridge (bin/net-bitchat-bridge)
     'net-chat' => [qw(key_file key_id last_session bitchat_scope bitchat_geohash)], # auth-dialog "Always" + last-open session + bitchat scope/geohash
     ipv6_vlan  => [qw(type name mode server prefix local_suffix forwarding ext_if
                       id addr attach gateway

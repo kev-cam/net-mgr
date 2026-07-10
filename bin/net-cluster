@@ -334,7 +334,7 @@ sub cmd_observe {
 sub cmd_poll {
     my ($m) = @_;
     my $name = shift @ARGV
-        or do { warn "poll: need <probe> (ipv6, ifaces, routes, netmgr-log, fw_state, ssh_forwards, host-debug)\n"; return 2 };
+        or do { warn "poll: need <probe> (ipv6, ifaces, routes, netmgr-log, relay-log, bitchat-bridge-log, fw_state, ssh_forwards, host-debug)\n"; return 2 };
     my (%out, $any_err);
     for my $p ($m->peers) {
         unless ($p->{client}) {

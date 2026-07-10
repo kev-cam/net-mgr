@@ -3542,6 +3542,32 @@ my %POLL_METHODS = (
         return "== journalctl $unit -n 120 ==\n$j" if $j =~ /\S/;
         return "(no journald entries for $unit)\n";
     },
+    # Tail of net-bitchat-bridge.service — supervisor + bitchat-jsonl child
+    # journal. Non-invasive: read-only, no side effects on the bridge. Gated
+    # by [debug] enabled (master switch) AND [bitchat_bridge] diag_journal
+    # (per-probe kill switch, default on). Useful when a foreign client (the
+    # Java Android app, our WIP iOS build, etc.) fires NOISE_HANDSHAKE_INIT
+    # and we need to see whether bitchat-jsonl received it, refused it, or
+    # silently dropped the frame — the receive-side is otherwise a black box.
+    'bitchat-bridge-log' => sub {
+        my ($self) = @_;
+        my $cfg = $self->{config}{bitchat_bridge} || {};
+        my $en = lc($cfg->{diag_journal} // 'on');
+        if ($en =~ /^(off|no|0|false|disabled)$/) {
+            return "(POLL bitchat-bridge-log refused — [bitchat_bridge] diag_journal = off)\n";
+        }
+        my $lines = int($cfg->{diag_journal_lines} // 500);
+        $lines = 100  if $lines < 100;
+        $lines = 5000 if $lines > 5000;
+        my $unit = 'net-bitchat-bridge';
+        # Child bitchat-jsonl procs inherit the supervisor's SyslogIdentifier,
+        # so -u <unit>.service catches them. Fall back to -t on older builds
+        # where the unit reroutes only the supervisor.
+        my $j = `journalctl -u "$unit.service" -n $lines --no-pager 2>/dev/null`;
+        $j = `journalctl -t "$unit" -n $lines --no-pager 2>/dev/null` if $j !~ /\S/;
+        return "== journalctl $unit -n $lines ==\n$j" if $j =~ /\S/;
+        return "(no journald entries for $unit)\n";
+    },
 );
 
 sub _handle_poll {
