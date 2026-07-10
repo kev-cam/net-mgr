@@ -1452,7 +1452,7 @@ sub cmd_gui {
     # refresh — we don't have a heartbeat channel yet, and "seen recently"
     # is the honest signal.
     my $bridge_status = 'unknown';                 # unknown | up | down
-    my $bridge_seen_at;                            # epoch of last marker
+    my $bridge_seen_at;                            # kv->{ts} of last marker (ISO string)
     my %BR_COLOR = (unknown => 'grey60', up => '#2c9f2c', down => '#c33');
     my $bridge_dot = $top->Label(
         -text     => "\x{25CF}",                   # BLACK CIRCLE, sized by font
@@ -1464,8 +1464,10 @@ sub cmd_gui {
     my $bridge_bln = $mw->Balloon(-state => 'balloon', -initwait => 400);
     my $update_bridge_tip = sub {
         my $t = "BitChat bridge: $bridge_status";
-        $t .= "\n  last online marker: "
-            . scalar(localtime $bridge_seen_at) if $bridge_seen_at;
+        # $bridge_seen_at is whatever the wire ts is — an ISO string
+        # ("2026-07-10T13:45:56.123") on the current daemon. Display
+        # as-is; localtime() would explode on it.
+        $t .= "\n  last online marker: $bridge_seen_at" if $bridge_seen_at;
         $bridge_dot_tip = $t;
     };
     $update_bridge_tip->();
@@ -1852,7 +1854,7 @@ sub cmd_gui {
         # to flip the top-bar dot green. Nothing else in the codebase
         # emits this exact prefix, so the match is safe.
         if (($kv->{body} // '') =~ /^\[bridge\] online nick=/) {
-            $bridge_seen_at = $kv->{ts} || time;
+            $bridge_seen_at = $kv->{ts} || scalar localtime;
             $set_bridge_status->('up');
             return;
         }
