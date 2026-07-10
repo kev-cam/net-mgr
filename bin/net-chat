@@ -1445,6 +1445,38 @@ sub cmd_gui {
     # -- top: server + session picker + refresh --------------------------
     my $top = $mw->Frame->pack(-fill => 'x', -padx => 4, -pady => 3);
 
+    # BitChat-bridge liveness dot. Starts gray = "unknown". Flips green when
+    # net-bitchat-bridge posts its startup marker "[bridge] online nick=..."
+    # to a session we can see (we suppress that marker from the message
+    # stream and use it as the presence signal). Stays green until a manual
+    # refresh — we don't have a heartbeat channel yet, and "seen recently"
+    # is the honest signal.
+    my $bridge_status = 'unknown';                 # unknown | up | down
+    my $bridge_seen_at;                            # epoch of last marker
+    my %BR_COLOR = (unknown => 'grey60', up => '#2c9f2c', down => '#c33');
+    my $bridge_dot = $top->Label(
+        -text     => "\x{25CF}",                   # BLACK CIRCLE, sized by font
+        -fg       => $BR_COLOR{unknown},
+        -padx     => 4,
+    )->pack(-side => 'left');
+    my $bridge_dot_tip;
+    require Tk::Balloon;
+    my $bridge_bln = $mw->Balloon(-state => 'balloon', -initwait => 400);
+    my $update_bridge_tip = sub {
+        my $t = "BitChat bridge: $bridge_status";
+        $t .= "\n  last online marker: "
+            . scalar(localtime $bridge_seen_at) if $bridge_seen_at;
+        $bridge_dot_tip = $t;
+    };
+    $update_bridge_tip->();
+    $bridge_bln->attach($bridge_dot, -msg => sub { $bridge_dot_tip });
+    my $set_bridge_status = sub {
+        my ($state) = @_;
+        $bridge_status = $state;
+        $bridge_dot->configure(-fg => $BR_COLOR{$state} // $BR_COLOR{unknown});
+        $update_bridge_tip->();
+    };
+
     # Server picker. Options are the configured [servers] PLUS the peers the
     # current daemon knows about (its `peers` table — net-mgr instances
     # discovered on the LAN), so you can hop to any of them without editing
@@ -1816,6 +1848,14 @@ sub cmd_gui {
     my $insert_msg = sub {
         my ($where, $kv, $fold) = @_;        # $where = 'end' or '1.0'
         return if defined $kv->{id} && $shown{$kv->{id}}++;
+        # BitChat bridge presence marker — filter from the stream, use it
+        # to flip the top-bar dot green. Nothing else in the codebase
+        # emits this exact prefix, so the match is safe.
+        if (($kv->{body} // '') =~ /^\[bridge\] online nick=/) {
+            $bridge_seen_at = $kv->{ts} || time;
+            $set_bridge_status->('up');
+            return;
+        }
         my $ord = $mseq++;
         my $t = $fmt->($kv);
         chomp $t;
