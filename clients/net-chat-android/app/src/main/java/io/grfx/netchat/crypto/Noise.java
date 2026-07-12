@@ -41,6 +41,16 @@ public final class Noise {
     private static final byte[] PROTOCOL_NAME =
             "Noise_XX_25519_ChaChaPoly_SHA256".getBytes();
 
+    /** Opt-in trace hook. Set to a non-null sink from the outside
+     *  (MainActivity wires it to logcat) to dump h/ck/k at every
+     *  symmetric-state transition. Default null = no overhead. */
+    public interface Tracer { void trace(String label, byte[] data); }
+    public static volatile Tracer TRACER;
+    private static void tr(String label, byte[] data) {
+        Tracer t = TRACER;
+        if (t != null) t.trace(label, data);
+    }
+
     private static final int DHLEN = 32;
     private static final int HASHLEN = 32;
     private static final int KEYLEN = 32;
@@ -60,27 +70,41 @@ public final class Noise {
                 h = sha256(name);
             }
             ck = h.clone();
+            tr("init/h ", h);
+            tr("init/ck", ck);
         }
 
         void mixHash(byte[] data) {
+            tr("mixHash/in ", data);
             byte[] cat = concat(h, data);
             h = sha256(cat);
+            tr("mixHash/h  ", h);
         }
 
         void mixKey(byte[] input) {
+            tr("mixKey/dh ", input);
             byte[][] out = hkdf(ck, input, 2);
             ck = out[0];
-            cipher.initializeKey(truncateOrPad(out[1]));
+            byte[] k = truncateOrPad(out[1]);
+            cipher.initializeKey(k);
+            tr("mixKey/ck ", ck);
+            tr("mixKey/k  ", k);
         }
 
         byte[] encryptAndHash(byte[] plaintext) throws GeneralSecurityException {
+            tr("encAndHash/pt ", plaintext);
+            tr("encAndHash/ad ", h);
             byte[] ct = cipher.encryptWithAd(h, plaintext);
+            tr("encAndHash/ct ", ct);
             mixHash(ct);
             return ct;
         }
 
         byte[] decryptAndHash(byte[] ciphertext) throws GeneralSecurityException {
+            tr("decAndHash/ct ", ciphertext);
+            tr("decAndHash/ad ", h);
             byte[] pt = cipher.decryptWithAd(h, ciphertext);
+            tr("decAndHash/pt ", pt);
             mixHash(ciphertext);
             return pt;
         }

@@ -103,6 +103,16 @@ public class MainActivity extends AppCompatActivity
             }
         });
 
+        // Wire the Noise trace sink to logcat. Filter with:
+        //   adb logcat -s NoiseTrace
+        // for the full state-transition trace of every handshake.
+        io.grfx.netchat.crypto.Noise.TRACER = (label, data) -> {
+            StringBuilder sb = new StringBuilder(label).append("=");
+            if (data == null) sb.append("(null)");
+            else for (byte b : data) sb.append(String.format("%02x", b));
+            android.util.Log.i("NoiseTrace", sb.toString());
+        };
+
         try {
             identity = Identity.ephemeral();
         } catch (Throwable t) {
