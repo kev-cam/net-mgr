@@ -1,0 +1,51 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'io.grfx.netchat'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "io.grfx.netchat"
+        minSdk 28           // Android 9.0 — needed for javax.crypto ChaCha20-Poly1305
+                             // (Peripheral works from 26, but we don't ship 8.x)
+        targetSdk 34
+        versionCode 1
+        versionName "0.1"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    // No third-party BLE — using android.bluetooth.* directly.
+    implementation 'androidx.core:core:1.13.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    // Google Tink: X25519, Ed25519, HKDF primitives. We hand-roll
+    // the Noise-XX pattern in io.grfx.netchat.crypto.Noise;
+    // ChaCha20-Poly1305 rides javax.crypto (Android 28+).
+    implementation 'com.google.crypto.tink:tink-android:1.14.0'
+
+    // Kotlin stdlib alignment — AndroidX pulls stdlib-jdk7/jdk8 at 1.6.21,
+    // Tink pulls stdlib at 1.8.22. Classes migrated INTO the main stdlib
+    // in Kotlin 1.8, so mixing the two versions produces duplicate-class
+    // dex errors. Force the jdk7/jdk8 shims up to 1.8.22 (empty at that
+    // version, which is exactly what we want).
+    constraints {
+        implementation('org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22')
+        implementation('org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22')
+        implementation('org.jetbrains.kotlin:kotlin-stdlib:1.8.22')
+    }
+
+    testImplementation 'junit:junit:4.13.2'
+}
