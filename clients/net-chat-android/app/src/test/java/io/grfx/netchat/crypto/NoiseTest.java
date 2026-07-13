@@ -108,6 +108,50 @@ public class NoiseTest {
         resp.decrypt(ct);                               // AEAD auth must fail
     }
 
+    @Test
+    public void failed_msg2_read_restores_session_state() throws Exception {
+        // Regression: previously, an AEAD-failing msg 2 dirtied the
+        // Initiator's h/ck/cipher partway through readMessage, so a
+        // subsequent retry with the CORRECT msg 2 would fail too.
+        // With snapshot+restore, the retry must succeed.
+        Identity a = Identity.ephemeral();
+        Identity b = Identity.ephemeral();
+        Noise.Initiator init = new Noise.Initiator(a.staticPrivateKey, a.staticPublicKey);
+        Noise.Responder resp = new Noise.Responder(b.staticPrivateKey, b.staticPublicKey);
+
+        // Step 1: run msg 1 normally, capture the responder's real msg 2.
+        byte[] msg1 = init.writeMessage(new byte[0]);
+        resp.readMessage(msg1);
+        byte[] realMsg2 = resp.writeMessage(new byte[0]);
+
+        // Step 2: hand the Initiator a CORRUPTED msg 2 first (flip a
+        // byte inside the ct_static field, at offset 32+5 — after e_r,
+        // before the AEAD tag). AEAD verify must fail.
+        byte[] badMsg2 = realMsg2.clone();
+        badMsg2[32 + 5] ^= 0x5a;
+        try {
+            init.readMessage(badMsg2);
+            fail("expected AEAD failure on corrupted msg 2");
+        } catch (java.security.GeneralSecurityException expected) {
+            // good
+        }
+
+        // Step 3: retry with the REAL msg 2. If snapshot/restore works,
+        // the Initiator's state is exactly as it was after writing msg 1,
+        // so this must succeed and the handshake must complete.
+        init.readMessage(realMsg2);
+        byte[] msg3 = init.writeMessage(new byte[0]);
+        resp.readMessage(msg3);
+        assertTrue("initiator established after retry", init.isEstablished());
+        assertTrue("responder established after retry", resp.isEstablished());
+
+        // Transport also works — proves the state wasn't just superficially
+        // reset but is actually consistent with the responder's.
+        byte[] ct = init.encrypt("hello after retry".getBytes(StandardCharsets.UTF_8));
+        byte[] pt = resp.decrypt(ct);
+        org.junit.Assert.assertArrayEquals("hello after retry".getBytes(StandardCharsets.UTF_8), pt);
+    }
+
     private static void runHandshake(Noise.Initiator init, Noise.Responder resp) throws Exception {
         resp.readMessage(init.writeMessage(new byte[0]));
         init.readMessage(resp.writeMessage(new byte[0]));

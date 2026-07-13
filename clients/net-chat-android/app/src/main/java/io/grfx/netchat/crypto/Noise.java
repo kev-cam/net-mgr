@@ -62,6 +62,32 @@ public final class Noise {
         byte[] h  = new byte[HASHLEN];
         CipherState cipher = new CipherState();
 
+        /** Snapshot of ck+h+cipher key+cipher nonce. Used by
+         *  {@link Session#readMessage(byte[])} to restore state when the
+         *  final AEAD verify throws, so a retry (peer resends msg 2)
+         *  doesn't compound the mid-mutation state into a permanent
+         *  "cannot ever complete" session. */
+        static final class Snapshot {
+            final byte[] ck, h, key;
+            final long nonce;
+            Snapshot(byte[] ck, byte[] h, byte[] key, long nonce) {
+                this.ck = ck; this.h = h; this.key = key; this.nonce = nonce;
+            }
+        }
+        Snapshot snapshot() {
+            return new Snapshot(
+                    ck.clone(),
+                    h.clone(),
+                    cipher.key == null ? null : cipher.key.clone(),
+                    cipher.nonce);
+        }
+        void restore(Snapshot s) {
+            ck = s.ck.clone();
+            h  = s.h.clone();
+            cipher.key = s.key == null ? null : s.key.clone();
+            cipher.nonce = s.nonce;
+        }
+
         SymmetricState() {
             byte[] name = PROTOCOL_NAME;
             if (name.length <= HASHLEN) {
@@ -237,13 +263,23 @@ public final class Noise {
                     return concat(ephPub, pt);
                 }
                 case 2: {
-                    // -> s, se
-                    byte[] encStatic = sym.encryptAndHash(staticPub);
-                    sym.mixKey(dh(staticPriv, remoteEphPub));
-                    byte[] pt = sym.encryptAndHash(payload);
-                    msgIndex++;
-                    promoteToTransport(true);
-                    return concat(encStatic, pt);
+                    // -> s, se. Encryption failures are rare (only if the
+                    // cipher misbehaves) but snapshot anyway so a caller
+                    // retry sees a clean session.
+                    SymmetricState.Snapshot snap = sym.snapshot();
+                    byte[] savedRemoteEph = remoteEphPub == null ? null : remoteEphPub.clone();
+                    try {
+                        byte[] encStatic = sym.encryptAndHash(staticPub);
+                        sym.mixKey(dh(staticPriv, remoteEphPub));
+                        byte[] pt = sym.encryptAndHash(payload);
+                        msgIndex++;
+                        promoteToTransport(true);
+                        return concat(encStatic, pt);
+                    } catch (GeneralSecurityException | RuntimeException e) {
+                        sym.restore(snap);
+                        remoteEphPub = savedRemoteEph;
+                        throw e;
+                    }
                 }
                 default:
                     return null;
@@ -254,21 +290,37 @@ public final class Noise {
         public byte[] readMessage(byte[] frame) throws GeneralSecurityException {
             switch (msgIndex) {
                 case 1: {
-                    // <- e, ee, s, es
-                    int off = 0;
-                    remoteEphPub = Arrays.copyOfRange(frame, off, off + DHLEN); off += DHLEN;
-                    sym.mixHash(remoteEphPub);
-                    sym.mixKey(dh(ephPriv, remoteEphPub));
+                    // <- e, ee, s, es. Snapshot BEFORE any mutation so a
+                    // failed AEAD verify (peer speaks a subtly different
+                    // Noise variant, or we're processing a stray msg 2
+                    // meant for a different session) doesn't dirty h/ck/
+                    // cipher — the peer may retransmit, and we need the
+                    // second attempt to start from the same clean state
+                    // as the first.
+                    SymmetricState.Snapshot snap = sym.snapshot();
+                    byte[] savedRemoteEph = remoteEphPub == null ? null : remoteEphPub.clone();
+                    byte[] savedRemoteStatic = remoteStaticPub == null ? null : remoteStaticPub.clone();
+                    try {
+                        int off = 0;
+                        remoteEphPub = Arrays.copyOfRange(frame, off, off + DHLEN); off += DHLEN;
+                        sym.mixHash(remoteEphPub);
+                        sym.mixKey(dh(ephPriv, remoteEphPub));
 
-                    int sEncLen = DHLEN + TAGLEN;
-                    byte[] encRs = Arrays.copyOfRange(frame, off, off + sEncLen); off += sEncLen;
-                    remoteStaticPub = sym.decryptAndHash(encRs);
-                    sym.mixKey(dh(ephPriv, remoteStaticPub));
+                        int sEncLen = DHLEN + TAGLEN;
+                        byte[] encRs = Arrays.copyOfRange(frame, off, off + sEncLen); off += sEncLen;
+                        remoteStaticPub = sym.decryptAndHash(encRs);
+                        sym.mixKey(dh(ephPriv, remoteStaticPub));
 
-                    byte[] payloadCt = Arrays.copyOfRange(frame, off, frame.length);
-                    byte[] payload = sym.decryptAndHash(payloadCt);
-                    msgIndex++;
-                    return payload;
+                        byte[] payloadCt = Arrays.copyOfRange(frame, off, frame.length);
+                        byte[] payload = sym.decryptAndHash(payloadCt);
+                        msgIndex++;
+                        return payload;
+                    } catch (GeneralSecurityException | RuntimeException e) {
+                        sym.restore(snap);
+                        remoteEphPub = savedRemoteEph;
+                        remoteStaticPub = savedRemoteStatic;
+                        throw e;
+                    }
                 }
                 default:
                     throw new IllegalStateException("initiator has no read at msg " + msgIndex);
@@ -299,26 +351,46 @@ public final class Noise {
         public byte[] readMessage(byte[] frame) throws GeneralSecurityException {
             switch (msgIndex) {
                 case 0: {
-                    // <- e (from initiator)
-                    remoteEphPub = Arrays.copyOfRange(frame, 0, DHLEN);
-                    sym.mixHash(remoteEphPub);
-                    byte[] payload = sym.decryptAndHash(
-                            Arrays.copyOfRange(frame, DHLEN, frame.length));
-                    msgIndex++;
-                    return payload;
+                    // <- e (from initiator). msg 1 has no AEAD, so we
+                    // never throw partway through — but snapshot for
+                    // symmetry with the other paths.
+                    SymmetricState.Snapshot snap = sym.snapshot();
+                    byte[] savedRemoteEph = remoteEphPub == null ? null : remoteEphPub.clone();
+                    try {
+                        remoteEphPub = Arrays.copyOfRange(frame, 0, DHLEN);
+                        sym.mixHash(remoteEphPub);
+                        byte[] payload = sym.decryptAndHash(
+                                Arrays.copyOfRange(frame, DHLEN, frame.length));
+                        msgIndex++;
+                        return payload;
+                    } catch (GeneralSecurityException | RuntimeException e) {
+                        sym.restore(snap);
+                        remoteEphPub = savedRemoteEph;
+                        throw e;
+                    }
                 }
                 case 2: {
-                    // <- s, se (last handshake frame from initiator)
-                    int sEncLen = DHLEN + TAGLEN;
-                    byte[] encRs = Arrays.copyOfRange(frame, 0, sEncLen);
-                    remoteStaticPub = sym.decryptAndHash(encRs);
-                    sym.mixKey(dh(ephPriv, remoteStaticPub));
+                    // <- s, se (last handshake frame from initiator).
+                    // AEAD on the static-pubkey frame CAN throw — snapshot
+                    // and restore so a retransmit lands cleanly.
+                    SymmetricState.Snapshot snap = sym.snapshot();
+                    byte[] savedRemoteStatic = remoteStaticPub == null ? null : remoteStaticPub.clone();
+                    try {
+                        int sEncLen = DHLEN + TAGLEN;
+                        byte[] encRs = Arrays.copyOfRange(frame, 0, sEncLen);
+                        remoteStaticPub = sym.decryptAndHash(encRs);
+                        sym.mixKey(dh(ephPriv, remoteStaticPub));
 
-                    byte[] payload = sym.decryptAndHash(
-                            Arrays.copyOfRange(frame, sEncLen, frame.length));
-                    msgIndex++;
-                    promoteToTransport(false);
-                    return payload;
+                        byte[] payload = sym.decryptAndHash(
+                                Arrays.copyOfRange(frame, sEncLen, frame.length));
+                        msgIndex++;
+                        promoteToTransport(false);
+                        return payload;
+                    } catch (GeneralSecurityException | RuntimeException e) {
+                        sym.restore(snap);
+                        remoteStaticPub = savedRemoteStatic;
+                        throw e;
+                    }
                 }
                 default:
                     throw new IllegalStateException("responder has no read at msg " + msgIndex);
@@ -330,17 +402,28 @@ public final class Noise {
             if (payload == null) payload = new byte[0];
             switch (msgIndex) {
                 case 1: {
-                    // -> e, ee, s, es
-                    genEphemeral();
-                    sym.mixHash(ephPub);
-                    sym.mixKey(dh(ephPriv, remoteEphPub));
+                    // -> e, ee, s, es. Snapshot for the same
+                    // atomic-write rationale as Initiator.writeMessage(2).
+                    SymmetricState.Snapshot snap = sym.snapshot();
+                    byte[] savedEphPriv = ephPriv == null ? null : ephPriv.clone();
+                    byte[] savedEphPub  = ephPub  == null ? null : ephPub.clone();
+                    try {
+                        genEphemeral();
+                        sym.mixHash(ephPub);
+                        sym.mixKey(dh(ephPriv, remoteEphPub));
 
-                    byte[] encStatic = sym.encryptAndHash(staticPub);
-                    sym.mixKey(dh(staticPriv, remoteEphPub));
+                        byte[] encStatic = sym.encryptAndHash(staticPub);
+                        sym.mixKey(dh(staticPriv, remoteEphPub));
 
-                    byte[] pt = sym.encryptAndHash(payload);
-                    msgIndex++;
-                    return concat(ephPub, encStatic, pt);
+                        byte[] pt = sym.encryptAndHash(payload);
+                        msgIndex++;
+                        return concat(ephPub, encStatic, pt);
+                    } catch (GeneralSecurityException | RuntimeException e) {
+                        sym.restore(snap);
+                        ephPriv = savedEphPriv;
+                        ephPub  = savedEphPub;
+                        throw e;
+                    }
                 }
                 default:
                     return null;
