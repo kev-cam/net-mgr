@@ -86,7 +86,11 @@ sub bootstrap_schema {
             next if $s eq '';
             $self->{dbh}->do($s);
         }
-        return $self->current_schema_version;
+        # The snapshot's appended sections stop at the last regeneration
+        # (currently v30) — fall through and replay the remainder from
+        # _apply_migration rather than leaving a fresh install short.
+        $cur = $self->current_schema_version;
+        return $cur if $cur >= $SCHEMA_VERSION;
     }
 
     # Incremental migrations from $cur to $SCHEMA_VERSION.

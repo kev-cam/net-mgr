@@ -529,13 +529,10 @@ CREATE TABLE IF NOT EXISTS chat_members (
     added_by       VARCHAR(128),
     requested_at   DATETIME     NULL,
     joined_at      DATETIME     NULL,
-    -- request_pubkey carries the SSH pubkey supplied with an unverified
-    -- join request; cleared on approval (key moves to chat_authorized_keys).
-    request_pubkey TEXT         NULL,
-    -- requested_from: peer IP/host the join request came in on, so an
-    -- approver sees WHERE the request originated, not just the
-    -- (potentially self-asserted) principal. Set when state=requested.
-    requested_from VARCHAR(64)  NULL,
+    -- (request_pubkey and requested_from are NOT in the snapshot CREATE:
+    -- they arrive via the v28 section below and the v31 migration in
+    -- NetMgr::DB. Folding a column here AND keeping its ALTER makes the
+    -- duplicate-column error abort the whole fresh-install load.)
     PRIMARY KEY (session, principal),
     KEY idx_member_state (state),
     CONSTRAINT fk_chat_members_session
@@ -591,6 +588,8 @@ CREATE TABLE IF NOT EXISTS host_keys (
     CONSTRAINT fk_host_keys_machine
         FOREIGN KEY (machine_id) REFERENCES machines(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO schema_version (version) VALUES (23);
 
 -- DB-native DHCP plan (schema v24) — moves the dynamic-pool bounds and the
 -- static reservations out of the hand-edited /etc/net-mgr/dhcp.master and into
@@ -659,6 +658,10 @@ CREATE TABLE IF NOT EXISTS chat_authorized_keys (
 
 INSERT IGNORE INTO schema_version (version) VALUES (25);
 
+-- v26 (aps.exclude) is folded into the base CREATE TABLE aps above — the
+-- delta ships in the snapshot, only the version stamp lands here.
+INSERT IGNORE INTO schema_version (version) VALUES (26);
+
 -- mesh_tunnels (schema v27): tunnel/uplink metadata replicated cluster-wide.
 -- Source of truth for net-mgr's "overlay" tunnels: the row says "this kind of
 -- tunnel, terminated on this owner_node, has these endpoints/prefixes." Any
@@ -723,6 +726,46 @@ INSERT IGNORE INTO schema_version (version) VALUES (29);
 ALTER TABLE peers ADD COLUMN cluster_member VARCHAR(64) NULL;
 
 INSERT IGNORE INTO schema_version (version) VALUES (30);
+
+-- Schema v31: chat_members.requested_from — peer IP/host the join request
+-- came in on, so an approver can see WHERE the request originated, not just
+-- WHO claimed to send it. Especially useful for unverified joins (the
+-- principal is a self-asserted name; the source addr is real).
+ALTER TABLE chat_members ADD COLUMN requested_from VARCHAR(64) NULL;
+
+INSERT IGNORE INTO schema_version (version) VALUES (31);
+
+-- Schema v32: node_capabilities — per-mesh-member snapshot of the host's
+-- runtime capabilities (BLE, IPv6 forwarding, gateway, wifi_ap, cargo, ...).
+-- Published by each daemon via HEARTBEAT and persisted by the master. Keyed
+-- by mesh member name because HEARTBEAT identifies by member (not host:port).
+CREATE TABLE IF NOT EXISTS node_capabilities (
+    member          VARCHAR(64)  NOT NULL,
+    capabilities    TEXT         NOT NULL,
+    updated_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                 ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from VARCHAR(64)  NULL,
+    PRIMARY KEY (member),
+    KEY idx_nc_replicated (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO schema_version (version) VALUES (32);
+
+-- Schema v33: bitchat_peers — BitChat BLE mesh peers seen by the local
+-- helper on this bridge site. Populated by net-bitchat-bridge polling the
+-- Rust helper's {"cmd":"peers"} response every ~30s. Not cluster-replicated
+-- on purpose — each bridge site sees its OWN BLE neighbourhood.
+CREATE TABLE IF NOT EXISTS bitchat_peers (
+    peer_id       VARCHAR(16)  NOT NULL PRIMARY KEY,   -- SHA-256(noise_pk)[:8] hex
+    nickname      VARCHAR(64)  NULL,
+    is_connected  TINYINT(1)   NOT NULL DEFAULT 0,
+    last_seen     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                               ON UPDATE CURRENT_TIMESTAMP,
+    signing_pk    VARBINARY(32) NULL   -- Ed25519 signing pubkey from Announce TLV 0x03,
+                                       -- filled when the RX side captures it
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO schema_version (version) VALUES (33);
 
 -- Schema v34: wan-failover data model. Three cluster-replicated tables
 -- carry the state the failover orchestrator (commit C) needs, ahead of
