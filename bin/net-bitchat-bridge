@@ -167,7 +167,11 @@ if (preflight()) {
 }
 
 my $backoff = 1;
+my $adv_wedge_seen;         # set by run_once when helper stderr shows the
+                            # leaked-advertising-slot signature
+my $last_ble_reset = 0;
 while (1) {
+    $adv_wedge_seen = 0;
     my $exit = eval { run_once() };
     my $err  = $@;
     if ($err) {
@@ -176,6 +180,24 @@ while (1) {
         warn "[bridge] helper exited (code=" . ($exit // '?') . ")\n";
     }
     last if $opt{once};
+    # BLE stack recovery: a helper generation that dies without
+    # unregistering its LE advertisement leaks a controller adv slot;
+    # once they're exhausted every relaunch fails with "Maximum
+    # advertisements reached" until bluez + the controller are bounced
+    # (the net-mgr-reset-ble wedge). Do the two BT steps inline here,
+    # rate-limited, instead of waiting for an operator or timer.
+    if ($adv_wedge_seen && time - $last_ble_reset > 120) {
+        warn "[bridge] adv-slot wedge — resetting BT stack before respawn\n";
+        # Enumerate controllers rather than assuming hci0 — usbipd/hotplug
+        # cycles bump the index (observed: the dongle came back as hci1).
+        for my $h (glob '/sys/class/bluetooth/hci*') {
+            next unless $h =~ m{/(hci\d+)$};
+            system('hciconfig', $1, 'reset');
+        }
+        system('systemctl', 'try-restart', 'bluetooth.service');
+        $last_ble_reset = time;
+        sleep 2;
+    }
     # Belt-and-braces reap. run_once's blocking waitpid at line ~232 catches
     # the main helper PID, but the Rust helper's bluer runtime can hand a
     # forked-off thread (BLE central task, dbus worker) inherited pipe FDs
@@ -189,7 +211,8 @@ while (1) {
     $backoff = $backoff >= 30 ? 30 : $backoff * 2;
     # Successful run resets backoff (we only get here if helper actually
     # produced output for a while — a quick crash should keep backing off).
-    $backoff = 1 if defined $exit && $exit == 0;
+    # 143 = SIGTERM, i.e. our own watchdog kick — deliberate, not a crash.
+    $backoff = 1 if defined $exit && ($exit == 0 || $exit == 143);
 }
 
 # ---- supervisor inner loop ----
@@ -309,6 +332,7 @@ sub run_once {
     # while(1) at the top of the file respawns after backoff. Seeded to
     # now so a fresh startup gets one full grace window before we'd kick.
     my $last_peer_reply_ts = time;
+    my $term_sent_at;   # set on watchdog TERM; drives the KILL escalation
     my $peer_cli;
     unless ($opt{'dry-run'}) {
         $peer_cli = NetMgr::Client->new(listen => $listen, timeout => 6);
@@ -317,17 +341,30 @@ sub run_once {
 
   OUTER:
     while (!($eof{$rh} && $eof{$eh})) {
+        # TERM escalation: bluer's forked workers inherit our pipe FDs, so
+        # a TERM'd-but-wedged helper can leave stdout/stderr open and the
+        # EOF that ends this loop never arrives (observed as the watchdog
+        # re-kicking the same pid every poll window). 15s after TERM, KILL
+        # the pid and stop waiting for pipes.
+        if ($term_sent_at && time - $term_sent_at > 15) {
+            warn "[bridge/watchdog] pid=$pid still holding pipes 15s after "
+               . "TERM; KILL + forced respawn\n";
+            kill 'KILL', $pid if $pid;
+            last OUTER;
+        }
         # Peer poll tick — fire only when the helper's stdin is still open
         # so we don't stall on a dead pipe during helper respawn.
         if ($wh && time - $last_peer_poll >= $PEER_POLL_S) {
             # Watchdog check runs BEFORE we send another peers poll, so
             # a wedged helper doesn't accumulate an outbox of unanswered
             # queries.
-            if (time - $last_peer_reply_ts > 2 * $PEER_POLL_S) {
+            if (!$term_sent_at
+                && time - $last_peer_reply_ts > 2 * $PEER_POLL_S) {
                 warn "[bridge/watchdog] no peers reply for "
                    . (time - $last_peer_reply_ts) . "s (> 2x "
-                   . "$PEER_POLL_S s); kicking helper pid=$pid\n";
+                   . "$PEER_POLL_S s); kicking helper pid=$pid (TERM)\n";
                 kill 'TERM', $pid if $pid;
+                $term_sent_at = time;
                 $last_peer_reply_ts = time;  # avoid a kick storm while it dies
                 # run_once returns naturally when the helper's stdout EOFs,
                 # and the outer retry loop respawns with backoff.
@@ -356,6 +393,11 @@ sub run_once {
                 if ($fh == $eh) {
                     # Helper diagnostic — surface to our own stderr.
                     warn "[helper/err] $line\n";
+                    # Leaked-adv-slot wedge signature — the outer loop
+                    # resets the BT stack before the next respawn.
+                    $adv_wedge_seen = 1
+                        if $line =~ /Maximum\ advertisements\ reached
+                                    |Failed\ to\ register\ advertisement/x;
                     next;
                 }
                 # Subscription stream: net-chat client posted a new message
@@ -646,7 +688,12 @@ sub run_once {
     eval { close $wh }      if $wh;
     waitpid($pid, 0);
     my $code = $? >> 8;
+    my $sig  = $? & 127;
     warn "[bridge] processed $posted inbound BLE, forwarded $forwarded outbound to BLE, before helper exited\n";
+    # Don't mask signal deaths as clean exits: a watchdog TERM used to
+    # surface as "helper exited (code=0)", which read as the helper
+    # choosing to quit ~10 min in when it was really our own kick.
+    $code = 128 + $sig if $sig;
     return $code;
 }
 
