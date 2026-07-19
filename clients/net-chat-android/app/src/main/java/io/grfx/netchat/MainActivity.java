@@ -114,7 +114,7 @@ public class MainActivity extends AppCompatActivity
         };
 
         try {
-            identity = Identity.ephemeral();
+            identity = loadOrCreateIdentity();
         } catch (Throwable t) {
             append("identity error: " + t.getMessage());
         }
@@ -126,6 +126,30 @@ public class MainActivity extends AppCompatActivity
             @Override public void onPeerChanged(Peer peer) { renderPeers(); }
             @Override public void onPeerRemoved(String peerIdHex) { renderPeers(); }
         });
+    }
+
+    // Persisted identity: one seed per install, so peer_id survives
+    // activity recreation and app restarts (the bridge-side equivalent is
+    // BITCHAT_ID_FILE). SharedPreferences, not Keystore: the seed must be
+    // the raw Ed25519 input (see Identity's cross-platform derivation),
+    // and Keystore won't release raw private key bytes.
+    private Identity loadOrCreateIdentity() throws Exception {
+        android.content.SharedPreferences sp =
+                getSharedPreferences("identity", MODE_PRIVATE);
+        String hex = sp.getString("seed", null);
+        if (hex != null && hex.length() == Identity.SEED_LEN * 2) {
+            byte[] seed = new byte[Identity.SEED_LEN];
+            for (int i = 0; i < seed.length; i++) {
+                seed[i] = (byte) Integer.parseInt(
+                        hex.substring(i * 2, i * 2 + 2), 16);
+            }
+            return Identity.fromSeed(seed);
+        }
+        Identity id = Identity.ephemeral();
+        StringBuilder sb = new StringBuilder(Identity.SEED_LEN * 2);
+        for (byte b : id.seed) sb.append(String.format("%02x", b & 0xFF));
+        sp.edit().putString("seed", sb.toString()).apply();
+        return id;
     }
 
     // ---- Service lifecycle -------------------------------------
