@@ -1189,17 +1189,52 @@ sub _daemon_ip_names {
 # As or Delete it. Owners also get approve/reject pop-ups for join requests. Bar widgets
 # use ASCII (the default UI font lacks many glyphs; the message pane is
 # Courier and renders Unicode fine).
-# The "terminal" button launches your terminal emulator on a tmux session bound
-# to the current chat; its input is the keyboard plus any chat message starting
-# "@<local user>" (injected via tmux send-keys). See _ssh_knows/$term_feed.
+# The "term:" drop-down bridges one tmux session to the current chat, in a
+# chosen direction: Input (chat msgs starting "@<local user>" drive the command
+# line via tmux send-keys), Output (the terminal's output is captured with tmux
+# pipe-pane and posted back to the chat), Both, or Off. One session per GUI
+# process. See $term_set_mode.
 # Multi-line messages fold to their first line (a " [+]"
 # marker; left-click to open, right-click to close) and older/seeded lines
 # start folded; the search box reveals and highlights matches across the whole
 # loaded log; each sender gets a light background tint. Uses two connections:
 # one read via Tk fileevent for
 # subscriptions, one for blocking control ops (snapshot/post/join/member).
+
+# Terminal-bridge cleanup safety net. cmd_gui registers its single tmux
+# session here so an unexpected GUI exit still kills the session and removes
+# its capture file instead of orphaning them. Reached two ways: the END
+# block below (normal exit after MainLoop, and die), and the INT/TERM/HUP
+# handlers cmd_gui installs (Perl does NOT run END on signal death). PID-
+# guarded so the double-forked terminal children (which CORE::exit and would
+# otherwise run END) never trigger it against the parent's session.
+my %NC_TERM_CLEANUP;         # session_name => capture_file
+my $NC_TERM_OWNER_PID;       # PID of the GUI process that owns the session
+sub _nc_term_cleanup_all {
+    return unless defined $NC_TERM_OWNER_PID && $$ == $NC_TERM_OWNER_PID;
+    for my $sess (sort keys %NC_TERM_CLEANUP) {
+        my $cap = delete $NC_TERM_CLEANUP{$sess};
+        system("tmux kill-session -t $sess 2>/dev/null");
+        unlink $cap if defined $cap;
+    }
+}
+END { _nc_term_cleanup_all() }
+
 sub cmd_gui {
     my ($session) = @_;
+    $NC_TERM_OWNER_PID = $$;
+    # Perl does NOT run END on default signal termination, so a Ctrl-C
+    # (SIGINT), terminal/shell close (SIGHUP), or kill/logout/shutdown
+    # (SIGTERM) would orphan the terminal-bridge tmux session + capture
+    # file. Reap it here, then re-raise with the default handler so the
+    # process still dies with the right status.
+    for my $sig (qw(INT TERM HUP)) {
+        $SIG{$sig} = sub {
+            _nc_term_cleanup_all();
+            $SIG{ $_[0] } = 'DEFAULT';
+            kill $_[0], $$;
+        };
+    }
     $session //= shift @ARGV;
     # Fall back to the last-open session from the per-user config when the
     # user didn't pass a session name. Same two-path merge the auth defaults
@@ -2281,12 +2316,22 @@ sub cmd_gui {
         $ne->focus;
     };
 
-    # -- chat-driven terminal --------------------------------------------
-    # "terminal" launches your terminal emulator running a tmux session bound to
-    # the current chat. Its input is then BOTH the keyboard (native, in the
-    # terminal) AND any chat message that starts with "@<local user>": the
-    # prefix is stripped and the rest is injected with `tmux send-keys`. Only
-    # live messages from others in this chat are fed; output is not echoed back.
+    # -- chat<->terminal bridge ------------------------------------------
+    # The "terminal" drop-down bridges ONE tmux session to the current chat
+    # in a chosen direction:
+    #   Input  — chat drives the command line. A live message starting
+    #            "@<local user>" has the prefix stripped and the remainder
+    #            injected as keystrokes (tmux send-keys). Output stays local.
+    #   Output — the terminal's own output is captured (tmux pipe-pane),
+    #            ANSI-stripped, and posted back to the bound chat. The chat
+    #            does NOT drive input.
+    #   Both   — both directions at once.
+    #   Off    — tear the bridge down (kills the tmux session).
+    # Exactly ONE session exists per GUI process (nc-term-$$): selecting a
+    # direction launches it if needed and reconfigures the existing one
+    # otherwise, so stray terminals never accumulate. The session is bound
+    # to whatever chat was current when it started; to move it, pick Off
+    # then a direction again on the new chat.
     my $localuser = $ENV{USER} // (getpwuid($<))[0] // 'user';
     my $term_cfg;                       # optional [chat] terminal override
     for my $p ($ENV{NET_MGR_CONF} // '/etc/net-mgr/config', NetMgr::Config->user_path) {
@@ -2303,37 +2348,207 @@ sub cmd_gui {
             }
         }
     }
+    # Bridge state — one session per GUI process.
     my ($term_session, $term_chat);
-    my $tmux_send = sub {               # one literal line + Enter (no shell)
+    my $term_mode    = 'Off';           # Off | Input | Output | Both
+    my $term_modevar = 'Off';           # tied to the drop-down widget
+    # Output-capture state (Output/Both): pipe-pane appends the pane's byte
+    # stream to $term_cap_file; a repeating poll tails it and posts batches.
+    my $term_cap_file = "/tmp/nc-term-$$.out";
+    my ($term_cap_fh, $term_cap_buf, $term_poll_id);
+    my $term_cap_bytes = 0;             # bytes consumed since last rotation
+    my $term_tick = 0;
+    my $term_post_fails = 0;            # consecutive chat_post failures
+    my $POLL_MS   = 300;
+    my $MAX_POST  = 4000;               # chars posted per poll tick
+    my $MAX_LINE  = 512;                # chars kept per output line
+    my $MAX_BUF   = 262144;             # cap the unposted partial-line buffer
+    my $MAX_FILE  = 4 * 1024 * 1024;    # rotate the capture file past this
+
+    # Forward declarations so the closures below can reference each other.
+    my ($term_start, $term_apply_mode, $term_cap_start, $term_cap_stop,
+        $term_stop, $term_poll);
+
+    # Inject one literal line + Enter (no shell). Returns 1 on success, 0 if
+    # the session is gone — in which case it tears the bridge down so the
+    # UI never falsely confirms a command that reached nothing (Input mode
+    # has no other liveness check).
+    my $tmux_send = sub {
         my ($text) = @_;
-        return unless defined $term_session;
+        return 0 unless defined $term_session;
+        if (system("tmux has-session -t $term_session 2>/dev/null") != 0) {
+            $set_status->("terminal '$term_session' exited");
+            $term_stop->();
+            return 0;
+        }
         system('tmux', 'send-keys', '-t', $term_session, '-l', '--', $text);
         system('tmux', 'send-keys', '-t', $term_session, 'Enter');
+        return 1;
     };
-    my $term_feed = sub {               # inject a live chat message if it's for us
+
+    # chat -> terminal: inject a live message iff we're in an input-capable
+    # mode and it's addressed to us in the bound chat. Confirm only on a
+    # successful send.
+    my $term_feed = sub {
         my ($kv) = @_;
         return unless defined $term_session && defined $term_chat;
+        return unless $term_mode eq 'Input' || $term_mode eq 'Both';
         return unless ($kv->{session} // '') eq $term_chat;
         return if ($kv->{sender} // '') eq $me;          # skip our own posts
         my $body = $kv->{body};
         return unless defined $body
                    && $body =~ s/^\s*\@\Q$localuser\E\b[\s:,]*//i && length $body;
-        $tmux_send->($body);
-        $set_status->("terminal <= \@$localuser: $body");
+        $tmux_send->($body)
+            and $set_status->("terminal <= \@$localuser: $body");
     };
-    my $launch_term = sub {
-        return $set_status->('terminal: no terminal emulator found '
-                           . '(set [chat] terminal or $TERMINAL)') unless $term_prog;
-        return $set_status->('terminal: pick a chat first') unless defined $cur;
-        (my $name = "nc-$cur") =~ s/[^A-Za-z0-9_-]/_/g;   # tmux-safe session name
-        # Pre-create the session so injection works the instant it's bound.
+
+    # Reduce a raw pane line to something sane for chat: drop ANSI/OSC
+    # escapes and control chars, collapse carriage-return overwrites
+    # (progress bars), trim trailing whitespace.
+    my $term_clean = sub {
+        my ($s) = @_;
+        $s =~ s/\e\][^\a\e]*(?:\a|\e\\)//g;    # OSC ... BEL/ST
+        $s =~ s/\e\[[0-9;?]*[ -\/]*[\@-~]//g;  # CSI (incl. SGR colour)
+        $s =~ s/\e[\@-Z\\-_]//g;               # other 2-char escapes
+        $s =~ s/\e.//g;                        # any straggler ESC+char
+        $s =~ s/\r\z//;                        # CRLF: drop the trailing CR
+        $s =~ s/.*\r//s;                       # overwrite: keep after last CR
+        $s =~ s/[\x00-\x08\x0b-\x1f\x7f]//g;   # other control chars (keep \t)
+        $s =~ s/\s+\z//;
+        return $s;
+    };
+
+    # terminal -> chat: drain the capture file, clean + batch this tick's
+    # complete lines into ONE post (multi-line posts are wire-safe since the
+    # Protocol LF-escape). Bounded so a chatty command can't flood the chat.
+    $term_poll = sub {
+        return unless $term_cap_fh;
+        # Auto-stop if the session went away (user exited the shell).
+        if (++$term_tick % 7 == 0 && defined $term_session
+            && system("tmux has-session -t $term_session 2>/dev/null") != 0) {
+            $set_status->("terminal '$term_session' exited");
+            $term_stop->();
+            return;
+        }
+        my $chunk = '';
+        my $n = sysread($term_cap_fh, $chunk, 65536);
+        return unless defined $n && $n > 0;
+        $term_cap_bytes += $n;
+        $term_cap_buf .= $chunk;
+        # Bound the partial-line buffer: a newline-less firehose (e.g. an
+        # injected `yes | tr -d '\n'` in Both mode) would otherwise grow it
+        # ~64KB/tick until the GUI OOMs. Keep only the most-recent tail.
+        $term_cap_buf = substr($term_cap_buf, -$MAX_BUF)
+            if length($term_cap_buf) > $MAX_BUF;
+        my @lines;
+        while ((my $i = index($term_cap_buf, "\n")) >= 0) {
+            my $line = substr($term_cap_buf, 0, $i, '');
+            substr($term_cap_buf, 0, 1, '');           # drop the \n
+            $line = $term_clean->($line);
+            next unless length $line;
+            $line = substr($line, 0, $MAX_LINE) . '…' if length($line) > $MAX_LINE;
+            push @lines, $line;
+        }
+        return unless @lines;
+        my $body  = join("\n", @lines);
+        my $trunc = length($body) > $MAX_POST;
+        $body = substr($body, 0, $MAX_POST) . "\n(… output truncated)" if $trunc;
+        return unless defined $term_chat;
+        eval { $ctrl->chat_post(session => $term_chat, body => $body,
+                                ($is_loopback ? (as => $as) : ())) };
+        if ($@) {
+            # Don't silently swallow output: report, and after a few
+            # consecutive failures (closed chat, lost membership, dead
+            # daemon) stop the bridge rather than discarding forever.
+            chomp(my $e = $@);
+            $e =~ s/\s+at\s+\S+\s+line\s+\d+.*//s;
+            if (++$term_post_fails >= 3) {
+                $set_status->("terminal => $term_chat: post failing ($e) — stopping");
+                $term_stop->();
+            } else {
+                $set_status->("terminal => $term_chat: post failed ($e)");
+            }
+        } else {
+            $term_post_fails = 0;
+            $set_status->("terminal => $term_chat: " . scalar(@lines) . " line(s)");
+        }
+        # Rotate the on-disk capture file once we've consumed a lot of it and
+        # we're fully drained (no partial line pending), so a long/chatty
+        # Output binding (build logs, tail -f) doesn't fill /tmp. Swap the
+        # FILE only — do NOT call $term_cap_stop/$term_cap_start here: we're
+        # inside their repeat() timer, and cancelling+recreating it mid-tick
+        # risks a duplicate timer. NOT truncate() on the read-only tail fh
+        # (that silently fails; a naive seek(0) would re-read+re-post the
+        # whole file). The brief gap loses at most a sliver, like seek-to-end.
+        if ($term_cap_fh && $term_cap_buf eq '' && $term_cap_bytes > $MAX_FILE
+            && defined $term_session) {
+            system('tmux', 'pipe-pane', '-t', $term_session);   # stop piping
+            close $term_cap_fh; $term_cap_fh = undef;
+            if (open my $t, '>', $term_cap_file) { close $t }   # recreate empty
+            system('tmux', 'pipe-pane', '-O', '-t', $term_session,
+                   "cat >> $term_cap_file");
+            if (open $term_cap_fh, '<', $term_cap_file) {
+                seek($term_cap_fh, 0, 2);
+                $term_cap_bytes = 0;
+            }
+        }
+    };
+
+    $term_cap_start = sub {
+        return if $term_cap_fh;                 # already capturing
+        return unless defined $term_session;
+        open my $t, '>', $term_cap_file
+            or return $set_status->("terminal: cannot open capture file: $!");
+        close $t;                                # start empty
+        # -O: pipe pane OUTPUT to the command; append to our capture file.
+        # $term_cap_file is a fixed, metachar-free path so plain interpolation
+        # into the sh command tmux runs is safe.
+        system('tmux', 'pipe-pane', '-O', '-t', $term_session,
+               "cat >> $term_cap_file");
+        unless (open $term_cap_fh, '<', $term_cap_file) {
+            $term_cap_fh = undef;
+            return $set_status->("terminal: cannot read capture file: $!");
+        }
+        seek($term_cap_fh, 0, 2);                # skip anything already there
+        $term_cap_buf   = '';
+        $term_cap_bytes = 0;
+        $term_poll_id = $mw->repeat($POLL_MS, $term_poll);
+    };
+
+    $term_cap_stop = sub {
+        $mw->afterCancel($term_poll_id) if $term_poll_id;
+        $term_poll_id = undef;
+        system('tmux', 'pipe-pane', '-t', $term_session)   # no cmd = stop
+            if defined $term_session;
+        if ($term_cap_fh) { close $term_cap_fh; $term_cap_fh = undef; }
+        unlink $term_cap_file;
+        $term_cap_buf = '';
+    };
+
+    $term_start = sub {                 # returns 1 on success, 0 on failure
+        unless ($term_prog) {
+            $set_status->('terminal: no terminal emulator found '
+                        . '(set [chat] terminal or $TERMINAL)');
+            return 0;
+        }
+        unless (defined $cur) {
+            $set_status->('terminal: pick a chat first');
+            return 0;
+        }
+        my $name = "nc-term-$$";        # single, unique per GUI process
         system("tmux has-session -t $name 2>/dev/null") == 0
             or system('tmux', 'new-session', '-d', '-s', $name);
         my @cmd  = ('tmux', 'new-session', '-A', '-s', $name);
         my @argv = ($term_prog =~ /(?:gnome-terminal|konsole)$/)
                  ? ($term_prog, '--', @cmd) : ($term_prog, '-e', @cmd);
         my $pid = fork();
-        return $set_status->("terminal: fork failed: $!") unless defined $pid;
+        unless (defined $pid) {
+            # We pre-created the session above; don't orphan it — nothing has
+            # registered $name in %NC_TERM_CLEANUP yet, so kill it here.
+            system("tmux kill-session -t $name 2>/dev/null");
+            $set_status->("terminal: fork failed: $!");
+            return 0;
+        }
         if ($pid == 0) {                              # detach via double-fork
             my $p2 = fork();
             CORE::exit(0) if $p2;
@@ -2342,7 +2557,45 @@ sub cmd_gui {
         }
         waitpid($pid, 0);
         ($term_session, $term_chat) = ($name, $cur);
-        $set_status->("terminal '$name' up - '\@$localuser ...' in '$cur' runs in it");
+        $NC_TERM_CLEANUP{$name} = $term_cap_file;   # END/safety-net teardown
+        return 1;
+    };
+
+    $term_apply_mode = sub {            # start/stop output capture per mode
+        if ($term_mode eq 'Output' || $term_mode eq 'Both') { $term_cap_start->() }
+        else                                                { $term_cap_stop->()  }
+        # The input side is pull-driven by $term_feed's own mode check.
+    };
+
+    $term_stop = sub {
+        $term_cap_stop->();
+        if (defined $term_session) {
+            system("tmux kill-session -t $term_session 2>/dev/null");
+            delete $NC_TERM_CLEANUP{$term_session};
+        }
+        ($term_session, $term_chat) = (undef, undef);
+        $term_mode = $term_modevar = 'Off';
+        $term_post_fails = 0;
+        $set_status->('terminal: off');
+    };
+
+    # The drop-down's -command. Idempotent: re-selecting a live mode, or
+    # 'Off' when nothing is up, is a harmless no-op.
+    my $term_set_mode = sub {
+        my $want = $_[0] // $term_modevar // 'Off';
+        if ($want eq 'Off') { $term_stop->(); return }
+        unless ($want eq 'Input' || $want eq 'Output' || $want eq 'Both') {
+            $term_modevar = $term_mode; return;
+        }
+        unless (defined $term_session) {
+            unless ($term_start->()) {  # launch bound to $cur; may fail
+                $term_modevar = 'Off';  # revert the drop-down selection
+                return;
+            }
+        }
+        $term_mode = $term_modevar = $want;
+        $term_apply_mode->();
+        $set_status->("terminal '$term_session' bound to '$term_chat' [$term_mode]");
     };
 
     $om->configure(-command => sub {
@@ -2753,14 +3006,21 @@ sub cmd_gui {
 
     my $refresh_btn = $mw->Button(-text => 'Refresh', -command => $refresh);
     my $history_btn = $mw->Button(-text => 'History', -command => $load_history);
-    my $term_btn    = $mw->Button(-text => 'terminal', -command => $launch_term);
+    # terminal bridge direction picker (Off/Input/Output/Both). Optionmenu's
+    # -command fires with the chosen value; $term_set_mode is idempotent.
+    my $term_lbl    = $mw->Label(-text => 'term:');
+    my $term_menu   = $mw->Optionmenu(
+        -variable => \$term_modevar,
+        -options  => ['Off', 'Input', 'Output', 'Both'],
+        -command  => sub { $term_set_mode->($_[0]) },
+    );
     my $members_btn = $mw->Button(-text => 'Members',  -command => $members_popup);
     my $aplus_btn   = $mw->Button(-text => 'A+', -width => 2,
         -command => sub { $fontsize++ if $fontsize < 32; $set_font->() });
     my $aminus_btn  = $mw->Button(-text => 'A-', -width => 2,
         -command => sub { $fontsize-- if $fontsize > 6; $set_font->() });
-    my @action_btns = ($refresh_btn, $history_btn, $term_btn, $members_btn,
-                       $aplus_btn, $aminus_btn);
+    my @action_btns = ($refresh_btn, $history_btn, $term_lbl, $term_menu,
+                       $members_btn, $aplus_btn, $aminus_btn);
     # Initial pack: side-by-side in $top (wide). Reflow on <Configure>.
     $_->pack(-in => $top, -side => 'right') for @action_btns;
 
@@ -2968,6 +3228,10 @@ sub cmd_gui {
             my $n = sysread($stream->{sock}, my $b, 4096);
             if (defined $n && $n == 0) {
                 $mw->fileevent($stream->{sock}, 'readable', '');
+                # Tear the terminal bridge down: its poll posts through the
+                # now-dead $ctrl, and leaving it bound would resume against
+                # whatever server we reconnect to.
+                $term_stop->();
                 $set_status->('disconnected (daemon gone) -- pick a server to reconnect');
                 $cur = undef;
                 $sessvar = 'select';
@@ -3053,6 +3317,19 @@ sub cmd_gui {
         $stream->send_line('SUBSCRIBE sub=2 mode=snapshot+stream'
                          . " FROM chat_members WHERE state = 'requested'");
 
+        # Tear the terminal bridge down — it was bound to a session on the
+        # OLD server via the OLD $ctrl; leaving it live would post local
+        # terminal output to a like-named session on the NEW server.
+        $term_stop->();
+        # Re-derive our identity + loopback state for the new server (the
+        # terminal echo guard 'sender eq $me' and the loopback 'as' both
+        # depend on them; a switch can change the effective principal).
+        ($host) = NetMgr::Client::split_hostport($listen); $host //= '';
+        $is_loopback = $host =~ /^(?:127\.\d+\.\d+\.\d+|::1|localhost)$/;
+        $authed = $force_auth || (!$is_loopback && !$no_auth);
+        $authed = 0 if $no_auth;
+        $me = $authed ? ($key_id // NetMgr::Client::_default_key_id()) : $as;
+
         # Reset the current-session state; $refresh + optional $follow
         # below will re-establish it against the new server.
         $cur     = undef;
@@ -3074,6 +3351,7 @@ sub cmd_gui {
     };
 
     $mw->protocol('WM_DELETE_WINDOW', sub {
+        $term_stop->();                  # kill the tmux session + capture file
         eval { $ctrl->chat_leave(session => $cur) } if defined $cur;
         eval { $ctrl->bye }; eval { $stream->bye };
         $mw->destroy;
@@ -3501,9 +3779,11 @@ usage: net-chat <command> [args]
 
   --gui [name]                     Tk window: pick/watch a chat, type to
                                    post, approve/reject join requests via
-                                   pop-ups (Perl/Tk required). The "terminal"
-                                   button opens a tmux terminal fed by the
-                                   keyboard + chat msgs starting "@<user>".
+                                   pop-ups (Perl/Tk required). The "term:"
+                                   drop-down bridges a tmux session to the
+                                   chat: Input (chat msgs "@<user> ..." drive
+                                   it), Output (its output posts to the chat),
+                                   Both, or Off. One session per GUI.
 
   --listen HOST:PORT   daemon address (overrides --server and config)
   --server NAME|HOST:PORT
