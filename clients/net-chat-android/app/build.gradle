@@ -21,6 +21,13 @@ android {
         }
     }
 
+    // AGP 8.x generates BuildConfig only when asked. We use BuildConfig.DEBUG
+    // to gate the Noise handshake tracer (which logs key material) to debug
+    // builds only — see MainActivity.onCreate.
+    buildFeatures {
+        buildConfig true
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17

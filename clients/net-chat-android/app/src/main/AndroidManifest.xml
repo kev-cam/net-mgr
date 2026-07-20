@@ -38,8 +38,14 @@
         android:name="android.hardware.bluetooth_le"
         android:required="false" />
 
+    <!-- allowBackup=false: the app now persists the raw 32-byte identity
+         seed in SharedPreferences (see MainActivity.loadOrCreateIdentity).
+         That seed reconstructs the Ed25519 signing key, the Noise static
+         key, and the peer_id, so it must not be swept into Android Auto
+         Backup / `adb backup`. Before identity was persisted there was no
+         key material to protect; the persistence is what creates the path. -->
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:label="net-chat"
         android:supportsRtl="true"
         android:theme="@style/Theme.AppCompat.DayNight">

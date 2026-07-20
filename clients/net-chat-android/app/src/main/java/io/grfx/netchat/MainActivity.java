@@ -106,12 +106,17 @@ public class MainActivity extends AppCompatActivity
         // Wire the Noise trace sink to logcat. Filter with:
         //   adb logcat -s NoiseTrace
         // for the full state-transition trace of every handshake.
-        io.grfx.netchat.crypto.Noise.TRACER = (label, data) -> {
-            StringBuilder sb = new StringBuilder(label).append("=");
-            if (data == null) sb.append("(null)");
-            else for (byte b : data) sb.append(String.format("%02x", b));
-            android.util.Log.i("NoiseTrace", sb.toString());
-        };
+        // DEBUG-only: the trace dumps DH shared secrets, chaining/cipher
+        // keys and handshake plaintext — never leave it enabled in a
+        // release build (readable via adb/bugreport).
+        if (BuildConfig.DEBUG) {
+            io.grfx.netchat.crypto.Noise.TRACER = (label, data) -> {
+                StringBuilder sb = new StringBuilder(label).append("=");
+                if (data == null) sb.append("(null)");
+                else for (byte b : data) sb.append(String.format("%02x", b));
+                android.util.Log.i("NoiseTrace", sb.toString());
+            };
+        }
 
         try {
             identity = loadOrCreateIdentity();
@@ -138,12 +143,21 @@ public class MainActivity extends AppCompatActivity
                 getSharedPreferences("identity", MODE_PRIVATE);
         String hex = sp.getString("seed", null);
         if (hex != null && hex.length() == Identity.SEED_LEN * 2) {
-            byte[] seed = new byte[Identity.SEED_LEN];
-            for (int i = 0; i < seed.length; i++) {
-                seed[i] = (byte) Integer.parseInt(
-                        hex.substring(i * 2, i * 2 + 2), 16);
+            // Guard the parse: a stored value that is the right LENGTH but
+            // contains a non-hex char (corruption/tampering of app-private
+            // prefs) must self-heal by regenerating, not throw out of here
+            // and leave identity == null (which then NPEs in startAll).
+            try {
+                byte[] seed = new byte[Identity.SEED_LEN];
+                for (int i = 0; i < seed.length; i++) {
+                    seed[i] = (byte) Integer.parseInt(
+                            hex.substring(i * 2, i * 2 + 2), 16);
+                }
+                return Identity.fromSeed(seed);
+            } catch (NumberFormatException e) {
+                append("stored seed unparseable; regenerating identity");
+                // fall through to regenerate + overwrite
             }
-            return Identity.fromSeed(seed);
         }
         Identity id = Identity.ephemeral();
         StringBuilder sb = new StringBuilder(Identity.SEED_LEN * 2);
