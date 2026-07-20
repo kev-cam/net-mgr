@@ -312,6 +312,21 @@ sub start_listener {
                                      $self->{config}{manager}{listen_exclude});
     croak "no listen addresses resolved from '$spec'" unless @binds;
 
+    # Scoped relay-endpoint bind: an he6in4 [ipv6_vlan] with bind_relay=on ALSO
+    # listens on its tunnel endpoint (a PUBLIC address) so remote sites can
+    # reach us for cross-site BitChat relay. This is the only path that binds a
+    # non-private address (listen=all never does); the public-endpoint
+    # admission gate (see _via_is_public in the dispatch) restricts such
+    # connections to the authenticated relay surface. Deliberate opt-in.
+    {
+        my %seen;
+        $seen{"$_->{host}|$_->{port}"} = 1 for @binds;
+        for my $b ($self->_relay_endpoint_binds) {
+            next if $seen{"$b->{host}|$b->{port}"}++;
+            push @binds, $b;
+        }
+    }
+
     $self->{select} = IO::Select->new;
     for my $b (@binds) {
         # IO::Socket::IP binds either family; V6Only on v6 binds so a v6 listener
@@ -1175,6 +1190,30 @@ sub _auto_spec_desc {
 # 'a:p, b:p, …' → one per entry; missing port defaults to 7531
 # 'a, b, …'     → ditto, port 7531 implicit
 # 'host'        → single entry, port 7531
+# Extra listen binds for he6in4 [ipv6_vlan] sections with bind_relay=on: the
+# node's own tunnel endpoint (tunnel_prefix::local_suffix), port 7531. Derived
+# from the effective (config + mesh_tunnels-merged) network set. Returns a list
+# of { host => v6, port => 7531 }. The admission gate protects these.
+sub _relay_endpoint_binds {
+    my ($self) = @_;
+    my $nets = eval { $self->_ipv6_vlan_networks } || {};
+    my @out;
+    for my $name (sort keys %$nets) {
+        my $e = $nets->{$name};
+        next unless ($e->{type} // '') eq 'he6in4';
+        next unless ($e->{bind_relay} // '') =~ /^(1|on|true|yes)$/i;
+        my $prefix = $e->{prefix};
+        next unless defined $prefix && length $prefix && $prefix ne 'auto';
+        require NetMgr::Tunnel;
+        my $v6 = NetMgr::Tunnel::tunnel_addr($prefix, $e->{local_suffix} // 2);
+        next unless defined $v6 && length $v6 && $v6 =~ /:/;
+        push @out, { host => $v6, port => 7531 };
+        $self->_log("relay-endpoint: also listening on [$v6]:7531 "
+                  . "for ipv6_vlan '$name' (bind_relay)");
+    }
+    return @out;
+}
+
 sub _resolve_listen_spec {
     my ($spec, $control_prefix, $exclude) = @_;
     my $default_port = 7531;
@@ -1249,6 +1288,20 @@ sub _is_private_addr {
              || $a =~ /^172\.(1[6-9]|2\d|3[01])\./;          # RFC1918 v4
     return 1 if $a =~ /^f[cd][0-9a-f][0-9a-f]:/i;            # fc00::/7 ULA
     return 0;
+}
+
+# True if a connection arrived on a PUBLIC (Internet-routable) local address
+# — i.e. a daemon deliberately exposed on its he6in4 tunnel endpoint for
+# cross-site BitChat relay. Loopback and private-LAN vias are NOT public.
+# The admission gate (in the dispatch) restricts such connections to the
+# authenticated relay surface only.
+sub _via_is_public {
+    my ($self, $cli) = @_;
+    my $h = $cli->{via_host};
+    return 0 unless defined $h && length $h;
+    return 0 if $h =~ /^127\./ || $h eq '::1' || lc($h) eq 'localhost'; # loopback
+    return 0 if _is_private_addr($h);                                   # RFC1918 / ULA
+    return 1;                                                           # global/public
 }
 
 # Parse listen_exclude into { iface | ip | cidr } tokens. A token with '/' is a
@@ -1363,14 +1416,16 @@ sub _accept {
     # daemon binds distinct sockets per address (V6Only on v6), so sockhost
     # here is the local bind address the peer actually dialed. Cheap to
     # capture at accept; noisy to reconstruct after the fact.
+    my $via_host = $cli->sockhost // ($listener->sockhost // '');
     my $via = sprintf "%s:%d",
-        $cli->sockhost // ($listener->sockhost // '?'),
+        $via_host // '?',
         $cli->sockport // ($listener->sockport // 0);
     my $fd   = fileno($cli);
     $self->{clients}{$fd} = {
         sock     => $cli,
         peer     => $peer,
         via      => $via,     # local bind addr:port that accepted this conn
+        via_host => $via_host, # just the local bind addr (v6-safe, no port)
         buffer   => '',
         kind     => undef,    # 'producer' | 'consumer'
         ident    => undef,    # source=... or consumer=...
@@ -1484,6 +1539,17 @@ sub _send {
 sub _handle_line {
     my ($self, $cli, $line) = @_;
 
+    # FORWARD_TO is intercepted before parse_line, so the public-endpoint
+    # admission gate further down never sees it. It is NOT a permitted relay
+    # verb, so on a public (Internet-facing) via refuse it here — otherwise it
+    # could be used to proxy arbitrary commands through us to a peer.
+    if ($self->_via_is_public($cli) && $line =~ /^\s*FORWARD_TO\b/i) {
+        $self->_log("relay-gate: refuse FORWARD_TO from $cli->{peer} "
+                  . "via=$cli->{via}");
+        return $self->_send($cli, format_err(
+            "FORWARD_TO: not permitted on the relay endpoint"));
+    }
+
     # Intercept FORWARD_TO before parse_line — parse_line croaks on
     # unknown verbs, and this one wraps an inner command we don't want
     # this daemon to parse in its own context. Syntax:
@@ -1501,6 +1567,40 @@ sub _handle_line {
     return unless $cmd;
 
     my $verb = $cmd->{verb};
+
+    # ---- public-endpoint admission gate --------------------------------
+    # A connection that arrived on a PUBLIC (Internet-routable) local address
+    # is one reaching us over an he6in4 tunnel endpoint we exposed for
+    # cross-site BitChat relay. Today a bare connection can SUBSCRIBE much of
+    # the DB with no auth — fine on a LAN, unacceptable on the Internet. So on
+    # a public via we allow ONLY: (a) the handshake verbs needed to
+    # authenticate/close, and (b) once AUTH-verified, the relay surface
+    # (BITCHAT_PACKET_RELAY + SUBSCRIBE bitchat_relay_packets). Everything else
+    # — general SUBSCRIBE/OBSERVE/CHAT_*/REPAIR/etc. — is refused. Loopback and
+    # private-LAN connections are entirely unaffected (full behaviour).
+    if ($self->_via_is_public($cli)) {
+        my %handshake = map { $_ => 1 } qw(HELLO AUTH AUTH_RESPONSE BYE);
+        unless ($handshake{$verb}) {
+            unless ($cli->{auth} && $cli->{auth}{verified}) {
+                $self->_log("relay-gate: refuse $verb from $cli->{peer} "
+                          . "via=$cli->{via} (unauthenticated)");
+                return $self->_send($cli, format_err(
+                    "$verb: authentication required on this endpoint"));
+            }
+            my $ok_verb = $verb eq 'BITCHAT_PACKET_RELAY'
+                       || ($verb eq 'SUBSCRIBE'
+                           && ($cmd->{table} // '') eq 'bitchat_relay_packets')
+                       || $verb eq 'UNSUB';
+            unless ($ok_verb) {
+                $self->_log("relay-gate: refuse $verb from $cli->{peer} "
+                          . "via=$cli->{via} (not a relay verb)");
+                return $self->_send($cli, format_err(
+                    "$verb: not permitted on the relay endpoint"));
+            }
+        }
+    }
+    # --------------------------------------------------------------------
+
     if    ($verb eq 'HELLO')     { $self->_handle_hello($cli, $cmd) }
     elsif ($verb eq 'OBSERVE')   { $self->_handle_observe($cli, $cmd) }
     elsif ($verb eq 'GONE')      { $self->_handle_gone($cli, $cmd) }
