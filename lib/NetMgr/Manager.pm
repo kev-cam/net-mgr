@@ -3828,7 +3828,8 @@ sub _handle_chat_open {
             $self->_log("chat resurrect $name failed: $@") if $@;
             my $rr = $self->{db}->reopen_chat_session($name,
                 (defined $kv->{mode}  ? (access_mode => $mode)        : ()),
-                (defined $kv->{topic} ? (topic       => $kv->{topic}) : ()));
+                (defined $kv->{topic} ? (topic       => $kv->{topic}) : ()),
+                (exists  $kv->{vlan}  ? (ipv6_vlan   => $kv->{vlan})  : ()));
             $self->_emit_change(table => 'chat_sessions', op => 'update',
                                 row => $rr->{now}) if $rr->{now};
             $self->_log("chat reopen $name by $who");
@@ -3842,7 +3843,8 @@ sub _handle_chat_open {
     my $r = eval {
         $self->{db}->open_chat_session(
             name => $name, created_by => $who,
-            access_mode => $mode, topic => $kv->{topic});
+            access_mode => $mode, topic => $kv->{topic},
+            (defined $kv->{vlan} ? (ipv6_vlan => $kv->{vlan}) : ()));
     };
     return $self->_send($cli, format_err("CHAT_OPEN: $@")) if $@;
     return $self->_send($cli, format_err("CHAT_OPEN: session '$name' exists"))
@@ -3875,7 +3877,8 @@ sub _handle_chat_set {
         $self->{db}->set_chat_session(
             name => $name,
             (defined $kv->{mode}  ? (access_mode => $kv->{mode})  : ()),
-            (exists  $kv->{topic} ? (topic       => $kv->{topic}) : ()));
+            (exists  $kv->{topic} ? (topic       => $kv->{topic}) : ()),
+            (exists  $kv->{vlan}  ? (ipv6_vlan   => $kv->{vlan})  : ()));
     };
     return $self->_send($cli, format_err("CHAT_SET: $@")) if $@;
     $self->_emit_change(table => 'chat_sessions', op => 'update', row => $r->{now})

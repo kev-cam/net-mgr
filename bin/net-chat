@@ -75,6 +75,7 @@ my $key_id;
 my $key_file;
 my $mode;
 my $topic;
+my $vlan;   # --vlan NAME binds a session to an [ipv6_vlan]; --vlan '' unbinds
 my $limit;
 my $since;
 my $show_all;
@@ -103,6 +104,7 @@ GetOptions(
     'key-file=s' => \$key_file,
     'mode=s'     => \$mode,
     'topic=s'    => \$topic,
+    'vlan=s'     => \$vlan,
     'n=i'        => \$limit,
     'since=s'    => \$since,
     'all'        => \$show_all,
@@ -242,6 +244,7 @@ my %DISPATCH = (
     ls       => \&cmd_ls,
     open     => \&cmd_open,
     set      => \&cmd_set,
+    vlan     => \&cmd_vlan,
     close    => \&cmd_close,
     join     => \&cmd_join,
     leave    => \&cmd_leave,
@@ -364,10 +367,12 @@ sub cmd_open {
     my $cli = connect_client();
     my $r = eval { $cli->chat_open(name => $name,
         (defined $mode  ? (mode  => $mode)  : ()),
-        (defined $topic ? (topic => $topic) : ())) };
+        (defined $topic ? (topic => $topic) : ()),
+        (defined $vlan  ? (vlan  => $vlan)  : ())) };
     die "net-chat: $@" if $@;
     print +($r->{reopened} ? "reopened" : "opened"),
-          " '$name' (mode=", $r->{mode} // $mode // 'open', ")\n";
+          " '$name' (mode=", $r->{mode} // $mode // 'open', ")",
+          (defined $vlan && length $vlan ? " vlan=$vlan" : ''), "\n";
 }
 
 sub cmd_set {
@@ -377,9 +382,33 @@ sub cmd_set {
     my $cli = connect_client();
     eval { $cli->chat_set(name => $name,
         (defined $mode  ? (mode  => $mode)  : ()),
-        (defined $topic ? (topic => $topic) : ())) };
+        (defined $topic ? (topic => $topic) : ()),
+        (defined $vlan  ? (vlan  => $vlan)  : ())) };
     die "net-chat: $@" if $@;
     print "updated '$name'\n";
+}
+
+# net-chat vlan NAME [VLAN|-]  — show / set / clear a session's IPv6-VLAN
+# binding. With no VLAN arg: print the current binding. With a VLAN name:
+# bind. With '-' (or an empty string): unbind. Binding a session routes its
+# BitChat cross-site relay over that [ipv6_vlan]'s routable IPv6.
+sub cmd_vlan {
+    my $name = need_name(shift @ARGV);
+    my $val  = shift @ARGV;                 # undef = show; '-' = clear
+    # Show is read-only (no auth); set connects like `set` (default) and lets
+    # the daemon authorize (loopback = admin; remote needs an owner key).
+    my $cli  = defined $val ? connect_client() : connect_client(want_auth => 0);
+    if (!defined $val) {
+        my $rows = $cli->snapshot(1, 'chat_sessions', where => "name = '$name'");
+        die "net-chat: no such session '$name'\n" unless $rows && @$rows;
+        my $v = $rows->[0]{ipv6_vlan};
+        print "'$name' vlan: ", (defined $v && length $v ? $v : '(unbound)'), "\n";
+        return;
+    }
+    $val = '' if $val eq '-';               # '-' clears the binding
+    eval { $cli->chat_set(name => $name, vlan => $val) };
+    die "net-chat: $@" if $@;
+    print "'$name' vlan ", (length $val ? "bound to '$val'" : 'unbound'), "\n";
 }
 
 sub cmd_close {

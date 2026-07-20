@@ -763,7 +763,8 @@ sub chat_open {
     return $self->_chat_cmd('CHAT_OPEN',
         name => $a{name},
         (defined $a{mode}  ? (mode  => $a{mode})  : ()),
-        (defined $a{topic} ? (topic => $a{topic}) : ()));
+        (defined $a{topic} ? (topic => $a{topic}) : ()),
+        (defined $a{vlan}  ? (vlan  => $a{vlan})  : ()));
 }
 
 sub chat_set {
@@ -772,7 +773,9 @@ sub chat_set {
     return $self->_chat_cmd('CHAT_SET',
         name => $a{name},
         (defined $a{mode}  ? (mode  => $a{mode})  : ()),
-        (exists  $a{topic} ? (topic => $a{topic}) : ()));
+        (exists  $a{topic} ? (topic => $a{topic}) : ()),
+        # vlan present (even empty) = set/clear the binding.
+        (exists  $a{vlan}  ? (vlan  => $a{vlan})  : ()));
 }
 
 sub chat_close {

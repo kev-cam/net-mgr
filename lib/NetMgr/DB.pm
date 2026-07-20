@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 35;
+our $SCHEMA_VERSION = 36;
 
 sub new {
     my ($class, %args) = @_;
@@ -903,6 +903,18 @@ INSERT IGNORE INTO public_dns_servers (addr, provider, family) VALUES
     ('2001:4860:4860::8888', 'google',     6),
     ('2620:fe::fe',          'quad9',      6)
 SQL
+        return;
+    }
+    if ($v == 36) {
+        # chat_sessions.ipv6_vlan: optional binding of a chat session to a
+        # named [ipv6_vlan] network, so that session's BitChat cross-site
+        # relay egresses over that VLAN's routable IPv6 (he6in4 tunnel)
+        # instead of the LAN control plane — extending the BLE mesh across
+        # the Internet. NULL = LAN relay (the default). See sql/schema.sql
+        # and Manager::_bitchat_relay_fanout.
+        $self->{dbh}->do(
+            "ALTER TABLE chat_sessions ADD COLUMN ipv6_vlan VARCHAR(64) NULL"
+        );
         return;
     }
     croak "no migration for schema v$v";
@@ -2252,19 +2264,30 @@ sub get_chat_session {
 
 # Create a session. op => 'insert' on success, 'exists' if the name is
 # already taken (caller reports ERR). access_mode defaults to 'open'.
+# Validate an [ipv6_vlan] binding name. Empty/undef means "unbound" (NULL);
+# a set value must be a plain config-section-style token so it can't smuggle
+# anything into the config/relay lookups it drives.
+sub _norm_ipv6_vlan {
+    my ($v) = @_;
+    return undef unless defined $v && length $v;
+    croak "bad ipv6_vlan name '$v'" unless $v =~ /^[\w.\-]+$/;
+    return $v;
+}
+
 sub open_chat_session {
     my ($self, %f) = @_;
     croak "name required"       unless defined $f{name} && length $f{name};
     croak "created_by required" unless defined $f{created_by} && length $f{created_by};
     my $mode = $f{access_mode} // 'open';
     croak "bad access_mode '$mode'" unless $mode =~ /^(open|list|request)$/;
+    my $vlan = _norm_ipv6_vlan($f{ipv6_vlan});
     if (my $was = $self->get_chat_session($f{name})) {
         return { op => 'exists', now => $was };
     }
     $self->{dbh}->do(
-        "INSERT INTO chat_sessions (name, topic, created_by, access_mode)
-         VALUES (?, ?, ?, ?)",
-        undef, $f{name}, $f{topic}, $f{created_by}, $mode);
+        "INSERT INTO chat_sessions (name, topic, created_by, access_mode, ipv6_vlan)
+         VALUES (?, ?, ?, ?, ?)",
+        undef, $f{name}, $f{topic}, $f{created_by}, $mode, $vlan);
     return { op => 'insert', now => $self->get_chat_session($f{name}) };
 }
 
@@ -2279,6 +2302,10 @@ sub set_chat_session {
         push @set, "access_mode = ?"; push @bind, $f{access_mode};
     }
     if (exists $f{topic}) { push @set, "topic = ?"; push @bind, $f{topic}; }
+    # ipv6_vlan: present key = set/clear the binding (empty => NULL/unbind).
+    if (exists $f{ipv6_vlan}) {
+        push @set, "ipv6_vlan = ?"; push @bind, _norm_ipv6_vlan($f{ipv6_vlan});
+    }
     return { op => 'noop', now => $self->get_chat_session($f{name}) } unless @set;
     $self->{dbh}->do(
         "UPDATE chat_sessions SET " . join(', ', @set) . " WHERE name = ?",
@@ -2310,6 +2337,9 @@ sub reopen_chat_session {
     }
     if (exists $f{topic} && defined $f{topic}) {
         push @set, "topic = ?"; push @bind, $f{topic};
+    }
+    if (exists $f{ipv6_vlan}) {
+        push @set, "ipv6_vlan = ?"; push @bind, _norm_ipv6_vlan($f{ipv6_vlan});
     }
     $self->{dbh}->do(
         "UPDATE chat_sessions SET " . join(', ', @set) . " WHERE name = ?",

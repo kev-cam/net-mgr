@@ -513,6 +513,12 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_activity DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     closed_at     DATETIME     NULL,
+    -- ipv6_vlan (schema v36): optional binding to a named [ipv6_vlan]
+    -- network. When set, this session's BitChat cross-site relay egresses
+    -- over that VLAN's routable IPv6 (the he6in4 tunnel) instead of the LAN
+    -- control plane, extending the BLE mesh across the Internet. NULL = LAN
+    -- relay. Consumed by Manager::_bitchat_relay_fanout.
+    ipv6_vlan     VARCHAR(64)  NULL,
     KEY idx_status        (status),
     KEY idx_last_activity (last_activity)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -847,3 +853,11 @@ INSERT IGNORE INTO public_dns_servers (addr, provider, family) VALUES
     ('2620:fe::fe',          'quad9',      6);
 
 INSERT IGNORE INTO schema_version (version) VALUES (35);
+
+-- Schema v36: chat_sessions.ipv6_vlan — bind a chat session to a named
+-- [ipv6_vlan] network so its BitChat cross-site relay egresses over that
+-- VLAN's routable IPv6 (he6in4 tunnel) instead of the LAN control plane.
+-- NULL = LAN relay. Consumed by Manager::_bitchat_relay_fanout.
+ALTER TABLE chat_sessions ADD COLUMN ipv6_vlan VARCHAR(64) NULL;
+
+INSERT IGNORE INTO schema_version (version) VALUES (36);
