@@ -6411,11 +6411,12 @@ sub _handle_bitchat_peer_upsert {
 sub _handle_bitchat_packet_relay {
     my ($self, $cli, $cmd) = @_;
     my $kv = $cmd->{kv} || {};
-    my $pid    = $kv->{packet_id} // '';
-    my $hex    = $kv->{hex}       // '';
-    my $origin = $kv->{origin}    // '';
-    my $from   = $kv->{from}      // '';
-    my $me     = $self->{cluster}{self_name} // '';
+    my $pid     = $kv->{packet_id} // '';
+    my $hex     = $kv->{hex}       // '';
+    my $origin  = $kv->{origin}    // '';
+    my $from    = $kv->{from}      // '';
+    my $session = $kv->{session}   // '';   # which chat session this relays for
+    my $me      = $self->{cluster}{self_name} // '';
 
     unless (length $pid && length $hex) {
         return $self->_send($cli,
@@ -6445,7 +6446,7 @@ sub _handle_bitchat_packet_relay {
             unless _peer_is_loopback($cli);
         my $count = $self->_bitchat_relay_fanout(
             packet_id => $pid, hex => $hex, from => $from,
-            origin    => $me);
+            origin    => $me, session => $session);
         return $self->_send($cli, format_ok(fanned => $count));
     }
 
@@ -6459,21 +6460,51 @@ sub _handle_bitchat_packet_relay {
             hex       => $hex,
             origin    => $origin,
             from_addr => $from,
+            session   => $session,   # so the receiving bridge injects only for its session
             seen_at   => time(),
         });
     return $self->_send($cli, format_ok(injected => 1));
 }
 
 # Fan out one packet to every mesh peer with 'ble' in their advertised
-# node_capabilities. Follows the _forward_observe_to_master pattern
-# (canonical daemon→peer push): open a NetMgr::Client, HELLO, send verb,
-# BYE, done. Sync sequential today — TODO: swap to non-blocking when
-# peer count grows beyond a handful. Skips self by member name.
+# node_capabilities. Skips self by member name. Returns the number of peers
+# the packet was DISPATCHED to (dials happen in a forked child, so this is
+# the target count, not a per-peer success count).
+#
+# VLAN routing: when the packet's session (chat_sessions.ipv6_vlan) is bound
+# to a named [ipv6_vlan], each peer's dial target becomes its routable IPv6
+# (the he6in4 tunnel endpoint from the cluster-replicated mesh_tunnels table)
+# instead of the LAN control-plane address — extending the mesh over the
+# Internet. Peers without a tunnel row fall back to the LAN address.
+#
+# Non-blocking: all DB lookups happen HERE (parent, event loop); the actual
+# connect/observe/bye dials are handed to a forked child (mirrors
+# _broadcast_regen_dnsmasq) so a slow or unreachable peer — very likely for a
+# remote v6 site — can't block the daemon. The old sync-sequential version
+# wedged the event loop under relay load.
 sub _bitchat_relay_fanout {
     my ($self, %a) = @_;
     my $me    = $self->{cluster}{self_name} // '';
     my $rows  = eval { $self->{db}->list_node_capabilities } || [];
-    my $count = 0;
+
+    # Session -> [ipv6_vlan] binding. Empty = LAN relay (unchanged behaviour).
+    my $vlan;
+    if (length($a{session} // '')) {
+        my $s = eval { $self->{db}->get_chat_session($a{session}) };
+        $vlan = $s->{ipv6_vlan}
+            if $s && defined $s->{ipv6_vlan} && length $s->{ipv6_vlan};
+    }
+    # One query for every peer's he6in4 tunnel prefix (rather than per peer).
+    my %v6prefix;
+    if (defined $vlan) {
+        my $mt = eval { $self->{db}->list_mesh_tunnels('he6in4') } || [];
+        for my $t (@$mt) {
+            $v6prefix{ $t->{owner_node} } = $t->{tunnel_prefix}
+                if length($t->{owner_node} // '') && length($t->{tunnel_prefix} // '');
+        }
+    }
+
+    my @targets;
     for my $r (@$rows) {
         my $member = $r->{member} // '';
         next unless length $member;
@@ -6482,30 +6513,83 @@ sub _bitchat_relay_fanout {
                    grep { length }
                    split /,/, ($r->{capabilities} // '');
         next unless $caps{ble};
-        my $addr = eval { $self->{mesh}->address_for($member) }
-                || "$member:7531";
+        my $addr;
+        if (defined $vlan && $v6prefix{$member}) {
+            $addr = _bitchat_relay_v6_dial($v6prefix{$member});
+        }
+        $addr //= (eval { $self->{mesh}->address_for($member) } || "$member:7531");
+        push @targets, { member => $member, addr => $addr };
+    }
+    return 0 unless @targets;
+
+    # Bound concurrent fanout children so a packet flood can't fork-storm.
+    my $live = grep { ($_->{name} // '') eq 'bitchat-relay-fanout' }
+               values %{ $self->{triggers} || {} };
+    if ($live >= 32) {
+        $self->_log("bitchat-relay fanout: $live in flight; dropping "
+                  . ($a{packet_id} // '?'));
+        return 0;
+    }
+
+    my $pid = fork();
+    if (!defined $pid) {                 # fork failed — inline rather than drop
+        $self->_bitchat_relay_dial(\@targets, \%a);
+        return scalar @targets;
+    }
+    if ($pid) {
+        $self->{triggers}{$pid} = { cli_fd => undef,
+            name => 'bitchat-relay-fanout', started_at => time() };
+        return scalar @targets;
+    }
+    # child: drop inherited sockets so we don't disturb the parent's I/O.
+    for my $c (values %{ $self->{clients} }) { close $c->{sock} if $c->{sock} }
+    close $self->{listen} if $self->{listen};
+    $self->_bitchat_relay_dial(\@targets, \%a);
+    exit 0;
+}
+
+# The blocking part of the fanout: dial each pre-resolved target and push the
+# packet. Runs in the forked child (or inline on fork failure). No DB access
+# (all lookups were done in the parent) so the shared dbh is never touched
+# across the fork.
+sub _bitchat_relay_dial {
+    my ($self, $targets, $a) = @_;
+    require NetMgr::Client;
+    for my $t (@$targets) {
         my $ok = eval {
-            require NetMgr::Client;
-            my $c = NetMgr::Client->new(listen => $addr, timeout => 6);
+            my $c = NetMgr::Client->new(listen => $t->{addr}, timeout => 6);
             $c->hello(consumer => "bitchat-relay-fanout.$$");
-            eval { $c->auth };   # tolerate no-key (mirrors _forward_observe_to_master:874-886)
+            eval { $c->auth };   # tolerate no-key (mirrors _forward_observe_to_master)
             $c->send_recv('BITCHAT_PACKET_RELAY '
                         . NetMgr::Protocol::format_kv(
-                            packet_id => $a{packet_id},
-                            hex       => $a{hex},
-                            from      => $a{from},
-                            origin    => $a{origin},
+                            packet_id => $a->{packet_id},
+                            hex       => $a->{hex},
+                            from      => $a->{from},
+                            origin    => $a->{origin},
+                            (length($a->{session} // '')
+                                ? (session => $a->{session}) : ()),
                           ));
             $c->bye;
             1;
         };
-        if ($ok) { $count++ }
-        else {
-            $self->_log("bitchat-relay fanout to $member ($addr) failed: $@")
-                if $@;
-        }
+        $self->_log("bitchat-relay fanout to $t->{member} ($t->{addr}) failed: $@")
+            if !$ok && $@;
     }
-    return $count;
+}
+
+# Peer's routable v6 dial target for a bound vlan: the he6in4 tunnel endpoint
+# (tunnel_prefix::2). Returns "[v6]:7531" or undef (caller falls back to LAN).
+# local_suffix defaults to 2 (the tunnel client endpoint that comes up with
+# the tunnel); a node overriding it would need the endpoint stored on
+# mesh_tunnels — a future refinement.
+sub _bitchat_relay_v6_dial {
+    my ($prefix) = @_;
+    return undef unless defined $prefix && length $prefix;
+    require NetMgr::Tunnel;
+    require NetMgr::Addr;
+    my $v6 = NetMgr::Tunnel::tunnel_addr($prefix, 2);
+    return undef unless defined $v6 && length $v6 && $v6 =~ /:/;
+    return NetMgr::Addr::join_hostport($v6, 7531);
 }
 
 # ---- REPAIR (default-allow, [repair] gates) ----------------------------

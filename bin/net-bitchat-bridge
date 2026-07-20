@@ -376,8 +376,14 @@ sub run_once {
                         my $pid    = $c->{kv}{packet_id} // '';
                         my $hex    = $c->{kv}{hex}       // '';
                         my $origin = $c->{kv}{origin}    // '';
+                        my $rsess  = $c->{kv}{session};
                         next unless length $pid && length $hex;
                         next if $origin eq $me;         # belt-and-braces
+                        # Per-session scoping: only inject packets relayed for
+                        # OUR session. An untagged packet (older peer) injects
+                        # anyway for backward compatibility.
+                        next if defined $rsess && length $rsess
+                                              && $rsess ne $session;
                         next if $relay_seen->($pid);
                         my $cmd = encode_json({
                             cmd  => 'inject_packet',
@@ -462,11 +468,15 @@ sub run_once {
                         next;
                     }
                     if ($cli) {
+                        # Tag the relay with our chat session so the daemon can
+                        # route it over the session's [ipv6_vlan] (if bound) and
+                        # remote bridges inject it only for the same session.
                         my $line = 'BITCHAT_PACKET_RELAY '
                                  . NetMgr::Protocol::format_kv(
                                      packet_id => $pid,
                                      hex       => ($ev->{hex} // ''),
                                      from      => $from_addr,
+                                     session   => $session,
                                    );
                         my $reply = eval { $cli->send_recv($line) };
                         if ($@) {
