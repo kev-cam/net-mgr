@@ -723,6 +723,13 @@ sub run_once {
         }       # close for my $fh
     }           # close OUTER while
 
+    # Flush any relay-fanout drops accumulated in the final second: these
+    # counters are run_once-local and reset on respawn, and the periodic
+    # warn only fires when a LATER-second packet arrives, so a storm's
+    # trailing drops would otherwise never be logged.
+    warn "[bridge] relay fanout rate-limit dropped $relay_out_dropped packet(s) "
+       . "(final window)\n" if $relay_out_dropped;
+
     eval { $cli->bye }      if $cli;
     eval { $sub->bye }      if $sub;
     eval { $peer_cli->bye } if $peer_cli;
@@ -813,11 +820,31 @@ sub _kill_stray_helpers {
         close $fh;
         my @argv = split /\0/, $cmd;
         next unless @argv && $argv[0] eq $path;
+        # ONLY kill our OWN orphaned children. Without this, a second
+        # supervisor instance (an operator running --foreground/--dry-run
+        # alongside the systemd service — both open3 a real helper with the
+        # same argv[0]) would have its healthy helper SIGKILLed here, which
+        # re-creates the exact adv-slot leak this sweep exists to prevent
+        # (and root-vs-root instances would mutually kill in a storm). The
+        # helper's parent is always this supervisor, so gate on PPID == $$.
+        next unless _ppid_of($p) == $$;
         warn "[bridge] killing stray helper pid=$p\n";
         kill 'KILL', $p;
     }
     # Reap any that were our direct children so they don't linger defunct.
     1 while waitpid(-1, WNOHANG) > 0;
+}
+
+# Parent PID of $p from /proc/$p/stat. Field 4 (1-based) is ppid, but the
+# comm field (2) can contain spaces/parens, so anchor parsing after the
+# closing ')' of comm. Returns -1 if unreadable (so it never matches $$).
+sub _ppid_of {
+    my ($p) = @_;
+    open my $fh, '<', "/proc/$p/stat" or return -1;
+    my $stat = <$fh>;
+    close $fh;
+    return -1 unless defined $stat && $stat =~ /\)\s+\S+\s+(\d+)/;
+    return $1;
 }
 
 # True if at least one BLE controller is exposed by the kernel. We look at
