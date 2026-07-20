@@ -1193,7 +1193,17 @@ sub _auto_spec_desc {
 # Extra listen binds for he6in4 [ipv6_vlan] sections with bind_relay=on: the
 # node's own tunnel endpoint (tunnel_prefix::local_suffix), port 7531. Derived
 # from the effective (config + mesh_tunnels-merged) network set. Returns a list
-# of { host => v6, port => 7531 }. The admission gate protects these.
+# of { host => v6, port => 7531 }.
+#
+# SECURITY: the public-endpoint admission gate (_via_is_public in the dispatch)
+# restricts connections here to the authenticated relay surface, but the
+# daemon's shared event loop is NOT yet hardened for direct Internet exposure
+# (blocking in-loop signature verification, no connection/rate caps, unbounded
+# input buffering). A 2025 security review's verdict was DO-NOT-EXPOSE raw. So
+# bind_relay is an EXPERIMENTAL opt-in that logs a loud warning; the intended
+# safe deployment is to reach the tunnel endpoint over a trusted channel or
+# behind a source-IP allowlist / firewall, NOT bare on the public Internet,
+# until the daemon-hardening pass lands.
 sub _relay_endpoint_binds {
     my ($self) = @_;
     my $nets = eval { $self->_ipv6_vlan_networks } || {};
@@ -1208,8 +1218,10 @@ sub _relay_endpoint_binds {
         my $v6 = NetMgr::Tunnel::tunnel_addr($prefix, $e->{local_suffix} // 2);
         next unless defined $v6 && length $v6 && $v6 =~ /:/;
         push @out, { host => $v6, port => 7531 };
-        $self->_log("relay-endpoint: also listening on [$v6]:7531 "
-                  . "for ipv6_vlan '$name' (bind_relay)");
+        $self->_log("SECURITY WARNING: bind_relay exposes the control port on "
+                  . "[$v6]:7531 (ipv6_vlan '$name'). The daemon is not yet "
+                  . "hardened for raw Internet exposure — firewall / source-IP "
+                  . "allowlist this endpoint. See _relay_endpoint_binds.");
     }
     return @out;
 }
@@ -6521,6 +6533,23 @@ sub _handle_bitchat_packet_relay {
     unless (length $pid && length $hex) {
         return $self->_send($cli,
             format_err('BITCHAT_PACKET_RELAY: need packet_id + hex'));
+    }
+    # hex is injected verbatim onto the local BLE radio by the bridge, so
+    # validate it: hex digits only, and a sane cap (a BLE mesh frame is a few
+    # hundred bytes; 8192 hex chars = 4KB is already generous). Rejects
+    # malformed/oversized payloads — important now that an authenticated
+    # REMOTE peer (over the exposed tunnel endpoint) can reach this path.
+    if ($hex !~ /\A[0-9a-fA-F]+\z/ || length($hex) > 8192 || length($hex) % 2) {
+        return $self->_send($cli,
+            format_err('BITCHAT_PACKET_RELAY: bad hex'));
+    }
+    # On a PUBLIC (Internet-facing) endpoint the relay MUST be session-tagged
+    # so it can only ever be injected into a matching, deliberately-bridged
+    # session — never sprayed untagged onto every site's radio. (Loopback /
+    # LAN peers may still relay untagged for backward compatibility.)
+    if (!length($session) && $self->_via_is_public($cli)) {
+        return $self->_send($cli,
+            format_err('BITCHAT_PACKET_RELAY: session required on this endpoint'));
     }
 
     # LRU dedup — a moderately-sized ring of recent packet ids. Not
