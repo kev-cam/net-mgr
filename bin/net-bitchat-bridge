@@ -180,6 +180,15 @@ while (1) {
         warn "[bridge] helper exited (code=" . ($exit // '?') . ")\n";
     }
     last if $opt{once};
+    # Stray-helper sweep: any die() between open3 and the OUTER loop
+    # (HELLO/SUBSCRIBE failures against a busy daemon, most commonly)
+    # used to leak a LIVE helper — still scanning, still holding its
+    # LE advertisement via its D-Bus connection, permanently occupying
+    # a controller adv slot (bluez only unregisters when the client's
+    # bus connection closes). Observed on P620A as two helpers under
+    # one supervisor. Kill anything running $helper_path that isn't
+    # ours-current before respawning; their death frees the slots.
+    _kill_stray_helpers($helper_path);
     # BLE stack recovery: a helper generation that dies without
     # unregistering its LE advertisement leaks a controller adv slot;
     # once they're exhausted every relaunch fails with "Maximum
@@ -285,6 +294,11 @@ sub run_once {
     # or injected twice. Bounded ring; drop oldest at 4096 entries.
     my %relay_lru;
     my @relay_lru_ord;
+    # Relay-fanout rate limit (see the packet_rx handler): tokens per
+    # one-second window + a dropped counter for visibility.
+    my $relay_out_sec = 0;
+    my $relay_out_n = 0;
+    my $relay_out_dropped = 0;
     my $relay_seen = sub {
         my ($pid) = @_;
         return 1 if !defined $pid || $pid eq '';
@@ -471,7 +485,14 @@ sub run_once {
                     }
                     next;
                 }
-                # stdout path: JSON event
+                # stdout path: JSON event. ANY stdout line proves the
+                # helper's runtime is alive — stamp the liveness watchdog
+                # here, not only on peers replies. A supervisor stalled in
+                # a synchronous daemon call would otherwise let the stamp
+                # age while perfectly-good helper output sat unread in the
+                # pipe, then kick a healthy helper (observed on P620A
+                # during relay-packet storms).
+                $last_peer_reply_ts = time;
                 my $ev = eval { decode_json($line) };
                 if ($@ || ref($ev) ne 'HASH') {
                     warn "[bridge] skip non-JSON: " . substr($line, 0, 200) . "\n";
@@ -504,6 +525,26 @@ sub run_once {
                         next;
                     }
                     if ($cli) {
+                        # Rate-limit the daemon fanout: a peer retry-storm
+                        # emits dozens of distinct packets/sec, and each
+                        # fanout is a synchronous send_recv (seconds, when
+                        # the daemon is itself busy fanning out) that
+                        # starves this select loop. Cap at 5/s; BLE mesh
+                        # re-delivery covers what we drop, and we log the
+                        # drop count so storms stay visible.
+                        if (time == $relay_out_sec) {
+                            if (++$relay_out_n > 5) {
+                                $relay_out_dropped++;
+                                next;
+                            }
+                        } else {
+                            warn "[bridge] relay fanout rate-limit dropped "
+                               . "$relay_out_dropped packet(s)\n"
+                                if $relay_out_dropped;
+                            $relay_out_sec     = time;
+                            $relay_out_n       = 1;
+                            $relay_out_dropped = 0;
+                        }
                         my $line = 'BITCHAT_PACKET_RELAY '
                                  . NetMgr::Protocol::format_kv(
                                      packet_id => $pid,
@@ -754,6 +795,29 @@ sub _find_in_home_clone {
         return $p if -x $p;
     }
     return undef;
+}
+
+# Kill every process whose argv[0] is exactly the helper binary. Called
+# between helper generations, when no helper of ours should be alive —
+# anything matching is a leaked orphan from an exception path. Their
+# death closes their D-Bus connections, which is what actually releases
+# the LE advertising slots they pinned.
+sub _kill_stray_helpers {
+    my ($path) = @_;
+    return unless defined $path && length $path;
+    for my $d (glob '/proc/[0-9]*') {
+        my ($p) = $d =~ m{/proc/(\d+)$} or next;
+        next if $p == $$;
+        open my $fh, '<', "$d/cmdline" or next;
+        my $cmd = do { local $/; <$fh> } // '';
+        close $fh;
+        my @argv = split /\0/, $cmd;
+        next unless @argv && $argv[0] eq $path;
+        warn "[bridge] killing stray helper pid=$p\n";
+        kill 'KILL', $p;
+    }
+    # Reap any that were our direct children so they don't linger defunct.
+    1 while waitpid(-1, WNOHANG) > 0;
 }
 
 # True if at least one BLE controller is exposed by the kernel. We look at
