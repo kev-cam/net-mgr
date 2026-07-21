@@ -556,7 +556,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     session      VARCHAR(64)  NOT NULL,
     ts           DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     sender       VARCHAR(128) NOT NULL,
-    sender_kind  ENUM('agent','human','system') NOT NULL DEFAULT 'agent',
+    sender_kind  ENUM('agent','human','system','unverified') NOT NULL DEFAULT 'agent',
     body         TEXT         NOT NULL,
     in_reply_to  BIGINT       NULL,
     KEY idx_session_ts (session, ts),
@@ -861,3 +861,15 @@ INSERT IGNORE INTO schema_version (version) VALUES (35);
 ALTER TABLE chat_sessions ADD COLUMN ipv6_vlan VARCHAR(64) NULL;
 
 INSERT IGNORE INTO schema_version (version) VALUES (36);
+
+-- Schema v37: admit 'unverified' into chat_messages.sender_kind. _chat_identity
+-- stamps remote self-asserted posters (as=NAME without AUTH) as kind
+-- 'unverified', but the enum lacked the value, so every remote unauthenticated
+-- OBSERVE chat_msg failed the insert with "Data truncated for column
+-- 'sender_kind'". Append-only enum change; MODIFY is idempotent / re-run safe.
+-- (Authored by dkc as v36 on a parallel line; renumbered to v37 here because
+-- v36 is chat_sessions.ipv6_vlan on this line.)
+ALTER TABLE chat_messages MODIFY COLUMN sender_kind
+    ENUM('agent','human','system','unverified') NOT NULL DEFAULT 'agent';
+
+INSERT IGNORE INTO schema_version (version) VALUES (37);

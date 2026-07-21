@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 36;
+our $SCHEMA_VERSION = 37;
 
 sub new {
     my ($class, %args) = @_;
@@ -574,7 +574,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     session      VARCHAR(64)  NOT NULL,
     ts           DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     sender       VARCHAR(128) NOT NULL,
-    sender_kind  ENUM('agent','human','system') NOT NULL DEFAULT 'agent',
+    sender_kind  ENUM('agent','human','system','unverified') NOT NULL DEFAULT 'agent',
     body         TEXT         NOT NULL,
     in_reply_to  BIGINT       NULL,
     KEY idx_session_ts (session, ts),
@@ -914,6 +914,21 @@ SQL
         # and Manager::_bitchat_relay_fanout.
         $self->{dbh}->do(
             "ALTER TABLE chat_sessions ADD COLUMN ipv6_vlan VARCHAR(64) NULL"
+        );
+        return;
+    }
+    if ($v == 37) {
+        # _chat_identity stamps remote self-asserted posters as kind
+        # 'unverified', but the enum never got the value — every remote
+        # unauthenticated OBSERVE chat_msg died with "Data truncated for
+        # column 'sender_kind'" even when unverified:NAME was an admitted
+        # member. Append-only enum change (no table rewrite). Re-run safe.
+        # (Originally authored as v36 on a parallel line; renumbered to v37
+        # here because v36 is chat_sessions.ipv6_vlan on this line.)
+        $self->{dbh}->do(
+            "ALTER TABLE chat_messages MODIFY COLUMN sender_kind
+                 ENUM('agent','human','system','unverified')
+                 NOT NULL DEFAULT 'agent'"
         );
         return;
     }
