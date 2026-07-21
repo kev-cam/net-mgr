@@ -355,42 +355,61 @@ async fn main() -> Result<()> {
                             let msg = BitchatMessage::new(
                                 my_nick.clone(), body.clone(), chrono::Utc::now(),
                             );
-                            // Priority: explicit hex peer_id > nickname > broadcast.
-                            // to_peer is 16 hex chars = 8 bytes. Useful when a
-                            // peer's stored nickname is garbled (old-format
-                            // announce senders) but we know the peer id.
-                            let (ok, err, path) = if let Some(hex_id) = to_peer.as_deref() {
-                                match hex::decode(hex_id) {
-                                    Ok(bytes) if bytes.len() == 8 => {
-                                        let mut rid = [0u8; 8];
-                                        rid.copy_from_slice(&bytes);
-                                        match mesh_stdin.send_private_message(msg, rid).await {
-                                            Ok(_)  => (true,  String::new(), format!("private:{}", hex_id)),
-                                            Err(e) => (false, format!("{}", e), format!("private:{}", hex_id)),
+                            // Spawned + bounded: bluer's connect/write paths
+                            // have no timeout of their own, and awaiting them
+                            // inline froze this whole loop when a peripheral
+                            // hung (rotating-MAC Android peers) — peers polls
+                            // went unanswered and the supervisor's watchdog
+                            // killed us. The reader loop must stay live no
+                            // matter what one send does.
+                            let mesh_send = mesh_stdin.clone();
+                            tokio::spawn(async move {
+                                // Priority: explicit hex peer_id > nickname > broadcast.
+                                // to_peer is 16 hex chars = 8 bytes. Useful when a
+                                // peer's stored nickname is garbled (old-format
+                                // announce senders) but we know the peer id.
+                                let fut = async {
+                                    if let Some(hex_id) = to_peer.as_deref() {
+                                        match hex::decode(hex_id) {
+                                            Ok(bytes) if bytes.len() == 8 => {
+                                                let mut rid = [0u8; 8];
+                                                rid.copy_from_slice(&bytes);
+                                                match mesh_send.send_private_message(msg, rid).await {
+                                                    Ok(_)  => (true,  String::new(), format!("private:{}", hex_id)),
+                                                    Err(e) => (false, format!("{}", e), format!("private:{}", hex_id)),
+                                                }
+                                            }
+                                            Ok(_)  => (false, "to_peer must decode to 8 bytes".into(), format!("private:{}", hex_id)),
+                                            Err(e) => (false, format!("bad hex: {}", e), format!("private:{}", hex_id)),
+                                        }
+                                    } else if let Some(nick) = to.as_deref() {
+                                        match mesh_send.send_private_message_by_nickname(
+                                            msg, nick.to_string()).await
+                                        {
+                                            Ok(_)  => (true,  String::new(), format!("private:{}", nick)),
+                                            Err(e) => (false, format!("{}", e), format!("private:{}", nick)),
+                                        }
+                                    } else {
+                                        match mesh_send.send_message(msg).await {
+                                            Ok(_)  => (true,  String::new(), "broadcast".to_string()),
+                                            Err(e) => (false, format!("{}", e), "broadcast".to_string()),
                                         }
                                     }
-                                    Ok(_)  => (false, "to_peer must decode to 8 bytes".into(), format!("private:{}", hex_id)),
-                                    Err(e) => (false, format!("bad hex: {}", e), format!("private:{}", hex_id)),
-                                }
-                            } else if let Some(nick) = to.as_deref() {
-                                match mesh_stdin.send_private_message_by_nickname(
-                                    msg, nick.to_string()).await
+                                };
+                                let (ok, err, path) = match tokio::time::timeout(
+                                    std::time::Duration::from_secs(30), fut).await
                                 {
-                                    Ok(_)  => (true,  String::new(), format!("private:{}", nick)),
-                                    Err(e) => (false, format!("{}", e), format!("private:{}", nick)),
-                                }
-                            } else {
-                                match mesh_stdin.send_message(msg).await {
-                                    Ok(_)  => (true,  String::new(), "broadcast".to_string()),
-                                    Err(e) => (false, format!("{}", e), "broadcast".to_string()),
-                                }
-                            };
-                            println!("{}", json!({
-                                "type": "cmd_reply", "cmd": "send",
-                                "ok":   ok,
-                                "path": path,
-                                "err":  err,
-                            }));
+                                    Ok(r)  => r,
+                                    Err(_) => (false, "send timed out after 30s (BLE stack hung)".to_string(),
+                                               "timeout".to_string()),
+                                };
+                                println!("{}", json!({
+                                    "type": "cmd_reply", "cmd": "send",
+                                    "ok":   ok,
+                                    "path": path,
+                                    "err":  err,
+                                }));
+                            });
                         }
                         "inject_packet" => {
                             // Cross-site mesh relay: replay raw wire bytes
@@ -404,18 +423,36 @@ async fn main() -> Result<()> {
                                             .unwrap_or("");
                             let from = ev.get("from").and_then(|v| v.as_str())
                                          .unwrap_or("relay:unknown").to_string();
-                            let (ok, err, len) = match hex::decode(hex_str) {
+                            match hex::decode(hex_str) {
                                 Ok(bytes) => {
+                                    // Spawned + bounded for the same reason as
+                                    // "send": the local rebroadcast side of an
+                                    // injected packet can hang in bluer and
+                                    // must not freeze the reader loop.
                                     let n = bytes.len();
-                                    mesh_stdin.inject_raw_packet(bytes, from).await;
-                                    (true, String::new(), n)
+                                    let mesh_inj = mesh_stdin.clone();
+                                    tokio::spawn(async move {
+                                        let (ok, err) = match tokio::time::timeout(
+                                            std::time::Duration::from_secs(30),
+                                            mesh_inj.inject_raw_packet(bytes, from)).await
+                                        {
+                                            Ok(_)  => (true, String::new()),
+                                            Err(_) => (false, "inject timed out after 30s (BLE stack hung)".to_string()),
+                                        };
+                                        println!("{}", json!({
+                                            "type": "cmd_reply", "cmd": "inject_packet",
+                                            "ok":   ok, "len":  n, "err":  err,
+                                        }));
+                                    });
                                 }
-                                Err(e) => (false, format!("bad hex: {}", e), 0),
-                            };
-                            println!("{}", json!({
-                                "type": "cmd_reply", "cmd": "inject_packet",
-                                "ok":   ok, "len":  len, "err":  err,
-                            }));
+                                Err(e) => {
+                                    println!("{}", json!({
+                                        "type": "cmd_reply", "cmd": "inject_packet",
+                                        "ok":   false, "len": 0,
+                                        "err":  format!("bad hex: {}", e),
+                                    }));
+                                }
+                            }
                         }
                         other => {
                             println!("{}", json!({

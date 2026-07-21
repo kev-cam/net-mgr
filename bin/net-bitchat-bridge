@@ -167,7 +167,11 @@ if (preflight()) {
 }
 
 my $backoff = 1;
+my $adv_wedge_seen;         # set by run_once when helper stderr shows the
+                            # leaked-advertising-slot signature
+my $last_ble_reset = 0;
 while (1) {
+    $adv_wedge_seen = 0;
     my $exit = eval { run_once() };
     my $err  = $@;
     if ($err) {
@@ -176,6 +180,33 @@ while (1) {
         warn "[bridge] helper exited (code=" . ($exit // '?') . ")\n";
     }
     last if $opt{once};
+    # Stray-helper sweep: any die() between open3 and the OUTER loop
+    # (HELLO/SUBSCRIBE failures against a busy daemon, most commonly)
+    # used to leak a LIVE helper — still scanning, still holding its
+    # LE advertisement via its D-Bus connection, permanently occupying
+    # a controller adv slot (bluez only unregisters when the client's
+    # bus connection closes). Observed on P620A as two helpers under
+    # one supervisor. Kill anything running $helper_path that isn't
+    # ours-current before respawning; their death frees the slots.
+    _kill_stray_helpers($helper_path);
+    # BLE stack recovery: a helper generation that dies without
+    # unregistering its LE advertisement leaks a controller adv slot;
+    # once they're exhausted every relaunch fails with "Maximum
+    # advertisements reached" until bluez + the controller are bounced
+    # (the net-mgr-reset-ble wedge). Do the two BT steps inline here,
+    # rate-limited, instead of waiting for an operator or timer.
+    if ($adv_wedge_seen && time - $last_ble_reset > 120) {
+        warn "[bridge] adv-slot wedge — resetting BT stack before respawn\n";
+        # Enumerate controllers rather than assuming hci0 — usbipd/hotplug
+        # cycles bump the index (observed: the dongle came back as hci1).
+        for my $h (glob '/sys/class/bluetooth/hci*') {
+            next unless $h =~ m{/(hci\d+)$};
+            system('hciconfig', $1, 'reset');
+        }
+        system('systemctl', 'try-restart', 'bluetooth.service');
+        $last_ble_reset = time;
+        sleep 2;
+    }
     # Belt-and-braces reap. run_once's blocking waitpid at line ~232 catches
     # the main helper PID, but the Rust helper's bluer runtime can hand a
     # forked-off thread (BLE central task, dbus worker) inherited pipe FDs
@@ -189,7 +220,8 @@ while (1) {
     $backoff = $backoff >= 30 ? 30 : $backoff * 2;
     # Successful run resets backoff (we only get here if helper actually
     # produced output for a while — a quick crash should keep backing off).
-    $backoff = 1 if defined $exit && $exit == 0;
+    # 143 = SIGTERM, i.e. our own watchdog kick — deliberate, not a crash.
+    $backoff = 1 if defined $exit && ($exit == 0 || $exit == 143);
 }
 
 # ---- supervisor inner loop ----
@@ -262,6 +294,11 @@ sub run_once {
     # or injected twice. Bounded ring; drop oldest at 4096 entries.
     my %relay_lru;
     my @relay_lru_ord;
+    # Relay-fanout rate limit (see the packet_rx handler): tokens per
+    # one-second window + a dropped counter for visibility.
+    my $relay_out_sec = 0;
+    my $relay_out_n = 0;
+    my $relay_out_dropped = 0;
     my $relay_seen = sub {
         my ($pid) = @_;
         return 1 if !defined $pid || $pid eq '';
@@ -309,6 +346,7 @@ sub run_once {
     # while(1) at the top of the file respawns after backoff. Seeded to
     # now so a fresh startup gets one full grace window before we'd kick.
     my $last_peer_reply_ts = time;
+    my $term_sent_at;   # set on watchdog TERM; drives the KILL escalation
     my $peer_cli;
     unless ($opt{'dry-run'}) {
         $peer_cli = NetMgr::Client->new(listen => $listen, timeout => 6);
@@ -317,17 +355,30 @@ sub run_once {
 
   OUTER:
     while (!($eof{$rh} && $eof{$eh})) {
+        # TERM escalation: bluer's forked workers inherit our pipe FDs, so
+        # a TERM'd-but-wedged helper can leave stdout/stderr open and the
+        # EOF that ends this loop never arrives (observed as the watchdog
+        # re-kicking the same pid every poll window). 15s after TERM, KILL
+        # the pid and stop waiting for pipes.
+        if ($term_sent_at && time - $term_sent_at > 15) {
+            warn "[bridge/watchdog] pid=$pid still holding pipes 15s after "
+               . "TERM; KILL + forced respawn\n";
+            kill 'KILL', $pid if $pid;
+            last OUTER;
+        }
         # Peer poll tick — fire only when the helper's stdin is still open
         # so we don't stall on a dead pipe during helper respawn.
         if ($wh && time - $last_peer_poll >= $PEER_POLL_S) {
             # Watchdog check runs BEFORE we send another peers poll, so
             # a wedged helper doesn't accumulate an outbox of unanswered
             # queries.
-            if (time - $last_peer_reply_ts > 2 * $PEER_POLL_S) {
+            if (!$term_sent_at
+                && time - $last_peer_reply_ts > 2 * $PEER_POLL_S) {
                 warn "[bridge/watchdog] no peers reply for "
                    . (time - $last_peer_reply_ts) . "s (> 2x "
-                   . "$PEER_POLL_S s); kicking helper pid=$pid\n";
+                   . "$PEER_POLL_S s); kicking helper pid=$pid (TERM)\n";
                 kill 'TERM', $pid if $pid;
+                $term_sent_at = time;
                 $last_peer_reply_ts = time;  # avoid a kick storm while it dies
                 # run_once returns naturally when the helper's stdout EOFs,
                 # and the outer retry loop respawns with backoff.
@@ -356,6 +407,11 @@ sub run_once {
                 if ($fh == $eh) {
                     # Helper diagnostic — surface to our own stderr.
                     warn "[helper/err] $line\n";
+                    # Leaked-adv-slot wedge signature — the outer loop
+                    # resets the BT stack before the next respawn.
+                    $adv_wedge_seen = 1
+                        if $line =~ /Maximum\ advertisements\ reached
+                                    |Failed\ to\ register\ advertisement/x;
                     next;
                 }
                 # Subscription stream: net-chat client posted a new message
@@ -435,7 +491,14 @@ sub run_once {
                     }
                     next;
                 }
-                # stdout path: JSON event
+                # stdout path: JSON event. ANY stdout line proves the
+                # helper's runtime is alive — stamp the liveness watchdog
+                # here, not only on peers replies. A supervisor stalled in
+                # a synchronous daemon call would otherwise let the stamp
+                # age while perfectly-good helper output sat unread in the
+                # pipe, then kick a healthy helper (observed on P620A
+                # during relay-packet storms).
+                $last_peer_reply_ts = time;
                 my $ev = eval { decode_json($line) };
                 if ($@ || ref($ev) ne 'HASH') {
                     warn "[bridge] skip non-JSON: " . substr($line, 0, 200) . "\n";
@@ -468,6 +531,26 @@ sub run_once {
                         next;
                     }
                     if ($cli) {
+                        # Rate-limit the daemon fanout: a peer retry-storm
+                        # emits dozens of distinct packets/sec, and each
+                        # fanout is a synchronous send_recv (seconds, when
+                        # the daemon is itself busy fanning out) that
+                        # starves this select loop. Cap at 5/s; BLE mesh
+                        # re-delivery covers what we drop, and we log the
+                        # drop count so storms stay visible.
+                        if (time == $relay_out_sec) {
+                            if (++$relay_out_n > 5) {
+                                $relay_out_dropped++;
+                                next;
+                            }
+                        } else {
+                            warn "[bridge] relay fanout rate-limit dropped "
+                               . "$relay_out_dropped packet(s)\n"
+                                if $relay_out_dropped;
+                            $relay_out_sec     = time;
+                            $relay_out_n       = 1;
+                            $relay_out_dropped = 0;
+                        }
                         # Tag the relay with our chat session so the daemon can
                         # route it over the session's [ipv6_vlan] (if bound) and
                         # remote bridges inject it only for the same session.
@@ -650,13 +733,25 @@ sub run_once {
         }       # close for my $fh
     }           # close OUTER while
 
+    # Flush any relay-fanout drops accumulated in the final second: these
+    # counters are run_once-local and reset on respawn, and the periodic
+    # warn only fires when a LATER-second packet arrives, so a storm's
+    # trailing drops would otherwise never be logged.
+    warn "[bridge] relay fanout rate-limit dropped $relay_out_dropped packet(s) "
+       . "(final window)\n" if $relay_out_dropped;
+
     eval { $cli->bye }      if $cli;
     eval { $sub->bye }      if $sub;
     eval { $peer_cli->bye } if $peer_cli;
     eval { close $wh }      if $wh;
     waitpid($pid, 0);
     my $code = $? >> 8;
+    my $sig  = $? & 127;
     warn "[bridge] processed $posted inbound BLE, forwarded $forwarded outbound to BLE, before helper exited\n";
+    # Don't mask signal deaths as clean exits: a watchdog TERM used to
+    # surface as "helper exited (code=0)", which read as the helper
+    # choosing to quit ~10 min in when it was really our own kick.
+    $code = 128 + $sig if $sig;
     return $code;
 }
 
@@ -717,6 +812,49 @@ sub _find_in_home_clone {
         return $p if -x $p;
     }
     return undef;
+}
+
+# Kill every process whose argv[0] is exactly the helper binary. Called
+# between helper generations, when no helper of ours should be alive —
+# anything matching is a leaked orphan from an exception path. Their
+# death closes their D-Bus connections, which is what actually releases
+# the LE advertising slots they pinned.
+sub _kill_stray_helpers {
+    my ($path) = @_;
+    return unless defined $path && length $path;
+    for my $d (glob '/proc/[0-9]*') {
+        my ($p) = $d =~ m{/proc/(\d+)$} or next;
+        next if $p == $$;
+        open my $fh, '<', "$d/cmdline" or next;
+        my $cmd = do { local $/; <$fh> } // '';
+        close $fh;
+        my @argv = split /\0/, $cmd;
+        next unless @argv && $argv[0] eq $path;
+        # ONLY kill our OWN orphaned children. Without this, a second
+        # supervisor instance (an operator running --foreground/--dry-run
+        # alongside the systemd service — both open3 a real helper with the
+        # same argv[0]) would have its healthy helper SIGKILLed here, which
+        # re-creates the exact adv-slot leak this sweep exists to prevent
+        # (and root-vs-root instances would mutually kill in a storm). The
+        # helper's parent is always this supervisor, so gate on PPID == $$.
+        next unless _ppid_of($p) == $$;
+        warn "[bridge] killing stray helper pid=$p\n";
+        kill 'KILL', $p;
+    }
+    # Reap any that were our direct children so they don't linger defunct.
+    1 while waitpid(-1, WNOHANG) > 0;
+}
+
+# Parent PID of $p from /proc/$p/stat. Field 4 (1-based) is ppid, but the
+# comm field (2) can contain spaces/parens, so anchor parsing after the
+# closing ')' of comm. Returns -1 if unreadable (so it never matches $$).
+sub _ppid_of {
+    my ($p) = @_;
+    open my $fh, '<', "/proc/$p/stat" or return -1;
+    my $stat = <$fh>;
+    close $fh;
+    return -1 unless defined $stat && $stat =~ /\)\s+\S+\s+(\d+)/;
+    return $1;
 }
 
 # True if at least one BLE controller is exposed by the kernel. We look at
