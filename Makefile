@@ -416,6 +416,10 @@ SSHOPTS    ?=
 # Config file `make deploy` reads its [deploy] hosts from.
 DEPLOY_CONF ?= $(if $(NET_MGR_CONF),$(NET_MGR_CONF),/etc/net-mgr/config)
 MAKEARGS   ?=
+# Tool used to resolve a deploy TARGET's host name to a fleet IP (net-mgr's own
+# name->IP, independent of DNS) so a [deploy] host whose DNS name has gone stale
+# is still reachable. Set NETLOOKUP= (empty) to disable and use DNS as before.
+NETLOOKUP  ?= net-lookup
 
 install-on: .version
 	@if [ -z "$(TARGET)" ]; then \
@@ -426,14 +430,21 @@ install-on: .version
 	@# password from the user's terminal; rsync still uses the bare
 	@# SSHOPTS so it doesn't get confused by the -t.
 	$(eval RUNOPTS := $(if $(SUDO),-t $(SSHOPTS),$(SSHOPTS)))
+	@# Resolve TARGET's host to a fleet IP via net-lookup so a [deploy] host
+	@# whose DNS name has gone stale is still reachable. Keeps any user@ prefix;
+	@# leaves IP-literal targets alone; on a miss retries with a trailing
+	@# -<iface> suffix stripped (gateway2-down -> gateway2); falls back to the
+	@# original TARGET (DNS) when net-lookup is empty/absent or finds nothing.
+	$(eval SSHTGT := $(shell t='$(TARGET)'; h=$${t##*@}; pre=$${t%$$h}; nl='$(NETLOOKUP)'; [ -n "$$nl" ] && ! command -v "$$nl" >/dev/null 2>&1 && nl=./bin/net-lookup; if [ -z "$$nl" ] || printf '%s' "$$h" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$$|:'; then printf '%s' "$$t"; else ip=$$($$nl "$$h" 2>/dev/null | head -1); [ -z "$$ip" ] && ip=$$($$nl "$${h%-*}" 2>/dev/null | head -1); [ -n "$$ip" ] && printf '%s' "$$pre$$ip" || printf '%s' "$$t"; fi))
+	@if [ "$(SSHTGT)" != "$(TARGET)" ]; then echo "==> $(TARGET): net-lookup -> $(SSHTGT)"; fi
 	@echo "==> $(TARGET): preparing $(REMOTE_TMP)"
-	@ssh $(SSHOPTS) $(TARGET) "mkdir -p $(REMOTE_TMP)"
+	@ssh $(SSHOPTS) $(SSHTGT) "mkdir -p $(REMOTE_TMP)"
 	@echo "==> $(TARGET): rsync working tree"
 	@rsync -az --delete \
 	  --exclude='.git/' --exclude='*.swp' --exclude='*~' \
 	  --exclude='/tmp' --exclude='blib/' \
 	  -e "ssh $(SSHOPTS)" \
-	  ./ $(TARGET):$(REMOTE_TMP)/
+	  ./ $(SSHTGT):$(REMOTE_TMP)/
 	@# Per-host config overlay: if /etc/net-mgr/deploy/<target>/ exists on
 	@# THIS (deploying) host, rsync its contents under /etc/net-mgr/ on
 	@# the target BEFORE the install runs. Lets the deployer (e.g. nas3)
@@ -445,16 +456,16 @@ install-on: .version
 	if [ -d "$$overlay" ]; then \
 	  echo "==> $(TARGET): overlay $$overlay -> /etc/net-mgr/"; \
 	  rsync -az -e "ssh $(SSHOPTS)" --rsync-path="$(SUDO) rsync" \
-	    "$$overlay/" $(TARGET):/etc/net-mgr/ \
+	    "$$overlay/" $(SSHTGT):/etc/net-mgr/ \
 	    || echo "  *** overlay rsync failed (continuing)"; \
 	fi
 	@echo "==> $(TARGET): $(SUDO) make -C $(REMOTE_TMP) install $(MAKEARGS)"
-	@ssh $(RUNOPTS) $(TARGET) "$(SUDO) make -C $(REMOTE_TMP) install $(MAKEARGS)"
+	@ssh $(RUNOPTS) $(SSHTGT) "$(SUDO) make -C $(REMOTE_TMP) install $(MAKEARGS)"
 	@if [ "$(KEEP)" = "1" ]; then \
 	  echo "==> $(TARGET): leaving $(REMOTE_TMP) in place (KEEP=1)"; \
 	else \
 	  echo "==> $(TARGET): cleaning up $(REMOTE_TMP)"; \
-	  ssh $(SSHOPTS) $(TARGET) "rm -rf $(REMOTE_TMP)"; \
+	  ssh $(SSHOPTS) $(SSHTGT) "rm -rf $(REMOTE_TMP)"; \
 	fi
 	@echo "==> $(TARGET): install-on done"
 
