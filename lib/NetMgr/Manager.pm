@@ -5050,6 +5050,109 @@ sub _obs_he_update {
     return ();
 }
 
+# OBSERVE kind=he_diag — introspect this node's he6in4 IPv6 uplink and hand the
+# result back over the mesh, so an operator with NO ssh to a gateway can see WHY
+# the tunnel is dark without eyes on the box. The daemon runs as root, so it
+# reads the tunnel/route/forwarding state and probes HE + the v6 Internet
+# directly. READ-ONLY. Gated on may_internet, like he_net/he_update. Returns kv:
+# report_b64 (a base64 text report — fetch with `net-cluster … --json`) plus
+# top-line flags a caller can branch on without decoding: local_v4,
+# local_v4_scope (public|private|cgnat|none — private/cgnat means 6in4 is
+# structurally broken), tunnel_ifaces, routed_lan (0|1 — is the routed-/64 LAN
+# address the peers forward through actually up?), forwarding, he_server_ping,
+# tunnel_remote_ping, ext_v6. A few 1s pings block the loop briefly — same shape
+# as he_net/he_update, and it's a manual one-shot.
+sub _obs_he_diag {
+    my ($self, $cli, $kv) = @_;
+    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_internet})) {
+        die "he_diag: not authorized (add the key to /etc/net-mgr/allowed_internet)\n";
+    }
+    my $name = $kv->{name} // 'he_net';
+    $name =~ /^[\w.\-]+$/ or die "he_diag: bad name '$name'\n";
+    my $e = ($self->{config}{ipv6_vlan} || {})->{$name} || {};
+    $e = $self->_merge_tunnel_from_db($name, $e);
+    my $server  = $e->{server} // $e->{server_v4} // '';
+    my $tprefix = $e->{prefix} // $e->{tunnel_prefix} // '';
+    my $rprefix = $e->{routed_prefix} // '';
+    my $ext_if  = $e->{ext_if};
+    $ext_if = undef unless defined $ext_if && $ext_if =~ /^[\w.\-]+$/;
+
+    # network portion of each /64 (distinctive substring for addr matching)
+    my $rnet = $rprefix; $rnet =~ s{/\d+\s*$}{}; $rnet =~ s/:+$//;
+    my $tnet = $tprefix; $tnet =~ s{/\d+\s*$}{}; $tnet =~ s/:+$//;
+    my $ping1 = sub { my ($fam,$dst)=@_; my $o=`ping $fam -c1 -W1 $dst 2>&1`;
+                      ($o =~ /1 (?:packets )?received/) ? 'ok' : 'FAIL' };
+
+    my (@r, %f);
+    my $host = `hostname 2>/dev/null`; chomp $host;
+    push @r, "== he_diag '$name' on $host ==";
+    push @r, "config: server=" . ($server || '-')
+           . " tunnel_prefix=" . ($tprefix || '-')
+           . " routed_prefix=" . ($rprefix || '-')
+           . " mode=" . ($e->{mode} // '-')
+           . " ext_if=" . ($ext_if // '(auto)')
+           . " tunnel_id=" . ($e->{tunnel_id} // $e->{provider_id} // '-');
+
+    # 1) tunnel local IPv4 endpoint + scope — private/cgnat here == 6in4 broken
+    my ($lif, $lv4) = NetMgr::Tunnel::external_ipv4($ext_if);
+    my $scope = !defined $lv4                                             ? 'none'
+              : $lv4 =~ /^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)/ ? 'private'
+              : $lv4 =~ /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./       ? 'cgnat'
+              :                                                             'public';
+    $f{local_v4}       = $lv4 // 'none';
+    $f{local_v4_scope} = $scope;
+    push @r, "tunnel local endpoint: iface=" . ($lif // '-') . " ipv4=" . ($lv4 // 'none')
+           . " scope=$scope"
+           . (($scope eq 'private' || $scope eq 'cgnat')
+              ? "  <<< 6in4 cannot work: HE routes to a public IPv4, this endpoint is $scope-NATed"
+              : ($scope eq 'none' ? "  <<< no WAN IPv4 on the default-route iface" : ""));
+
+    # 2) sit/6in4 tunnel interfaces
+    my $sit = `ip -d -o link show type sit 2>/dev/null`;
+    my @tuns = grep { $_ ne 'sit0' } ($sit =~ /^\d+:\s+([^:@\s]+)/mg);
+    $f{tunnel_ifaces} = @tuns ? join(',', @tuns) : 'none';
+    push @r, "sit tunnels: " . $f{tunnel_ifaces};
+    for my $ln (split /\n/, $sit) { $ln =~ s/\\\s*$//; push @r, "  $ln" if $ln =~ /\S/; }
+
+    # 3) global v6 addrs — is the routed-/64 LAN addr up (what peers forward via)?
+    my $v6 = `ip -6 -o addr show scope global 2>/dev/null`;
+    push @r, "global v6 addrs:";
+    for my $ln (split /\n/, $v6) { push @r, "  $ln" if $ln =~ /inet6/; }
+    $f{routed_lan} = ($rnet && index($v6, $rnet) >= 0) ? 1 : 0;
+
+    # 4) ipv6 forwarding
+    my $fwd = '?';
+    if (open my $fh, '<', '/proc/sys/net/ipv6/conf/all/forwarding') {
+        my $x = <$fh>; close $fh; $fwd = ($x && $x =~ /(\d)/) ? $1 : '?';
+    }
+    $f{forwarding} = $fwd;
+    push @r, "ipv6 forwarding(all) = $fwd";
+
+    # 5) default v6 route
+    my $dr = `ip -6 route show default 2>/dev/null`; $dr =~ s/\s*\n/ | /g; $dr =~ s/ \| $//;
+    push @r, "default v6 route: " . ($dr || '(none)');
+
+    # 6) HE tunnel server reachable over IPv4?
+    $f{he_server_ping} = ($server =~ /^\d{1,3}(?:\.\d{1,3}){3}$/) ? $ping1->('-4', $server) : 'n/a';
+    push @r, "HE server ($server) v4 ping: " . $f{he_server_ping};
+
+    # 7) tunnel remote endpoint (HE side ::1) reachable over v6? (does 6in4 flow)
+    my $remote = ($tnet =~ /^[0-9a-fA-F:]+$/) ? "$tnet\::1" : '';
+    $f{tunnel_remote_ping} = ($remote && $remote =~ /^[0-9a-fA-F:]+$/) ? $ping1->('-6', $remote) : 'n/a';
+    push @r, "tunnel remote ($remote) v6 ping: " . $f{tunnel_remote_ping} if $remote;
+
+    # 8) external v6 Internet
+    $f{ext_v6} = $ping1->('-6', '2001:4860:4860::8888');
+    push @r, "external v6 (2001:4860:4860::8888) ping: " . $f{ext_v6};
+
+    require MIME::Base64;
+    $self->_send($cli, format_ok(
+        %f,
+        report_b64 => MIME::Base64::encode_base64(join("\n", @r) . "\n", ''),
+    ));
+    return ();
+}
+
 # OBSERVE kind=mesh_tunnel — write/delete a row of the cluster-replicated
 # mesh_tunnels table (tunnel topology — server/prefixes/provider_id per owner).
 # Required: action (set|delete), owner_node, kind. For set: any of provider_id,
@@ -5379,6 +5482,7 @@ sub _handle_observe {
         elsif ($kind eq 'dhcp_cycle')  { @events = $self->_obs_dhcp_cycle($cli, $kv) }
         elsif ($kind eq 'he_net')      { @events = $self->_obs_he_net($cli, $kv) }
         elsif ($kind eq 'he_update')   { @events = $self->_obs_he_update($cli, $kv) }
+        elsif ($kind eq 'he_diag')     { @events = $self->_obs_he_diag($cli, $kv) }
         elsif ($kind eq 'write_config'){ @events = $self->_obs_write_config($cli, $kv) }
         elsif ($kind eq 'mesh_tunnel') { @events = $self->_obs_mesh_tunnel($cli, $kv) }
         elsif ($kind eq 'publish_self'){ @events = $self->_obs_publish_self($cli, $kv) }
