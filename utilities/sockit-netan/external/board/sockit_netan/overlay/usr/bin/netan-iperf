@@ -15,10 +15,12 @@
 # ifound/iscanned/isrc/iwhen) and prints a one-line "[SoCKit-netan] ..." summary
 # on stdout (for net-chat). Verbose steps go to stderr.
 
-IFACE=${IFACE:-eth0}
+[ -r /etc/netan.conf ] && . /etc/netan.conf
+IFACE=${IFACE:-${NETAN_IFACE:-eth0}}
+LABEL=${NETAN_LABEL:-netan@$(hostname 2>/dev/null || echo host)}
 P3=5201                       # iperf3 default control/data port
 P1=5001                       # iperf (classic) default port
-PREFERRED="192.168.15.104 192.168.223.220"   # nas3 (DMZ, secure) — known iperf3 server
+PREFERRED=${NETAN_IPERF_PREFERRED:-}   # known iperf3 server(s), tried before scanning
 TEST_SECS=${TEST_SECS:-4}     # per-direction test length
 CONNECT_MS=${CONNECT_MS:-1200}
 SRVFILE=/etc/netan-iperf-servers
@@ -110,7 +112,7 @@ write_out() {  # isrv iproto iup idown
 
 if [ "$found" -eq 0 ]; then
     write_out "" "" "" ""
-    echo "[SoCKit-netan] iperf: no server found (scanned=$scanned, no :$P3/:$P1)"
+    echo "[$LABEL] iperf: no server found (scanned=$scanned, no :$P3/:$P1)"
     exit 0
 fi
 
@@ -133,4 +135,4 @@ else
 fi
 
 write_out "$SRV" "$PROTO" "$UP" "$DOWN"
-echo "[SoCKit-netan] iperf srv=$SRV $PROTO up=${UP:-?} down=${DOWN:-?} Mbps (src=$src found=$found scanned=$scanned)"
+echo "[$LABEL] iperf srv=$SRV $PROTO up=${UP:-?} down=${DOWN:-?} Mbps (src=$src found=$found scanned=$scanned)"

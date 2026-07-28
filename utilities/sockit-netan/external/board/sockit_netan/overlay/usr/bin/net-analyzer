@@ -1,5 +1,7 @@
 #!/bin/sh
-# net-analyzer — SoCKit portable network probe.
+# net-analyzer — portable network probe. Runs on any Linux; everything
+# board- or site-specific lives in /etc/netan.conf (all optional, with
+# auto-detecting defaults, so a bare Linux host needs no config at all).
 # On Ethernet link-up: loop { DHCP obtain -> test gateway/Internet/DNS ->
 # ARP-scan peers -> report (LEDs + console + net-chat) -> DHCP release }.
 #
@@ -13,20 +15,43 @@
 # auto-detected) to pause the loop before the release step; the background
 # udhcpc keeps renewing so the address stays valid while held.
 
-IFACE=eth0
-MAC=02:53:4f:43:4b:49                 # locally administered, "SOCKI" — stable for net-mgr naming
-CHAT_HOSTS="192.168.15.104 192.168.223.220"   # nas3 (DMZ, secure) — best effort only
-CHAT_PORT=7531
-CHAT_SESSION=Net-Mgr
-CHAT_AS=dkc     # unverified:dkc is a member of Net-Mgr; after `net-chat allow Net-Mgr unverified:sockit`, switch to sockit
+# --- configuration ----------------------------------------------------------
+# /etc/netan.conf overrides any of the NETAN_* knobs below; every one has a
+# working default, so the file is optional. See the shipped sample for docs.
+[ -r /etc/netan.conf ] && . /etc/netan.conf
+
+IFACE=${NETAN_IFACE:-}                 # empty => auto-detect (see detect_iface)
+MAC=${NETAN_MAC:-}                     # empty => leave the interface's real MAC alone
+HOSTNAME_ADV=${NETAN_HOSTNAME:-netan}  # DHCP hostname advertised in the lease
+CHAT_HOSTS=${NETAN_CHAT_HOSTS:-}       # net-chat sink(s), best effort; empty => no chat
+CHAT_PORT=${NETAN_CHAT_PORT:-7531}
+CHAT_SESSION=${NETAN_CHAT_SESSION:-Net-Mgr}
+CHAT_AS=${NETAN_CHAT_AS:-netan}
+LABEL=${NETAN_LABEL:-netan@$(hostname 2>/dev/null || echo host)}  # report prefix
 LEASE_ENV=/tmp/netan-lease.env
-LOG=/var/log/net-analyzer.log
+LOG=${NETAN_LOG:-/var/log/net-analyzer.log}
 SPOOL=/tmp/netan-chat.spool
 HOLD=/tmp/netan-hold
 MODEF=/tmp/netan-mode         # active operating mode (dhcp|iperf); see netan-mode
 MODE_DEFAULT=/etc/netan-mode  # boot default seeded into MODEF on start
-CYCLE_DELAY=5
+CYCLE_DELAY=${NETAN_CYCLE_DELAY:-5}
 mode=dhcp                     # current cycle's mode (set each cycle from MODEF)
+
+# Pick an interface when none is pinned in config: prefer one already carrying
+# link, else a wired-looking name (eth*/en*), else the first non-loopback iface.
+detect_iface() {
+    for i in /sys/class/net/*; do
+        n=${i##*/}; [ "$n" = lo ] && continue
+        [ "$(cat "$i/carrier" 2>/dev/null)" = 1 ] && { echo "$n"; return 0; }
+    done
+    for i in /sys/class/net/eth* /sys/class/net/en* /sys/class/net/*; do
+        [ -e "$i" ] || continue
+        n=${i##*/}; [ "$n" = lo ] && continue
+        echo "$n"; return 0
+    done
+    echo eth0
+}
+[ -n "$IFACE" ] || IFACE=$(detect_iface)
 
 # --- LED helpers -------------------------------------------------------------
 led() {  # led <n> <0|1|blink>
@@ -48,6 +73,7 @@ say() {  # log to console + file (single line)
 chat_send() {
     # wire format: OBSERVE as=NAME body="..." kind=chat_msg session=NAME\n  -> "OK"
     # kv quoting: backslash doubled, literal double-quote doubled
+    [ -n "$CHAT_HOSTS" ] || return 1     # no sink configured => nothing to send
     b=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/""/g')
     for h in $CHAT_HOSTS; do
         if printf 'OBSERVE as=%s body="%s" kind=chat_msg session=%s\n' \
@@ -60,6 +86,7 @@ chat_send() {
 }
 
 chat() {  # spool on failure (no address yet, or nas3 unreachable); capped at 50 lines
+    [ -n "$CHAT_HOSTS" ] || return 0     # chat disabled: succeed silently, don't spool
     chat_send "$1" && return 0
     echo "[@$(cut -d. -f1 /proc/uptime)s] $1" >> "$SPOOL"
     tail -n 50 "$SPOOL" > "$SPOOL.t" 2>/dev/null && mv "$SPOOL.t" "$SPOOL"
@@ -124,7 +151,7 @@ dhcp_report() {  # print the full DHCP-obtained data as a clear block (console +
     say "  DHCP server : ${serverid:-(none)}"
     say "  Lease time  : ${lease:-?} s"
     say "  Acquired in : $((t1 - t0)) s"
-    say "  MAC address : $MAC"
+    say "  MAC address : ${MAC:-$(cat /sys/class/net/$IFACE/address 2>/dev/null)}"
     say "===================================================================="
 }
 
@@ -169,12 +196,12 @@ trap cleanup TERM INT
 # self-heal after an untrappable death (SIGKILL/OOM): reap orphaned clients
 killall udhcpc 2>/dev/null
 
-# --- bring interface up with fixed MAC --------------------------------------
+# --- bring interface up (force MAC only if one was configured) --------------
 ip link set "$IFACE" down 2>/dev/null
-ip link set "$IFACE" address "$MAC" 2>/dev/null
+[ -n "$MAC" ] && ip link set "$IFACE" address "$MAC" 2>/dev/null
 ip link set "$IFACE" up
 
-say "started ($IFACE mac=$MAC), waiting for link"
+say "started ($IFACE mac=${MAC:-native}), waiting for link"
 led 0 0; led 1 0; led 2 0; led 3 0
 
 # seed the operating mode from the boot default unless already set at runtime
@@ -192,7 +219,7 @@ while :; do
         t0=$(cut -d. -f1 /proc/uptime); publish_fail NO-LINK
         while ! carrier; do sleep 1; done
         say "link up"
-        chat "[SoCKit-netan] link up, starting DHCP cycles"   # spooled until first lease
+        chat "[$LABEL] link up, starting DHCP cycles"   # spooled until first lease
         cycle=0
     fi
     led 0 1
@@ -205,7 +232,7 @@ while :; do
     # ---- obtain lease: udhcpc in background, -R => DHCPRELEASE on TERM ------
     # hostname shows up in the DHCP server's logs / net-mgr's dnsmasq bridge
     t0=$(cut -d. -f1 /proc/uptime)
-    udhcpc -i "$IFACE" -f -R -t 5 -T 3 -x hostname:sockit-netan \
+    udhcpc -i "$IFACE" -f -R -t 5 -T 3 -x "hostname:$HOSTNAME_ADV" \
            -s /usr/share/udhcpc/netan.script >/dev/null 2>&1 &
     DHCP_PID=$!
     n=0
@@ -215,7 +242,7 @@ while :; do
         kill "$DHCP_PID" 2>/dev/null; wait "$DHCP_PID" 2>/dev/null; DHCP_PID=
         led 1 0; led 2 0; led 3 0
         say "cycle=$cycle NO DHCP LEASE after 30s"
-        chat "[SoCKit-netan] cycle=$cycle NO-LEASE (link up, DHCP timeout 30s)"   # spooled
+        chat "[$LABEL] cycle=$cycle NO-LEASE (link up, DHCP timeout 30s)"   # spooled
         publish_fail NO-LEASE
         wait_cycle
         continue
@@ -290,7 +317,7 @@ while :; do
     fi
 
     # ---- report (single line — net-chat multi-line is broken) ----
-    R="[SoCKit-netan] cycle=$cycle ip=$ip gw=$GW($gw_ok) dns=$DNS1(q:$dns_ok) inet=ping:$inet_ok/http:$http_ok peers=$peers lease=${lease}s dhcp=$((t1 - t0))s state=$lease_state"
+    R="[$LABEL] cycle=$cycle ip=$ip gw=$GW($gw_ok) dns=$DNS1(q:$dns_ok) inet=ping:$inet_ok/http:$http_ok peers=$peers lease=${lease}s dhcp=$((t1 - t0))s state=$lease_state"
     say "$R"
     if chat "$R"; then chat_st=sent; else chat_st=spooled; fi
     publish
