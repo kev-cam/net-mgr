@@ -1,8 +1,28 @@
 #!/bin/sh
 # Stage the extlinux boot config where genimage's vfat step can pick it up.
 set -eu
-BOARD_DIR="$(dirname "$0")"
+# Resolve the PHYSICAL board dir: BR2_EXTERNAL is normally a symlink
+# (/home/dkc/sockit-netan/external -> .../net-mgr/utilities/sockit-netan/external),
+# and the shared netan payload is found by walking up from the real location, so
+# a naive $(dirname $0) with the symlink in it would traverse the wrong parent.
+BOARD_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 cp -f "$BOARD_DIR/extlinux.conf" "$BINARIES_DIR/extlinux.conf"
+
+# Assemble the board-agnostic netan core from the shared payload (single source
+# of truth for net-analyzer / netan-iperf / netan-mode; netan-lcd is board-
+# specific and ships in the overlay). Layout: BOARD_DIR is
+# .../utilities/sockit-netan/external/board/sockit_netan, so the shared dir is
+# four levels up. Fail loudly rather than let the chmod below emit a cryptic
+# "No such file" under set -eu.
+NETAN_SHARED="$BOARD_DIR/../../../../netan"
+if [ ! -d "$NETAN_SHARED/bin" ]; then
+    echo "post-build.sh: FATAL: shared netan payload not found at $NETAN_SHARED/bin" >&2
+    echo "post-build.sh:        expected net-mgr/utilities/netan/ beside sockit-netan/" >&2
+    exit 1
+fi
+mkdir -p "$TARGET_DIR/usr/bin"
+cp -f "$NETAN_SHARED/bin/net-analyzer" "$NETAN_SHARED/bin/netan-iperf" \
+      "$NETAN_SHARED/bin/netan-mode"   "$TARGET_DIR/usr/bin/"
 
 # buildroot's overlay copy normalizes modes — re-tighten ssh material.
 # overlay/root/.ssh/authorized_keys is deliberately NOT tracked in git (this

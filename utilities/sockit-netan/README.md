@@ -77,10 +77,19 @@ utilities/sockit-netan/
     └── sockit-serial-cap.sh     90s ttyUSB0 capture across a power-cycle
 ```
 
+**The portable analyzer core is NOT in this tree.** `net-analyzer`,
+`netan-iperf`, and `netan-mode` are board-agnostic and live once in
+`../netan/bin/` (see `../netan/README.md`); this board's `post-build.sh` copies
+them into the image at build time. Only board-specific pieces live here: the LCD
+renderer `netan-lcd`, `evkeys`, the init scripts, and the identity-pinning
+`overlay/etc/netan.conf`.
+
 The buildroot source tree and the `O=` build directory are **not** tracked (they
 are ~160 MB of generated output). They live at `/home/dkc/sockit-netan/`, whose
 `external/` is a symlink back to this directory — so this repo is the single
-source of truth and the existing build dir keeps working unchanged.
+source of truth and the existing build dir keeps working unchanged. Because
+`post-build.sh` reaches the shared `../netan/` payload by resolving that symlink
+(`pwd -P`), keep `sockit-netan/` and `netan/` siblings under `utilities/`.
 
 ## Prerequisites
 

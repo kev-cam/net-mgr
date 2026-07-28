@@ -1,0 +1,45 @@
+# netan.conf — settings for the net-analyzer, sourced by net-analyzer and
+# netan-iperf. EVERY setting is optional: with no file at all the tools
+# auto-detect an interface, observe it without disturbing it (guest model),
+# label reports "netan@<hostname>", and skip net-chat. Copy to /etc/netan.conf
+# and uncomment what you want to change.
+
+# --- operating model --------------------------------------------------------
+# guest      observe the host's EXISTING connection every cycle and never touch
+#            the interface (no MAC change, no DHCP, no lease release). Safe on a
+#            machine you're actually using. This is the default.
+# appliance  OWN the interface: force NETAN_MAC (if set), run our own udhcpc,
+#            and DHCP release/renew every cycle. For a DEDICATED box only — it
+#            will knock the host off the network each cycle.
+#NETAN_MODEL=guest
+
+# --- interface --------------------------------------------------------------
+# Empty / unset => auto-detect: the default-route interface first (best for
+# guest), else one already carrying link, else eth*/en*, else first non-lo.
+#NETAN_IFACE=eth0
+
+# --- appliance identity (ignored in guest model) ----------------------------
+# Force this MAC before use so the DHCP server / naming sees a stable address.
+# Leave unset to keep the NIC's real MAC.
+#NETAN_MAC=02:53:4f:43:4b:49
+# DHCP hostname advertised in the lease.
+#NETAN_HOSTNAME=netan
+
+# --- reporting --------------------------------------------------------------
+# Prefix on every report line (console + net-chat). Default netan@<hostname>.
+#NETAN_LABEL=myhost
+# Log file.
+#NETAN_LOG=/var/log/net-analyzer.log
+# Seconds between cycles.
+#NETAN_CYCLE_DELAY=5
+
+# --- net-chat sink (optional; reports spool to tmpfs if unreachable) ---------
+# Space-separated host list; empty => net-chat disabled entirely.
+#NETAN_CHAT_HOSTS="192.168.15.104"
+#NETAN_CHAT_PORT=7531
+#NETAN_CHAT_SESSION=Net-Mgr
+#NETAN_CHAT_AS=netan
+
+# --- iperf mode -------------------------------------------------------------
+# Server(s) tried before scanning the /24 (see also /etc/netan-iperf-servers).
+#NETAN_IPERF_PREFERRED="192.168.15.104"

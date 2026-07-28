@@ -22,6 +22,11 @@
 
 IFACE=${NETAN_IFACE:-}                 # empty => auto-detect (see detect_iface)
 MAC=${NETAN_MAC:-}                     # empty => leave the interface's real MAC alone
+MODEL=${NETAN_MODEL:-guest}            # guest = observe the host's existing connection, never
+                                       #   touch the iface; appliance = own it (set MAC + DHCP
+                                       #   release/renew each cycle). Default guest is safe on a
+                                       #   host you're using; the SoCKit conf sets appliance.
+case "$MODEL" in appliance|guest) ;; *) MODEL=guest ;; esac
 HOSTNAME_ADV=${NETAN_HOSTNAME:-netan}  # DHCP hostname advertised in the lease
 CHAT_HOSTS=${NETAN_CHAT_HOSTS:-}       # net-chat sink(s), best effort; empty => no chat
 CHAT_PORT=${NETAN_CHAT_PORT:-7531}
@@ -40,6 +45,9 @@ mode=dhcp                     # current cycle's mode (set each cycle from MODEF)
 # Pick an interface when none is pinned in config: prefer one already carrying
 # link, else a wired-looking name (eth*/en*), else the first non-loopback iface.
 detect_iface() {
+    # 0. the interface carrying the default route — the right pick for guest mode
+    di=$(ip -4 route 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    [ -n "$di" ] && { echo "$di"; return 0; }
     for i in /sys/class/net/*; do
         n=${i##*/}; [ "$n" = lo ] && continue
         [ "$(cat "$i/carrier" 2>/dev/null)" = 1 ] && { echo "$n"; return 0; }
@@ -179,6 +187,105 @@ probe_iperf() {
     publish
 }
 
+# --- measure reachability + peers (shared by appliance + guest) -------------
+# Needs ip/GW/DNS1/mask set; sets gw_ok/dns_ok/inet_ok/http_ok/peers/others,
+# writes /tmp/netan-peers, and drives led2 (inet) + led3 (peers). Read-only on
+# the network (ping/dns/http/arp), so it is safe to run in guest mode.
+measure() {
+    gw_ok=no
+    [ -n "$GW" ] && ping -c 2 -W 2 "$GW" >/dev/null 2>&1 && gw_ok=yes
+
+    inet_ok=no
+    ping -c 2 -W 2 8.8.8.8 >/dev/null 2>&1 && inet_ok=yes
+    dns_ok=no
+    nslookup google.com >/dev/null 2>&1 && dns_ok=yes
+    http_ok=no
+    body=$(wget -T 5 -q -O - http://detectportal.firefox.com/success.txt 2>/dev/null)
+    case "$body" in success*) http_ok=yes ;; esac
+    if [ "$inet_ok" = yes ] && [ "$http_ok" = yes ]; then led 2 1
+    elif [ "$inet_ok" = yes ]; then led 2 blink       # ping ok but HTTP filtered/captive
+    else led 2 0; fi
+
+    # peer visibility: ARP scan (bounded: never wider than /24)
+    peers=0; others=0
+    if command -v arp-scan >/dev/null 2>&1; then
+        m=${mask:-24}
+        if [ "$m" -ge 22 ]; then
+            TARGET=--localnet                # <= 1024 targets, ~4 s worst case
+        else
+            TARGET="${ip%.*}.0/24"           # large offered mask: scan only our /24
+        fi
+        scan=$(timeout 30 arp-scan --interface="$IFACE" $TARGET --retry=2 --timeout=200 \
+                        --ignoredups 2>/dev/null \
+               | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}[[:space:]]')
+        peers=$(printf '%s\n' "$scan" | grep -c .)
+        others=$peers
+        # subtract the gateway iff it actually appeared in the scan (exact match)
+        if [ -n "$GW" ] && printf '%s\n' "$scan" | awk -v gw="$GW" '$1 == gw {f=1} END {exit !f}'; then
+            others=$((peers - 1))
+        fi
+        # publish the peer IP list (sorted by address) for the LCD peers page
+        { printf '%s\n' "$scan" | awk 'NF{print $1}' \
+              | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n 2>/dev/null; } > /tmp/netan-peers.tmp
+        [ -s /tmp/netan-peers.tmp ] || printf '%s\n' "$scan" | awk 'NF{print $1}' > /tmp/netan-peers.tmp
+        mv /tmp/netan-peers.tmp /tmp/netan-peers
+    else
+        : > /tmp/netan-peers
+    fi
+    if [ "$others" -ge 1 ]; then led 3 1; else led 3 0; fi
+}
+
+# --- emit the single-line report (console + net-chat) + publish LCD state ----
+emit() {
+    R="[$LABEL] cycle=$cycle ip=$ip gw=$GW($gw_ok) dns=$DNS1(q:$dns_ok) inet=ping:$inet_ok/http:$http_ok peers=$peers lease=${lease}s dhcp=$((t1 - t0))s state=$lease_state"
+    say "$R"
+    if chat "$R"; then chat_st=sent; else chat_st=spooled; fi
+    publish
+}
+
+# --- guest mode: read the host's CURRENT network config, never change it -----
+# Populates the same slots as a DHCP lease from the live system (ip/route/
+# resolv.conf) so measure()/emit()/publish() work unchanged. subnet/broadcast/
+# serverid aren't recoverable this way and stay blank; lease time is unknown.
+read_current() {
+    ip=; mask=; subnet=; broadcast=; domain=; serverid=; lease="?"
+    cidr=$(ip -4 addr show dev "$IFACE" 2>/dev/null | awk '/inet /{print $2; exit}')
+    ip=${cidr%/*}; [ "$ip" = "$cidr" ] && ip=              # no address => empty
+    mask=${cidr#*/}; [ "$mask" = "$cidr" ] && mask=
+    broadcast=$(ip -4 addr show dev "$IFACE" 2>/dev/null \
+                | awk '/inet /{for(i=1;i<=NF;i++) if($i=="brd") print $(i+1); exit}')
+    GW=$(ip -4 route 2>/dev/null | awk -v d="$IFACE" \
+         '/^default/{g="";dev="";for(i=1;i<=NF;i++){if($i=="via")g=$(i+1);if($i=="dev")dev=$(i+1)} if(dev==d||d==""){print g; exit}}')
+    DNS1=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf 2>/dev/null)
+    domain=$(awk '/^(search|domain)/{print $2; exit}' /etc/resolv.conf 2>/dev/null)
+}
+
+guest_loop() {
+    while :; do
+        cycle=$((cycle + 1))
+        read_current
+        if [ -z "$ip" ]; then
+            led 0 blink; led 1 0; led 2 0; led 3 0
+            t0=$(cut -d. -f1 /proc/uptime)
+            say "cycle=$cycle guest: no IPv4 on $IFACE"
+            publish_fail NO-IP
+            wait_cycle; continue
+        fi
+        led 0 1; led 1 1
+        t0=$(cut -d. -f1 /proc/uptime); t1=$t0
+        say "==== guest observe (cycle $cycle): $ip/${mask:-?} gw=${GW:-none} dns=${DNS1:-none} ===="
+        mode=$(cat "$MODEF" 2>/dev/null); case "$mode" in iperf) ;; *) mode=dhcp ;; esac
+        if [ "$mode" = iperf ]; then
+            probe_iperf
+        else
+            lease_state=guest
+            measure
+            emit
+        fi
+        wait_cycle
+    done
+}
+
 # --- shutdown: keep the box reachable ---------------------------------------
 # kill -9 skips udhcpc's DHCPRELEASE/deconfig so a deliberate stop leaves the
 # current address configured (lease just expires server-side); the per-cycle
@@ -193,15 +300,6 @@ cleanup() {
 }
 trap cleanup TERM INT
 
-# self-heal after an untrappable death (SIGKILL/OOM): reap orphaned clients
-killall udhcpc 2>/dev/null
-
-# --- bring interface up (force MAC only if one was configured) --------------
-ip link set "$IFACE" down 2>/dev/null
-[ -n "$MAC" ] && ip link set "$IFACE" address "$MAC" 2>/dev/null
-ip link set "$IFACE" up
-
-say "started ($IFACE mac=${MAC:-native}), waiting for link"
 led 0 0; led 1 0; led 2 0; led 3 0
 
 # seed the operating mode from the boot default unless already set at runtime
@@ -209,9 +307,24 @@ if [ ! -f "$MODEF" ]; then
     m=$(cat "$MODE_DEFAULT" 2>/dev/null); case "$m" in iperf) ;; *) m=dhcp ;; esac
     echo "$m" > "$MODEF"
 fi
-say "mode=$(cat "$MODEF" 2>/dev/null)"
-
 cycle=0
+say "started ($IFACE model=$MODEL mac=${MAC:-native} mode=$(cat "$MODEF" 2>/dev/null))"
+
+# guest mode: observe the host's existing connection and never touch the
+# interface. Runs forever; the appliance takeover code below is never reached.
+if [ "$MODEL" = guest ]; then
+    guest_loop
+fi
+
+# ---- appliance mode: OWN the interface -------------------------------------
+# self-heal after an untrappable death (SIGKILL/OOM): reap orphaned clients.
+# (appliance-only — in guest mode this would kill the HOST's own DHCP client.)
+killall udhcpc 2>/dev/null
+ip link set "$IFACE" down 2>/dev/null
+[ -n "$MAC" ] && ip link set "$IFACE" address "$MAC" 2>/dev/null
+ip link set "$IFACE" up
+say "appliance: $IFACE up (mac=${MAC:-native}), waiting for link"
+
 while :; do
     # ---- wait for cable (led0 blinks while unplugged = daemon alive) ----
     if ! carrier; then
@@ -261,66 +374,18 @@ while :; do
         probe_iperf
     else
 
-    # ---- gateway reachability ----
-    gw_ok=no
-    [ -n "$GW" ] && ping -c 2 -W 2 "$GW" >/dev/null 2>&1 && gw_ok=yes
-
-    # ---- Internet: raw IP ping + DNS resolve + captive-portal-aware HTTP ----
-    inet_ok=no
-    ping -c 2 -W 2 8.8.8.8 >/dev/null 2>&1 && inet_ok=yes
-    dns_ok=no
-    nslookup google.com >/dev/null 2>&1 && dns_ok=yes
-    http_ok=no
-    body=$(wget -T 5 -q -O - http://detectportal.firefox.com/success.txt 2>/dev/null)
-    case "$body" in success*) http_ok=yes ;; esac
-    if [ "$inet_ok" = yes ] && [ "$http_ok" = yes ]; then led 2 1
-    elif [ "$inet_ok" = yes ]; then led 2 blink       # ping ok but HTTP filtered/captive
-    else led 2 0; fi
-
-    # ---- peer visibility: ARP scan (bounded: never wider than /24) ----------
-    peers=0; others=0
-    if command -v arp-scan >/dev/null 2>&1; then
-        m=${mask:-24}
-        if [ "$m" -ge 22 ]; then
-            TARGET=--localnet                # <= 1024 targets, ~4 s worst case
-        else
-            TARGET="${ip%.*}.0/24"           # large offered mask: scan only our /24
-        fi
-        scan=$(timeout 30 arp-scan --interface="$IFACE" $TARGET --retry=2 --timeout=200 \
-                        --ignoredups 2>/dev/null \
-               | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}[[:space:]]')
-        peers=$(printf '%s\n' "$scan" | grep -c .)
-        others=$peers
-        # subtract the gateway iff it actually appeared in the scan (exact match)
-        if [ -n "$GW" ] && printf '%s\n' "$scan" | awk -v gw="$GW" '$1 == gw {f=1} END {exit !f}'; then
-            others=$((peers - 1))
-        fi
-        # publish the peer IP list (sorted by address) for the LCD peers page
-        { printf '%s\n' "$scan" | awk 'NF{print $1}' \
-              | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n 2>/dev/null; } > /tmp/netan-peers.tmp
-        [ -s /tmp/netan-peers.tmp ] || printf '%s\n' "$scan" | awk 'NF{print $1}' > /tmp/netan-peers.tmp
-        mv /tmp/netan-peers.tmp /tmp/netan-peers
-    else
-        : > /tmp/netan-peers
-    fi
-    if [ "$others" -ge 1 ]; then led 3 1; else led 3 0; fi
-
-    # ---- re-validate the lease (a mid-cycle NAK/deconfig may have hit) ------
+    # ---- measure (gw/inet/dns/http/peers), re-validate lease, report --------
     lease_state=held
+    measure
     if [ -f "$LEASE_ENV" ]; then
         old_ip=$ip
-        . "$LEASE_ENV"
+        . "$LEASE_ENV"                        # a mid-cycle NAK/rebind may have changed it
         [ "$ip" = "$old_ip" ] || lease_state=rebound
     else
         lease_state=LOST
         led 1 0
     fi
-
-    # ---- report (single line — net-chat multi-line is broken) ----
-    R="[$LABEL] cycle=$cycle ip=$ip gw=$GW($gw_ok) dns=$DNS1(q:$dns_ok) inet=ping:$inet_ok/http:$http_ok peers=$peers lease=${lease}s dhcp=$((t1 - t0))s state=$lease_state"
-    say "$R"
-    if chat "$R"; then chat_st=sent; else chat_st=spooled; fi
-    publish
+    emit
     fi   # ---- end mode dispatch ----
 
     # ---- hold: pause before release while an operator is on the box ---------
