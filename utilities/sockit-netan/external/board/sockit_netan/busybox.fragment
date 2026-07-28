@@ -1,0 +1,5 @@
+# net-analyzer needs nc (chat posts to nas3) and timeout (bounds arp-scan/nc).
+# NC_EXTRA is load-bearing: bare CONFIG_NC rejects `nc -w 2 HOST PORT`.
+CONFIG_NC=y
+CONFIG_NC_EXTRA=y
+CONFIG_TIMEOUT=y

@@ -1,0 +1,127 @@
+#!/bin/sh
+# netan-lcd — status/help pages on the 128x64 LCM (fbcon on /dev/tty0,
+# MINI4x6 font = 32 cols x 10 rows), driven by the HPS push-buttons.
+#
+#   hkey0 (KEY_F17/187): next page       hkey1 (KEY_F18/188): toggle hold
+#   hkey2 (KEY_F19/189): force re-cycle  hkey3 (KEY_F20/190): toggle mode + redraw
+#
+# Page 0 help | 1 status | 2 DHCP lease | 3 peers | 4 maintenance | 5 iperf.
+# The analyzer publishes /tmp/netan-status (k=v) + /tmp/netan-peers (one IP/line);
+# netan-iperf publishes /tmp/netan-iperf (k=v) for the iperf page.
+
+TTY=/dev/tty0
+ST=/tmp/netan-status
+HOLD=/tmp/netan-hold
+PAGEF=/tmp/netan-page     # shared between the key loop (subshell) and refresher
+
+[ -c "$TTY" ] || exit 0
+echo 0 > "$PAGEF"
+trap 'setlogcons 0 2>/dev/null; exit 0' TERM INT
+# divert VT-bound printk to unused tty63 so it stops scrolling over our pages,
+# WITHOUT touching console_loglevel (dmesg -n would blank ttyS0 diagnostics too)
+setlogcons 63 2>/dev/null
+printf '\033[?25l\033[9;0]\033[2J' > "$TTY"  # cursor off, no blanking, clear
+
+val() { sed -n "s/^$1=//p" "$ST" 2>/dev/null | head -1; }
+ival() { sed -n "s/^$1=//p" /tmp/netan-iperf 2>/dev/null | head -1; }
+
+eff_hold() {  # effective hold = file OR live inbound ssh session (mirror the daemon)
+    [ -f "$HOLD" ] && { echo "held(btn)"; return; }
+    netstat -tn 2>/dev/null | awk '$4 ~ /:22$/ && $6 == "ESTABLISHED" {f=1} END{exit !f}' \
+        && { echo "held(ssh)"; return; }
+    echo "off"
+}
+
+render() {
+    PAGE=$(cat "$PAGEF" 2>/dev/null || echo 0)
+    case "$PAGE" in
+    0)  printf '\033[H== netan : press a key ==\033[K
+KEY1  next page\033[K
+KEY2  hold lease (ssh=auto)\033[K
+KEY3  force DHCP re-cycle\033[K
+KEY4  mode: dhcp <-> iperf\033[K
+\033[K
+pages: help status dhcp\033[K
+       peers maint iperf\033[K
+\033[K
+KEY1 -> status\033[K' > "$TTY" ;;
+    1)  printf '\033[H== netan  mode:%s ==\033[K
+cycle %s  %s\033[K
+ip   %s\033[K
+gw   %s  ping:%s\033[K
+inet %s  http:%s\033[K
+dns  %s\033[K
+peers %s   lease %ss\033[K
+hold: %s\033[K
+\033[K
+[pg][hold][cyc][mode]\033[K' \
+        "$(val mode)" "$(val cycle)" "$(val state)" "$(val ip)" "$(val gw)" "$(val gw_ok)" \
+        "$(val inet)" "$(val http)" "$(val dns)" "$(val peers)" "$(val lease)" \
+        "$(eff_hold)" > "$TTY" ;;
+    2)  printf '\033[H== DHCP lease ==\033[K
+ip   %s/%s\033[K
+mask %s\033[K
+gw   %s\033[K
+dns  %s\033[K
+dom  %s\033[K
+srv  %s  lease %ss\033[K
+bcast %s\033[K
+dhcp %ss  state %s\033[K\033[J' \
+        "$(val ip)" "$(val mask)" "$(val subnet)" "$(val gw)" "$(val dns)" \
+        "$(val domain)" "$(val serverid)" "$(val lease)" "$(val broadcast)" \
+        "$(val dhcp_t)" "$(val state)" > "$TTY" ;;
+    3)  gw=$(val gw); snap=$(cat /tmp/netan-peers 2>/dev/null)
+        total=$(printf '%s\n' "$snap" | grep -c .); : "${total:=0}"
+        { printf '\033[H== peers (%s) ==\033[K\n' "$total"
+          printf '%s\n' "$snap" | { n=0
+              while IFS= read -r pip; do
+                  [ -z "$pip" ] && continue
+                  n=$((n + 1)); [ "$n" -gt 8 ] && break
+                  if [ "$pip" = "$gw" ]; then printf '%s *gw\033[K\n' "$pip"
+                  else printf '%s\033[K\n' "$pip"; fi
+              done; }
+          [ "$total" -gt 8 ] && printf '...+%s more (log)\033[K' "$((total - 8))"
+          printf '\033[J'
+        } > "$TTY" ;;
+    4)  printf '\033[H== maintenance ==\033[K
+hold:  %s\033[K
+ssh:   root@%s\033[K
+       (pw netan / dkc key)\033[K
+log:   /var/log/net-analyzer.log\033[K
+stop:  S99netanalyzer stop\033[K
+\033[K
+KEY2 toggles hold\033[K
+KEY3 kicks a fresh cycle\033[K\033[J' \
+        "$(eff_hold)" "$(val ip)" > "$TTY" ;;
+    5)  printf '\033[H== iperf throughput ==\033[K
+mode  %s\033[K
+srv   %s\033[K
+proto %s  src %s\033[K
+up    %s Mbps\033[K
+down  %s Mbps\033[K
+found %s  scan %s\033[K
+\033[K
+KEY4 toggles mode\033[K\033[J' \
+        "$(val mode)" "$(ival isrv)" "$(ival iproto)" "$(ival isrc)" \
+        "$(ival iup)" "$(ival idown)" "$(ival ifound)" "$(ival iscanned)" > "$TTY" ;;
+    esac
+}
+
+render
+evkeys /dev/input/event0 2>/dev/null | while read -r tag code value; do
+    if [ "$tag" = K ] && [ "$value" = 1 ]; then
+        case "$code" in
+            187) p=$(cat "$PAGEF" 2>/dev/null || echo 0)
+                 echo $(( (p + 1) % 6 )) > "$PAGEF.t" && mv "$PAGEF.t" "$PAGEF"
+                 printf '\033[2J' > "$TTY" ;;
+            188) if [ -f "$HOLD" ]; then rm -f "$HOLD"; else touch "$HOLD"; fi ;;
+            189) rm -f "$HOLD"; touch /tmp/netan-kick ;;
+            190) netan-mode toggle >/dev/null 2>&1
+                 printf '\033[?25l\033[9;0]\033[2J' > "$TTY" ;;
+        esac
+    fi
+    render
+done &
+
+# periodic refresh independent of key events (page 0 counters, hold state)
+while :; do sleep 3; render; done

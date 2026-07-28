@@ -1,0 +1,32 @@
+#!/bin/sh
+# Start the LCM status-page renderer (before the analyzer daemon).
+
+PIDFILE=/var/run/netan-lcd.pid
+
+case "$1" in
+    start)
+        printf "Starting netan-lcd: "
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ] \
+           && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q netan-lcd; then
+            echo "already running (pid $pid)"
+            exit 0
+        fi
+        rm -f "$PIDFILE"
+        start-stop-daemon -S -b -m -p "$PIDFILE" -x /usr/bin/netan-lcd
+        echo "OK"
+        ;;
+    stop)
+        printf "Stopping netan-lcd: "
+        start-stop-daemon -K -p "$PIDFILE" 2>/dev/null
+        rm -f "$PIDFILE"
+        killall netan-lcd evkeys 2>/dev/null   # -K signals only the pidfile PID; reap the pipeline
+        setlogcons 0 2>/dev/null               # restore VT printk (trap is skipped on SIGKILL)
+        echo "OK"
+        ;;
+    restart)
+        "$0" stop; sleep 1; "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac

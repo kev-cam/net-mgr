@@ -1,0 +1,21 @@
+# socfpga_defconfig lacks the LED triggers the analyzer uses for status display
+CONFIG_LEDS_CLASS=y
+CONFIG_LEDS_GPIO=y
+CONFIG_LEDS_TRIGGERS=y
+CONFIG_LEDS_TRIGGER_TIMER=y
+CONFIG_LEDS_TRIGGER_HEARTBEAT=y
+# LCM 128x64 (NT7534 on SPIM1) as framebuffer console: kernel boot log on the
+# LCD from ~2s after power-on, then the netan-lcd status pages
+CONFIG_FB=y
+CONFIG_STAGING=y
+CONFIG_BACKLIGHT_CLASS_DEVICE=y
+CONFIG_FB_TFT=y
+CONFIG_FB_TFT_UC1701=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY=y
+CONFIG_FONTS=y
+CONFIG_FONT_MINI_4x6=y
+CONFIG_FONT_8x16=y
+# hps_hkey0-3 buttons + hps_sw0-3 switches for the LCD page UI
+CONFIG_KEYBOARD_GPIO=y
+CONFIG_INPUT_EVDEV=y

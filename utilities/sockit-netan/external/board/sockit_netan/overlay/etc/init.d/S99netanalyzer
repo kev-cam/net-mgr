@@ -1,0 +1,39 @@
+#!/bin/sh
+# Start the net-analyzer probe daemon.
+
+PIDFILE=/var/run/net-analyzer.pid
+
+case "$1" in
+    start)
+        printf "Starting net-analyzer: "
+        # busybox start-stop-daemon can't match a script by -x (/proc/pid/exe
+        # is the busybox binary), so guard duplicates via the pidfile +
+        # /proc cmdline (immune to pid reuse, clears stale pidfiles)
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ] \
+           && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q net-analyzer; then
+            echo "already running (pid $pid)"
+            exit 0
+        fi
+        rm -f "$PIDFILE"
+        start-stop-daemon -S -b -m -p "$PIDFILE" -x /usr/bin/net-analyzer
+        echo "OK"
+        ;;
+    stop)
+        printf "Stopping net-analyzer: "
+        start-stop-daemon -K -p "$PIDFILE" 2>/dev/null
+        rm -f "$PIDFILE"
+        # -9 skips udhcpc's DHCPRELEASE/deconfig: the current address stays
+        # configured so a stop over ssh doesn't strand the box off-net
+        killall -9 udhcpc 2>/dev/null
+        killall arp-scan 2>/dev/null
+        echo "OK"
+        ;;
+    restart)
+        "$0" stop; sleep 1; "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

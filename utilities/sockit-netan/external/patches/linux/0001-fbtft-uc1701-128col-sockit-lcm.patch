@@ -1,0 +1,11 @@
+--- a/drivers/staging/fbtft/fb_uc1701.c
++++ b/drivers/staging/fbtft/fb_uc1701.c
+@@ -18,7 +18,7 @@
+ #include "fbtft.h"
+ 
+ #define DRVNAME	"fb_uc1701"
+-#define WIDTH	  102
++#define WIDTH	  128
+ #define HEIGHT	 64
+ #define PAGES	  (HEIGHT / 8)
+ 

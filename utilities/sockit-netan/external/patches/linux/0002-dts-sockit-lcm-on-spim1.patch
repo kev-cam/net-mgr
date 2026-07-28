@@ -1,0 +1,19 @@
+--- a/arch/arm/boot/dts/intel/socfpga/socfpga_cyclone5_sockit.dts
++++ b/arch/arm/boot/dts/intel/socfpga/socfpga_cyclone5_sockit.dts
+@@ -185,3 +185,16 @@
+ &usb1 {
+ 	status = "okay";
+ };
++
++&spi1 {
++	status = "okay";
++
++	lcd@0 {
++		compatible = "UltraChip,uc1701";
++		reg = <0>;
++		spi-max-frequency = <3125000>;
++		buswidth = <8>;	/* fbtft: required, else probe leaves it 0 and no data is clocked */
++		dc-gpios = <&portc 4 0>;	/* HPS_LCM_D_C = HPS_GPIO62, active high */
++		reset-gpios = <&portb 19 1>;	/* HPS_LCM_RST_N = HPS_GPIO48, active low */
++	};
++};

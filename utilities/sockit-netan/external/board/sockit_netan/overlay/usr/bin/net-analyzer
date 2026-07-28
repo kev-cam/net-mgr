@@ -1,0 +1,317 @@
+#!/bin/sh
+# net-analyzer — SoCKit portable network probe.
+# On Ethernet link-up: loop { DHCP obtain -> test gateway/Internet/DNS ->
+# ARP-scan peers -> report (LEDs + console + net-chat) -> DHCP release }.
+#
+# LEDs (HPS user LEDs via /sys/class/leds):
+#   led0 = link carrier (blink = waiting for cable)
+#   led1 = DHCP lease held (blink = lease pinned by maintenance hold)
+#   led2 = Internet reachable (blink = ping ok but HTTP filtered/captive)
+#   led3 = peers visible (>= 1 besides gateway)
+#
+# Maintenance: touch /tmp/netan-hold (or just ssh in — established :22 is
+# auto-detected) to pause the loop before the release step; the background
+# udhcpc keeps renewing so the address stays valid while held.
+
+IFACE=eth0
+MAC=02:53:4f:43:4b:49                 # locally administered, "SOCKI" — stable for net-mgr naming
+CHAT_HOSTS="192.168.15.104 192.168.223.220"   # nas3 (DMZ, secure) — best effort only
+CHAT_PORT=7531
+CHAT_SESSION=Net-Mgr
+CHAT_AS=dkc     # unverified:dkc is a member of Net-Mgr; after `net-chat allow Net-Mgr unverified:sockit`, switch to sockit
+LEASE_ENV=/tmp/netan-lease.env
+LOG=/var/log/net-analyzer.log
+SPOOL=/tmp/netan-chat.spool
+HOLD=/tmp/netan-hold
+MODEF=/tmp/netan-mode         # active operating mode (dhcp|iperf); see netan-mode
+MODE_DEFAULT=/etc/netan-mode  # boot default seeded into MODEF on start
+CYCLE_DELAY=5
+mode=dhcp                     # current cycle's mode (set each cycle from MODEF)
+
+# --- LED helpers -------------------------------------------------------------
+led() {  # led <n> <0|1|blink>
+    d=$(ls -d /sys/class/leds/*led${1}* 2>/dev/null | head -1)
+    [ -z "$d" ] && return 0
+    case "$2" in
+        blink) echo timer > "$d/trigger" 2>/dev/null ;;
+        1) echo none > "$d/trigger" 2>/dev/null; echo 255 > "$d/brightness" ;;
+        0) echo none > "$d/trigger" 2>/dev/null; echo 0 > "$d/brightness" ;;
+    esac
+}
+
+say() {  # log to console + file (single line)
+    echo "netan: $*" > /dev/console 2>/dev/null
+    echo "$(cut -d. -f1 /proc/uptime)s $*" >> "$LOG"
+}
+
+# --- net-chat posting (single-line only; spool while off-net) ----------------
+chat_send() {
+    # wire format: OBSERVE as=NAME body="..." kind=chat_msg session=NAME\n  -> "OK"
+    # kv quoting: backslash doubled, literal double-quote doubled
+    b=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/""/g')
+    for h in $CHAT_HOSTS; do
+        if printf 'OBSERVE as=%s body="%s" kind=chat_msg session=%s\n' \
+               "$CHAT_AS" "$b" "$CHAT_SESSION" \
+               | timeout 5 nc -w 2 "$h" "$CHAT_PORT" 2>/dev/null | grep -q '^OK'; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+chat() {  # spool on failure (no address yet, or nas3 unreachable); capped at 50 lines
+    chat_send "$1" && return 0
+    echo "[@$(cut -d. -f1 /proc/uptime)s] $1" >> "$SPOOL"
+    tail -n 50 "$SPOOL" > "$SPOOL.t" 2>/dev/null && mv "$SPOOL.t" "$SPOOL"
+    return 1
+}
+
+chat_flush() {  # drain the spool; bail on first failure (same dest, rest would fail too)
+    [ -s "$SPOOL" ] || return 0
+    mv "$SPOOL" "$SPOOL.q" 2>/dev/null || return 0
+    while IFS= read -r l; do
+        if ! chat_send "$l"; then
+            echo "$l" >> "$SPOOL"      # requeue this line...
+            cat >> "$SPOOL"            # ...and the remainder, then stop
+            break
+        fi
+    done < "$SPOOL.q"
+    rm -f "$SPOOL.q"
+}
+
+carrier() { [ "$(cat /sys/class/net/$IFACE/carrier 2>/dev/null)" = "1" ]; }
+
+wait_cycle() {  # inter-cycle delay, cut short by the LCD's KEY3 kick
+    rm -f /tmp/netan-kick    # consume any kick that arrived mid-cycle (edge, not level)
+    w=0
+    while [ "$w" -lt "$CYCLE_DELAY" ] && [ ! -f /tmp/netan-kick ]; do
+        sleep 1; w=$((w + 1))
+    done
+    rm -f /tmp/netan-kick
+}
+
+publish() {  # per-cycle state for the LCD pages
+    {
+        echo "cycle=$cycle";   echo "state=$lease_state"
+        echo "ip=$ip";         echo "mask=${mask:-24}"
+        echo "subnet=$subnet"; echo "broadcast=$broadcast"
+        echo "domain=$domain"
+        echo "gw=$GW";         echo "gw_ok=$gw_ok"
+        echo "inet=$inet_ok";  echo "http=$http_ok"
+        echo "dns=$DNS1";      echo "peers=$peers"
+        echo "lease=$lease";   echo "dhcp_t=$((t1 - t0))"
+        echo "serverid=$serverid"; echo "chat=$chat_st"
+        echo "mode=$mode"
+    } > /tmp/netan-status.tmp && mv /tmp/netan-status.tmp /tmp/netan-status
+}
+
+publish_fail() {  # $1 = NO-LINK|NO-LEASE — blank stale lease vars (they persist from last cycle)
+    lease_state=$1; ip=; mask=; GW=; gw_ok=no; inet_ok=no; http_ok=no
+    DNS1=; peers=0; lease=; serverid=; chat_st=
+    t1=$(cut -d. -f1 /proc/uptime)
+    : > /tmp/netan-peers
+    publish
+}
+
+dhcp_report() {  # print the full DHCP-obtained data as a clear block (console + log)
+    say "==================== DHCP LEASE  (cycle $cycle) ===================="
+    say "  IP address  : $ip/${mask:-24}"
+    say "  Subnet mask : ${subnet:-(none)}"
+    say "  Gateway     : ${router:-(none)}"
+    say "  DNS server  : ${dns:-(none)}"
+    say "  Domain      : ${domain:-(none)}"
+    say "  Broadcast   : ${broadcast:-(none)}"
+    say "  DHCP server : ${serverid:-(none)}"
+    say "  Lease time  : ${lease:-?} s"
+    say "  Acquired in : $((t1 - t0)) s"
+    say "  MAC address : $MAC"
+    say "===================================================================="
+}
+
+# --- iperf mode: find an iperf/iperf3 server and run a throughput test -------
+# Assumes a lease is up (ip/GW/DNS1 set). Reuses the generic publish() slots so
+# the existing LCD status page stays sane; the dedicated iperf page reads the
+# richer /tmp/netan-iperf that netan-iperf writes.
+probe_iperf() {
+    led 2 blink                                   # led2 blinks = test running
+    isrv=; iproto=; iup=; idown=; ifound=0
+    IR=$(IFACE="$IFACE" netan-iperf 2>>"$LOG")     # discovers + tests, writes /tmp/netan-iperf
+    [ -f /tmp/netan-iperf ] && . /tmp/netan-iperf  # -> isrv iproto iup idown ifound iscanned isrc
+    say "$IR"
+    if chat "$IR"; then chat_st=sent; else chat_st=spooled; fi
+
+    # generic slots for publish()/status page
+    gw_ok=no; [ -n "$GW" ] && ping -c 1 -W 2 "$GW" >/dev/null 2>&1 && gw_ok=yes
+    inet_ok=no; ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 && inet_ok=yes
+    http_ok=na
+    peers=${ifound:-0}
+    : > /tmp/netan-peers; [ -n "$isrv" ] && echo "$isrv" > /tmp/netan-peers
+    lease_state=iperf
+    if [ "${ifound:-0}" -ge 1 ]; then led 2 1; else led 2 0; fi
+    if [ "${ifound:-0}" -ge 1 ]; then led 3 1; else led 3 0; fi
+    publish
+}
+
+# --- shutdown: keep the box reachable ---------------------------------------
+# kill -9 skips udhcpc's DHCPRELEASE/deconfig so a deliberate stop leaves the
+# current address configured (lease just expires server-side); the per-cycle
+# release is the analyzer's job, not shutdown's.
+DHCP_PID=
+cleanup() {
+    [ -n "$DHCP_PID" ] && kill -9 "$DHCP_PID" 2>/dev/null
+    wait
+    rm -f "$LEASE_ENV"
+    led 0 0; led 1 0; led 2 0; led 3 0
+    exit 0
+}
+trap cleanup TERM INT
+
+# self-heal after an untrappable death (SIGKILL/OOM): reap orphaned clients
+killall udhcpc 2>/dev/null
+
+# --- bring interface up with fixed MAC --------------------------------------
+ip link set "$IFACE" down 2>/dev/null
+ip link set "$IFACE" address "$MAC" 2>/dev/null
+ip link set "$IFACE" up
+
+say "started ($IFACE mac=$MAC), waiting for link"
+led 0 0; led 1 0; led 2 0; led 3 0
+
+# seed the operating mode from the boot default unless already set at runtime
+if [ ! -f "$MODEF" ]; then
+    m=$(cat "$MODE_DEFAULT" 2>/dev/null); case "$m" in iperf) ;; *) m=dhcp ;; esac
+    echo "$m" > "$MODEF"
+fi
+say "mode=$(cat "$MODEF" 2>/dev/null)"
+
+cycle=0
+while :; do
+    # ---- wait for cable (led0 blinks while unplugged = daemon alive) ----
+    if ! carrier; then
+        led 0 blink; led 1 0; led 2 0; led 3 0
+        t0=$(cut -d. -f1 /proc/uptime); publish_fail NO-LINK
+        while ! carrier; do sleep 1; done
+        say "link up"
+        chat "[SoCKit-netan] link up, starting DHCP cycles"   # spooled until first lease
+        cycle=0
+    fi
+    led 0 1
+
+    cycle=$((cycle + 1))
+    rm -f "$LEASE_ENV"
+    ip addr flush dev "$IFACE" 2>/dev/null
+    ip route flush dev "$IFACE" 2>/dev/null
+
+    # ---- obtain lease: udhcpc in background, -R => DHCPRELEASE on TERM ------
+    # hostname shows up in the DHCP server's logs / net-mgr's dnsmasq bridge
+    t0=$(cut -d. -f1 /proc/uptime)
+    udhcpc -i "$IFACE" -f -R -t 5 -T 3 -x hostname:sockit-netan \
+           -s /usr/share/udhcpc/netan.script >/dev/null 2>&1 &
+    DHCP_PID=$!
+    n=0
+    while [ ! -f "$LEASE_ENV" ] && [ $n -lt 30 ]; do sleep 1; n=$((n+1)); done
+
+    if [ ! -f "$LEASE_ENV" ]; then
+        kill "$DHCP_PID" 2>/dev/null; wait "$DHCP_PID" 2>/dev/null; DHCP_PID=
+        led 1 0; led 2 0; led 3 0
+        say "cycle=$cycle NO DHCP LEASE after 30s"
+        chat "[SoCKit-netan] cycle=$cycle NO-LEASE (link up, DHCP timeout 30s)"   # spooled
+        publish_fail NO-LEASE
+        wait_cycle
+        continue
+    fi
+    . "$LEASE_ENV"   # ip, mask, subnet, router, dns, domain, broadcast, lease, serverid
+    t1=$(cut -d. -f1 /proc/uptime)
+    led 1 1
+    dhcp_report       # print the full DHCP data on every fresh lease
+    GW=${router%% *}
+    DNS1=${dns%% *}
+    chat_flush        # address + route are up — drain any spooled reports
+
+    # ---- dispatch on operating mode: iperf throughput, or the DHCP probe ----
+    mode=$(cat "$MODEF" 2>/dev/null); case "$mode" in iperf) ;; *) mode=dhcp ;; esac
+    if [ "$mode" = iperf ]; then
+        probe_iperf
+    else
+
+    # ---- gateway reachability ----
+    gw_ok=no
+    [ -n "$GW" ] && ping -c 2 -W 2 "$GW" >/dev/null 2>&1 && gw_ok=yes
+
+    # ---- Internet: raw IP ping + DNS resolve + captive-portal-aware HTTP ----
+    inet_ok=no
+    ping -c 2 -W 2 8.8.8.8 >/dev/null 2>&1 && inet_ok=yes
+    dns_ok=no
+    nslookup google.com >/dev/null 2>&1 && dns_ok=yes
+    http_ok=no
+    body=$(wget -T 5 -q -O - http://detectportal.firefox.com/success.txt 2>/dev/null)
+    case "$body" in success*) http_ok=yes ;; esac
+    if [ "$inet_ok" = yes ] && [ "$http_ok" = yes ]; then led 2 1
+    elif [ "$inet_ok" = yes ]; then led 2 blink       # ping ok but HTTP filtered/captive
+    else led 2 0; fi
+
+    # ---- peer visibility: ARP scan (bounded: never wider than /24) ----------
+    peers=0; others=0
+    if command -v arp-scan >/dev/null 2>&1; then
+        m=${mask:-24}
+        if [ "$m" -ge 22 ]; then
+            TARGET=--localnet                # <= 1024 targets, ~4 s worst case
+        else
+            TARGET="${ip%.*}.0/24"           # large offered mask: scan only our /24
+        fi
+        scan=$(timeout 30 arp-scan --interface="$IFACE" $TARGET --retry=2 --timeout=200 \
+                        --ignoredups 2>/dev/null \
+               | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}[[:space:]]')
+        peers=$(printf '%s\n' "$scan" | grep -c .)
+        others=$peers
+        # subtract the gateway iff it actually appeared in the scan (exact match)
+        if [ -n "$GW" ] && printf '%s\n' "$scan" | awk -v gw="$GW" '$1 == gw {f=1} END {exit !f}'; then
+            others=$((peers - 1))
+        fi
+        # publish the peer IP list (sorted by address) for the LCD peers page
+        { printf '%s\n' "$scan" | awk 'NF{print $1}' \
+              | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n 2>/dev/null; } > /tmp/netan-peers.tmp
+        [ -s /tmp/netan-peers.tmp ] || printf '%s\n' "$scan" | awk 'NF{print $1}' > /tmp/netan-peers.tmp
+        mv /tmp/netan-peers.tmp /tmp/netan-peers
+    else
+        : > /tmp/netan-peers
+    fi
+    if [ "$others" -ge 1 ]; then led 3 1; else led 3 0; fi
+
+    # ---- re-validate the lease (a mid-cycle NAK/deconfig may have hit) ------
+    lease_state=held
+    if [ -f "$LEASE_ENV" ]; then
+        old_ip=$ip
+        . "$LEASE_ENV"
+        [ "$ip" = "$old_ip" ] || lease_state=rebound
+    else
+        lease_state=LOST
+        led 1 0
+    fi
+
+    # ---- report (single line — net-chat multi-line is broken) ----
+    R="[SoCKit-netan] cycle=$cycle ip=$ip gw=$GW($gw_ok) dns=$DNS1(q:$dns_ok) inet=ping:$inet_ok/http:$http_ok peers=$peers lease=${lease}s dhcp=$((t1 - t0))s state=$lease_state"
+    say "$R"
+    if chat "$R"; then chat_st=sent; else chat_st=spooled; fi
+    publish
+    fi   # ---- end mode dispatch ----
+
+    # ---- hold: pause before release while an operator is on the box ---------
+    # inbound ssh = local addr (col 4) ends in :22 AND state (col 6) ESTABLISHED
+    while [ -f "$HOLD" ] || netstat -tn 2>/dev/null \
+            | awk '$4 ~ /:22$/ && $6 == "ESTABLISHED" {f=1} END{exit !f}'; do
+        [ -f /tmp/netan-kick ] && [ ! -f "$HOLD" ] && break   # KEY3 cuts a stale hold
+        led 1 blink   # visual cue: lease pinned, cycles paused
+        sleep 5
+    done
+    led 1 1
+
+    # ---- release (udhcpc -R sends DHCPRELEASE on SIGTERM) ----
+    kill "$DHCP_PID" 2>/dev/null
+    wait "$DHCP_PID" 2>/dev/null
+    DHCP_PID=
+    led 1 0
+    ip addr flush dev "$IFACE" 2>/dev/null
+
+    wait_cycle
+done

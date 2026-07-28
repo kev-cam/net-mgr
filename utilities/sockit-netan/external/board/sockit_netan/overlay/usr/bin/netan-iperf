@@ -1,0 +1,136 @@
+#!/bin/sh
+# netan-iperf — discover an iperf/iperf3 server on the LAN and run a throughput test.
+#
+# Used by net-analyzer in "iperf" mode (see netan-mode), and runnable standalone.
+# Discovery order:
+#   1. /etc/netan-iperf-servers if present  (one "host" or "host:port" per line,
+#      '#' comments ok) — an explicit override; nothing else is tried.
+#   2. otherwise the PREFERRED hosts (nas3) — the known iperf3 server, tried first
+#      so a test is fast+reliable without a full scan.
+#   3. otherwise (or with NETAN_IPERF_FULLSCAN=1) arp-scan the local /24 and
+#      TCP-probe each live host for 5201 (iperf3) then 5001 (iperf classic).
+# The first responder is tested: up = client->server, down = server->client (-R).
+#
+# Writes shell-sourceable results to /tmp/netan-iperf (isrv/iproto/iup/idown/
+# ifound/iscanned/isrc/iwhen) and prints a one-line "[SoCKit-netan] ..." summary
+# on stdout (for net-chat). Verbose steps go to stderr.
+
+IFACE=${IFACE:-eth0}
+P3=5201                       # iperf3 default control/data port
+P1=5001                       # iperf (classic) default port
+PREFERRED="192.168.15.104 192.168.223.220"   # nas3 (DMZ, secure) — known iperf3 server
+TEST_SECS=${TEST_SECS:-4}     # per-direction test length
+CONNECT_MS=${CONNECT_MS:-1200}
+SRVFILE=/etc/netan-iperf-servers
+OUT=/tmp/netan-iperf
+
+vlog() { echo "netan-iperf: $*" >&2; }
+
+# TCP connect probe (busybox nc has -w with NC_EXTRA). 0 = something listening.
+tcp_open() { nc -w 1 "$1" "$2" </dev/null >/dev/null 2>&1; }
+
+# Extract the Mbits/sec value from the line(s) matching $1 (last match wins).
+mbps() { awk -v pat="$1" '$0 ~ pat { for (i=1;i<=NF;i++) if ($i=="Mbits/sec") v=$(i-1) } END { print v }'; }
+
+# which clients are actually installed (classic iperf is optional — needs C++)
+command -v iperf3 >/dev/null 2>&1 && HAVE_IPERF3=1 || HAVE_IPERF3=
+command -v iperf  >/dev/null 2>&1 && HAVE_IPERF=1  || HAVE_IPERF=
+
+# probe one host: echo "host proto" for a server we have a client to test, else nothing
+probe_host() {
+    if [ -n "$HAVE_IPERF3" ] && tcp_open "$1" "$P3"; then echo "$1 iperf3"
+    elif [ -n "$HAVE_IPERF" ] && tcp_open "$1" "$P1"; then echo "$1 iperf"
+    fi
+}
+
+scanned=0
+src=
+
+# --- discover a server, most-specific source first --------------------------
+discover() {
+    # 1. explicit override file
+    if [ -s "$SRVFILE" ]; then
+        src=file
+        while IFS= read -r line; do
+            line=${line%%#*}; line=$(printf '%s' "$line" | tr -d ' \t')
+            [ -z "$line" ] && continue
+            host=${line%%:*}; port=${line#*:}; [ "$port" = "$line" ] && port=
+            scanned=$((scanned + 1))
+            if [ -n "$port" ]; then
+                if tcp_open "$host" "$port"; then
+                    if [ "$port" = "$P1" ]; then [ -n "$HAVE_IPERF" ] && echo "$host iperf"
+                    else [ -n "$HAVE_IPERF3" ] && echo "$host iperf3"; fi
+                fi
+            else
+                probe_host "$host"
+            fi
+        done < "$SRVFILE"
+        return
+    fi
+
+    # 2. preferred known server(s) — nas3
+    seen=" "
+    for h in $PREFERRED; do
+        scanned=$((scanned + 1)); seen="$seen$h "
+        r=$(probe_host "$h")
+        if [ -n "$r" ]; then
+            src=preferred; echo "$r"
+            [ -z "$NETAN_IPERF_FULLSCAN" ] && return   # good enough; skip the scan
+        fi
+    done
+
+    # 3. arp-scan the local /24 for any other servers
+    ips=$(timeout 25 arp-scan --interface="$IFACE" --localnet --retry=2 --timeout=200 \
+                     --ignoredups 2>/dev/null \
+          | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}[ \t]/ {print $1}' | sort -u)
+    for h in $ips; do
+        case "$seen" in *" $h "*) continue ;; esac
+        scanned=$((scanned + 1))
+        r=$(probe_host "$h"); [ -n "$r" ] && { echo "$r"; [ -z "$src" ] && src=scan; }
+    done
+}
+
+vlog "discovering iperf servers on $IFACE ..."
+# run discover in the CURRENT shell (stdout redirected to a file) so its updates
+# to the scanned/src globals persist; `servers=$(discover)` would fork a subshell
+# and those writes would be lost (src would stay "none", scanned 0).
+discover > "$OUT.srv"
+servers=$(cat "$OUT.srv" 2>/dev/null); rm -f "$OUT.srv"
+found=$(printf '%s\n' "$servers" | grep -c .)
+: "${found:=0}"
+: "${src:=none}"
+
+write_out() {  # isrv iproto iup idown
+    {
+        echo "isrv=$1"; echo "iproto=$2"; echo "iup=$3"; echo "idown=$4"
+        echo "ifound=$found"; echo "iscanned=$scanned"; echo "isrc=$src"
+        echo "iwhen=$(cut -d. -f1 /proc/uptime)"
+    } > "$OUT.t" && mv "$OUT.t" "$OUT"
+}
+
+if [ "$found" -eq 0 ]; then
+    write_out "" "" "" ""
+    echo "[SoCKit-netan] iperf: no server found (scanned=$scanned, no :$P3/:$P1)"
+    exit 0
+fi
+
+# test the first discovered server
+set -- $(printf '%s\n' "$servers" | grep . | head -1)
+SRV=$1; PROTO=$2
+vlog "testing $SRV ($PROTO) via=$src, found=$found scanned=$scanned"
+
+UP=; DOWN=
+if [ "$PROTO" = iperf3 ]; then
+    fwd=$(timeout $((TEST_SECS + 6)) iperf3 -c "$SRV" -t "$TEST_SECS" -O 1 -f m \
+                  --connect-timeout "$CONNECT_MS" 2>/dev/null)
+    UP=$(printf '%s\n' "$fwd" | mbps 'sender')
+    rev=$(timeout $((TEST_SECS + 6)) iperf3 -c "$SRV" -t "$TEST_SECS" -O 1 -f m -R \
+                  --connect-timeout "$CONNECT_MS" 2>/dev/null)
+    DOWN=$(printf '%s\n' "$rev" | mbps 'receiver')
+else
+    out=$(timeout $((TEST_SECS + 6)) iperf -c "$SRV" -t "$TEST_SECS" -f m 2>/dev/null)
+    UP=$(printf '%s\n' "$out" | mbps 'Mbits/sec')
+fi
+
+write_out "$SRV" "$PROTO" "$UP" "$DOWN"
+echo "[SoCKit-netan] iperf srv=$SRV $PROTO up=${UP:-?} down=${DOWN:-?} Mbps (src=$src found=$found scanned=$scanned)"

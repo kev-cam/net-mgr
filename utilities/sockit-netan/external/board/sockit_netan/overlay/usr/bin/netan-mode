@@ -1,0 +1,36 @@
+#!/bin/sh
+# netan-mode — get/set/toggle the net-analyzer operating mode.
+#
+#   dhcp   (default) per-cycle DHCP release/renew probe + reachability + peers
+#   iperf            find an iperf/iperf3 server (nas3 first, then scan) and
+#                    run an up/down throughput test each cycle
+#
+# The daemon reads /tmp/netan-mode at the top of every cycle; setting it here
+# also kicks a fresh cycle so the change takes effect immediately.
+
+MODEF=/tmp/netan-mode
+DEF=/etc/netan-mode
+
+cur() {
+    m=$(cat "$MODEF" 2>/dev/null)
+    [ -n "$m" ] || m=$(cat "$DEF" 2>/dev/null)
+    case "$m" in iperf) echo iperf ;; *) echo dhcp ;; esac
+}
+
+set_mode() {
+    case "$1" in
+        dhcp|iperf)
+            echo "$1" > "$MODEF.t" && mv "$MODEF.t" "$MODEF"
+            rm -f /tmp/netan-hold      # don't let a pinned lease block the switch
+            touch /tmp/netan-kick      # cut the inter-cycle wait; apply now
+            echo "$1"
+            ;;
+        *)  echo "usage: netan-mode [dhcp|iperf|toggle]" >&2; exit 2 ;;
+    esac
+}
+
+case "${1:-}" in
+    ""|get|status) cur ;;
+    toggle) [ "$(cur)" = iperf ] && set_mode dhcp || set_mode iperf ;;
+    *) set_mode "$1" ;;
+esac

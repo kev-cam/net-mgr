@@ -1,0 +1,8 @@
+# socfpga_sockit_defconfig ships with USE_BOOTCOMMAND unset — without this the
+# board stops at the U-Boot prompt instead of running the distroboot/extlinux scan.
+CONFIG_USE_BOOTCOMMAND=y
+CONFIG_BOOTCOMMAND="run distro_bootcmd"
+# no EFI on this appliance — extlinux boot doesn't need it, and the capsule
+# host tool drags in gnutls headers the build host doesn't have
+# CONFIG_EFI_LOADER is not set
+# CONFIG_TOOLS_MKEFICAPSULE is not set
