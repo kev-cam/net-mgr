@@ -36,9 +36,17 @@ With no config file at all they auto-detect an interface and run in guest model.
 sudo ./install.sh                       # guest model, auto-detect iface
 sudo ./install.sh --model guest --start # ...and run it in the foreground now
 sudo ./install.sh --service             # install + enable a systemd service
+sudo ./install.sh --service --display   # ...also show the dashboard on a monitor
 sudo ./install.sh --model appliance --iface eth1   # dedicated box owning eth1
 sudo ./install.sh --uninstall
 ```
+
+`--display [VT]` adds a second service (`netan-display.service`) that renders the
+full-screen dashboard (`netan-display`) on a Linux console VT (default 8) with a
+large console font, so a monitor plugged into the box becomes a live wall
+display. It coexists with a desktop — the GUI keeps its own VT (usually 7), and
+`chvt <n>` switches the monitor between them. Proven on the DE2i-150's HDMI
+(gma500 framebuffer, 1080p).
 
 `install.sh` copies the three scripts to `<prefix>/bin` (default `/usr/local/bin`),
 writes `/etc/netan.conf` (only if absent — it never clobbers yours), warns about

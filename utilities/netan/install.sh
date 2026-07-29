@@ -14,8 +14,10 @@
 #     --iface IFACE    pin the interface (default: auto-detect)
 #     --label TEXT     report label (default: netan@<hostname>)
 #     --service        install + enable a systemd service (netan.service)
+#     --display [VT]    also show the dashboard on a console VT (default 8) via a
+#                       netan-display.service (large font, coexists with a desktop)
 #     --start          run once in the foreground now (Ctrl-C to stop)
-#     --uninstall      remove installed files, the service, and /etc/netan.conf
+#     --uninstall      remove installed files, the services, and /etc/netan.conf
 #   Run as root (writes $prefix/bin, /etc, and systemd units).
 set -eu
 
@@ -27,6 +29,8 @@ LABEL=
 DO_SERVICE=0
 DO_START=0
 DO_UNINSTALL=0
+DO_DISPLAY=0
+DISPLAY_VT=8
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -35,20 +39,24 @@ while [ $# -gt 0 ]; do
         --iface)     IFACE=$2; shift 2 ;;
         --label)     LABEL=$2; shift 2 ;;
         --service)   DO_SERVICE=1; shift ;;
+        --display)   DO_DISPLAY=1; case "${2:-}" in [0-9]*) DISPLAY_VT=$2; shift 2 ;; *) shift ;; esac ;;
         --start)     DO_START=1; shift ;;
         --uninstall) DO_UNINSTALL=1; shift ;;
-        -h|--help)   sed -n '2,25p' "$0"; exit 0 ;;
+        -h|--help)   sed -n '2,26p' "$0"; exit 0 ;;
         *) echo "install.sh: unknown option: $1" >&2; exit 2 ;;
     esac
 done
 
 BINDIR=$PREFIX/bin
 UNIT=/etc/systemd/system/netan.service
+DUNIT=/etc/systemd/system/netan-display.service
 
 if [ "$DO_UNINSTALL" = 1 ]; then
-    if command -v systemctl >/dev/null 2>&1 && [ -f "$UNIT" ]; then
-        systemctl disable --now netan.service 2>/dev/null || true
-        rm -f "$UNIT"; systemctl daemon-reload 2>/dev/null || true
+    if command -v systemctl >/dev/null 2>&1; then
+        for svc in netan.service netan-display.service; do
+            [ -f "/etc/systemd/system/$svc" ] && systemctl disable --now "$svc" 2>/dev/null || true
+        done
+        rm -f "$UNIT" "$DUNIT"; systemctl daemon-reload 2>/dev/null || true
     fi
     rm -f "$BINDIR/net-analyzer" "$BINDIR/netan-iperf" "$BINDIR/netan-mode" "$BINDIR/netan-display"
     rm -f /etc/netan.conf /tmp/netan-mode
@@ -107,6 +115,41 @@ EOF
     else
         echo "netan: no systemd here — start it yourself, e.g.:"
         echo "         $BINDIR/net-analyzer >>/var/log/net-analyzer.log 2>&1 &"
+    fi
+fi
+
+if [ "$DO_DISPLAY" = 1 ]; then
+    if command -v systemctl >/dev/null 2>&1; then
+        SETFONT=$(command -v setfont 2>/dev/null || true)
+        CHVT=$(command -v chvt 2>/dev/null || true)
+        # a large console font (32px tall) so the 80x24 dashboard fills a monitor;
+        # fall back silently to the default font if none is installed
+        FONT=$(ls /usr/share/consolefonts/ 2>/dev/null | grep -iE 'Terminus32x16' | head -1)
+        FONT=${FONT%.psf.gz}; FONT=${FONT%.psfu.gz}; FONT=${FONT%.psf}
+        {
+            echo "[Unit]"
+            echo "Description=netan console status dashboard (vt$DISPLAY_VT)"
+            echo "After=netan.service display-manager.service"
+            echo "Wants=netan.service"
+            echo ""
+            echo "[Service]"
+            echo "Type=simple"
+            [ -n "$SETFONT" ] && [ -n "$FONT" ] && \
+                echo "ExecStartPre=-$SETFONT -C /dev/tty$DISPLAY_VT $FONT"
+            [ -n "$CHVT" ] && echo "ExecStartPre=-$CHVT $DISPLAY_VT"
+            echo "ExecStart=$BINDIR/netan-display --tty /dev/tty$DISPLAY_VT --refresh 3"
+            echo "Restart=always"
+            echo "RestartSec=3"
+            echo ""
+            echo "[Install]"
+            echo "WantedBy=multi-user.target"
+        } > "$DUNIT"
+        systemctl daemon-reload
+        systemctl enable --now netan-display.service
+        echo "netan: dashboard on VT$DISPLAY_VT (font ${FONT:-default}) — coexists with a"
+        echo "       desktop; 'chvt <n>' switches the monitor. journalctl -u netan-display -f"
+    else
+        echo "netan: --display needs systemd; else run: netan-display --tty /dev/ttyN &" >&2
     fi
 fi
 
