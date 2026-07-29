@@ -50,7 +50,7 @@ if [ "$DO_UNINSTALL" = 1 ]; then
         systemctl disable --now netan.service 2>/dev/null || true
         rm -f "$UNIT"; systemctl daemon-reload 2>/dev/null || true
     fi
-    rm -f "$BINDIR/net-analyzer" "$BINDIR/netan-iperf" "$BINDIR/netan-mode"
+    rm -f "$BINDIR/net-analyzer" "$BINDIR/netan-iperf" "$BINDIR/netan-mode" "$BINDIR/netan-display"
     rm -f /etc/netan.conf /tmp/netan-mode
     echo "netan: uninstalled from $BINDIR (left /var/log/net-analyzer.log if any)"
     exit 0
@@ -60,7 +60,7 @@ case "$MODEL" in guest|appliance) ;; *) echo "install.sh: --model must be guest 
 
 echo "netan: installing core -> $BINDIR (model=$MODEL)"
 mkdir -p "$BINDIR"
-for f in net-analyzer netan-iperf netan-mode; do
+for f in net-analyzer netan-iperf netan-mode netan-display; do
     install -m 0755 "$SRC/bin/$f" "$BINDIR/$f"
 done
 

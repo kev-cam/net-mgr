@@ -1,0 +1,147 @@
+#!/bin/sh
+# netan-display — portable full-screen status dashboard for the net-analyzer.
+#
+# The FPGA-free analog of the SoCKit's netan-lcd: reads the same published
+# state (/tmp/netan-status, /tmp/netan-peers, /tmp/netan-iperf) and draws one
+# 80x24 ANSI dashboard to a terminal, a Linux VT, or a framebuffer console —
+# anything that understands ANSI escapes. No buttons, no board hardware, so it
+# runs on any Linux (a monitor on an Atom/Intel box, a laptop screen, or over
+# ssh). Passive by design: one comprehensive screen, refreshed on a timer.
+#
+# Usage:
+#   netan-display                 draw to this terminal, refresh every 3s
+#   netan-display --tty /dev/tty1 draw to a specific VT (e.g. a wall monitor)
+#   netan-display --once          draw a single frame and exit (screenshots/ssh)
+#   netan-display --refresh N     seconds between frames (default 3)
+# Env equivalents: NETAN_TTY, NETAN_DISPLAY_REFRESH.
+
+ST=/tmp/netan-status
+PEERS=/tmp/netan-peers
+IPERF=/tmp/netan-iperf
+
+TTY=${NETAN_TTY:-}
+REFRESH=${NETAN_DISPLAY_REFRESH:-3}
+ONCE=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --tty)     TTY=$2; shift 2 ;;
+        --refresh) REFRESH=$2; shift 2 ;;
+        --once)    ONCE=1; shift ;;
+        -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+        *) echo "netan-display: unknown option: $1" >&2; exit 2 ;;
+    esac
+done
+
+# Output goes to fd 3: a named VT if asked, else this process's stdout.
+if [ -n "$TTY" ]; then
+    exec 3>"$TTY" || { echo "netan-display: cannot open $TTY" >&2; exit 1; }
+else
+    exec 3>&1
+fi
+
+ESC=$(printf '\033')
+BAR="============================================================================"  # 76
+SEP="----------------------------------------------------------------------------"
+RCOL=48   # column where the right-hand panel starts
+
+val()  { sed -n "s/^$1=//p" "$ST"    2>/dev/null | head -1; }
+ival() { sed -n "s/^$1=//p" "$IPERF" 2>/dev/null | head -1; }
+or()   { [ -n "$1" ] && printf '%s' "$1" || printf '%s' "-"; }
+
+badge() {  # badge yes|no|na|blink -> colored fixed-width status cell
+    case "$1" in
+        yes)         printf '%s[  OK  ]%s' "$ESC[1;32m" "$ESC[0m" ;;
+        no)          printf '%s[ FAIL ]%s' "$ESC[1;31m" "$ESC[0m" ;;
+        blink|captive) printf '%s[CAPTIV]%s' "$ESC[1;33m" "$ESC[0m" ;;
+        na)          printf '%s[  --  ]%s' "$ESC[2m" "$ESC[0m" ;;
+        *)           printf '[  ??  ]' ;;
+    esac
+}
+
+at() { printf '%s[%s;%sH%s' "$ESC" "$1" "$2" "$3" >&3; }   # at ROW COL TEXT
+
+draw() {
+    if [ ! -f "$ST" ]; then
+        printf '%s[2J%s[H  netan-display: waiting for net-analyzer (%s not found)...\n' \
+               "$ESC" "$ESC" "$ST" >&3
+        return
+    fi
+    HOSTN=$(hostname 2>/dev/null || echo host)
+    ts=$(date '+%H:%M:%S' 2>/dev/null)
+    model=$(or "$(val model 2>/dev/null)")   # not published today; blank -> "-"
+    mode=$(or "$(val mode)")
+    ip=$(or "$(val ip)"); mask=$(or "$(val mask)")
+    gw=$(or "$(val gw)"); dns=$(or "$(val dns)")
+    domain=$(or "$(val domain)"); state=$(or "$(val state)"); cycle=$(or "$(val cycle)")
+    lease=$(or "$(val lease)")
+    b_gw=$(badge "$(val gw_ok)")
+    b_inet=$(badge "$(val inet)")
+    b_http=$(badge "$(val http)")
+
+    # state colour: green when observing/held, red when lost/no-link/no-lease
+    case "$state" in
+        LOST|NO-*|"") sc="$ESC[1;31m" ;;
+        *)            sc="$ESC[1;32m" ;;
+    esac
+
+    printf '%s[2J' "$ESC" >&3        # clear
+    at 1  1 "$BAR"
+    at 2  3 "netan @ $HOSTN"
+    at 2  "$RCOL" "state:$sc $state $ESC[0m  mode: $mode   $ts"
+    at 3  1 "$BAR"
+
+    at 4  3 "$ESC[1mCONNECTION$ESC[0m"
+    at 4  "$RCOL" "$ESC[1mREACHABILITY$ESC[0m"
+    at 5  5 "ip       $ip/$mask"
+    at 6  5 "gateway  $gw"
+    at 7  5 "dns      $dns"
+    at 8  5 "domain   $domain"
+    at 9  5 "cycle    $cycle    lease ${lease}s"
+    at 5  "$RCOL" "gateway   ping   $b_gw"
+    at 6  "$RCOL" "internet  ping   $b_inet"
+    at 7  "$RCOL" "http / portal    $b_http"
+
+    at 10 1 "$SEP"
+
+    # peers (left) + throughput (right)
+    snap=$(cat "$PEERS" 2>/dev/null)
+    total=$(printf '%s\n' "$snap" | grep -c .); : "${total:=0}"
+    at 11 3 "$ESC[1mPEERS ($total)$ESC[0m"
+    at 11 "$RCOL" "$ESC[1mTHROUGHPUT (iperf)$ESC[0m"
+    r=12; n=0
+    printf '%s\n' "$snap" | { while IFS= read -r pip; do
+        [ -z "$pip" ] && continue
+        n=$((n + 1)); [ "$n" -gt 7 ] && break
+        if [ "$pip" = "$gw" ]; then at "$r" 5 "$pip  $ESC[2m(gw)$ESC[0m"
+        else at "$r" 5 "$pip"; fi
+        r=$((r + 1))
+    done
+    [ "$total" -gt 7 ] && at "$r" 5 "$ESC[2m...+$((total - 7)) more (see log)$ESC[0m"; }
+
+    if [ "$mode" = iperf ] && [ -f "$IPERF" ]; then
+        at 12 "$RCOL" "server   $(or "$(ival isrv)")"
+        at 13 "$RCOL" "proto    $(or "$(ival iproto)")   src $(or "$(ival isrc)")"
+        at 14 "$RCOL" "up       $(or "$(ival iup)") Mbps"
+        at 15 "$RCOL" "down     $(or "$(ival idown)") Mbps"
+        at 16 "$RCOL" "found $(or "$(ival ifound)")  scanned $(or "$(ival iscanned)")"
+    else
+        at 13 "$RCOL" "$ESC[2m(switch to iperf mode:$ESC[0m"
+        at 14 "$RCOL" "$ESC[2m  netan-mode iperf)$ESC[0m"
+    fi
+
+    at 21 1 "$BAR"
+    at 22 3 "log: /var/log/net-analyzer.log"
+    at 22 "$RCOL" "refresh ${REFRESH}s    Ctrl-C to quit"
+    at 23 1 "$BAR"
+    at 24 1 ""   # park the cursor
+}
+
+restore() { printf '%s[?25h%s[2J%s[H' "$ESC" "$ESC" "$ESC" >&3 2>/dev/null; exit 0; }
+trap restore INT TERM
+
+printf '%s[?25l' "$ESC" >&3    # hide cursor
+while :; do
+    draw
+    [ "$ONCE" = 1 ] && { printf '%s[?25h' "$ESC" >&3; exit 0; }
+    sleep "$REFRESH"
+done
