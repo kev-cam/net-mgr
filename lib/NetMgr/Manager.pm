@@ -2502,7 +2502,7 @@ sub _peer_may_mutate {
 sub _is_allowed_updater {
     my ($self, $key_id) = @_;
     return 0 unless defined $key_id && length $key_id;
-    return scalar grep { $_ eq $key_id }
+    return scalar grep { NetMgr::Auth::id_matches_principal($key_id, $_) }
         NetMgr::Auth::principals('/etc/net-mgr/allowed_updaters');
 }
 
@@ -2511,7 +2511,7 @@ sub _is_allowed_updater {
 sub _is_allowed_internet {
     my ($self, $key_id) = @_;
     return 0 unless defined $key_id && length $key_id;
-    return scalar grep { $_ eq $key_id }
+    return scalar grep { NetMgr::Auth::id_matches_principal($key_id, $_) }
         NetMgr::Auth::principals('/etc/net-mgr/allowed_internet');
 }
 
@@ -2557,7 +2557,7 @@ sub _chatkey_verify {
 sub _is_allowed_debug {
     my ($self, $key_id) = @_;
     return 0 unless defined $key_id && length $key_id;
-    return scalar grep { $_ eq $key_id }
+    return scalar grep { NetMgr::Auth::id_matches_principal($key_id, $_) }
         NetMgr::Auth::principals('/etc/net-mgr/allowed_debug');
 }
 
@@ -2567,7 +2567,7 @@ sub _is_allowed_debug {
 sub _is_allowed_repairer {
     my ($self, $key_id) = @_;
     return 0 unless defined $key_id && length $key_id;
-    return scalar grep { $_ eq $key_id }
+    return scalar grep { NetMgr::Auth::id_matches_principal($key_id, $_) }
         NetMgr::Auth::principals('/etc/net-mgr/allowed_repairers');
 }
 

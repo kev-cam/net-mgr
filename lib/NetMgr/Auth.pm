@@ -102,9 +102,12 @@ sub merged_signers_path {
             # converted principal comes from the pubkey comment, which is the
             # key_id ($USER@$(hostname)) the client AUTHs as.
             if ($line =~ /^\s*(?:ssh-(?:rsa|ed25519|dss)|ecdsa-sha2-\S+|sk-\S+)\s/) {
-                my $converted = _authorized_to_allowed($line);
+                my $converted = _authorized_to_allowed($line);   # principal host-wildcarded inside
                 next unless defined $converted;
                 $line = $converted;
+            } else {
+                # native allowed_signers line — relax its principal's host too
+                $line =~ s/^(\S+)/hostwild($1)/e;
             }
             print $tmp "$line\n";
             $count++;
@@ -131,6 +134,36 @@ sub merged_signers_path {
     $state->{last_built} = $now;
     $state->{count}      = $count;
     return $tmp->filename;
+}
+
+# Host-wildcard a principals field (comma-list): user@host -> user@*, a bare
+# user -> user@*, while '*' and an already-wildcarded user@* pass through. The
+# hostname in an ssh key comment is decorative — the same key is presented from
+# whatever machine the user is logged into (roaming users, shared/NFS homes) —
+# so we relax it to a wildcard: only the user part and the key itself gate auth.
+# ssh-keygen -Y verify honours the '*' pattern, so `claude@*` matches key_id
+# claude@P620A or claude@anywhere, but never root@evil.
+sub hostwild {
+    my ($field) = @_;
+    return '' unless defined $field && length $field;
+    return join ',', map {
+        $_ eq '*' ? '*'
+      : /\@/      ? s/\@.*/\@*/r    # user@host -> user@*  (non-destructive)
+      :             "$_\@*"         # bare 'user' -> user@*
+    } split /,/, $field;
+}
+
+# True if a client key_id (user@host) satisfies an allowlist principal, ignoring
+# the host — the capability-file counterpart to hostwild()'s signer relaxation.
+# claude@P620A satisfies claude@P620A, claude@bigsony, claude@*, or bare claude;
+# never root@anything. '*' satisfies everyone.
+sub id_matches_principal {
+    my ($key_id, $p) = @_;
+    return 0 unless defined $key_id && length $key_id && defined $p && length $p;
+    return 1 if $p eq '*' || $p eq $key_id;
+    (my $pu = $p)      =~ s/\@.*//;
+    (my $iu = $key_id) =~ s/\@.*//;
+    return ($pu eq $iu && length $iu) ? 1 : 0;
 }
 
 # authorized_keys line:    [options] KEYTYPE BASE64KEY [comment...]
@@ -160,6 +193,9 @@ sub _authorized_to_allowed {
         # OpenSSH allowed_signers needs the principal as a single token.
         # If the comment has spaces, replace them with underscores.
         $principal =~ s/\s+/_/g;
+        # Drop the decorative hostname: claude@DESKTOP-3SRS8MD -> claude@*, so
+        # the same key authenticates from whatever host the user is logged into.
+        $principal = hostwild($principal);
         my $ns = NAMESPACE;
         return qq($principal namespaces="$ns" $kt $kdata);
     }
