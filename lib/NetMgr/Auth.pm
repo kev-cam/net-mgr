@@ -102,9 +102,12 @@ sub merged_signers_path {
             # converted principal comes from the pubkey comment, which is the
             # key_id ($USER@$(hostname)) the client AUTHs as.
             if ($line =~ /^\s*(?:ssh-(?:rsa|ed25519|dss)|ecdsa-sha2-\S+|sk-\S+)\s/) {
-                my $converted = _authorized_to_allowed($line);
+                my $converted = _authorized_to_allowed($line);   # principal host-wildcarded inside
                 next unless defined $converted;
                 $line = $converted;
+            } else {
+                # native allowed_signers line — relax its principal's host too
+                $line =~ s/^(\S+)/hostwild($1)/e;
             }
             print $tmp "$line\n";
             $count++;
@@ -131,6 +134,37 @@ sub merged_signers_path {
     $state->{last_built} = $now;
     $state->{count}      = $count;
     return $tmp->filename;
+}
+
+# Normalise a principals field (comma-list) to lc(user)@* : user@host and a
+# bare user both become lc(user)@*, while '*' passes through. Both the hostname
+# AND the letter-case of the key comment are decorative — the same key is
+# presented from whatever machine the user is on (roaming users, shared/NFS
+# homes), and case is an accident of the OS username (Windows 'Claude' vs unix
+# 'claude'). Only the user identity and the key itself gate auth. ssh-keygen -Y
+# verify honours '*' but matches principals case-SENSITIVELY, so we lowercase
+# here and verify() lowercases the -I to meet it: `claude@*` matches key_id
+# claude@P620A / Claude@anywhere, but never root@evil.
+sub hostwild {
+    my ($field) = @_;
+    return '' unless defined $field && length $field;
+    return join ',', map {
+        $_ eq '*' ? '*'
+                  : do { (my $u = $_) =~ s/\@.*//; lc($u) . '@*' }
+    } split /,/, $field;
+}
+
+# True if a client key_id (user@host) satisfies an allowlist principal, ignoring
+# the host AND letter-case — the capability-file counterpart to hostwild()'s
+# signer relaxation. claude@P620A satisfies Claude@P620A, claude@bigsony,
+# claude@*, or bare Claude; never root@anything. '*' satisfies everyone.
+sub id_matches_principal {
+    my ($key_id, $p) = @_;
+    return 0 unless defined $key_id && length $key_id && defined $p && length $p;
+    return 1 if $p eq '*';
+    (my $pu = $p)      =~ s/\@.*//;
+    (my $iu = $key_id) =~ s/\@.*//;
+    return (length $iu && lc($pu) eq lc($iu)) ? 1 : 0;
 }
 
 # authorized_keys line:    [options] KEYTYPE BASE64KEY [comment...]
@@ -160,6 +194,9 @@ sub _authorized_to_allowed {
         # OpenSSH allowed_signers needs the principal as a single token.
         # If the comment has spaces, replace them with underscores.
         $principal =~ s/\s+/_/g;
+        # Drop the decorative hostname: claude@DESKTOP-3SRS8MD -> claude@*, so
+        # the same key authenticates from whatever host the user is logged into.
+        $principal = hostwild($principal);
         my $ns = NAMESPACE;
         return qq($principal namespaces="$ns" $kt $kdata);
     }
@@ -217,9 +254,13 @@ sub verify {
     $sig_file->flush;
 
     my $ns = NAMESPACE;
+    # The merged signers wildcard the host and lowercase the user (hostwild);
+    # ssh-keygen matches principals case-sensitively, so present a -I whose
+    # user-part is lowercased to meet them (host is already irrelevant).
+    (my $match_id = $key_id) =~ s/^([^\@]*)/lc $1/e;
     my @cmd = ('ssh-keygen', '-Y', 'verify',
                '-n', $ns,
-               '-I', $key_id,
+               '-I', $match_id,
                '-f', $signers,
                '-s', $sig_file->filename);
     # Feed nonce on stdin; capture stderr for diagnostics.

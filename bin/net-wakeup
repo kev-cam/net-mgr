@@ -1,0 +1,243 @@
+#!/usr/bin/perl
+# net-wakeup — Wake-on-LAN a machine by name, sourcing name→MAC (+ the target's
+# subnet) from the net-mgr DB via the daemon snapshot — the same machinery
+# net-lookup uses — instead of the legacy fix_dhcp.tmpl / ypcat lookups of the
+# old ~/wakeup. So it runs from any host with net-mgr installed, no DB creds.
+#
+# It resolves <name-regex> to machine(s), gathers their interface MAC(s) and
+# known IPv4s, then sends the WoL magic packet as a UDP broadcast out the local
+# interface that shares the target's subnet (falling back to a limited/global
+# broadcast when the target isn't on one of our segments). No etherwake and no
+# root needed — SO_BROADCAST datagrams are enough for standard WoL NICs on the
+# local link. Optionally pings afterward to confirm the host came up.
+#
+# Usage:
+#   net-wakeup [options] <name-regex>
+#   net-wakeup --list                 # every wakeable machine name + its MAC(s)
+#
+# Options:
+#   --list             list known machine names and MAC(s), then exit
+#   --ping[=N]         after sending, ping the target(s) up to N times
+#                      (default 12, ~5s apart) and report when one responds
+#   --count=N          magic packets to send per MAC (default 10)
+#   --wired            only wake ethernet interfaces (skip wifi/virtual)
+#   --iface=IF         force the egress interface (else auto, by subnet)
+#   -n, --dry-run      show what would be sent without sending
+#   --listen HOST:PORT daemon address (overrides discovery / --server)
+#   --server NAME      named daemon (resolved via config), else auto-discover
+#   -v, --verbose      per-MAC detail
+#   -h, --help
+#
+# As in net-lookup, '=' in the pattern is rewritten to '.*' and the whole thing
+# is anchored (^(?:…)$), so `net-wakeup 'zmc='` wakes zmc1, zmc-air, etc.
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use Socket qw(PF_INET SOCK_DGRAM SOL_SOCKET SO_BROADCAST
+              sockaddr_in inet_aton inet_ntoa);
+use NetMgr::Client;
+use NetMgr::Config;
+
+my ($listen, $server, $list, $count, $wired, $force_if, $dry, $verbose, $help);
+my $ping;
+$count = 10;
+GetOptions(
+    'listen=s'  => \$listen,
+    'server=s'  => \$server,
+    'list'      => \$list,
+    'ping:i'    => \$ping,          # optional value; --ping alone => 0 => 12
+    'count=i'   => \$count,
+    'wired'     => \$wired,
+    'iface=s'   => \$force_if,
+    'n|dry-run' => \$dry,
+    'verbose|v' => \$verbose,
+    'help|h'    => \$help,
+) or die usage();
+print usage() and exit 0 if $help;
+$ping = 12 if defined $ping && $ping == 0;
+
+my $pattern = shift @ARGV;
+die "net-wakeup: need a <name-regex> (or --list)\n" . usage()
+    unless defined $pattern || $list;
+
+# --- connect + snapshot the machine-model tables (same as net-lookup) -------
+$listen = NetMgr::Config->resolve_server($server) if $server && !$listen;
+my $cli = defined $listen
+    ? NetMgr::Client->new(listen => $listen, timeout => 5)
+    : NetMgr::Client->new(discover => 1, consumer => "net-wakeup.$$", timeout => 5);
+$cli->hello(consumer => "net-wakeup.$$");
+my $machines  = $cli->snapshot(1, 'machines');
+my $friendly  = $cli->snapshot(2, 'friendly_names');
+my $hostnames = $cli->snapshot(3, 'hostnames');
+my $aliases   = $cli->snapshot(4, 'aliases');
+my $ifaces    = $cli->snapshot(5, 'interfaces');
+my $addresses = $cli->snapshot(6, 'addresses',
+                               where => "family = 'v4' AND last_observed IS NOT NULL");
+$cli->bye;
+
+# --- index name → machine_id, machine_id → MAC(kind), MAC → IPv4s -----------
+my (%name2mids, %pname);
+for my $m (@$machines) {
+    $pname{ $m->{id} } = $m->{primary_name} if defined $m->{id};
+    push @{ $name2mids{ $m->{primary_name} } }, $m->{id} if $m->{primary_name};
+}
+push @{ $name2mids{ $_->{name} } }, $_->{machine_id} for @$friendly;
+push @{ $name2mids{ $_->{name} } }, $_->{machine_id} for @$hostnames;
+push @{ $name2mids{ $_->{name} } }, $_->{machine_id} for @$aliases;
+
+my %macs_by_mid;                     # mid => [ {mac, kind} ]
+for my $i (@$ifaces) {
+    next unless $i->{mac} && defined $i->{machine_id} && length $i->{machine_id};
+    push @{ $macs_by_mid{ $i->{machine_id} } },
+         { mac => lc $i->{mac}, kind => ($i->{kind} // 'unknown') };
+}
+my %ips_by_mac;                      # mac => [ ipv4 ]
+for my $a (@$addresses) {
+    next unless $a->{mac} && $a->{addr};
+    push @{ $ips_by_mac{ lc $a->{mac} } }, $a->{addr};
+}
+
+# --- --list -----------------------------------------------------------------
+if ($list) {
+    for my $m (sort { ($a->{primary_name} // '') cmp ($b->{primary_name} // '') } @$machines) {
+        my @macs = map { $_->{mac} } @{ $macs_by_mid{ $m->{id} } || [] };
+        next unless @macs;
+        printf "%-24s %s\n", ($m->{primary_name} // "(mid $m->{id})"), join(' ', @macs);
+    }
+    exit 0;
+}
+
+# --- resolve the pattern → machine ids --------------------------------------
+(my $rxsrc = $pattern) =~ s/=/.*/g;
+my $rx = eval { qr/^(?:$rxsrc)$/ };
+die "net-wakeup: bad name pattern '$pattern'\n" if $@;
+my %mids;
+for my $name (keys %name2mids) {
+    next unless defined $name && $name =~ $rx;
+    $mids{$_} = 1 for @{ $name2mids{$name} };
+}
+die "net-wakeup: no machine matches '$pattern'\n" unless %mids;
+
+# --- local interfaces, for subnet-matched egress + broadcast ----------------
+my @locals;                          # {iface, ip, prefix, bcast}
+for my $ln (`ip -o -4 addr show 2>/dev/null`) {
+    next unless $ln =~ /^\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)\/(\d+)
+                        (?:\s+brd\s+(\d+\.\d+\.\d+\.\d+))?/x;
+    my ($if, $ip, $pfx, $brd) = ($1, $2, $3, $4);
+    next if $if eq 'lo';
+    $brd //= bcast_of($ip, $pfx);
+    push @locals, { iface => $if, ip => $ip, prefix => $pfx, bcast => $brd };
+}
+
+# --- collect targets (one per MAC) ------------------------------------------
+my @targets;
+for my $mid (sort { $a <=> $b } keys %mids) {
+    for my $mi (@{ $macs_by_mid{$mid} || [] }) {
+        next if $wired && $mi->{kind} ne 'ethernet';
+        push @targets, {
+            mac  => $mi->{mac}, kind => $mi->{kind},
+            ips  => ($ips_by_mac{ $mi->{mac} } || []),
+            name => $pname{$mid},
+        };
+    }
+}
+die "net-wakeup: matched machine(s) have no MAC to wake"
+  . ($wired ? " (with --wired)\n" : "\n") unless @targets;
+
+# --- send -------------------------------------------------------------------
+my @pingips;
+for my $t (@targets) {
+    my ($bcast, $bindip, $viaif);
+    if ($force_if) {
+        my ($L) = grep { $_->{iface} eq $force_if } @locals;
+        ($bcast, $bindip, $viaif) = $L
+            ? ($L->{bcast}, $L->{ip}, $L->{iface}) : (undef, undef, $force_if);
+    } else {
+        for my $ip (@{ $t->{ips} }) {
+            my ($L) = grep { subnet_has($_->{ip}, $_->{prefix}, $ip) } @locals;
+            if ($L) { ($bcast, $bindip, $viaif) = ($L->{bcast}, $L->{ip}, $L->{iface}); last }
+        }
+    }
+    push @pingips, $t->{ips}[0] if $t->{ips}[0];
+    # No subnet match → limited broadcast on every local segment + 255.…
+    my @bcasts = $bcast ? ($bcast) : (map { $_->{bcast} } @locals);
+    push @bcasts, '255.255.255.255' unless grep { $_ eq '255.255.255.255' } @bcasts;
+    printf "%s %s (%s)%s %s\n",
+        ($dry ? "[dry-run] would wake" : "waking"),
+        $t->{mac}, ($t->{name} // '?'),
+        ($t->{ips}[0] ? " [$t->{ips}[0]]" : ''),
+        ($viaif ? "via $viaif" : "broadcast " . join(',', @bcasts));
+    next if $dry;
+    wol($t->{mac}, \@bcasts, $bindip, $count);
+}
+
+# --- optional ping-to-confirm -----------------------------------------------
+if (defined $ping && @pingips) {
+    my %seen; @pingips = grep { !$seen{$_}++ } @pingips;
+    print "pinging " . join(', ', @pingips) . " (up to $ping tries)...\n";
+    for my $try (1 .. $ping) {
+        for my $ip (@pingips) {
+            if (system("ping -c1 -w2 $ip >/dev/null 2>&1") == 0) {
+                print "$ip is up\n";
+                exit 0;
+            }
+        }
+        sleep 5;
+    }
+    print "no response after $ping tries\n";
+    exit 1;
+}
+exit 0;
+
+# --- helpers ----------------------------------------------------------------
+sub wol {
+    my ($mac, $bcasts, $bindip, $n) = @_;
+    (my $hex = $mac) =~ s/[^0-9a-fA-F]//g;
+    return warn "net-wakeup: bad MAC '$mac'\n" unless length($hex) == 12;
+    my $pkt = ("\xff" x 6) . (pack('H*', $hex) x 16);      # magic packet, 102 B
+    socket(my $s, PF_INET, SOCK_DGRAM, getprotobyname('udp'))
+        or return warn "net-wakeup: socket: $!\n";
+    setsockopt($s, SOL_SOCKET, SO_BROADCAST, 1);
+    bind($s, sockaddr_in(0, inet_aton($bindip))) if $bindip && inet_aton($bindip);
+    for (1 .. $n) {
+        for my $b (@$bcasts) {
+            my $dst = inet_aton($b) or next;
+            send($s, $pkt, 0, sockaddr_in($_, $dst)) for (9, 7);   # WoL ports
+        }
+        select(undef, undef, undef, 0.1);
+    }
+    close($s);
+    print "  sent $n magic packets for $mac\n" if $verbose;
+}
+
+sub ip2n { unpack('N', inet_aton($_[0]) // pack('N', 0)) }
+sub mask { my $p = shift; $p <= 0 ? 0 : (0xffffffff << (32 - $p)) & 0xffffffff }
+sub bcast_of {
+    my ($ip, $p) = @_; my $m = mask($p);
+    inet_ntoa(pack('N', (ip2n($ip) & $m) | (~$m & 0xffffffff)));
+}
+sub subnet_has {
+    my ($netip, $p, $ip) = @_; my $m = mask($p);
+    (ip2n($netip) & $m) == (ip2n($ip) & $m);
+}
+
+sub usage {
+    return <<'USAGE';
+net-wakeup — Wake-on-LAN by name, using the net-mgr DB for name->MAC + subnet.
+Usage:
+  net-wakeup [options] <name-regex>
+  net-wakeup --list
+Options:
+  --list          list known machine names and MAC(s), then exit
+  --ping[=N]      after sending, ping target(s) up to N times (default 12)
+  --count=N       magic packets per MAC (default 10)
+  --wired         only wake ethernet interfaces
+  --iface=IF      force egress interface (else auto, by subnet)
+  -n, --dry-run   show what would be sent, don't send
+  --listen H:P    daemon address     --server NAME   named daemon
+  -v, --verbose   per-MAC detail      -h, --help
+USAGE
+}
