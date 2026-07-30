@@ -60,3 +60,8 @@ fi
 # evkeys: the one C helper (evdev buttons -> text lines for netan-lcd)
 "$HOST_DIR/bin/arm-buildroot-linux-gnueabihf-gcc" -Os -Wall \
     -o "$TARGET_DIR/usr/bin/evkeys" "$BOARD_DIR/evkeys.c"
+
+# netan-vga: mmap-writes the 80x30 FPGA VGA char buffer (the readable dashboard).
+"$HOST_DIR/bin/arm-buildroot-linux-gnueabihf-gcc" -Os -Wall \
+    -o "$TARGET_DIR/usr/bin/netan-vga" "$BOARD_DIR/netan-vga.c"
+chmod 0755 "$TARGET_DIR/usr/bin/netan-vga-render" "$TARGET_DIR/etc/init.d/S97netanvga"

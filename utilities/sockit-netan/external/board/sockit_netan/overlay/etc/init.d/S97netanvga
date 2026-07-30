@@ -1,0 +1,43 @@
+#!/bin/sh
+# S97netanvga — live analyzer dashboard on the FPGA VGA output (the full-screen,
+# readable alternative to the tiny LCD). Loops `netan-vga-render | netan-vga`,
+# writing the 80x30 char buffer every few seconds.
+#
+# Requires the FPGA fabric loaded + HPS->FPGA bridges enabled, which the fork
+# U-Boot bootcmd does at boot (fpga load + bridge enable). If that didn't happen
+# (e.g. no gateware), the charbuf window is inaccessible and we skip cleanly so
+# a blank fabric can never wedge boot.
+
+PIDFILE=/var/run/netan-vga.pid
+REFRESH=3
+
+case "$1" in
+    start)
+        printf "Starting netan-vga dashboard: "
+        # gate: only run if the lwh2f charbuf window actually responds. `timeout`
+        # bounds it so a stalled bus can't hang boot; a SIGBUS just fails the read.
+        if ! timeout 3 devmem 0xFF200000 32 >/dev/null 2>&1; then
+            echo "skipped (VGA charbuf not accessible - fabric not loaded)"
+            exit 0
+        fi
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ] \
+           && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q netan-vga; then
+            echo "already running (pid $pid)"; exit 0
+        fi
+        rm -f "$PIDFILE"
+        ( while :; do netan-vga-render | netan-vga; sleep "$REFRESH"; done ) \
+            </dev/null >/dev/null 2>&1 &
+        echo $! > "$PIDFILE"
+        echo "OK"
+        ;;
+    stop)
+        printf "Stopping netan-vga dashboard: "
+        [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
+        pkill -f netan-vga-render 2>/dev/null
+        rm -f "$PIDFILE"
+        echo "OK"
+        ;;
+    restart) "$0" stop; sleep 1; "$0" start ;;
+    *) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac

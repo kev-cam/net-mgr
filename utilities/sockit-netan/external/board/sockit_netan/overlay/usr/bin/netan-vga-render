@@ -1,0 +1,79 @@
+#!/bin/sh
+# netan-vga-render — emit an 80x30 PLAIN-TEXT analyzer dashboard for the FPGA
+# VGA character generator (pipe into netan-vga). Same data the tiny LCD shows
+# (/tmp/netan-status, /tmp/netan-peers, /tmp/netan-iperf) but full-screen and
+# readable on a monitor. No ANSI/colour — the char-gen renders a mono 8x16 font.
+#
+#   netan-vga-render | netan-vga        # one frame
+#   while :; do netan-vga-render | netan-vga; sleep 3; done   # live
+ST=/tmp/netan-status
+PEERS=/tmp/netan-peers
+IPERF=/tmp/netan-iperf
+BAR="================================================================================"
+SEP="--------------------------------------------------------------------------------"
+
+val()  { sed -n "s/^$1=//p" "$ST"    2>/dev/null | head -1; }
+ival() { sed -n "s/^$1=//p" "$IPERF" 2>/dev/null | head -1; }
+or()   { [ -n "$1" ] && printf '%s' "$1" || printf '-'; }
+badge() { case "$1" in
+    yes) printf '[  OK  ]' ;; no) printf '[ FAIL ]' ;;
+    blink|captive) printf '[CAPTIV]' ;; na) printf '[  --  ]' ;; *) printf '[  --  ]' ;;
+  esac; }
+row() { printf '%-45s%s\n' "$1" "$2"; }   # 2-column: left 45 wide, then right
+
+HOST=$(hostname 2>/dev/null || echo sockit)
+TS=$(date '+%H:%M:%S' 2>/dev/null)
+mode=$(or "$(val mode)"); state=$(or "$(val state)")
+ip=$(or "$(val ip)"); mask=$(or "$(val mask)"); gw=$(or "$(val gw)")
+dns=$(or "$(val dns)"); domain=$(or "$(val domain)")
+cycle=$(or "$(val cycle)"); lease=$(or "$(val lease)")
+b_gw=$(badge "$(val gw_ok)"); b_in=$(badge "$(val inet)"); b_ht=$(badge "$(val http)")
+
+# uplink line (read live; not in netan-status)
+wip=$(ip -4 -o addr show wlan0 2>/dev/null | awk '{print $4}' | head -1)
+[ -e /sys/class/bluetooth/hci0 ] && ble="hci0 up" || ble="none"
+
+snap=$(cat "$PEERS" 2>/dev/null); total=$(printf '%s\n' "$snap" | grep -c .); : "${total:=0}"
+
+# --- emit exactly the screen (netan-vga pads to 80x30) ---
+echo "$BAR"
+row "  netan @ $HOST" "state: $state   mode: $mode   $TS"
+echo "$BAR"
+echo ""
+row "  CONNECTION" "REACHABILITY"
+row "    ip       $ip/$mask" "gateway   ping    $b_gw"
+row "    gateway  $gw" "internet  ping    $b_in"
+row "    dns      $dns" "http / portal     $b_ht"
+row "    domain   $domain" ""
+row "    cycle    $cycle    lease ${lease}s" ""
+echo ""
+echo "$SEP"
+if [ "$mode" = iperf ]; then
+    row "  PEERS ($total)" "THROUGHPUT (iperf)"
+    rp1="server $(or "$(ival isrv)")  $(or "$(ival iproto)")"
+    rp2="up $(or "$(ival iup)")  down $(or "$(ival idown)") Mbps"
+else
+    row "  PEERS ($total)" "THROUGHPUT"
+    rp1="(dhcp mode - netan-mode iperf"
+    rp2="  to run a throughput test)"
+fi
+# up to 6 peers on the left, iperf/hint on the right (rows 13-14)
+i=0
+printf '%s\n' "$snap" | { r=0
+    while IFS= read -r p; do
+        [ -z "$p" ] && continue
+        r=$((r + 1)); [ "$r" -gt 6 ] && break
+        case "$r" in
+            1) row "    $p" "$rp1" ;;
+            2) row "    $p" "$rp2" ;;
+            *) echo "    $p" ;;
+        esac
+    done
+    [ "$r" -eq 0 ] && { row "    (no peers seen)" "$rp1"; echo "$rp2"; }
+    [ "$total" -gt 6 ] && printf '    ...+%s more (see log)\n' "$((total - 6))"; }
+echo ""
+echo "$SEP"
+row "  UPLINK  wlan0 $(or "$wip")" "BLE  $ble"
+echo ""
+echo "  log: /var/log/net-analyzer.log        stop pages: S98netanlcd stop"
+echo "$BAR"
