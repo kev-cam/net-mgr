@@ -136,34 +136,35 @@ sub merged_signers_path {
     return $tmp->filename;
 }
 
-# Host-wildcard a principals field (comma-list): user@host -> user@*, a bare
-# user -> user@*, while '*' and an already-wildcarded user@* pass through. The
-# hostname in an ssh key comment is decorative — the same key is presented from
-# whatever machine the user is logged into (roaming users, shared/NFS homes) —
-# so we relax it to a wildcard: only the user part and the key itself gate auth.
-# ssh-keygen -Y verify honours the '*' pattern, so `claude@*` matches key_id
-# claude@P620A or claude@anywhere, but never root@evil.
+# Normalise a principals field (comma-list) to lc(user)@* : user@host and a
+# bare user both become lc(user)@*, while '*' passes through. Both the hostname
+# AND the letter-case of the key comment are decorative — the same key is
+# presented from whatever machine the user is on (roaming users, shared/NFS
+# homes), and case is an accident of the OS username (Windows 'Claude' vs unix
+# 'claude'). Only the user identity and the key itself gate auth. ssh-keygen -Y
+# verify honours '*' but matches principals case-SENSITIVELY, so we lowercase
+# here and verify() lowercases the -I to meet it: `claude@*` matches key_id
+# claude@P620A / Claude@anywhere, but never root@evil.
 sub hostwild {
     my ($field) = @_;
     return '' unless defined $field && length $field;
     return join ',', map {
         $_ eq '*' ? '*'
-      : /\@/      ? s/\@.*/\@*/r    # user@host -> user@*  (non-destructive)
-      :             "$_\@*"         # bare 'user' -> user@*
+                  : do { (my $u = $_) =~ s/\@.*//; lc($u) . '@*' }
     } split /,/, $field;
 }
 
 # True if a client key_id (user@host) satisfies an allowlist principal, ignoring
-# the host — the capability-file counterpart to hostwild()'s signer relaxation.
-# claude@P620A satisfies claude@P620A, claude@bigsony, claude@*, or bare claude;
-# never root@anything. '*' satisfies everyone.
+# the host AND letter-case — the capability-file counterpart to hostwild()'s
+# signer relaxation. claude@P620A satisfies Claude@P620A, claude@bigsony,
+# claude@*, or bare Claude; never root@anything. '*' satisfies everyone.
 sub id_matches_principal {
     my ($key_id, $p) = @_;
     return 0 unless defined $key_id && length $key_id && defined $p && length $p;
-    return 1 if $p eq '*' || $p eq $key_id;
+    return 1 if $p eq '*';
     (my $pu = $p)      =~ s/\@.*//;
     (my $iu = $key_id) =~ s/\@.*//;
-    return ($pu eq $iu && length $iu) ? 1 : 0;
+    return (length $iu && lc($pu) eq lc($iu)) ? 1 : 0;
 }
 
 # authorized_keys line:    [options] KEYTYPE BASE64KEY [comment...]
@@ -253,9 +254,13 @@ sub verify {
     $sig_file->flush;
 
     my $ns = NAMESPACE;
+    # The merged signers wildcard the host and lowercase the user (hostwild);
+    # ssh-keygen matches principals case-sensitively, so present a -I whose
+    # user-part is lowercased to meet them (host is already irrelevant).
+    (my $match_id = $key_id) =~ s/^([^\@]*)/lc $1/e;
     my @cmd = ('ssh-keygen', '-Y', 'verify',
                '-n', $ns,
-               '-I', $key_id,
+               '-I', $match_id,
                '-f', $signers,
                '-s', $sig_file->filename);
     # Feed nonce on stdin; capture stderr for diagnostics.
