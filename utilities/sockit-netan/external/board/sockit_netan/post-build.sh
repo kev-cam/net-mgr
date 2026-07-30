@@ -40,6 +40,22 @@ fi
 # ...and re-assert +x on the appliance scripts (overlay copy can drop it)
 chmod 0755 "$TARGET_DIR"/usr/bin/net-analyzer "$TARGET_DIR"/usr/bin/netan-lcd \
            "$TARGET_DIR"/usr/bin/netan-iperf  "$TARGET_DIR"/usr/bin/netan-mode
+chmod 0755 "$TARGET_DIR/etc/init.d/S45wlan"
+
+# WiFi supplicant conf carries the PSK; the real file is NOT tracked (public repo).
+if [ -f "$TARGET_DIR/etc/wpa_supplicant/wpa_supplicant-wlan0.conf" ]; then
+    chmod 600 "$TARGET_DIR/etc/wpa_supplicant/wpa_supplicant-wlan0.conf"
+else
+    echo "post-build.sh: WARNING: no wpa_supplicant-wlan0.conf in the overlay -" >&2
+    echo "post-build.sh:          WiFi uplink will NOT come up (cp the .sample, set PSK)." >&2
+fi
+
+# Phase-2 VGA: stage the FPGA bitstream into $BINARIES_DIR for genimage's vfat step.
+if [ -f "$BOARD_DIR/vga_hps.rbf" ]; then
+    cp -f "$BOARD_DIR/vga_hps.rbf" "$BINARIES_DIR/vga_hps.rbf"
+else
+    echo "post-build.sh: note: no vga_hps.rbf (VGA gateware) in board dir - VGA off." >&2
+fi
 
 # evkeys: the one C helper (evdev buttons -> text lines for netan-lcd)
 "$HOST_DIR/bin/arm-buildroot-linux-gnueabihf-gcc" -Os -Wall \

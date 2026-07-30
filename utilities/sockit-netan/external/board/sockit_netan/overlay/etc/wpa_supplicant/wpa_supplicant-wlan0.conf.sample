@@ -1,0 +1,14 @@
+# cp this to wpa_supplicant-wlan0.conf (SAME dir) and set your PSK, THEN build.
+# The un-suffixed file is GIT-IGNORED because this repo is PUBLIC — never commit
+# the PSK. Mirrors overlay/root/.ssh/authorized_keys{,.sample}.
+# Tip: avoid cleartext on the SD with a precomputed hash:
+#   wpa_passphrase scorpius 'YOUR_PSK'   # paste the psk=<hash> line (no quotes)
+ctrl_interface=/var/run/wpa_supplicant
+update_config=1
+country=US
+network={
+    scan_ssid=1
+    ssid="scorpius"
+    key_mgmt=WPA-PSK
+    psk="CHANGEME"
+}

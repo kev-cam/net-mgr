@@ -1,2 +1,6 @@
 # Supply your own — never committed (this repo is public). See README.md.
 external/board/sockit_netan/overlay/root/.ssh/authorized_keys
+# WiFi PSK carrier — supply from the .sample; never committed (public repo).
+external/board/sockit_netan/overlay/etc/wpa_supplicant/wpa_supplicant-wlan0.conf
+# VGA gateware (7MB, regenerable from ../../vga/); post-build tolerates absence.
+external/board/sockit_netan/vga_hps.rbf

@@ -1,0 +1,56 @@
+#!/bin/sh
+# S45wlan — always-on WiFi MANAGEMENT/REPORTING uplink (scorpius) on the USB
+# RT3070 dongle. Deliberately SEPARATE from eth0, which net-analyzer (S99) owns
+# and DHCP-cycles as the interface-under-test.
+#
+# Uses dhcpcd, NOT udhcpc: net-analyzer runs a GLOBAL `killall udhcpc` each cycle
+# (and S99 stop does `killall -9 udhcpc`), which would strand any udhcpc wlan
+# lease regardless of pidfile. dhcpcd is immune.
+#
+# Runs after S40network, before S98netanlcd / S99netanalyzer, so the uplink is
+# reachable before eth0's per-cycle churn begins.
+
+WPACONF=/etc/wpa_supplicant/wpa_supplicant-wlan0.conf
+WPAPID=/var/run/wpa_supplicant.wlan.pid
+
+find_wlan() {  # a wlan iface = a netdev with a phy80211 symlink
+    for d in /sys/class/net/*; do
+        [ -e "$d/phy80211" ] && { basename "$d"; return 0; }
+    done
+    return 1
+}
+
+start() {
+    [ -f "$WPACONF" ] || { echo "S45wlan: no $WPACONF (see .sample) — skipping"; return 0; }
+    n=0; WLAN=
+    while [ "$n" -lt 15 ]; do
+        WLAN=$(find_wlan) && [ -n "$WLAN" ] && break
+        sleep 1; n=$((n + 1))
+    done
+    [ -n "$WLAN" ] || { echo "S45wlan: no wlan iface (dongle absent?) — skipping"; return 0; }
+    printf "S45wlan: uplink on %s: " "$WLAN"
+    command -v rfkill >/dev/null 2>&1 && rfkill unblock wifi 2>/dev/null
+    ip link set "$WLAN" up
+    # eth0 (under test) and wlan may both sit on 192.168.15.0/24 -> loose rp_filter
+    # so return traffic on the "wrong" iface isn't dropped.
+    sysctl -w net.ipv4.conf.all.rp_filter=2 "net.ipv4.conf.$WLAN.rp_filter=2" >/dev/null 2>&1
+    wpa_supplicant -B -i "$WLAN" -c "$WPACONF" -P "$WPAPID" >/dev/null 2>&1
+    # dhcpcd owns wlan's lease + a STABLE low-metric default (100) so reporting/ssh
+    # prefer wlan over the churning eth0. Distinct hostname avoids a net-mgr naming
+    # collision with eth0's 'sockit-netan'.
+    dhcpcd -h sockit-wifi -m 100 "$WLAN" >/dev/null 2>&1 &
+    echo "OK"
+}
+
+stop() {
+    WLAN=$(find_wlan)
+    [ -n "$WLAN" ] && dhcpcd -x "$WLAN" 2>/dev/null   # NEVER `killall udhcpc` (would kill eth0's)
+    [ -f "$WPAPID" ] && kill "$(cat "$WPAPID" 2>/dev/null)" 2>/dev/null
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; sleep 1; start ;;
+    *) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac

@@ -40,6 +40,23 @@ BR2_PACKAGE_ETHTOOL=y
 BR2_PACKAGE_IPERF3=y
 # classic iperf (5001) needs a C++ toolchain, which this build omits; iperf3 only.
 BR2_PACKAGE_DROPBEAR=y
+# --- WiFi management uplink (RT3070 dongle): wpa_supplicant + iw + dhcpcd ---
+# dhcpcd (NOT udhcpc) for wlan: net-analyzer does a GLOBAL `killall udhcpc` each
+# cycle, which would strand a udhcpc wlan lease regardless of pidfile.
+BR2_PACKAGE_WPA_SUPPLICANT=y
+BR2_PACKAGE_WPA_SUPPLICANT_NL80211=y
+BR2_PACKAGE_WPA_SUPPLICANT_CLI=y
+BR2_PACKAGE_WPA_SUPPLICANT_PASSPHRASE=y
+BR2_PACKAGE_IW=y
+BR2_PACKAGE_DHCPCD=y
+# --- BLE (RTL8761BU dongle): bluez (bluetoothctl + btmgmt) ---
+BR2_PACKAGE_BLUEZ5_UTILS=y
+BR2_PACKAGE_BLUEZ5_UTILS_CLIENT=y
+BR2_PACKAGE_BLUEZ5_UTILS_TOOLS=y
+# --- firmware blobs: RALINK_RT2XX ships rt2870.bin; RTL_87XX_BT ships rtl8761bu_* ---
+BR2_PACKAGE_LINUX_FIRMWARE=y
+BR2_PACKAGE_LINUX_FIRMWARE_RALINK_RT2XX=y
+BR2_PACKAGE_LINUX_FIRMWARE_RTL_87XX_BT=y
 BR2_PACKAGE_HOST_DOSFSTOOLS=y
 BR2_PACKAGE_HOST_GENIMAGE=y
 BR2_PACKAGE_HOST_MTOOLS=y

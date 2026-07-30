@@ -19,3 +19,21 @@ CONFIG_FONT_8x16=y
 # hps_hkey0-3 buttons + hps_sw0-3 switches for the LCD page UI
 CONFIG_KEYBOARD_GPIO=y
 CONFIG_INPUT_EVDEV=y
+# --- WiFi: Ralink RT3070 USB dongle (rt2800usb; base driver covers RT3070) ---
+# MAC80211 depends-on-but-does-not-select CFG80211; RT2X00 is not selected by
+# anything; so every link in the chain is listed explicitly (buildroot's
+# merge_config + olddefconfig silently drops symbols with unmet deps).
+CONFIG_CFG80211=y
+CONFIG_MAC80211=y
+CONFIG_WLAN_VENDOR_RALINK=y
+CONFIG_RT2X00=y
+CONFIG_RT2800USB=y
+# --- BLE: Realtek RTL8761BU USB dongle (btusb + Realtek support) ---
+CONFIG_BT=y
+CONFIG_BT_LE=y
+CONFIG_BT_HCIBTUSB=y
+CONFIG_BT_HCIBTUSB_RTL=y
+CONFIG_BT_RTL=y
+# BT only 'imply's CRYPTO_AES (not select) -> list it; USER_API_HASH for bluez AF_ALG.
+CONFIG_CRYPTO_AES=y
+CONFIG_CRYPTO_USER_API_HASH=y
