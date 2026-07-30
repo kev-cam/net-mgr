@@ -59,7 +59,7 @@ detect_iface() {
     done
     echo eth0
 }
-[ -n "$IFACE" ] || IFACE=$(detect_iface)
+if [ -n "$IFACE" ]; then IFACE_AUTO=0; else IFACE=$(detect_iface); IFACE_AUTO=1; fi
 
 # --- LED helpers -------------------------------------------------------------
 led() {  # led <n> <0|1|blink>
@@ -263,6 +263,9 @@ read_current() {
 guest_loop() {
     while :; do
         cycle=$((cycle + 1))
+        # follow the live default-route interface so guest mode survives an
+        # interface change (e.g. Ethernet unplugged -> WiFi) without a restart
+        [ "${IFACE_AUTO:-1}" = 1 ] && IFACE=$(detect_iface)
         read_current
         if [ -z "$ip" ]; then
             led 0 blink; led 1 0; led 2 0; led 3 0
