@@ -1,0 +1,301 @@
+#!/usr/bin/perl
+# net-he-tunnel — set up (from scratch) or repair a Hurricane Electric 6in4
+# IPv6 uplink ("he_net") on a net-mgr node, locally or over the mesh.
+#
+# It ORCHESTRATES the pieces that already exist rather than re-implementing the
+# bring-up logic:
+#   net-tunnel set ...                      mesh_tunnels DB row = topology truth
+#   net-cluster observe kind=he_net ...     bring the SIT tunnel up / down
+#   net-cluster observe kind=he_update ...  register the WAN v4 with HE (DDNS)
+#   net-cluster observe kind=he_diag ...    READ-ONLY introspection = the verdict
+#   net-cluster observe kind=write_config   persist a [ipv6_vlan] config drop-in
+#
+# Why a dedicated repair path: NetMgr::Tunnel::up() only *creates* the SIT iface
+# when it is absent — it will NOT correct an existing iface whose `remote` no
+# longer matches the configured server (a stale hand-fix, a changed HE PoP, or a
+# leftover from a different tunnel). Repair detects that mismatch (and other
+# broken states) and does a down+up to rebuild the iface from the DB/config
+# truth, then re-verifies. That is exactly the state gateway3 was left in.
+#
+# Commands:
+#   net-he-tunnel status  [--node N]
+#       Print the he_diag report + a one-line verdict (UP / DOWN + why).
+#
+#   net-he-tunnel repair  [--node N] [--ddns] [--yes] [--dry-run]
+#       Diagnose, then fix a broken/mismatched tunnel: down+up to reconcile the
+#       iface with config, optionally re-register the WAN with HE, re-verify.
+#       No-op (exit 0) if the uplink is already healthy.
+#
+#   net-he-tunnel setup   --owner NAME --server IP --tunnel-prefix CIDR
+#                         --routed-prefix CIDR [--tunnel-id ID] [--secret NAME]
+#                         [--node N] [--persist] [--ddns] [--yes] [--dry-run]
+#       Provision a brand-new tunnel: write the mesh_tunnels DB row, optionally
+#       persist a config drop-in (--persist), bring it up, optionally register
+#       the WAN (--ddns), then verify.
+#
+# Options:
+#   --node N   target: a net-lookup name, host:port, or 'local' (default =
+#              127.0.0.1:7531; loopback is daemon-trusted, no key needed).
+#              Remote needs your key on that node's allowed_internet (he_*) and
+#              allowed_updaters (DB write / write_config).
+#   --name N   tunnel name (default 'he_net').
+#   --yes      apply mutations without the interactive confirm.
+#   --dry-run  print the underlying commands; change nothing.
+#
+# Exit: 0 = healthy/success, 1 = still broken/failed, 2 = usage/structural.
+use strict;
+use warnings;
+use Getopt::Long qw(GetOptions :config no_ignore_case bundling);
+use MIME::Base64 qw(encode_base64 decode_base64);
+
+my %opt = (name => 'he_net');
+GetOptions(\%opt,
+    'node=s', 'name=s', 'owner=s', 'server=s', 'tunnel-prefix=s',
+    'routed-prefix=s', 'tunnel-id=s', 'secret=s', 'suffix=s',
+    'persist', 'ddns', 'yes', 'dry-run', 'help|h',
+) or usage(2);
+usage(0) if $opt{help};
+
+my $cmd   = shift @ARGV // 'status';
+my $tname = $opt{name};
+$tname =~ /^[\w.\-]+$/ or die "net-he-tunnel: bad --name '$tname'\n";
+
+my ($hp, $need_auth, $label) = resolve_node($opt{node} // 'local');
+
+if    ($cmd eq 'status') { exit cmd_status() }
+elsif ($cmd eq 'repair') { exit cmd_repair() }
+elsif ($cmd eq 'setup')  { exit cmd_setup()  }
+else  { warn "net-he-tunnel: unknown command '$cmd'\n"; usage(2) }
+
+# ---- target resolution ------------------------------------------------
+sub resolve_node {
+    my ($n) = @_;
+    if (!defined $n || $n eq '' || lc($n) eq 'local'
+        || $n =~ m{^(?:127\.|::1$|localhost$)}) {
+        return ('127.0.0.1:7531', 0, 'local');
+    }
+    return ($n, 1, $n) if $n =~ /:\d+$/;                 # explicit host:port
+    my $out = run_capture('net-lookup', $n);             # name -> fleet IP
+    my ($ip) = $out =~ /(\d+\.\d+\.\d+\.\d+)/;
+    die "net-he-tunnel: cannot resolve node '$n' via net-lookup\n" unless $ip;
+    return ("$ip:7531", 1, "$n ($ip)");
+}
+
+# ---- shelling out -----------------------------------------------------
+sub shq { my $s = shift; $s //= ''; $s =~ s/'/'\\''/g; return "'$s'"; }
+
+sub run_capture {           # run, return stdout (dry-run: print + return '')
+    my @a = @_;
+    open(my $fh, '-|', @a) or do { warn "exec $a[0]: $!\n"; return '' };
+    local $/; my $out = <$fh> // ''; close $fh;
+    return $out;
+}
+
+# net-cluster observe kind=K k=v ...  (auth added for remote). Returns output.
+sub observe {
+    my (%kv) = @_;
+    my @a = ('net-cluster', '--peers', "node=$hp");
+    push @a, '--auth' if $need_auth;
+    push @a, 'observe', "kind=$kv{kind}";
+    for my $k (sort grep { $_ ne 'kind' } keys %kv) { push @a, "$k=$kv{$k}" }
+    if ($opt{'dry-run'} && $kv{kind} !~ /^he_diag$/) {   # diag is read-only, always run
+        print "  [dry-run] @{[map { shq($_) } @a]}\n";
+        return "node OK (dry-run)";
+    }
+    return run_capture(@a);
+}
+
+sub obs_ok  { my $o = shift; return $o =~ /\bOK\b/ && $o !~ /\bERR\b/ }
+sub obs_err {                    # extract a human error from an ERR/failure line
+    my $o = shift;
+    return $1 if $o =~ /\bERR\s+(.+)/;
+    return $1 if $o =~ /(not authorized[^\n]*)/i;
+    return $1 if $o =~ /(auth-FAILED[^\n]*)/;
+    $o =~ s/\s+/ /g; return $o;
+}
+
+# ---- he_diag: flags + decoded report ----------------------------------
+sub diag {
+    my $out = observe(kind => 'he_diag', name => $tname);
+    unless (obs_ok($out)) { die "net-he-tunnel: he_diag on $label failed: "
+                                . obs_err($out) . "\n" }
+    my $report = '';
+    $report = decode_base64($1) if $out =~ /report_b64="([^"]*)"/;
+    (my $flat = $out) =~ s/report_b64="[^"]*"//;
+    my %f;
+    while ($flat =~ /(\w+)=(\S+)/g) { $f{$1} = $2 }
+    my ($cfg_server)  = $report =~ /config:\s*server=(\S+)/;
+    my ($cfg_prefix)  = $report =~ /tunnel_prefix=(\S+)/;
+    my ($iface_peer)  = $report =~ /\bpeer\s+(\d+\.\d+\.\d+\.\d+)/;
+    $f{_cfg_server} = $cfg_server // '';
+    $f{_cfg_prefix} = $cfg_prefix // '';
+    $f{_iface_peer} = $iface_peer // '';
+    return (\%f, $report);
+}
+
+sub verdict {
+    my ($f) = @_;
+    return "UP — v6 Internet reachable" if ($f->{ext_v6} // '') eq 'ok';
+    my $s = $f->{local_v4_scope} // '?';
+    return "DOWN (structural) — WAN IPv4 is $s; 6in4 needs a public IPv4"
+        if $s eq 'private' || $s eq 'cgnat' || $s eq 'none';
+    my @why;
+    push @why, "iface peer $f->{_iface_peer} != config server $f->{_cfg_server}"
+        if $f->{_iface_peer} && $f->{_cfg_server}
+        && $f->{_iface_peer} ne $f->{_cfg_server};
+    push @why, "HE server unreachable over v4" if ($f->{he_server_ping}//'') eq 'FAIL';
+    push @why, "6in4 not flowing (tunnel remote unreachable)"
+        if ($f->{tunnel_remote_ping}//'') eq 'FAIL';
+    push @why, "routed /64 not on the LAN"    if defined $f->{routed_lan} && !$f->{routed_lan};
+    push @why, "ipv6 forwarding off"          if defined $f->{forwarding} && $f->{forwarding} eq '0';
+    return "DOWN — " . (@why ? join('; ', @why) : "v6 Internet unreachable");
+}
+
+sub print_report {
+    my ($f, $report) = @_;
+    print $report, "\n" if length $report;
+    printf "verdict: %s\n", verdict($f);
+}
+
+# ---- confirmation -----------------------------------------------------
+sub confirm_or_die {
+    my ($what) = @_;
+    return if $opt{yes} || $opt{'dry-run'};
+    die "net-he-tunnel: '$what' needs --yes (stdin is not a terminal)\n" unless -t STDIN;
+    print STDERR "About to $what on $label — proceed? [y/N] ";
+    my $a = <STDIN>;
+    die "aborted.\n" unless defined $a && $a =~ /^\s*y/i;
+}
+
+# ---- commands ---------------------------------------------------------
+sub cmd_status {
+    my ($f, $report) = diag();
+    print "== net-he-tunnel status: '$tname' on $label ==\n";
+    print_report($f, $report);
+    return (($f->{ext_v6}//'') eq 'ok') ? 0 : 1;
+}
+
+sub cmd_repair {
+    my ($f, $report) = diag();
+    print "== net-he-tunnel repair: '$tname' on $label ==\n";
+    print_report($f, $report);
+    if (($f->{ext_v6}//'') eq 'ok') { print "already healthy — nothing to do.\n"; return 0 }
+
+    my $scope = $f->{local_v4_scope} // '?';
+    if ($scope eq 'private' || $scope eq 'cgnat' || $scope eq 'none') {
+        print "REFUSING to rebuild: WAN IPv4 scope is '$scope'. 6in4 requires a\n"
+            . "public IPv4 local endpoint — this is structural, not a tunnel fault.\n"
+            . "(Fix the upstream: public IP / DMZ, or use a tunnel that doesn't need one.)\n";
+        return 2;
+    }
+    unless ($f->{_cfg_server}) {
+        print "REFUSING to rebuild: no configured server for '$tname' (DB/config empty).\n"
+            . "Provision it first: net-he-tunnel setup --owner ... --server ... .\n";
+        return 2;
+    }
+
+    print "\nplan: down+up '$tname' to rebuild the iface from config"
+        . " (server=$f->{_cfg_server}"
+        . ($f->{_iface_peer} && $f->{_iface_peer} ne $f->{_cfg_server}
+            ? ", replacing stale iface peer $f->{_iface_peer}" : "")
+        . ")"
+        . ($opt{ddns} ? " then re-register WAN with HE" : "") . "\n";
+    confirm_or_die("rebuild tunnel '$tname'");
+
+    my $d = observe(kind => 'he_net', action => 'down', name => $tname);
+    obs_ok($d) or do { warn "he_net down failed: ".obs_err($d)."\n"; return 1 };
+    my $u = observe(kind => 'he_net', action => 'up', name => $tname);
+    obs_ok($u) or do { warn "he_net up failed: ".obs_err($u)."\n"; return 1 };
+    if ($opt{ddns}) {
+        my $r = observe(kind => 'he_update', name => $tname);
+        warn "he_update warning: ".obs_err($r)."\n" unless obs_ok($r);
+    }
+
+    return 0 if $opt{'dry-run'};
+    print "\nre-verifying...\n";
+    my ($f2, $rep2) = diag();
+    print_report($f2, $rep2);
+    if (($f2->{ext_v6}//'') eq 'ok') { print "\nREPAIRED — v6 uplink is back.\n"; return 0 }
+    print "\nstill down after rebuild. If tunnel_remote is now reachable but ext_v6\n"
+        . "is not, the tunnel is up but HE may have a stale endpoint — try --ddns,\n"
+        . "or confirm the tunnel's server/prefixes against your tunnelbroker account.\n";
+    return 1;
+}
+
+sub cmd_setup {
+    for my $req (qw(owner server tunnel-prefix routed-prefix)) {
+        defined $opt{$req} && length $opt{$req}
+            or die "net-he-tunnel setup: --$req is required\n";
+    }
+    $opt{server} =~ /^\d+\.\d+\.\d+\.\d+$/ or die "setup: --server must be an IPv4\n";
+    $opt{'tunnel-prefix'} =~ m{:.*/\d+$}   or die "setup: --tunnel-prefix must be a /64 CIDR\n";
+    $opt{'routed-prefix'} =~ m{:.*/\d+$}   or die "setup: --routed-prefix must be a /64 CIDR\n";
+
+    print "== net-he-tunnel setup: '$tname' (owner=$opt{owner}) on $label ==\n";
+    print "  server=$opt{server} tunnel=$opt{'tunnel-prefix'} routed=$opt{'routed-prefix'}"
+        . (defined $opt{'tunnel-id'} ? " id=$opt{'tunnel-id'}" : "")
+        . ($opt{persist} ? " +persist" : "") . ($opt{ddns} ? " +ddns" : "") . "\n";
+    confirm_or_die("provision tunnel '$tname'");
+
+    # 1) DB row (mesh_tunnels = topology truth; replicates cluster-wide)
+    my @t = ('net-tunnel', '--listen', $hp);
+    push @t, '--auth' if $need_auth;
+    push @t, 'set', "--owner=$opt{owner}", '--kind=he6in4',
+             "--server-v4=$opt{server}", "--tunnel-prefix=$opt{'tunnel-prefix'}",
+             "--routed-prefix=$opt{'routed-prefix'}";
+    push @t, "--provider-id=$opt{'tunnel-id'}" if defined $opt{'tunnel-id'};
+    push @t, "--secret-name=$opt{secret}"      if defined $opt{secret};
+    if ($opt{'dry-run'}) { print "  [dry-run] @{[map { shq($_) } @t]}\n" }
+    else { my $o = run_capture(@t); warn "net-tunnel set: $o" unless $o =~ /OK|ok|set/i }
+
+    # 2) optional persistence: a config.d drop-in so it survives a reinstall
+    if ($opt{persist}) {
+        my $conf = "[ipv6_vlan \"$tname\"]\n"
+                 . "server = $opt{server}\n"
+                 . "prefix = $opt{'tunnel-prefix'}\n"
+                 . "routed_prefix = $opt{'routed-prefix'}\n"
+                 . (defined $opt{'tunnel-id'} ? "tunnel_id = $opt{'tunnel-id'}\n" : "")
+                 . "mode = on\n";
+        my $b64  = encode_base64($conf, '');
+        my $path = "/etc/net-mgr/config.d/50-$tname.conf";
+        my $w = observe(kind => 'write_config', path => $path, content_b64 => $b64);
+        obs_ok($w) or warn "persist warning: write_config failed: ".obs_err($w)."\n";
+        print "  persisted $path\n" if obs_ok($w) && !$opt{'dry-run'};
+    }
+
+    # 3) bring it up
+    my $u = observe(kind => 'he_net', action => 'up', name => $tname);
+    obs_ok($u) or do { warn "he_net up failed: ".obs_err($u)."\n"; return 1 };
+
+    # 4) optional DDNS registration of the current WAN
+    if ($opt{ddns}) {
+        my $r = observe(kind => 'he_update', name => $tname);
+        warn "he_update warning: ".obs_err($r)."\n" unless obs_ok($r);
+    }
+
+    return 0 if $opt{'dry-run'};
+    print "\nverifying...\n";
+    my ($f, $rep) = diag();
+    print_report($f, $rep);
+    return (($f->{ext_v6}//'') eq 'ok') ? 0 : 1;
+}
+
+sub usage {
+    my ($rc) = @_;
+    print <<'USAGE';
+net-he-tunnel — set up or repair a Hurricane Electric 6in4 IPv6 uplink.
+
+  net-he-tunnel status  [--node N] [--name he_net]
+  net-he-tunnel repair  [--node N] [--ddns] [--yes] [--dry-run]
+  net-he-tunnel setup   --owner NAME --server IP --tunnel-prefix CIDR
+                        --routed-prefix CIDR [--tunnel-id ID] [--secret NAME]
+                        [--node N] [--persist] [--ddns] [--yes] [--dry-run]
+
+  --node N   net-lookup name, host:port, or 'local' (default; loopback-trusted).
+  --name N   tunnel name (default he_net).
+  --persist  (setup) also write a /etc/net-mgr/config.d drop-in.
+  --ddns     register the current WAN IPv4 with HE after bring-up.
+  --yes      skip the interactive confirm.  --dry-run  print commands only.
+USAGE
+    exit $rc;
+}
