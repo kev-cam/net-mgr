@@ -33,6 +33,12 @@
 #                                    +/- keep or ignore subnets in the picker;
 #                                    reopens on the last subnet you viewed
 #                                    ([net-reserve] show/ignore/last in user config)
+#   net-reserve --gui --new [SUBNET] as above, and pop a chooser on launch listing
+#                                    recent devices seen at an address but not yet
+#                                    reserved (newest first) — pick one to jump to
+#                                    its subnet and reserve it. Also the "New…"
+#                                    toolbar button. Ideal after plugging in a new
+#                                    device (e.g. an IP camera) to give it a fixed IP.
 #
 #   --listen HOST:PORT   daemon address (overrides --server and config)
 #   --server NAME        a server from [servers] in ~/.config/net-mgr/config
@@ -75,7 +81,7 @@ my %GLYPH = (
 
 my ($listen, $server, $force_auth, $no_auth, $key_id, $key_file);
 my ($gui, $describe, $opt_name, $opt_group, $opt_notes, $opt_zone, $limit, $opt_force);
-my ($opt_push, $opt_dry);
+my ($opt_push, $opt_dry, $opt_new);
 GetOptions(
     'listen=s'   => \$listen,
     'server=s'   => \$server,
@@ -84,6 +90,7 @@ GetOptions(
     'key-id=s'   => \$key_id,
     'key-file=s' => \$key_file,
     'gui'        => \$gui,
+    'new'        => \$opt_new,
     'push'       => \$opt_push,
     'dry-run'    => \$opt_dry,
     'describe'   => \$describe,
@@ -129,6 +136,7 @@ my %DISPATCH = (
     gui       => sub { cmd_gui(shift @ARGV) },
 );
 
+$gui = 1 if $opt_new;   # --new is a GUI feature; imply --gui so `net-reserve --new` works
 if ($gui) { cmd_gui($cmd); exit 0; }
 # --push standalone: `net-reserve --push [SUBNET]` pushes every named
 # reservation (the leftover positional is in $cmd, like --gui). When --push
@@ -448,6 +456,7 @@ sub gather {
         observed => \%observed, mac_name => \%mac_name,
         mac_cur_ip => \%mac_cur_ip, mac_resv_ip => \%mac_resv_ip,
         subnets => \@subnets,
+        ifaces => $ifaces,   # raw interface rows (mac/first_seen/kind/vendor) for --new
     };
 }
 
@@ -1274,6 +1283,98 @@ sub cmd_gui {
             scalar(@resv) - scalar(@still), scalar(@resv), scalar(@still)));
     };
 
+    # --new / "New…" chooser: an ordered menu of RECENT devices that are live at
+    # an address but have no reservation yet — the set you'd want to give a fixed
+    # address. Built from the model's interface rows (first_seen, kind, vendor),
+    # cross-referenced against mac_cur_ip (must be live at an IPv4) and
+    # mac_resv_ip (must NOT already be reserved). Sorted newest-first, so a device
+    # you just plugged in — or a camera that just hopped from Ethernet to WiFi and
+    # re-announced under its WiFi MAC — sits at the top. Selecting one jumps the
+    # map to its subnet and opens the normal reserve dialog pre-filled.
+    my $new_devices = sub {
+        my $build = sub {
+            my $model = $S{model};
+            my @c;
+            for my $if (@{ $model->{ifaces} || [] }) {
+                my $mac = lc($if->{mac} // '');
+                next unless $mac =~ /^[0-9a-f:]{17}$/;
+                next if $model->{mac_resv_ip}{$mac};          # already reserved
+                my $ip = $model->{mac_cur_ip}{$mac};          # must be live at an IPv4
+                next unless defined $ip && length $ip;
+                push @c, {
+                    mac => $mac, ip => $ip,
+                    first_seen => $if->{first_seen} // '',
+                    kind => ($if->{kind} && $if->{kind} ne 'unknown') ? $if->{kind} : '?',
+                    name => ($model->{mac_name}{$mac}
+                             // (length($if->{vendor} // '') ? $if->{vendor} : undef)
+                             // oui_vendor($mac) // ''),
+                };
+            }
+            # first_seen is a DB DATETIME string; lexical sort == chronological.
+            return sort { ($b->{first_seen} // '') cmp ($a->{first_seen} // '') } @c;
+        };
+        my @cands = $build->();
+        my $cap = 40;
+        my $truncated = (@cands > $cap) ? 1 : 0;
+        @cands = @cands[0 .. $cap - 1] if $truncated;
+        unless (@cands) {
+            ($S{anchor} // $mw)->messageBox(-type => 'ok', -icon => 'info',
+                -title => 'New devices',
+                -message => "No recent devices without a reservation.\n\n"
+                    . "Every device currently seen live on the network already has\n"
+                    . "a reservation (or none has been observed at an address yet).");
+            return;
+        }
+        my $dlg = ($S{anchor} // $mw)->DialogBox(
+            -title => 'New devices — newest first',
+            -buttons => ['Reserve', 'Reload', 'Close']);
+        $dlg->add('Label', -anchor => 'w', -justify => 'left',
+            -text => "Recent devices seen at an address but not yet reserved"
+                   . " (newest first).\nPick one and Reserve — the map jumps to its"
+                   . " subnet and opens the reserve form.")
+            ->pack(-fill => 'x', -padx => 6, -pady => 2);
+        my $lb = $dlg->add('Scrolled', 'Listbox', -scrollbars => 'oe',
+            -selectmode => 'browse', -width => 64,
+            -height => (@cands < 18 ? scalar(@cands) + 1 : 18),
+            -font => 'nrmono')->pack(-fill => 'both', -expand => 1, -padx => 6, -pady => 2);
+        $dlg->add('Label', -anchor => 'w', -foreground => '#888',
+            -text => "showing the $cap most recent — reserve some to shorten the list")
+            ->pack(-fill => 'x', -padx => 6) if $truncated;
+        my $fill = sub {
+            $lb->delete(0, 'end');
+            for my $c (@cands) {
+                $lb->insert('end', sprintf('%-5s %-8s %-15s %-17s %s',
+                    _age_str($c->{first_seen}) || '?', $c->{kind},
+                    $c->{ip}, $c->{mac}, $c->{name}));
+            }
+            $lb->selectionSet(0) if @cands;      # preselect the newest
+        };
+        $fill->();
+        while (1) {
+            my $ans = $dlg->Show // 'Close';
+            if ($ans eq 'Reload') {
+                $S{model} = gather($cli);
+                @cands = $build->();
+                $truncated = (@cands > $cap) ? 1 : 0;
+                @cands = @cands[0 .. $cap - 1] if $truncated;
+                $fill->();
+                next;
+            }
+            last unless $ans eq 'Reserve';
+            my @sel = $lb->curselection;
+            next unless @sel;                    # nothing picked — reopen
+            my $c = $cands[$sel[0]] or next;
+            $dlg->destroy;
+            # Jump the map to the device's subnet (pin it so it's pickable even if
+            # undiscovered), refresh, then open the standard reserve dialog on it.
+            my $sub = subnet_of($c->{ip});
+            if (defined $sub) { $S{subnet} = $sub; $S{pinned}{$sub} = 1; $set_subnet->(); }
+            reserve_dialog($cli, \%S, $c->{ip}, $c->{mac}, $redraw, $status);
+            return;
+        }
+        $dlg->destroy;
+    };
+
     $subnet_be = $top->BrowseEntry(
         -variable  => \$S{subnet},
         -choices   => $all_subnets->(),
@@ -1300,6 +1401,12 @@ sub cmd_gui {
     $balloon->attach($reload_btn,
         -msg => "Re-pull the current subnet from the daemon.\n"
               . "The grid also self-refreshes every 5s; click to skip the wait.");
+    my $new_btn = $top->Button(-text => 'New…', -command => sub { $new_devices->() })
+        ->pack(-side => 'left', -padx => 2);
+    $balloon->attach($new_btn,
+        -msg => "Recent devices seen on the network but not yet reserved,\n"
+              . "newest first. Pick one to give it a fixed address.\n"
+              . "(net-reserve --gui --new opens this on launch.)");
     # DHCP-servers mode toggle, with the white "assigned" swatch beside it (the
     # legend no longer repeats it): colour the grid by the AP/gateway serving each
     # pool and list those servers in the right pane (instead of the reservations).
@@ -1664,6 +1771,9 @@ sub cmd_gui {
     # Name any nameless reservations on launch (was the "Name unnamed" button);
     # scheduled so the window paints first. A no-op when nothing needs naming.
     $mw->after(300, sub { $autoname->() });
+    # --new: pop the "recent devices without a reservation" chooser on launch,
+    # after the window has painted (and after autoname, so names are populated).
+    $mw->after(450, sub { $new_devices->() }) if $opt_new;
     # periodic refresh: lazy (local DB only) — explicit actions force-sync
     my $tick; $tick = sub {
         $S{model} = gather($cli); $refresh_subnets->(); $redraw->();
@@ -2237,6 +2347,27 @@ sub menu_color {
     return '#cc0000';                          # reserved / in-use (taken)
 }
 
+# Compact relative age of a DB DATETIME string ("2026-07-29 23:34:05") for the
+# --new chooser: "21m", "3h", "2d", "5mo". '' when it doesn't parse. Interpreted
+# in local time (the daemon's DATETIMEs are stored in server-local time; client
+# and server share a timezone on this fleet, so this is exact there and only
+# cosmetically off by the offset otherwise — it's a display hint, not a gate).
+sub _age_str {
+    my ($dt) = @_;
+    return '' unless defined $dt
+        && $dt =~ /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/;
+    require Time::Local;
+    my $t = eval { Time::Local::timelocal($6, $5, $4, $3, $2 - 1, $1) };
+    return '' unless defined $t;
+    my $d = time() - $t;
+    $d = 0 if $d < 0;                       # clock skew / future stamp
+    return "${d}s"                if $d < 60;
+    return int($d / 60) . 'm'     if $d < 3600;
+    return int($d / 3600) . 'h'   if $d < 86400;
+    return int($d / 86400) . 'd'  if $d < 30 * 86400;
+    return int($d / (30 * 86400)) . 'mo';
+}
+
 # Last time $ip was actually seen on the wire: the observed address's
 # last_observed (a live DHCP/ARP/nmap/ping signal) or a lease's last_seen. ''
 # when never seen live (e.g. a paper-only dhcp.master import) — note last_seen
@@ -2303,6 +2434,9 @@ usage:
                                          as never-seen hosts (--dry-run previews)
   net-reserve --gui [SUBNET]             Perl/Tk map (click a cell to select it,
                                          click again to reserve, move, or release)
+  net-reserve --gui --new [SUBNET]       ...and pop a chooser of recent devices
+                                         without a reservation (newest first) to
+                                         pick one and reserve it
 
   --listen H:P / --server NAME           daemon address
   --auth / --no-auth / --key-id / --key-file
