@@ -106,15 +106,20 @@ public class MainActivity extends AppCompatActivity
         // Wire the Noise trace sink to logcat. Filter with:
         //   adb logcat -s NoiseTrace
         // for the full state-transition trace of every handshake.
-        io.grfx.netchat.crypto.Noise.TRACER = (label, data) -> {
-            StringBuilder sb = new StringBuilder(label).append("=");
-            if (data == null) sb.append("(null)");
-            else for (byte b : data) sb.append(String.format("%02x", b));
-            android.util.Log.i("NoiseTrace", sb.toString());
-        };
+        // DEBUG-only: the trace dumps DH shared secrets, chaining/cipher
+        // keys and handshake plaintext — never leave it enabled in a
+        // release build (readable via adb/bugreport).
+        if (BuildConfig.DEBUG) {
+            io.grfx.netchat.crypto.Noise.TRACER = (label, data) -> {
+                StringBuilder sb = new StringBuilder(label).append("=");
+                if (data == null) sb.append("(null)");
+                else for (byte b : data) sb.append(String.format("%02x", b));
+                android.util.Log.i("NoiseTrace", sb.toString());
+            };
+        }
 
         try {
-            identity = Identity.ephemeral();
+            identity = loadOrCreateIdentity();
         } catch (Throwable t) {
             append("identity error: " + t.getMessage());
         }
@@ -126,6 +131,39 @@ public class MainActivity extends AppCompatActivity
             @Override public void onPeerChanged(Peer peer) { renderPeers(); }
             @Override public void onPeerRemoved(String peerIdHex) { renderPeers(); }
         });
+    }
+
+    // Persisted identity: one seed per install, so peer_id survives
+    // activity recreation and app restarts (the bridge-side equivalent is
+    // BITCHAT_ID_FILE). SharedPreferences, not Keystore: the seed must be
+    // the raw Ed25519 input (see Identity's cross-platform derivation),
+    // and Keystore won't release raw private key bytes.
+    private Identity loadOrCreateIdentity() throws Exception {
+        android.content.SharedPreferences sp =
+                getSharedPreferences("identity", MODE_PRIVATE);
+        String hex = sp.getString("seed", null);
+        if (hex != null && hex.length() == Identity.SEED_LEN * 2) {
+            // Guard the parse: a stored value that is the right LENGTH but
+            // contains a non-hex char (corruption/tampering of app-private
+            // prefs) must self-heal by regenerating, not throw out of here
+            // and leave identity == null (which then NPEs in startAll).
+            try {
+                byte[] seed = new byte[Identity.SEED_LEN];
+                for (int i = 0; i < seed.length; i++) {
+                    seed[i] = (byte) Integer.parseInt(
+                            hex.substring(i * 2, i * 2 + 2), 16);
+                }
+                return Identity.fromSeed(seed);
+            } catch (NumberFormatException e) {
+                append("stored seed unparseable; regenerating identity");
+                // fall through to regenerate + overwrite
+            }
+        }
+        Identity id = Identity.ephemeral();
+        StringBuilder sb = new StringBuilder(Identity.SEED_LEN * 2);
+        for (byte b : id.seed) sb.append(String.format("%02x", b & 0xFF));
+        sp.edit().putString("seed", sb.toString()).apply();
+        return id;
     }
 
     // ---- Service lifecycle -------------------------------------
