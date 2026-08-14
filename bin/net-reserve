@@ -1989,14 +1989,21 @@ sub _resv_index {
 
 sub reserve_dialog {
     my ($cli, $S, $ip, $mac, $redraw, $status) = @_;
-    my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Reserve $ip",
+    # A reservation already at $ip means we're EDITING it (e.g. the Edit button in
+    # release_dialog routes here) — title it accordingly and pre-fill from the row.
+    my $existing = $S->{model}{resv}{ canon_ip($ip) };
+    my $dlg = ($S->{anchor} // $status)->DialogBox(
+        -title   => ($existing ? "Edit reservation $ip" : "Reserve $ip"),
         -buttons => ['Probe', 'Reserve', 'Reserve+Push', 'Push', 'Cancel']);
-    # Default the name to what we already know the device by — its machine name,
-    # or failing that the hostname it gave over DHCP — so reserving a device uses
-    # its own name when none other is given (e.g. KP200 from its lease).
+    # When editing, default name/group to the reservation's stored values; else
+    # default the name to what we already know the device by — its machine name,
+    # or the DHCP hostname — so reserving uses its own name when none is given.
     my $known = $S->{model}{mac_name}{ lc($mac // '') };
     $known //= $S->{model}{leased}{$ip}{hostname} if $S->{model}{leased}{$ip};
-    my %v = (ip => $ip, mac => $mac, name => ($known // ''), group => '');
+    my %v = (ip => $ip, mac => $mac,
+        name  => ($existing && defined $existing->{name} && length $existing->{name})
+                   ? $existing->{name} : ($known // ''),
+        group => ($existing && defined $existing->{grp}) ? $existing->{grp} : '');
     # known groups for convenience
     my %groups; $groups{ $_->{grp} } = 1 for grep { $_->{grp} } values %{ $S->{model}{resv} };
     # Target address: a menu of the subnet's addresses with the occupant
@@ -2274,7 +2281,7 @@ sub release_dialog {
     # Loop so 'Probe' can pop the read-only detail dialog and return here.
     while (1) {
         my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Reservation $ip",
-            -buttons => ['Probe', 'Push', 'Move', 'Release', 'Cancel']);
+            -buttons => ['Edit', 'Probe', 'Push', 'Move', 'Release', 'Cancel']);
         my $seen = last_seen_str($S->{model}, $ip);
         $dlg->add('Label', -text =>
             sprintf("%s\nMAC:  %s\nName: %s\nGroup: %s\nLast seen: %s",
@@ -2284,6 +2291,14 @@ sub release_dialog {
         $ans = $dlg->Show // 'Cancel';
         last unless $ans eq 'Probe';
         probe_dialog($cli, $S, $ip, $r);
+    }
+    if ($ans eq 'Edit') {
+        # Open the full editor (name / group / MAC / target IP) for this row —
+        # reserve_dialog pre-fills from the existing reservation and its save
+        # preserves any field left unchanged. This is what the cell's
+        # "click again to edit / release" hint promises.
+        reserve_dialog($cli, $S, $ip, $r->{mac}, $redraw, $status);
+        return;
     }
     if ($ans eq 'Release') {
         # Use the row's stored IP so the daemon matches the exact record, even
