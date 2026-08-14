@@ -1,0 +1,320 @@
+#!/usr/bin/perl
+# net-onvif — find a camera's ONVIF / RTSP services even on non-standard ports.
+#
+# Cheap IP cameras (and some firmwares in a half-provisioned state) don't always
+# put ONVIF on 8899 or RTSP on 554 — they wander to odd high ports. This tool
+# stops guessing: it discovers EVERY open TCP port on the target, then actively
+# SPEAKS each protocol to each open port and reports which ones answer as ONVIF,
+# RTSP, or a plain camera web UI.
+#
+#   net-onvif <name|ip> [options]
+#
+# Per open port it tries, in order:
+#   - ONVIF : POST a GetSystemDateAndTime SOAP to /onvif/device_service (and a
+#             few common paths). That verb needs no auth per the ONVIF spec, so a
+#             real ONVIF endpoint answers with a SOAP body naming onvif.org. A
+#             SOAP *fault* still proves a SOAP/ONVIF endpoint (auth-gated).
+#   - RTSP  : OPTIONS rtsp://ip:port/ — a real RTSP server replies "RTSP/1.0 200"
+#             and lists its Public: methods (DESCRIBE/SETUP/PLAY…).
+#   - HTTP  : GET / — captures Server: and WWW-Authenticate realm, which usually
+#             name the camera firmware (uc-httpd, GoAhead, Boa, Hipcam, webs…).
+#   34567/37777 are flagged as XM/Sofia / Dahua DVRIP (proprietary, app-only).
+#
+# Options:
+#   --ports LIST   probe only these ports (e.g. 80,554,8000-8100); skips scan
+#   --fast         discover with a wide camera/ONVIF port SET, not all 65535
+#   --full         force an all-ports (-p-) scan even in --ports/fast defaults
+#   --timeout SEC  per-probe connect/read timeout (default 3)
+#   --user U --pass P   creds to note for RTSP/ONVIF URLs (default admin / blank)
+#   --listen H:P   net-mgr daemon for name resolution (passed to net-lookup)
+#   -v             verbose: dump the raw protocol responses
+#
+# Runs best from a host ON the camera's subnet — a router between you and the
+# camera can RST camera ports and hide them. Uses nmap for fast full-range
+# discovery when present; falls back to a pure-Perl scan of a wide port set.
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+use IO::Socket::INET;
+use IO::Select;
+
+my %opt = (timeout => 2, user => 'admin', pass => '');
+GetOptions(\%opt, 'ports=s', 'fast', 'full', 'timeout=i',
+           'user=s', 'pass=s', 'listen=s', 'verbose|v', 'help|h')
+    or usage(2);
+usage(0) if $opt{help};
+my $target = shift @ARGV or usage(2);
+
+# A broad set of ports these cameras are known to wander onto — used for --fast
+# and as the pure-Perl fallback when nmap is absent.
+my @CAMERA_PORTS = (
+    21,23,37,80,81,82,83,88,443,554,555,587,700,1024,1025,1935,2000,2020,3702,
+    5000,5353,6036,6668,7001,7080,7443,8000,8001,8008,8009,8010,8080,8081,8082,
+    8090,8091,8181,8200,8443,8500,8554,8555,8600,8800,8880,8888,8899,8999,9000,
+    9001,9002,9010,9080,9088,9090,9100,9200,9527,9999,10000,10001,10080,10554,
+    11554,12345,18080,20000,34567,34599,37777,37778,49152,49153,50000,55555,
+);
+
+# ONVIF GetSystemDateAndTime — an unauthenticated verb per the ONVIF spec, so a
+# live endpoint answers with a SOAP body naming onvif.org. Declared here (before
+# the main flow) so onvif_check() sees it — a `my` assigned lower in the file
+# runs after the probing loop and would be undef at call time.
+my $ONVIF_SOAP =
+  '<?xml version="1.0" encoding="UTF-8"?>'
+. '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+. '<s:Body xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+. '<tds:GetSystemDateAndTime/></s:Body></s:Envelope>';
+
+# ---------------------------------------------------------------------------
+my $ip = resolve_target($target);
+print "== net-onvif: probing $target ($ip) ==\n";
+
+my @ports = @{ $opt{ports} ? [expand_ports($opt{ports})] : discover_ports($ip) };
+unless (@ports) {
+    print "no open TCP ports found on $ip"
+        . ($opt{fast} ? " (scanned the camera port set; try without --fast for all 65535)" : "")
+        . ".\n";
+    exit 1;
+}
+printf "open TCP ports: %s\n\n", join(', ', @ports);
+
+my @onvif_hits;
+printf "%-7s  %-9s  %-9s  %s\n", 'PORT', 'ONVIF', 'RTSP', 'HTTP / notes';
+printf "%-7s  %-9s  %-9s  %s\n", '-------','---------','---------','------------';
+for my $port (@ports) {
+    my ($onvif, $opath, $odet) = onvif_check($ip, $port);
+    my ($rtsp, $rmeth)         = rtsp_options($ip, $port);
+    my ($hstat, $hserver, $hrealm) = http_probe($ip, $port);
+
+    my $onvif_col = $onvif == 2 ? 'YES' : $onvif == 1 ? 'soap?' : '-';
+    my $rtsp_col  = $rtsp ? 'YES' : '-';
+    my @notes;
+    push @notes, "HTTP $hstat" . (defined $hserver && length $hserver ? " [$hserver]" : '')
+        if defined $hstat;
+    push @notes, "realm=\"$hrealm\"" if defined $hrealm && length $hrealm;
+    push @notes, "XM/Dahua DVRIP (proprietary)" if $port == 34567 || $port =~ /^3777[78]$/;
+    push @notes, $rmeth if $rtsp && $rmeth;
+    push @notes, $odet  if $onvif && $odet;
+
+    printf "%-7s  %-9s  %-9s  %s\n", $port, $onvif_col, $rtsp_col, join(' | ', @notes);
+    push @onvif_hits, [$port, $opath] if $onvif == 2;
+}
+
+# UDP WS-Discovery (unicast) — a camera may announce its service URL directly.
+my $xaddr = ws_discovery($ip);
+
+print "\n";
+if (@onvif_hits) {
+    for my $h (@onvif_hits) {
+        my ($port, $path) = @$h;
+        printf "ONVIF service: http://%s:%s%s\n", $ip, $port, $path;
+        printf "  media/RTSP creds to try: user=%s pass=%s\n", $opt{user}, ($opt{pass} ne '' ? $opt{pass} : '(blank)');
+    }
+} elsif ($xaddr) {
+    print "ONVIF (via WS-Discovery): $xaddr\n";
+} else {
+    print "No ONVIF responder on any open port.\n";
+    print "  (If the only open port is 53/dnsmasq and nothing else, the camera is\n";
+    print "   likely in setup/SoftAP mode — its service stack isn't running yet.)\n";
+}
+exit(@onvif_hits || $xaddr ? 0 : 1);
+
+# ---- target resolution ----------------------------------------------------
+sub resolve_target {
+    my ($t) = @_;
+    return $t if $t =~ /^\d{1,3}(?:\.\d{1,3}){3}$/;
+    my $bin = (-x "$FindBin::Bin/net-lookup") ? "$FindBin::Bin/net-lookup" : 'net-lookup';
+    my @cmd = ($bin, '--family', 'v4',
+               ($opt{listen} ? ('--listen', $opt{listen}) : ()), "=$t");
+    my $out = '';
+    if (open my $fh, '-|', @cmd) { local $/; $out = <$fh> // ''; close $fh; }
+    my ($found) = $out =~ /(\d{1,3}(?:\.\d{1,3}){3})/;
+    die "net-onvif: cannot resolve '$t' to an IP (via net-lookup)\n" unless $found;
+    return $found;
+}
+
+# ---- port discovery -------------------------------------------------------
+sub expand_ports {
+    my ($spec) = @_;
+    my %seen;
+    for my $tok (split /[,\s]+/, $spec) {
+        if ($tok =~ /^(\d+)-(\d+)$/) { $seen{$_} = 1 for $1 .. $2 }
+        elsif ($tok =~ /^\d+$/)      { $seen{$tok} = 1 }
+    }
+    return sort { $a <=> $b } keys %seen;
+}
+
+sub have_nmap { my $p = `sh -c 'command -v nmap' 2>/dev/null`; return $p =~ /\S/ }
+
+sub discover_ports {
+    my ($host) = @_;
+    if (have_nmap()) {
+        my @spec = $opt{fast} && !$opt{full}
+                 ? ('-p', join(',', @CAMERA_PORTS))
+                 : ('-p-');            # every TCP port — the point of this tool
+        print "scanning "
+            . ($opt{fast} && !$opt{full} ? scalar(@CAMERA_PORTS) . " camera ports" : "all 65535 TCP ports")
+            . " on $host (nmap)...\n";
+        my @cmd = ('nmap', '-Pn', '-sT', '-T4', '--min-rate', '800',
+                   '--open', @spec, '-oG', '-', $host);
+        my @ports;
+        if (open my $fh, '-|', @cmd) {
+            while (<$fh>) {
+                next unless /Ports:\s*(.+)/;
+                for my $e (split /,\s*/, $1) { push @ports, $1 if $e =~ m{^(\d+)/open/tcp} }
+            }
+            close $fh;
+        }
+        return [ sort { $a <=> $b } @ports ];
+    }
+    # pure-Perl fallback: connect-scan the camera port set (can't do 65535 fast)
+    print "nmap not found — connect-scanning the camera port set on $host...\n";
+    my @open;
+    for my $p (@CAMERA_PORTS) {
+        my $s = IO::Socket::INET->new(PeerAddr => $host, PeerPort => $p,
+                                      Proto => 'tcp', Timeout => 1);
+        if ($s) { push @open, $p; close $s }
+    }
+    return [ @open ];
+}
+
+# ---- low-level send/recv --------------------------------------------------
+sub connect_tcp {
+    my ($host, $port) = @_;
+    return IO::Socket::INET->new(PeerAddr => $host, PeerPort => $port,
+                                 Proto => 'tcp', Timeout => $opt{timeout});
+}
+sub send_recv {
+    my ($host, $port, $payload, $max) = @_;
+    $max //= 8192;
+    my $sock = connect_tcp($host, $port) or return undef;
+    binmode $sock;
+    if (defined $payload && length $payload) {
+        local $SIG{PIPE} = 'IGNORE';
+        syswrite($sock, $payload) or do { close $sock; return undef };
+    }
+    my $sel = IO::Select->new($sock);
+    my $buf = '';
+    my $wait = $opt{timeout};      # wait the full timeout for the FIRST byte
+    while (length($buf) < $max && $sel->can_read($wait)) {
+        my $n = sysread($sock, my $chunk, 4096);
+        last if !defined $n || $n == 0;
+        $buf .= $chunk;
+        $wait = 0.4;               # after data arrives, only a short inter-chunk grace
+    }
+    close $sock;
+    return $buf;
+}
+
+# ---- protocol probes ------------------------------------------------------
+# Returns (level, path, detail): level 2 = real ONVIF, 1 = SOAP endpoint
+# (probably ONVIF requiring auth), 0 = no. Bails after the first path unless the
+# port actually speaks HTTP/SOAP — so a non-web port costs one probe, not four.
+sub onvif_check {
+    my ($host, $port) = @_;
+    my $http_seen = 0;
+    for my $path ('/onvif/device_service', '/onvif/device', '/onvif/services', '/') {
+        my $req = "POST $path HTTP/1.1\r\n"
+                . "Host: $host:$port\r\n"
+                . "Content-Type: application/soap+xml; charset=utf-8; "
+                . "action=\"http://www.onvif.org/ver10/device/wsdl/GetSystemDateAndTime\"\r\n"
+                . "Content-Length: " . length($ONVIF_SOAP) . "\r\n"
+                . "Connection: close\r\n\r\n" . $ONVIF_SOAP;
+        my $resp = send_recv($host, $port, $req);
+        if (defined $resp && length $resp) {
+            warn "  [onvif $port$path]\n$resp\n" if $opt{verbose};
+            if ($resp =~ /GetSystemDateAndTimeResponse|onvif\.org\/ver10|<tds:|SystemDateAndTime/i) {
+                my ($det) = $resp =~ m{<[^>]*(?:Manufacturer|Model)>([^<]+)}i;
+                return (2, $path, $det ? "model=$det" : 'GetSystemDateAndTime OK');
+            }
+            # A SOAP envelope/fault, or a gSOAP server, means a SOAP endpoint lives
+            # here (often ONVIF wanting WS-Security auth even for this verb).
+            if ($resp =~ /<(?:SOAP-ENV|s|env|soap):Envelope|soap\+xml|<[^>]*Fault>/i
+                || $resp =~ /^Server:\s*gSOAP/mi) {
+                return (1, $path, 'SOAP/gSOAP endpoint (ONVIF likely; auth required)');
+            }
+            $http_seen = 1 if $resp =~ m{^HTTP/}i;
+        }
+        # First path drew nothing HTTP-shaped -> not a web/ONVIF port; stop here
+        # rather than waste three more full-timeout probes on it.
+        last unless $http_seen;
+    }
+    return (0, undef, undef);
+}
+
+sub rtsp_options {
+    my ($host, $port) = @_;
+    my $req = "OPTIONS rtsp://$host:$port/ RTSP/1.0\r\nCSeq: 1\r\n"
+            . "User-Agent: net-onvif\r\n\r\n";
+    my $resp = send_recv($host, $port, $req, 2048);
+    return (0, undef) unless defined $resp && $resp =~ m{^RTSP/1\.\d\s+(\d+)}i;
+    warn "  [rtsp $port]\n$resp\n" if $opt{verbose};
+    my ($pub) = $resp =~ /^Public:\s*(.+?)\r?$/mi;
+    return (1, $pub ? "methods: $pub" : undef);
+}
+
+sub http_probe {
+    my ($host, $port) = @_;
+    my $req = "GET / HTTP/1.1\r\nHost: $host:$port\r\n"
+            . "User-Agent: net-onvif\r\nAccept: */*\r\nConnection: close\r\n\r\n";
+    my $resp = send_recv($host, $port, $req, 4096);
+    return (undef, undef, undef) unless defined $resp && $resp =~ m{^HTTP/\d\.\d\s+(\d+)}i;
+    my $stat = $1;
+    my ($server) = $resp =~ /^Server:\s*(.+?)\r?$/mi;
+    my ($realm)  = $resp =~ /^WWW-Authenticate:\s*\w+\s+realm="?([^"\r\n]+)/mi;
+    warn "  [http $port] status=$stat server=" . ($server // '-') . "\n" if $opt{verbose};
+    return ($stat, $server, $realm);
+}
+
+# UDP WS-Discovery unicast probe — returns the first XAddrs service URL or undef.
+sub ws_discovery {
+    my ($host) = @_;
+    my $mid = 'uuid:' . join('-', map { sprintf '%04x', ($_ * 4243 + 7) % 65536 } 1..8);
+    my $probe =
+      '<?xml version="1.0" encoding="UTF-8"?>'
+    . '<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"'
+    . ' xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+    . ' xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery"'
+    . ' xmlns:dn="http://www.onvif.org/ver10/network/wsdl">'
+    . "<e:Header><w:MessageID>$mid</w:MessageID>"
+    . '<w:To e:mustUnderstand="true">urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To>'
+    . '<w:Action e:mustUnderstand="true">http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action>'
+    . '</e:Header><e:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types>'
+    . '</d:Probe></e:Body></e:Envelope>';
+    my $sock = IO::Socket::INET->new(Proto => 'udp', PeerAddr => $host, PeerPort => 3702)
+        or return undef;
+    $sock->send($probe);
+    my $sel = IO::Select->new($sock);
+    if ($sel->can_read($opt{timeout})) {
+        my $reply; $sock->recv($reply, 65535);
+        close $sock;
+        return undef unless defined $reply;
+        warn "  [ws-discovery]\n$reply\n" if $opt{verbose};
+        my ($x) = $reply =~ m{<[^>]*XAddrs>\s*(\S+?)\s*</[^>]*XAddrs>}i;
+        return $x;
+    }
+    close $sock;
+    return undef;
+}
+
+sub usage {
+    my ($rc) = @_;
+    print <<'USAGE';
+net-onvif — find a camera's ONVIF / RTSP services, even on non-standard ports.
+
+  net-onvif <name|ip> [--fast|--full] [--ports LIST] [--timeout SEC]
+            [--user U --pass P] [--listen H:P] [-v]
+
+  <name|ip>     camera to probe; a name is resolved via net-lookup
+  --fast        scan a wide camera-port SET instead of all 65535 (quicker)
+  --ports LIST  probe only these ports (e.g. 80,554,8000-8100); skips scanning
+  --timeout N   per-probe timeout seconds (default 3)   -v  dump raw responses
+
+Discovers every open TCP port, then speaks ONVIF (SOAP GetSystemDateAndTime),
+RTSP (OPTIONS), and HTTP to each, plus a UDP WS-Discovery probe. Run it from a
+host on the camera's own subnet for accurate results.
+USAGE
+    exit $rc;
+}
