@@ -33,6 +33,32 @@ public final class BitChatGattServer {
         void onInbound(BluetoothDevice from, byte[] data);
         void onSubscribed(BluetoothDevice device);
         void onUnsubscribed(BluetoothDevice device);
+        /**
+         * Advertising settled. startAdvertising() is ASYNCHRONOUS: start()
+         * returning null only means the request was accepted, so without this
+         * the UI reported "peripheral up" even when the controller went on to
+         * reject the advertisement and the device never became discoverable.
+         * Default no-op so existing implementors keep compiling.
+         */
+        default void onAdvertiseResult(boolean ok, int errorCode) {}
+    }
+
+    /** Human-readable form of the AdvertiseCallback.ADVERTISE_FAILED_* codes. */
+    static String advertiseError(int code) {
+        switch (code) {
+            case AdvertiseCallback.ADVERTISE_FAILED_DATA_TOO_LARGE:
+                return "data too large (advert + scan response must each fit 31 bytes)";
+            case AdvertiseCallback.ADVERTISE_FAILED_TOO_MANY_ADVERTISERS:
+                return "too many advertisers (LE advertising slots exhausted)";
+            case AdvertiseCallback.ADVERTISE_FAILED_ALREADY_STARTED:
+                return "already started";
+            case AdvertiseCallback.ADVERTISE_FAILED_INTERNAL_ERROR:
+                return "internal error";
+            case AdvertiseCallback.ADVERTISE_FAILED_FEATURE_UNSUPPORTED:
+                return "feature unsupported on this adapter";
+            default:
+                return "unknown code " + code;
+        }
     }
 
     private final Context context;
@@ -95,18 +121,27 @@ public final class BitChatGattServer {
                 .setTimeout(0)                // indefinite
                 .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
                 .build();
-        // The BLE advertisement packet is ~31 bytes; the local name can
-        // eat all of it, so put service UUID in the primary packet and
-        // the local name in the scan response.
+        // Both the primary advertisement and the scan response are hard-capped
+        // at 31 bytes of AD payload each, and a 128-bit service UUID is 16 of
+        // them. Budget per packet:
+        //     primary: flags(3, added by the stack) + UUID AD(2 + 16)      = 21
+        //     scan rsp: service-data AD(2 + 16 UUID + 8 peer-id)           = 26
+        // The scan response previously carried the "bc-<16 hex>" string (19
+        // bytes) as service data: 2 + 16 + 19 = 37 > 31, so the controller
+        // rejected the WHOLE advertisement with ADVERTISE_FAILED_DATA_TOO_LARGE
+        // (code 1) and this peripheral never advertised at all — it was simply
+        // undiscoverable, which went unnoticed because the app also works as a
+        // central (it connects out to bridges, which is how the round-trip was
+        // demonstrated). Send the peer id as its 8 RAW bytes instead: same
+        // information, 11 bytes cheaper, and it fits.
         AdvertiseData data = new AdvertiseData.Builder()
                 .setIncludeDeviceName(false)
                 .addServiceUuid(BitChatConstants.SERVICE_PARCEL_UUID)
                 .build();
+        byte[] pidRaw = BitChatScanner.peerIdFromName(localName);   // 8 bytes
         AdvertiseData scanResponse = new AdvertiseData.Builder()
                 .setIncludeDeviceName(false)
-                // "bc-" + 16 hex = 19 bytes; comfortably fits scan response.
-                .addServiceData(BitChatConstants.SERVICE_PARCEL_UUID,
-                        localName.getBytes())
+                .addServiceData(BitChatConstants.SERVICE_PARCEL_UUID, pidRaw)
                 .build();
         advertiser.startAdvertising(settings, data, scanResponse, advertiseCallback);
         Log.i(TAG, "BitChat peripheral started, localName=" + localName);
@@ -158,9 +193,12 @@ public final class BitChatGattServer {
     private final AdvertiseCallback advertiseCallback = new AdvertiseCallback() {
         @Override public void onStartSuccess(AdvertiseSettings settingsInEffect) {
             Log.i(TAG, "advertise: onStartSuccess");
+            if (sink != null) sink.onAdvertiseResult(true, 0);
         }
         @Override public void onStartFailure(int errorCode) {
-            Log.w(TAG, "advertise: onStartFailure code=" + errorCode);
+            Log.w(TAG, "advertise: onStartFailure code=" + errorCode
+                    + " (" + advertiseError(errorCode) + ")");
+            if (sink != null) sink.onAdvertiseResult(false, errorCode);
         }
     };
 

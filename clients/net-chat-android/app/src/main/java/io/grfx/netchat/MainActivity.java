@@ -256,6 +256,15 @@ public class MainActivity extends AppCompatActivity
             @Override public void onUnsubscribed(BluetoothDevice device) {
                 append("unsubscribed by " + device.getAddress());
             }
+            @Override public void onAdvertiseResult(boolean ok, int errorCode) {
+                // Asynchronous verdict — "peripheral up" below only means the
+                // request was accepted. Say plainly when we are NOT advertising,
+                // because an undiscoverable peripheral looks identical to a
+                // healthy one from this screen.
+                runOnUiThread(() -> append(ok
+                        ? "advertising"
+                        : "NOT ADVERTISING — " + BitChatGattServer.advertiseError(errorCode)));
+            }
         });
         String err = peripheral.start(BitChatConstants.LOCAL_NAME_PREFIX + identity.peerIdHex);
         if (err != null) { append("peripheral start: " + err); peripheral = null; }

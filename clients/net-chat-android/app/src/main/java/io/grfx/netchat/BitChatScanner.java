@@ -96,11 +96,16 @@ public final class BitChatScanner {
         // present. Advertisers who put it in ServiceData carry
         // it in a per-service byte array — check that too.
         String name = rec == null ? null : rec.getDeviceName();
-        if (name == null && rec != null) {
-            byte[] sd = rec.getServiceData(BitChatConstants.SERVICE_PARCEL_UUID);
-            if (sd != null) name = new String(sd);
-        }
+        byte[] sd = rec == null ? null
+                : rec.getServiceData(BitChatConstants.SERVICE_PARCEL_UUID);
+        if (name == null && sd != null) name = new String(sd);
         byte[] pid = peerIdFromName(name);
+        // Raw-bytes form: a 128-bit service UUID already consumes 16 of the 31
+        // advertisable bytes, so we publish the peer id as its 8 RAW bytes —
+        // 16 hex characters cannot fit alongside the UUID (see
+        // BitChatGattServer). Only used when the string path found nothing, so
+        // an advertiser that does send hex keeps its existing interpretation.
+        if (sd != null && sd.length == 8 && isZero(pid)) pid = sd.clone();
         Log.i(TAG, "scan hit: addr=" + result.getDevice().getAddress()
                 + " name=" + (name == null ? "(none)" : name)
                 + " rssi=" + result.getRssi());
@@ -129,6 +134,13 @@ public final class BitChatScanner {
             }
         }
         return out;
+    }
+
+    /** True when peerIdFromName() found no hex and returned all zeroes. */
+    private static boolean isZero(byte[] b) {
+        if (b == null) return true;
+        for (byte x : b) if (x != 0) return false;
+        return true;
     }
 
     private static boolean allHex(String s, int start, int end) {
