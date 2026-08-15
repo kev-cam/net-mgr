@@ -5576,6 +5576,36 @@ sub _associate_machine {
         }
         $mid = $name_owner_mid;
     }
+    # Ambiguity guard. The check above only covers a name that is some machine's
+    # PRIMARY name; hostnames itself is keyed (machine_id, name, source), so the
+    # same name may bind to any number of machines and nothing stopped a
+    # device-supplied name from being attached to a machine that another device
+    # already answers to. Untreated, that silently MERGES distinct devices:
+    # observed live, `barrel.grfx.com` was bound to four machines, and machine
+    # 291 carried beds-1 + mint + mpy-esp32 + soil-3928 — four separate sensors.
+    # The driver is devices that share a name they did not choose: every
+    # unconfigured MicroPython board announces `mpy-esp32`, and a DHCP lease can
+    # hand a machine the name of whichever device previously held its address.
+    #
+    # So a name arriving from a LOW-TRUST source is not allowed to attach itself
+    # to a second machine. Low-trust means the device (or its lease) told us:
+    # dhcp/dnsmasq/ap. Operator-supplied sources (config, reservation) and
+    # sources proving we reached the host itself (ssh) still bind, since those
+    # are deliberate. A genuine rename is unaffected — the old name is not bound
+    # elsewhere, so there is no conflict to trip over.
+    my %LOW_TRUST = (dhcp => 1, dnsmasq => 1, ap => 1);
+    if ($LOW_TRUST{ $source // '' }) {
+        my ($other) = $self->{db}->dbh->selectrow_array(
+            "SELECT machine_id FROM hostnames WHERE name = ? AND machine_id <> ? LIMIT 1",
+            undef, $name, $mid);
+        if (defined $other) {
+            $self->_log("_associate_machine: REFUSING to bind '$name' to machine_id=$mid "
+                      . "from low-trust source '$source' — machine_id=$other already "
+                      . "answers to it (mac $mac). Two devices are reporting one name; "
+                      . "give them distinct hostnames, or bind it explicitly.");
+            return $mid;
+        }
+    }
     $self->_upsert('hostnames', 'upsert_hostname',
         machine_id => $mid, name => $name, source => $source);
     return $mid;

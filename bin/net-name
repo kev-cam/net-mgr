@@ -8,6 +8,8 @@
 #   net-name list [PATTERN]
 #   net-name set MACHINE NAME [--notes "…"]
 #   net-name remove MACHINE
+#   net-name conflicts                     Report hostnames bound to 2+ machines
+#                                          (the signature of merged devices)
 #
 # MACHINE may be a machine id, primary_name, or any hostnames entry;
 # the tool resolves it to a machine id.
@@ -36,6 +38,7 @@ net-name — friendly display names for the web UI.
   net-name list [PATTERN]                List names (optional shell glob).
   net-name set MACHINE NAME [--notes …]  Create or update.
   net-name remove MACHINE                Delete one entry.
+  net-name conflicts                     Hostnames claimed by 2+ machines.
 
 MACHINE may be a numeric id, primary_name, or hostname.
 EOT
@@ -74,6 +77,51 @@ sub primary_name {
     my ($n) = $db->dbh->selectrow_array(
         "SELECT primary_name FROM machines WHERE id = ?", undef, $id);
     return $n // "($id)";
+}
+
+if ($cmd eq 'conflicts') {
+    # Names bound to MORE THAN ONE machine. That is the signature of two devices
+    # answering to a single name — either a shared factory default (every
+    # unconfigured MicroPython board announces `mpy-esp32`) or a DHCP lease that
+    # handed a machine the name of whichever device previously held its address.
+    # net-mgr correlates machines by hostname, so each such name quietly welds
+    # separate devices into one machine record and their other names bleed
+    # across. Read-only: it reports but unpicks nothing, because which device
+    # legitimately owns a name is a judgement only the operator can make.
+    my $rows = $db->dbh->selectall_arrayref(
+        "SELECT h.name, h.machine_id, h.source
+           FROM hostnames h
+          WHERE h.name IN (SELECT name FROM hostnames
+                            GROUP BY name HAVING COUNT(DISTINCT machine_id) > 1)
+          ORDER BY h.name, h.machine_id", { Slice => {} });
+    unless (@$rows) { print "no hostname is bound to more than one machine\n"; exit 0 }
+    my %by_name;
+    push @{ $by_name{ $_->{name} }{ $_->{machine_id} } }, $_->{source} for @$rows;
+    for my $name (sort keys %by_name) {
+        print "$name\n";
+        for my $mid (sort { $a <=> $b } keys %{ $by_name{$name} }) {
+            my ($pn) = $db->dbh->selectrow_array(
+                "SELECT primary_name FROM machines WHERE id = ?", undef, $mid);
+            my $macs = $db->dbh->selectcol_arrayref(
+                "SELECT mac FROM interfaces WHERE machine_id = ? ORDER BY mac",
+                undef, $mid) || [];
+            my %src = map { $_ => 1 } @{ $by_name{$name}{$mid} };
+            # Cap the MAC list. A hypervisor host legitimately owns hundreds
+            # (P620A carries ~400 Hyper-V interfaces) and printing them all
+            # buries the report under thousands of characters of noise.
+            my $shown = @$macs > 3
+                      ? join(',', @{$macs}[0 .. 2]) . sprintf(' (+%d more)', scalar(@$macs) - 3)
+                      : @$macs ? join(',', @$macs) : '(no interface)';
+            printf "    machine %-5s %-22s %-46s [%s]\n",
+                $mid, ($pn // '(unnamed)'), $shown, join(',', sort keys %src);
+        }
+    }
+    printf "\n%d name(s) bound to multiple machines — each one merges those\n",
+        scalar keys %by_name;
+    print "machines' identities. Fix at the source: give the devices distinct\n",
+          "hostnames (a shared factory default is the usual cause). New bindings\n",
+          "from device-supplied sources are refused once a name is ambiguous.\n";
+    exit 0;
 }
 
 if ($cmd eq 'list') {
@@ -128,4 +176,4 @@ if ($cmd eq 'remove' || $cmd eq 'rm' || $cmd eq 'del') {
     exit 1;
 }
 
-die "unknown subcommand '$cmd'; try: list, set, remove\n";
+die "unknown subcommand '$cmd'; try: list, set, remove, conflicts\n";
