@@ -104,6 +104,19 @@ my %DEFAULTS = (
         out_dir  => '/usr/local/sgy/conf.d',
         push_aps => 0,
         gateways => '',    # space/comma list of DHCP gateways for net-import-dnsmasq --auto
+        # How a host with legs on SEVERAL zones is named in the generated files.
+        #   short     (default, historical) — the bare name goes into every
+        #             zone, so dnsmasq answers e.g. `nas3` itself, round-robining
+        #             that host's addresses with no idea which one the asking
+        #             client can actually reach.
+        #   qualified — for such hosts emit ONLY zone-qualified names
+        #             (nas3-up / nas3-dmz). The bare name is then absent from
+        #             dnsmasq's local data, so a `server=/…/` delegation can
+        #             reach a resolver that chooses per client.
+        # Set 'qualified' ONLY once such a resolver is actually answering:
+        # dnsmasq consults its own hosts/DHCP data before it forwards anything,
+        # so until then the bare name would simply stop resolving.
+        multihomed => 'short',
     },
     # BitChat-to-net-chat BLE bridge (bin/net-bitchat-bridge). Default on:
     # the systemd unit is installed enabled, but the supervisor's preflight
@@ -377,7 +390,7 @@ my %ACTIVE = (
                                               # loopback REFRESH socket
     uplinks    => '*',                        # consumed by net-uplink-probe
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
-    dnsmasq    => [qw(mode out_dir push_aps gateways)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
+    dnsmasq    => [qw(mode out_dir push_aps gateways multihomed)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
     bitchat_bridge => [qw(mode helper_path session_name adapter_index diag_journal diag_journal_lines)], # BLE bridge (bin/net-bitchat-bridge)
     'net-chat' => [qw(key_file key_id last_session bitchat_scope bitchat_geohash)], # auth-dialog "Always" + last-open session + bitchat scope/geohash
     ipv6_vlan  => [qw(type name mode server prefix local_suffix forwarding ext_if

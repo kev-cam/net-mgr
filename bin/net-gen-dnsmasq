@@ -386,6 +386,54 @@ sub gen_from_db {
     }
     warn "net-gen-dnsmasq: skipped $skipped reservation(s) on subnets with no zone mapping\n" if $skipped;
 
+    # Which hosts have legs in MORE THAN ONE zone? Those are exactly the names
+    # dnsmasq cannot answer well: the same bare name lands in several zone files
+    # and dnsmasq round-robins between addresses on different segments with no
+    # idea which one the asking client can reach. Under
+    # [dnsmasq] multihomed = qualified, emit only the zone-qualified name for
+    # them, leaving the bare name out of dnsmasq's local data — dnsmasq consults
+    # that data BEFORE any server=/…/ route, so leaving it in makes such a
+    # delegation dead config for precisely these names.
+    # Key on the name each file would actually EMIT, not on the machine the MAC
+    # belongs to. Only a name that lands in more than one zone can shadow, and
+    # keying on the machine instead renames entries that were never a problem:
+    # it rewrote garden sensors Barrel and Beds-1 to their (wrongly merged)
+    # machine's name — twice, colliding — and replaced operator-chosen suffixes
+    # like amfpc-air with amfpc-dmz. The two files emit different names, so each
+    # gets its own view.
+    my (%dh_zones, %host_zones);
+    for my $zone (keys %by_zone) {
+        for my $r (@{ $by_zone{$zone} }) {
+            my $dh = _short($r->{name} // '');
+            $dh_zones{$dh}{$zone} = 1 if length $dh;
+            my $hn = $mac2host{ lc $r->{mac} } // $r->{name};
+            $host_zones{$hn}{$zone} = 1 if defined $hn && length $hn;
+        }
+    }
+    my %dh_multi   = map { $_ => 1 } grep { keys %{ $dh_zones{$_} }   > 1 } keys %dh_zones;
+    my %host_multi = map { $_ => 1 } grep { keys %{ $host_zones{$_} } > 1 } keys %host_zones;
+    my %multi = (%dh_multi, %host_multi);
+    my $qualify = lc($dnsmasq_cfg{multihomed} // 'short') eq 'qualified';
+    if (%multi) {
+        warn sprintf("net-gen-dnsmasq: %d multi-homed host(s) [%s] — %s\n",
+                     scalar(keys %multi), join(',', sort keys %multi),
+                     $qualify ? "emitting zone-qualified names only"
+                              : "emitting the bare name in each zone; set "
+                              . "[dnsmasq] multihomed = qualified to delegate them");
+    }
+
+    # Zone-qualified name for a reservation: keep an explicit side suffix the
+    # operator already chose (nas3-up stays nas3-up) and only synthesise
+    # <host>-<zone> when the reservation carries no suffix of its own.
+    my $qualified_name = sub {
+        my ($r, $zone, $shadowing) = @_;
+        my $rn = $r->{name} // '';
+        # The reservation's own name already distinguishes this leg (nas3-up vs
+        # the shadowing bare nas3) — prefer it, so the operator's naming survives.
+        return $rn if length $rn && $rn ne $shadowing;
+        return "$shadowing-$zone";
+    };
+
     my %generated;
     for my $zone (sort keys %by_zone) {
         my @rs = @{ $by_zone{$zone} };
@@ -393,8 +441,9 @@ sub gen_from_db {
         # dnsmasq-<zone>: curated SHORT name, name-sort, dedup by MAC (keep first + warn)
         my (%seenmac, @dh);
         for my $r (sort { _short($a->{name}) cmp _short($b->{name}) or _ipkey($a->{ip}) <=> _ipkey($b->{ip}) } @rs) {
-            my $mac = lc $r->{mac};
-            my $sn  = _short($r->{name});
+            my $mac  = lc $r->{mac};
+            my $sn   = _short($r->{name});
+            $sn = $qualified_name->($r, $zone, $sn) if $qualify && $dh_multi{$sn};
             if (my $first = $seenmac{$mac}) {
                 warn "WARN dnsmasq-$zone duplicate mac $r->{mac}: skipping '$sn' at $r->{ip} (kept $first)\n";
                 next;
@@ -414,6 +463,11 @@ sub gen_from_db {
             $seenip{ $r->{ip} } = ($r->{name} // '?');
             my $mac  = lc $r->{mac};
             my $name = $mac2host{$mac} // $r->{name};
+            # Same rule as the dhcp-host line above: a multi-homed host must not
+            # appear here under its bare name either, or the hosts file shadows
+            # the delegation just as effectively as the DHCP entry would.
+            $name = $qualified_name->($r, $zone, $name)
+                if $qualify && defined $name && $host_multi{$name};
             next unless defined $name && length $name;
             (my $macid = $mac) =~ s/:/_/g;
             push @hl, sprintf("%-25s%s\t%s\tM%s\n", $r->{ip}, $name, "$name.$domain", $macid);
