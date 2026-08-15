@@ -62,12 +62,24 @@ public final class BitChatCentral {
         BluetoothGatt gatt;
         BluetoothGattCharacteristic tx;
         volatile boolean subscribed;
-        /** A connectGatt() is in flight (no CONNECTED/DISCONNECTED callback yet). */
+        /**
+         * An attempt is in flight: from connectGatt() until we are SUBSCRIBED or
+         * the attempt is released. It deliberately stays true across the whole
+         * CONNECTED → MTU → discover → CCCD chain, because that chain is exactly
+         * where a peer is both (a) still being advertised, so scan hits keep
+         * arriving, and (b) not yet `subscribed` — leaving the retry gate open
+         * would let one of those hits tear down a perfectly healthy connection.
+         */
         volatile boolean connecting;
-        /** elapsedRealtime of the last connectGatt(), for the backoff gate. */
-        volatile long lastAttemptMs;
-        /** Consecutive failed attempts; reset to 0 once connected. */
+        /** elapsedRealtime of the last released attempt — the backoff is measured
+         *  from when the attempt FAILED, not from when it started, so a slow
+         *  failure (the ~30s GATT-133 case) doesn't retire the backoff before it
+         *  is ever consulted. */
+        volatile long lastFailureMs;
+        /** Consecutive failed attempts; reset only once we are subscribed. */
         volatile int failures;
+        /** Monotonic attempt id, so a stale watchdog cannot abort a newer attempt. */
+        volatile int attempt;
 
         PeerConn(BluetoothDevice d, byte[] pid) { this.device = d; this.peerId = pid; }
     }
@@ -91,12 +103,13 @@ public final class BitChatCentral {
         String addr = device.getAddress();
         PeerConn pc;
         BluetoothGatt stale = null;
+        int attemptId;
         long now = SystemClock.elapsedRealtime();
         synchronized (byAddress) {
             pc = byAddress.get(addr);
             if (pc != null) {
                 if (pc.subscribed || pc.connecting) return;     // healthy, or in flight
-                long wait = backoffFor(pc.failures) - (now - pc.lastAttemptMs);
+                long wait = backoffFor(pc.failures) - (now - pc.lastFailureMs);
                 if (wait > 0) return;                           // still cooling down
                 // Retrying: the previous client interface must go. With
                 // autoConnect=false a dead BluetoothGatt is NOT reusable, and
@@ -110,7 +123,7 @@ public final class BitChatCentral {
                 byAddress.put(addr, pc);
             }
             pc.connecting = true;
-            pc.lastAttemptMs = now;
+            attemptId = ++pc.attempt;
         }
         closeQuietly(stale);        // outside the monitor — see markFailed()
         // autoConnect=false — a DIRECT connect. autoConnect=true looks tempting
@@ -128,17 +141,26 @@ public final class BitChatCentral {
         BluetoothGatt g = device.connectGatt(context, false /*autoConnect*/,
                 gattCallback, BluetoothDevice.TRANSPORT_LE);
         synchronized (byAddress) { pc.gatt = g; }
-        Log.i(TAG, "connect → " + addr + " direct attempt=" + (pc.failures + 1)
+        Log.i(TAG, "connect → " + addr + " direct attempt=" + attemptId
+                + " failures=" + pc.failures
                 + (g == null ? " FAILED (connectGatt returned null)" : ""));
         if (g == null) { markFailed(addr, "connectGatt returned null", true); return; }
-        // Watchdog: a direct connect that never calls back would otherwise pin
-        // this peer in `connecting` forever and it would never be retried.
+        // Watchdog covering the WHOLE chain (connect → MTU → discover → CCCD),
+        // since `connecting` is now held until we are subscribed: any stall in
+        // there — a dropped onMtuChanged, a silent discovery failure — would
+        // otherwise pin the peer and hold its GATT client interface forever.
+        // Tagged with the attempt id: the backoff tiers (2/5/15s) are all shorter
+        // than this timeout, so several attempts can overlap and an untagged
+        // watchdog would abort a newer one and charge it a bogus failure.
         final String watchAddr = addr;
+        final int watchAttempt = attemptId;
         handler.postDelayed(() -> {
             PeerConn p;
             synchronized (byAddress) { p = byAddress.get(watchAddr); }
-            if (p != null && p.connecting && !p.subscribed) {
-                Log.w(TAG, "connect timeout after " + CONNECT_TIMEOUT_MS + "ms: " + watchAddr);
+            if (p == null || p.attempt != watchAttempt) return;      // superseded
+            if (p.connecting && !p.subscribed) {
+                Log.w(TAG, "attempt " + watchAttempt + " timed out after "
+                        + CONNECT_TIMEOUT_MS + "ms: " + watchAddr);
                 markFailed(watchAddr, "timeout", true);
             }
         }, CONNECT_TIMEOUT_MS);
@@ -161,6 +183,7 @@ public final class BitChatCentral {
             pc.subscribed = false;
             pc.tx = null;
             if (countAsFailure) pc.failures++; else pc.failures = 0;
+            pc.lastFailureMs = SystemClock.elapsedRealtime();   // backoff runs from HERE
             doomed = pc.gatt;
             pc.gatt = null;
             failures = pc.failures;
@@ -183,23 +206,43 @@ public final class BitChatCentral {
     @SuppressLint("MissingPermission")
     public boolean send(byte[] peerId, byte[] data) {
         PeerConn pc = findByPeerId(peerId);
-        if (pc == null || pc.gatt == null || pc.tx == null) {
-            Log.i(TAG, "send skipped (peer not tracked/tx null): "
-                    + (pc == null ? "no PeerConn" : (pc.tx == null ? "no tx" : "no gatt")));
+        if (pc == null) { Log.i(TAG, "send skipped: no PeerConn for that peer id"); return false; }
+        return sendTo(pc, data);
+    }
+
+    /**
+     * Write to one specific peer. Takes the PeerConn directly so callers that
+     * already hold one do NOT round-trip through findByPeerId(): peers whose
+     * advertised name carries no 16-hex run all share peerId 0000000000000000,
+     * and re-resolving would hand every one of their packets to whichever of
+     * them the map happens to yield first.
+     */
+    @SuppressLint("MissingPermission")
+    private boolean sendTo(PeerConn pc, byte[] data) {
+        // Snapshot under the monitor: a callback thread can null both fields
+        // concurrently (markFailed/disconnect), and the old code null-checked
+        // them and then dereferenced them unlocked.
+        BluetoothGatt gatt;
+        BluetoothGattCharacteristic tx;
+        boolean subscribed;
+        synchronized (byAddress) { gatt = pc.gatt; tx = pc.tx; subscribed = pc.subscribed; }
+        if (gatt == null || tx == null) {
+            Log.i(TAG, "send skipped (" + (tx == null ? "no tx" : "no gatt") + "): "
+                    + pc.device.getAddress());
             return false;
         }
         int type = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE;
         boolean ok;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            int rc = pc.gatt.writeCharacteristic(pc.tx, data, type);
+            int rc = gatt.writeCharacteristic(tx, data, type);
             ok = rc == BluetoothGatt.GATT_SUCCESS;
         } else {
-            pc.tx.setWriteType(type);
-            pc.tx.setValue(data);
-            ok = pc.gatt.writeCharacteristic(pc.tx);
+            tx.setWriteType(type);
+            tx.setValue(data);
+            ok = gatt.writeCharacteristic(tx);
         }
         Log.i(TAG, "send " + data.length + "B → " + pc.device.getAddress()
-                + " ok=" + ok + " subscribed=" + pc.subscribed);
+                + " ok=" + ok + " subscribed=" + subscribed);
         return ok;
     }
 
@@ -212,7 +255,7 @@ public final class BitChatCentral {
         for (PeerConn pc : snapshot) {
             if (pc.tx != null && pc.subscribed) {
                 candidates++;
-                if (send(pc.peerId, data)) sent++;
+                if (sendTo(pc, data)) sent++;   // NOT send(pc.peerId, …): see sendTo
             }
         }
         Log.i(TAG, "broadcast " + data.length + "B → " + sent + "/" + candidates
@@ -224,16 +267,24 @@ public final class BitChatCentral {
         // Explicit user-driven teardown (STOP). Drop any pending connect
         // watchdogs too, or a retry could fire after the user stopped BLE.
         handler.removeCallbacksAndMessages(null);
+        java.util.List<BluetoothGatt> doomed = new java.util.ArrayList<>();
+        java.util.List<byte[]> wereConnected = new java.util.ArrayList<>();
         synchronized (byAddress) {
             for (PeerConn pc : byAddress.values()) {
+                if (pc.subscribed) wereConnected.add(pc.peerId);
                 pc.connecting = false;
                 pc.subscribed = false;
                 pc.tx = null;
-                closeQuietly(pc.gatt);
+                if (pc.gatt != null) doomed.add(pc.gatt);
                 pc.gatt = null;
             }
             byAddress.clear();
         }
+        // Close outside the monitor, same invariant markFailed() observes.
+        for (BluetoothGatt g : doomed) closeQuietly(g);
+        // Balance the sink: we fired onConnected for these, so fire the matching
+        // onDisconnected rather than letting close() swallow the state change.
+        if (sink != null) for (byte[] pid : wereConnected) sink.onDisconnected(pid);
     }
 
     private PeerConn findByPeerId(byte[] peerId) {
@@ -274,13 +325,26 @@ public final class BitChatCentral {
             }
             if (newState == BluetoothGatt.STATE_CONNECTED
                     && status == BluetoothGatt.GATT_SUCCESS) {
-                pc.connecting = false;
-                pc.failures = 0;                    // a good connect clears the backoff
+                // NOTE: `connecting` deliberately stays TRUE and `failures` is NOT
+                // cleared here. A link is not a usable peer — only completing the
+                // CCCD subscribe is. Clearing either now would reopen the retry
+                // gate for the 0.5–3s handshake that follows, and the next scan
+                // hit (they arrive several per second) would close this healthy
+                // GATT and start over, with no failure recorded and therefore no
+                // backoff to stop it looping. Both are cleared in onDescriptorWrite.
+                //
                 // Request the biggest MTU BLE allows (517) BEFORE discovering
                 // services — default 23-byte MTU truncates BitChat frames to
                 // 20 bytes and every packet fails to decode. onMtuChanged
-                // triggers discoverServices().
-                gatt.requestMtu(517);
+                // triggers discoverServices(); if the request is refused outright
+                // no callback ever comes, so fall through to discovery ourselves.
+                if (!gatt.requestMtu(517)) {
+                    Log.w(TAG, "requestMtu refused, discovering at default MTU: "
+                            + pc.device.getAddress());
+                    if (!gatt.discoverServices()) {
+                        markFailed(pc.device.getAddress(), "discoverServices refused", true);
+                    }
+                }
             } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
                 // Fire onDisconnected only if we previously fired onConnected —
                 // keeps the sink's connect/disconnect pairs balanced.
@@ -335,16 +399,26 @@ public final class BitChatCentral {
             // Enable local notification routing.
             gatt.setCharacteristicNotification(ch, true);
             // Write 0x0001 to the CCCD to tell the peer we want notifications.
+            // Every failure below must release the attempt: otherwise onDescriptorWrite
+            // never fires, `connecting` stays set, and the peer is stuck until the
+            // watchdog expires 35s later.
             BluetoothGattDescriptor cccd = ch.getDescriptor(BitChatConstants.CCCD_UUID);
-            if (cccd != null) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    gatt.writeDescriptor(cccd,
-                            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-                } else {
-                    cccd.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-                    gatt.writeDescriptor(cccd);
-                }
+            if (cccd == null) {
+                Log.w(TAG, "peer has no CCCD on the BitChat characteristic: "
+                        + pc.device.getAddress());
+                markFailed(pc.device.getAddress(), "no CCCD", true);
+                return;
             }
+            boolean queued;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                queued = gatt.writeDescriptor(cccd,
+                        BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                        == BluetoothGatt.GATT_SUCCESS;
+            } else {
+                cccd.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                queued = gatt.writeDescriptor(cccd);
+            }
+            if (!queued) markFailed(pc.device.getAddress(), "CCCD write not queued", true);
         }
 
         @Override
@@ -354,10 +428,21 @@ public final class BitChatCentral {
             Log.i(TAG, "onDescriptorWrite status=" + status
                     + " uuid=" + descriptor.getUuid()
                     + " peer=" + (pc == null ? "?" : pc.device.getAddress()));
-            if (pc != null && status == BluetoothGatt.GATT_SUCCESS
+            if (pc == null) return;
+            if (status == BluetoothGatt.GATT_SUCCESS
                     && BitChatConstants.CCCD_UUID.equals(descriptor.getUuid())) {
+                // THE success point: the peer is now usable. Only here do we drop
+                // `connecting` (closing the retry gate's coverage of the handshake)
+                // and clear the backoff.
                 pc.subscribed = true;
+                pc.connecting = false;
+                pc.failures = 0;
                 if (sink != null) sink.onConnected(pc.peerId);
+            } else if (BitChatConstants.CCCD_UUID.equals(descriptor.getUuid())) {
+                // Subscribe rejected — the link is useless to us; release it so
+                // the backoff applies rather than sitting `connecting` until the
+                // watchdog expires.
+                markFailed(pc.device.getAddress(), "CCCD write status=" + status, true);
             }
         }
 
