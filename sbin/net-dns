@@ -120,13 +120,53 @@ exit 1;                     # only reached if all workers die
 
 sub handler {
     my ($qname, $qclass, $qtype, $peerhost, $query, $conn) = @_;
-    my @result = eval { _handle($qname, $qclass, $qtype, $peerhost) };
+    # Answers are chosen for where the CLIENT is (see NetMgr::Resolver), so when
+    # the query was relayed by a forwarder, $peerhost is the forwarder and using
+    # it would give every client behind that forwarder the same answer. If the
+    # forwarder passed an EDNS Client Subnet option, believe that instead.
+    my $client = _client_subnet($query) // $peerhost;
+    my @result = eval { _handle($qname, $qclass, $qtype, $client) };
     if ($@) {
         my $err = $@; chomp $err;
         warn "[net-dns] handler error for $qname/$qtype from $peerhost: $err\n";
         return ('SERVFAIL', [], [], [], {});
     }
     return @result;
+}
+
+# EDNS Client Subnet (RFC 7871) → the querying client's address, or undef.
+#
+# dnsmasq attaches this when run with --add-subnet, and notably marks any reply
+# carrying a real client's subnet as NOT cacheable (src/edns0.c calc_subnet_opt
+# leaves cacheable=0 unless the configured subnet is a constant; forward.c then
+# sets FREC_NO_CACHE). That matters here: it means a forwarder will not serve one
+# client's segment-specific answer to a client on another segment, which is what
+# makes per-client answers survive the hop at all.
+#
+# Net::DNS returns the option as raw wire bytes, so decode it by hand:
+#   0-1 FAMILY (1=IPv4, 2=IPv6) · 2 SOURCE PREFIX-LEN · 3 SCOPE · 4.. ADDRESS,
+# where ADDRESS is truncated to ceil(SOURCE/8) bytes and must be zero-padded
+# back out before it can be read as an address.
+sub _client_subnet {
+    my ($query) = @_;
+    return undef unless $query && $query->can('edns');
+    my $opt = eval { $query->edns } or return undef;
+    my $raw = eval { $opt->option(8) };
+    return undef unless defined $raw && !ref $raw && length($raw) >= 4;
+    my ($family, $src_bits) = unpack('n C', $raw);
+    my $addr = substr($raw, 4);
+    return undef unless $src_bits > 0;          # /0 tells us nothing about them
+    if ($family == 1) {
+        return undef if $src_bits > 32;
+        $addr .= "\0" x (4 - length $addr) if length($addr) < 4;
+        return join('.', unpack('C4', substr($addr, 0, 4)));
+    }
+    if ($family == 2) {
+        return undef if $src_bits > 128;
+        $addr .= "\0" x (16 - length $addr) if length($addr) < 16;
+        return join(':', unpack('(H4)8', substr($addr, 0, 16)));
+    }
+    return undef;
 }
 
 sub _handle {
