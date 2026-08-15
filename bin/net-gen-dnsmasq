@@ -390,49 +390,111 @@ sub gen_from_db {
     # dnsmasq cannot answer well: the same bare name lands in several zone files
     # and dnsmasq round-robins between addresses on different segments with no
     # idea which one the asking client can reach. Under
-    # [dnsmasq] multihomed = qualified, emit only the zone-qualified name for
-    # them, leaving the bare name out of dnsmasq's local data — dnsmasq consults
-    # that data BEFORE any server=/…/ route, so leaving it in makes such a
-    # delegation dead config for precisely these names.
-    # Key on the name each file would actually EMIT, not on the machine the MAC
-    # belongs to. Only a name that lands in more than one zone can shadow, and
-    # keying on the machine instead renames entries that were never a problem:
-    # it rewrote garden sensors Barrel and Beds-1 to their (wrongly merged)
-    # machine's name — twice, colliding — and replaced operator-chosen suffixes
-    # like amfpc-air with amfpc-dmz. The two files emit different names, so each
-    # gets its own view.
-    my (%dh_zones, %host_zones);
-    for my $zone (keys %by_zone) {
-        for my $r (@{ $by_zone{$zone} }) {
-            my $dh = _short($r->{name} // '');
-            $dh_zones{$dh}{$zone} = 1 if length $dh;
-            my $hn = $mac2host{ lc $r->{mac} } // $r->{name};
-            $host_zones{$hn}{$zone} = 1 if defined $hn && length $hn;
-        }
-    }
-    my %dh_multi   = map { $_ => 1 } grep { keys %{ $dh_zones{$_} }   > 1 } keys %dh_zones;
-    my %host_multi = map { $_ => 1 } grep { keys %{ $host_zones{$_} } > 1 } keys %host_zones;
-    my %multi = (%dh_multi, %host_multi);
+    # [dnsmasq] multihomed = qualified, emit only zone-qualified names for them,
+    # leaving the bare name out of dnsmasq's local data — dnsmasq consults that
+    # data BEFORE any server=/…/ route, so leaving it in makes such a delegation
+    # dead config for precisely these names.
+    #
+    # Legs are grouped by the MACHINE a MAC belongs to, which is what actually
+    # makes them one host: nas3's third reservation is named nas3-dwn2, and only
+    # the machine says that it is another nas3 leg rather than a separate device.
+    # But machine records here are polluted by hostname collisions, so grouping
+    # alone would rewrite the garden sensors Barrel and Beds-1 to their wrongly
+    # merged machine's name. Hence the guard below: a reservation is only renamed
+    # when its own name is a VARIANT of the machine's base name (nas3-dwn2 is,
+    # Barrel is not), which keeps foreign entries dragged in by a bad merge under
+    # the names their owners chose.
+
+    # Compute each reservation's emitted name in two passes.
+    #
+    # Pass 1 groups a host's legs by the MACHINE its MAC belongs to, because
+    # that is what actually makes them one host: nas3's third reservation is
+    # named nas3-dwn2, and only the machine record says that is another nas3 leg
+    # rather than a separate device. A reservation is renamed only when its own
+    # name is a VARIANT of the machine's base name — machine records here are
+    # polluted by hostname collisions, and without that guard the garden sensors
+    # Barrel and Beds-1 get rewritten to their wrongly-merged machine's name.
+    #
+    # Pass 2 then enforces the property we actually need: NO emitted name may
+    # appear in more than one zone. Pass 1 alone does not achieve it, because
+    # some hosts have their legs split across separate machine records (dkctv,
+    # nas5, spa2100), so their bare name still landed in two zone files and would
+    # still shadow the delegation. Anything left spanning zones is qualified here
+    # regardless of how its legs are recorded.
+    #
+    # Names are <base>-<zone>, plus -<n> when a host has SEVERAL legs in one zone
+    # (nas3 has two on .223, so nas3-home-0 and nas3-home-1). The index follows IP
+    # order so the mapping is stable between runs rather than shifting with hash
+    # order. Note -up/-down are NOT zone names: they describe which way traffic
+    # leaves (up = toward the Internet), which is orthogonal to which segment an
+    # address is on, so they are not reused here.
     my $qualify = lc($dnsmasq_cfg{multihomed} // 'short') eq 'qualified';
-    if (%multi) {
-        warn sprintf("net-gen-dnsmasq: %d multi-homed host(s) [%s] — %s\n",
-                     scalar(keys %multi), join(',', sort keys %multi),
+
+    my $name_map = sub {
+        my ($base_of) = @_;              # ($r) -> the name this file would emit
+        my %out;                         # "mac|ip" -> name
+        my %legs;                        # base -> zone -> [r]
+        for my $zone (keys %by_zone) {
+            for my $r (@{ $by_zone{$zone} }) {
+                my $b = $base_of->($r);
+                next unless defined $b && length $b;
+                push @{ $legs{$b}{$zone} }, $r;
+            }
+        }
+        # pass 1 — machine-grouped legs
+        for my $base (grep { keys %{ $legs{$_} } > 1 } keys %legs) {
+            for my $zone (keys %{ $legs{$base} }) {
+                my @rs = sort { _ipkey($a->{ip}) <=> _ipkey($b->{ip}) }
+                         @{ $legs{$base}{$zone} };
+                my @own = grep {
+                    my $n = lc($_->{name} // '');
+                    $n eq lc($base) || index($n, lc($base) . '-') == 0
+                } @rs;
+                next unless @own;
+                my $i = 0;
+                for my $r (@own) {
+                    $out{ lc($r->{mac}) . '|' . $r->{ip} } =
+                        "$base-$zone" . (@own > 1 ? "-$i" : '');
+                    $i++;
+                }
+            }
+        }
+        # pass 2 — anything still spanning zones under its emitted name
+        my %by_emitted;
+        for my $zone (keys %by_zone) {
+            for my $r (@{ $by_zone{$zone} }) {
+                my $k = lc($r->{mac}) . '|' . $r->{ip};
+                my $n = $out{$k} // $base_of->($r);
+                next unless defined $n && length $n;
+                push @{ $by_emitted{$n}{$zone} }, $r;
+            }
+        }
+        for my $n (grep { keys %{ $by_emitted{$_} } > 1 } keys %by_emitted) {
+            for my $zone (keys %{ $by_emitted{$n} }) {
+                my @rs = sort { _ipkey($a->{ip}) <=> _ipkey($b->{ip}) }
+                         @{ $by_emitted{$n}{$zone} };
+                my $i = 0;
+                for my $r (@rs) {
+                    $out{ lc($r->{mac}) . '|' . $r->{ip} } =
+                        "$n-$zone" . (@rs > 1 ? "-$i" : '');
+                    $i++;
+                }
+            }
+        }
+        return \%out;
+    };
+
+    my $dh_name   = $name_map->(sub { _short($_[0]{name} // '') });
+    my $host_name = $name_map->(sub { $mac2host{ lc $_[0]{mac} } // $_[0]{name} });
+    if (%$dh_name) {
+        my %hosts = map { s/-[a-z0-9]+(-\d+)?$//r => 1 } values %$dh_name;
+        warn sprintf("net-gen-dnsmasq: %d multi-homed host(s) [%s] — %s
+",
+                     scalar(keys %hosts), join(',', sort keys %hosts),
                      $qualify ? "emitting zone-qualified names only"
                               : "emitting the bare name in each zone; set "
                               . "[dnsmasq] multihomed = qualified to delegate them");
     }
-
-    # Zone-qualified name for a reservation: keep an explicit side suffix the
-    # operator already chose (nas3-up stays nas3-up) and only synthesise
-    # <host>-<zone> when the reservation carries no suffix of its own.
-    my $qualified_name = sub {
-        my ($r, $zone, $shadowing) = @_;
-        my $rn = $r->{name} // '';
-        # The reservation's own name already distinguishes this leg (nas3-up vs
-        # the shadowing bare nas3) — prefer it, so the operator's naming survives.
-        return $rn if length $rn && $rn ne $shadowing;
-        return "$shadowing-$zone";
-    };
 
     my %generated;
     for my $zone (sort keys %by_zone) {
@@ -443,7 +505,7 @@ sub gen_from_db {
         for my $r (sort { _short($a->{name}) cmp _short($b->{name}) or _ipkey($a->{ip}) <=> _ipkey($b->{ip}) } @rs) {
             my $mac  = lc $r->{mac};
             my $sn   = _short($r->{name});
-            $sn = $qualified_name->($r, $zone, $sn) if $qualify && $dh_multi{$sn};
+            $sn = $dh_name->{"$mac|$r->{ip}"} if $qualify && $dh_name->{"$mac|$r->{ip}"};
             if (my $first = $seenmac{$mac}) {
                 warn "WARN dnsmasq-$zone duplicate mac $r->{mac}: skipping '$sn' at $r->{ip} (kept $first)\n";
                 next;
@@ -466,8 +528,8 @@ sub gen_from_db {
             # Same rule as the dhcp-host line above: a multi-homed host must not
             # appear here under its bare name either, or the hosts file shadows
             # the delegation just as effectively as the DHCP entry would.
-            $name = $qualified_name->($r, $zone, $name)
-                if $qualify && defined $name && $host_multi{$name};
+            $name = $host_name->{"$mac|$r->{ip}"}
+                if $qualify && $host_name->{"$mac|$r->{ip}"};
             next unless defined $name && length $name;
             (my $macid = $mac) =~ s/:/_/g;
             push @hl, sprintf("%-25s%s\t%s\tM%s\n", $r->{ip}, $name, "$name.$domain", $macid);
