@@ -4842,6 +4842,23 @@ sub _obs_dhcp_range {
     die "dhcp_range: subnet_cidr required\n" unless defined $cidr  && length $cidr;
     die "dhcp_range: start_ip required\n"    unless defined $start && length $start;
     die "dhcp_range: end_ip required\n"      unless defined $end   && length $end;
+    # A zone names the SUBNET, but it is stored per pool row, so the table can
+    # disagree with itself. Nothing downstream notices: the resolver runs
+    # `SELECT DISTINCT subnet_cidr ... WHERE zone = ?`, so two rows of one subnet
+    # carrying different zones quietly UNION their subnets into both zones, and a
+    # name like nas3-home starts answering with a dmz address. Refuse the write —
+    # a wrong zone is worse than no zone, because it fails silently.
+    if (defined $kv->{zone} && length $kv->{zone}) {
+        my ($clash) = $self->{db}->dbh->selectrow_array(
+            "SELECT zone FROM dhcp_ranges
+              WHERE subnet_cidr = ? AND start_ip <> ?
+                AND zone IS NOT NULL AND zone <> '' AND LOWER(zone) <> LOWER(?)
+              LIMIT 1",
+            undef, $cidr, $start, $kv->{zone});
+        die "dhcp_range: $cidr is already zone '$clash'; refusing to also call it"
+          . " '$kv->{zone}' (one zone per subnet — clear the others first)\n"
+            if defined $clash;
+    }
     $self->_upsert('dhcp_ranges', 'upsert_dhcp_range',
         subnet_cidr => $cidr, start_ip => $start, end_ip => $end,
         zone => $kv->{zone}, notes => $kv->{notes});

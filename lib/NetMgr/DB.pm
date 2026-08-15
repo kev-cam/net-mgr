@@ -2636,6 +2636,26 @@ sub get_dhcp_ranges {
 }
 
 # Upsert one dynamic range. Keyed by (subnet_cidr, start_ip).
+#
+# zone and notes MERGE rather than overwrite: an undef means "I have nothing to
+# say about this field", and the stored value survives. Passing the empty string
+# is the explicit way to clear one.
+#
+# This is load-bearing, not defensive tidying. Both fields are written by callers
+# that only know part of the row:
+#   - net-import-dnsmasq re-imports every pool from a dnsmasq config, which has
+#     no notion of a zone, so it sends none. Under the old unconditional
+#     `zone = VALUES(zone)` each import silently reset every zone to NULL, which
+#     is why all five live rows were NULL despite the column existing.
+#   - the cluster relay re-applies a peer's whole table on every reconnect. nas3
+#     and gateway3 relay from EACH OTHER (each stamps the other's rows with its
+#     own name in replicated_from), so with overwrite semantics a zone set on
+#     either node was wiped by the other's NULL seconds later, and no node could
+#     hold the value. Merging makes the pair converge on the non-NULL value
+#     instead of ping-ponging.
+# The cost is that a peer cannot propagate a deliberate clear by sending NULL; it
+# must send '' to do that. That is the right trade here — zone/notes are operator
+# annotations that no automatic producer is entitled to erase as a side effect.
 sub upsert_dhcp_range {
     my ($self, %f) = @_;
     croak "subnet_cidr + start_ip + end_ip required"
@@ -2649,8 +2669,8 @@ sub upsert_dhcp_range {
          VALUES (?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
             end_ip = VALUES(end_ip),
-            zone   = VALUES(zone),
-            notes  = VALUES(notes)",
+            zone   = IF(VALUES(zone)  IS NULL, zone,  NULLIF(VALUES(zone),  '')),
+            notes  = IF(VALUES(notes) IS NULL, notes, NULLIF(VALUES(notes), ''))",
         undef, $f{subnet_cidr}, $f{start_ip}, $f{end_ip},
         $f{zone}, $f{notes});
     my $now = $self->{dbh}->selectrow_hashref(

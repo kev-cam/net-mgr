@@ -22,6 +22,7 @@
 #   net-reserve release IP           remove a reservation
 #   net-reserve autoname [SUBNET]    fill missing reservation host names
 #   net-reserve add-range CIDR START END [--zone Z]
+#   net-reserve set-zone  CIDR ZONE          # name a subnet ('' clears)
 #   net-reserve del-range CIDR START
 #   net-reserve --push [SUBNET]      push named reservations into net-lookup as
 #                                    never-seen hosts (kind=host, last_observed
@@ -133,6 +134,7 @@ my %DISPATCH = (
     autoname   => \&cmd_autoname,
     'add-range' => \&cmd_add_range,
     'del-range' => \&cmd_del_range,
+    'set-zone'  => \&cmd_set_zone,
     gui       => sub { cmd_gui(shift @ARGV) },
 );
 
@@ -876,6 +878,43 @@ sub cmd_add_range {
     print "added range $cidr $start-$end\n";
 }
 
+# net-reserve set-zone CIDR ZONE  (ZONE '' clears)
+#
+# The zone names a SUBNET — it is what NetMgr::Resolver answers <host>-<zone>
+# lookups from (u32u-dmz, nas3-home). It is stored on each pool row, so setting
+# it one row at a time invites a subnet that disagrees with itself, and the
+# resolver would then union two subnets into one zone without complaining.
+# This applies the name to EVERY pool of the subnet in one go, and re-sends each
+# row's own start/end so no range is moved.
+sub cmd_set_zone {
+    my $cidr = shift @ARGV or usage("set-zone needs CIDR ZONE");
+    my $zone = shift @ARGV;
+    usage("set-zone needs CIDR ZONE") unless defined $zone;
+    my $cli  = connect_client();
+    my $rows = eval { $cli->snapshot(1, 'dhcp_ranges') } || [];
+    my @mine = grep { ($_->{subnet_cidr} // '') eq $cidr } @$rows;
+    die "net-reserve: no dhcp range recorded for $cidr — add one first with"
+      . " `net-reserve add-range $cidr START END --zone $zone`\n" unless @mine;
+    my $n = 0;
+    for my $r (@mine) {
+        # Re-send end_ip AND notes verbatim. The daemon-side upsert merges
+        # omitted fields now, but an older daemon overwrites them, and notes is
+        # what attributes each pool to the AP or gateway serving it
+        # ("dnsmasq:<host>") — losing it is silent and not reconstructible from
+        # anything else in the DB. Echoing the row back costs nothing and makes
+        # this safe to run against a node that has not been updated yet.
+        my $res = $cli->observe(kind => 'dhcp_range',
+            subnet_cidr => $cidr, start_ip => $r->{start_ip},
+            end_ip => $r->{end_ip}, zone => $zone,
+            (defined $r->{notes} && length $r->{notes}
+                ? (notes => $r->{notes}) : ()));
+        die "net-reserve: $res\n" if !defined $res || $res =~ /^ERR/;
+        $n++;
+    }
+    print length $zone ? "set zone '$zone' on $n range(s) of $cidr\n"
+                       : "cleared zone on $n range(s) of $cidr\n";
+}
+
 sub cmd_del_range {
     my $cidr  = shift @ARGV or usage("del-range needs CIDR START");
     my $start = shift @ARGV or usage("del-range needs CIDR START");
@@ -888,12 +927,16 @@ sub cmd_del_range {
 
 # ---- DHCP-range / server helpers (GUI "DHCP servers" mode) -----------
 # Each dynamic pool is served by some DHCP server (an AP or gateway). The
-# importer stamps that on the range's notes as "dnsmasq:<host>"; fall back to
-# the zone, then 'unknown'.
+# importer stamps that on the range's notes as "dnsmasq:<host>".
+#
+# `zone` is deliberately NOT consulted here any more. It names the SUBNET (dmz,
+# home) and is what NetMgr::Resolver answers <host>-<zone> lookups from; reading
+# it as a server label made the column mean two incompatible things at once, so
+# a pool tagged zone=home reported its server as "home". The authoritative
+# server tag is notes, which this GUI also writes.
 sub server_of_range {
     my ($r) = @_;
     return $1 if defined $r->{notes} && $r->{notes} =~ /dnsmasq:(\S+)/;
-    return $r->{zone} if defined $r->{zone} && length $r->{zone};
     return 'unknown';
 }
 # Best-guess management address for the AP/gateway that serves a pool, so the UI
@@ -1864,9 +1907,14 @@ sub range_assign_dialog {
     }
     my $ans = $dlg->Show // 'Cancel';
     return unless $ans eq 'Assign';
+    # Record the serving AP/gateway in notes only. This used to also write
+    # zone => $v{server}, which collided with the subnet zone (dmz/home) that
+    # NetMgr::Resolver answers <host>-<zone> from: assigning a pool would rename
+    # its subnet's zone to an AP hostname and break those lookups. Omitting zone
+    # here leaves whatever zone the subnet already has untouched.
     my $r = $cli->observe(kind => 'dhcp_range', subnet_cidr => $cidr,
         start_ip => $start, end_ip => $end,
-        ($v{server} ne '' ? (notes => "dnsmasq:$v{server}", zone => $v{server}) : ()));
+        ($v{server} ne '' ? (notes => "dnsmasq:$v{server}") : ()));
     if (!defined $r || $r =~ /^ERR/) { $status->configure(-text => " $r"); return }
     $S->{model} = gather($cli); $redraw->();
     $status->configure(-text => " assigned DHCP pool $start-$end"
@@ -2444,6 +2492,12 @@ usage:
   net-reserve autoname [SUBNET]          fill missing reservation host names
                                          from each MAC's machine
   net-reserve add-range CIDR START END [--zone Z]
+  net-reserve set-zone  CIDR ZONE        name a subnet, e.g.
+                                         `set-zone 192.168.15.0/24 dmz`. This is
+                                         the name net-dns answers <host>-<zone>
+                                         lookups from (nas3-dmz, u32u-dmz). Set
+                                         on every pool of the subnet at once so
+                                         they cannot disagree; '' clears it
   net-reserve del-range CIDR START
   net-reserve --push [SUBNET]            push named reservations into net-lookup
                                          as never-seen hosts (--dry-run previews)
