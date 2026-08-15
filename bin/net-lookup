@@ -20,7 +20,22 @@
 # inferred from the input. Paper-only addresses are honored on
 # reverse — the user typed the IP explicitly.
 #
-# Each candidate IP is scored on path quality from this host:
+# Candidates are ranked on IDENTITY first, then on path quality — because a
+# fast route to the wrong machine is still the wrong machine. Identity tiers:
+#   2  the address sits on a MAC that a DHCP RESERVATION binds to a name the
+#      query matched. A reservation is the only name→hardware binding an
+#      operator wrote down deliberately, so it is resolved directly, without
+#      going through machine correlation at all.
+#   1  the address sits on a permanent (universally-administered) MAC.
+#   0  the address sits on a randomised, locally-administered MAC.
+# That ordering matters because the name index is otherwise only as good as
+# what devices claim over DHCP, and those claims demonstrably collide: one
+# hostname can end up bound to several machines (a shared factory default like
+# `mpy-esp32`, or a lease handing on the previous tenant's name), and MAC
+# randomisation means a WiFi client's address identifies it only until it
+# decides otherwise. `net-name conflicts` lists names that are ambiguous.
+#
+# Within a tier, each candidate IP is scored on path quality from this host:
 #   +4  same /24 as one of our interface addresses (direct L2)
 #   +2  the address is on a wired (ethernet) interface
 #   +1  kernel-reachable (a route exists, even if via default)
@@ -161,6 +176,21 @@ my $ifaces    = $cli->snapshot(5, 'interfaces');
 my $where = "family = '$family'"
           . ($include_stale ? '' : ' AND last_observed IS NOT NULL');
 my $addresses = $cli->snapshot(6, 'addresses', where => $where);
+# DHCP reservations are the one NAME->MAC binding a human wrote down on purpose.
+# Everything else in the name index is inferred: hostnames are whatever a device
+# claimed over DHCP, and those demonstrably bleed between devices — a single name
+# can end up bound to several machines, so a lookup may match a machine that
+# merely inherited the name from a recycled address. A reservation names a
+# specific permanent MAC, so resolving name -> reserved MAC -> address skips the
+# correlation layer altogether.
+my $reservations = eval { $cli->snapshot(7, 'dhcp_reservations') } || [];
+# Current DHCP leases. For a device that takes its address from DHCP this is the
+# freshest MAC->IP binding we hold, and it is keyed by MAC, so it stays correct
+# across the address changes that make DNS unreliable here. The addresses table
+# can lag it badly: 192.168.15.179 was still recorded against Patio-PC's MAC
+# from 73 days earlier while u32u was actually answering on it, which is exactly
+# how a name lookup ends up pointing at the wrong machine.
+my $leases = eval { $cli->snapshot(8, 'dhcp_leases') } || [];
 $cli->bye;
 
 # --- index ----------------------------------------------------------
@@ -183,6 +213,31 @@ for my $a (@$aliases) {
         if $a->{prefer_subnet_cidr};
 }
 
+# Reserved name -> MAC(s), and the reverse. These MACs are REGISTERED: an
+# operator bound this name to this hardware, so they outrank anything a device
+# said about itself.
+my %resv_macs_by_name;
+my %is_reserved_mac;
+for my $r (@$reservations) {
+    next unless $r->{mac} && defined $r->{name} && length $r->{name};
+    my $mac = lc $r->{mac};
+    push @{ $resv_macs_by_name{ $r->{name} } }, $mac;
+    $is_reserved_mac{$mac} = 1;
+}
+
+# A MAC is PERMANENT when it is universally administered — i.e. a real
+# OUI-assigned, burned-in address. Bit 1 of the first octet (0x02) is the
+# locally-administered flag, which every MAC-randomising phone, tablet and
+# hypervisor NIC sets. Those addresses are ephemeral by design: the same
+# device comes back tomorrow under a different one, so any name or address
+# learned through them is worth much less than one learned through burned-in
+# hardware. (Bit 0 is the multicast flag; a unicast MAC never sets it.)
+sub _mac_is_permanent {
+    my ($mac) = @_;
+    return 0 unless defined $mac && $mac =~ /^([0-9a-f]{2}):/i;
+    return (hex($1) & 0x02) ? 0 : 1;
+}
+
 # Find machines whose name matches the regex, plus the prefer_subnet_cidr
 # hint when it came in via an alias row. Keep the matched-name list
 # per mid too — --verbose uses it to print "IP\tname1,name2,…".
@@ -198,7 +253,18 @@ for my $name (sort keys %name2mids) {
     push @prefer_cidrs, $alias_pref{$name} if $alias_pref{$name};
 }
 
-if (!%matched_mids) {
+# Match the SAME regex against reserved names. A hit here is authoritative: it
+# came from a registration, not from something a device asserted, so its MACs
+# are resolved directly rather than through machine correlation. This is what
+# makes the lookup survive a machine record that has been polluted by a shared
+# or recycled hostname.
+my %matched_resv_macs;        # mac => the reserved name that matched
+for my $name (sort keys %resv_macs_by_name) {
+    next unless $name =~ $rx;
+    $matched_resv_macs{$_} = $name for @{ $resv_macs_by_name{$name} };
+}
+
+if (!%matched_mids && !%matched_resv_macs) {
     exit 1;
 }
 
@@ -225,18 +291,95 @@ for my $a (@$addresses) {
     };
 }
 
+# Fold in current DHCP leases as an additional MAC-keyed address source. Only v4
+# (leases are v4), and only when the lease's own MAC does not already have that
+# address recorded, so real observation metadata (RTT, loss) is never overwritten
+# by a lease row that carries none. A lease is not proof the device answers —
+# scoring and --verify still apply — but it IS the binding DHCP made most
+# recently, and without it a device whose addresses row has gone stale is
+# unreachable by name even though the fleet knows exactly where it is.
+if ($family eq 'v4') {
+    # ONLY each MAC's most recent lease. dhcp_leases is keyed (mac, ip), so it
+    # retains every address a MAC has ever been given — on this fleet a single
+    # MAC accumulates a dozen of them. Feeding all of those in makes one name
+    # resolve to a fistful of addresses, most long since reassigned to other
+    # devices (a lookup for a garden sensor came back with the IP camera's
+    # address). A DHCP client holds exactly one lease at a time; the newest row
+    # is it.
+    my %newest;
+    for my $l (@$leases) {
+        next unless $l->{mac} && $l->{ip};
+        my $mac = lc $l->{mac};
+        my $ls  = $l->{last_seen} // '';
+        $newest{$mac} = { ip => $l->{ip}, last_seen => $ls }
+            if !$newest{$mac} || $ls gt $newest{$mac}{last_seen};
+    }
+    # An address belongs to ONE MAC at a time, so let the freshest claim win.
+    # Without this a lease that some MAC held months ago still resolves, and the
+    # name attached to it comes back pointing at whatever device holds that
+    # address today — a lookup for one garden sensor returned the laptop's
+    # current address purely because the sensor once had it. Compare each lease
+    # against every other claim on the same IP, from observations as well as
+    # other leases, and keep only the newest.
+    my %claim;      # ip => { mac, when }
+    for my $a (@$addresses) {
+        next unless defined $a->{addr} && defined $a->{mac};
+        my $when = $a->{last_observed} // '';
+        $claim{ $a->{addr} } = { mac => lc $a->{mac}, when => $when }
+            if !$claim{ $a->{addr} } || $when gt $claim{ $a->{addr} }{when};
+    }
+    for my $mac (keys %newest) {
+        my ($ip, $ls) = @{ $newest{$mac} }{qw(ip last_seen)};
+        $claim{$ip} = { mac => $mac, when => ($ls // '') }
+            if !$claim{$ip} || ($ls // '') gt $claim{$ip}{when};
+    }
+    my %have = map { lc($_->{mac} // '') . '|' . ($_->{addr} // '') => 1 } @$addresses;
+    for my $mac (keys %newest) {
+        my ($ip, $ls) = @{ $newest{$mac} }{qw(ip last_seen)};
+        next if $have{ "$mac|$ip" };
+        next unless ($claim{$ip}{mac} // '') eq $mac;   # someone else holds it now
+        push @{ $addrs_by_mac{$mac} }, $ip;
+        $meta_by_addr{$ip} //= { mac => $mac, last_observed => $ls };
+    }
+}
+
 my %seen;
-my @candidates;       # list of [score, rtt_for_tiebreak, ip, mid, last_observed]
+# [trust, score, rtt_for_tiebreak, ip, mid, last_observed]
+#
+# `trust` answers "is this even the right device?" and is ranked ABOVE `score`,
+# which only answers "how good is the path to it". Getting that order wrong is
+# how a lookup returns a well-connected address belonging to the wrong machine:
+#   2  the address sits on a MAC reserved under a name the query matched —
+#      a registration, the strongest statement of identity we hold
+#   1  the address sits on a permanent (burned-in) MAC
+#   0  the address sits on a randomised, locally-administered MAC, which
+#      identifies the device only until it decides to change it
+my @candidates;
+my $add_cand = sub {
+    my ($mac, $ip, $mid, $trust) = @_;
+    return if $seen{$ip}++;
+    my $score = _score($ip, \@prefer_cidrs, \%kind_by_mac, \%meta_by_addr);
+    my $meta  = $meta_by_addr{$ip} || {};
+    push @candidates, [ $trust, $score, ($meta->{min_rtt_ms} // 9999),
+                        $ip, $mid, ($meta->{last_observed} // '') ];
+};
+
+# Registered MACs first — literally, before the name-correlated machines below,
+# so a polluted machine record cannot outrank a reservation.
+for my $mac (sort keys %matched_resv_macs) {
+    my ($mid) = grep { defined } map { $_->{machine_id} }
+                grep { defined $_->{mac} && lc $_->{mac} eq $mac } @$ifaces;
+    $add_cand->($mac, $_, $mid, 2) for @{ $addrs_by_mac{$mac} || [] };
+    push @{ $matched_names_by_mid{$mid} }, $matched_resv_macs{$mac}
+        if defined $mid;
+}
+
 for my $mid (keys %matched_mids) {
     for my $mac (@{ $macs_by_mid{$mid} || [] }) {
-        for my $ip (@{ $addrs_by_mac{$mac} || [] }) {
-            next if $seen{$ip}++;
-            my $score = _score($ip, \@prefer_cidrs, \%kind_by_mac, \%meta_by_addr);
-            my $meta  = $meta_by_addr{$ip} || {};
-            my $rtt   = $meta->{min_rtt_ms} // 9999;
-            my $lo    = $meta->{last_observed} // '';
-            push @candidates, [ $score, $rtt, $ip, $mid, $lo ];
-        }
+        my $trust = $is_reserved_mac{ lc $mac } ? 2
+                  : _mac_is_permanent($mac)     ? 1
+                  :                               0;
+        $add_cand->($mac, $_, $mid, $trust) for @{ $addrs_by_mac{$mac} || [] };
     }
 }
 
@@ -250,9 +393,10 @@ if (!@candidates) {
 # last_observed is ISO "YYYY-MM-DD HH:MM:SS" so string cmp orders it by time.
 @candidates = sort {
        $b->[0] <=> $a->[0]
-    || ($b->[4] // '') cmp ($a->[4] // '')
-    || $a->[1] <=> $b->[1]
-    || _ipkey($a->[2]) cmp _ipkey($b->[2])
+    || $b->[1] <=> $a->[1]
+    || ($b->[5] // '') cmp ($a->[5] // '')
+    || $a->[2] <=> $b->[2]
+    || _ipkey($a->[3]) cmp _ipkey($b->[3])
 } @candidates;
 
 # --verify: keep only IPs confirmed reachable. An address counts as reachable
@@ -265,7 +409,7 @@ my %ping_ms;          # ip -> live RTT (ms) when a verify ping got a reply
 if ($verify) {
     my @alive;
     for my $c (@candidates) {
-        my $ip = $c->[2];
+        my $ip = $c->[3];
         my ($ok, $rtt);
         if ($ping_only) {
             $rtt = _ping_time($ip);
@@ -291,17 +435,17 @@ for my $c (@to_print) {
     if ($verbose) {
         my %seen_name;
         my @names = grep { !$seen_name{$_}++ }
-                    @{ $matched_names_by_mid{ $c->[3] } || [] };
-        my $line = sprintf "%s\t%s", $c->[2], join(',', @names);
+                    @{ $matched_names_by_mid{ $c->[4] } || [] };
+        my $line = sprintf "%s\t%s", $c->[3], join(',', @names);
         # --verify --verbose: annotate with the live ping time, or "# fresh"
         # when the address was kept on the fleet's observation, not a reply.
         if ($verify) {
-            my $rtt = $ping_ms{ $c->[2] };
+            my $rtt = $ping_ms{ $c->[3] };
             $line .= defined $rtt ? sprintf("\t# %s ms", $rtt) : "\t# fresh";
         }
         print "$line\n";
     } else {
-        print "$c->[2]\n";
+        print "$c->[3]\n";
     }
 }
 exit 0;
