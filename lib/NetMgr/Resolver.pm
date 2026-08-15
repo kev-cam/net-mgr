@@ -64,6 +64,34 @@ sub resolve {
         }
     }
 
+    # 1b. <host>-<subnet-name>: ask for a host ON a named subnet and get the
+    #     address it is CURRENTLY using there — e.g. u32u-dmz is u32u's live
+    #     address on the subnet named "dmz". This is synthesised from the subnet
+    #     naming rather than requiring a stored hostname per leg, so it keeps
+    #     working when a device moves within that subnet (a new DHCP lease
+    #     changes the address, not the name). Only addresses actually observed
+    #     are eligible: the question "where is it now" has no useful answer from
+    #     a paper record that no producer has ever seen respond.
+    #
+    #     Subnet names come from dhcp_ranges.zone, which is cluster-replicated
+    #     and already settable via `net-reserve add-range --zone`.
+    if ($name =~ /^(.+)-([A-Za-z0-9]+)$/) {
+        my ($host, $zone) = ($1, $2);
+        my $cidrs = $db->{dbh}->selectcol_arrayref(
+            "SELECT DISTINCT subnet_cidr FROM dhcp_ranges
+              WHERE zone IS NOT NULL AND zone <> '' AND LOWER(zone) = LOWER(?)",
+            undef, $zone);
+        if ($cidrs && @$cidrs) {
+            my $rows = _live_addresses_for_host($db, $host, $family);
+            my @on_subnet = grep {
+                my $ip = $_->{addr};
+                scalar grep { _in_cidr($ip, $_) } @$cidrs;
+            } @$rows;
+            push @hits, _rank(\@on_subnet, $from_cidr);
+            return _trim(\@hits, $limit) if @hits;
+        }
+    }
+
     # 2. <name>-* hostnames — the per-segment names. This is what lets a query
     #    for `nas3` answer with nas3-up's address to a client on the `up`
     #    segment and nas3-down's to one on the `down` segment: the client never
@@ -207,6 +235,85 @@ sub _rank {
     } @scored;
     my %seen;
     return grep { !$seen{$_}++ } map { $_->[3] } @scored;
+}
+
+# Addresses a host is CURRENTLY using, from both places that know.
+#
+# `addresses` records what producers have observed, but it lags a DHCP client
+# badly: 192.168.15.179 was still filed against Patio-PC's MAC from 73 days
+# earlier while u32u was answering on it, so asking that table alone for u32u
+# returns nothing. `dhcp_leases` holds the binding DHCP made most recently and
+# is keyed by MAC, so it survives the address changes. Two guards keep the lease
+# table's history out: only each MAC's newest lease counts (it is keyed
+# (mac,ip), so it retains every address a MAC ever held), and an address is
+# accepted only from whichever MAC has the freshest claim on it — otherwise a
+# host still answers to an address that has since moved to a different device.
+sub _live_addresses_for_host {
+    my ($db, $host, $family) = @_;
+    my $dbh = $db->{dbh};
+    # Gather every leg of the device, not just the record that carries the bare
+    # name. This fleet models a host's interfaces as SEPARATE machines when they
+    # were discovered separately — u32u's ethernet is machine "u32u" while its
+    # WiFi is machine "u32u-air" — so a query for u32u on a WiFi subnet finds
+    # nothing if we only look at the exact name. The base name identifies the
+    # device; the suffix identifies a leg. Matching "<host>" plus "<host>-%"
+    # collects both. The hyphen is required, so asking for wc1 does not sweep in
+    # wc10 and wc11.
+    my $macs = $dbh->selectcol_arrayref(
+        "SELECT DISTINCT i.mac
+           FROM machines   m
+           JOIN interfaces i ON i.machine_id = m.id
+      LEFT JOIN hostnames  h ON h.machine_id = m.id
+          WHERE m.primary_name = ? OR m.primary_name LIKE CONCAT(?, '-%')
+             OR h.name = ?        OR h.name        LIKE CONCAT(?, '-%')",
+        undef, $host, $host, $host, $host) || [];
+    return [] unless @$macs;
+    my %mine = map { lc($_) => 1 } @$macs;
+
+    my @rows;
+    my $obs = $dbh->selectall_arrayref(
+        "SELECT addr, mac, last_observed, min_rtt_ms, last_rtt_ms
+           FROM addresses WHERE family = ? AND last_observed IS NOT NULL",
+        { Slice => {} }, $family) || [];
+    my %claim;      # addr => { mac, when } — freshest claim on each address
+    for my $r (@$obs) {
+        my $when = $r->{last_observed} // '';
+        $claim{ $r->{addr} } = { mac => lc($r->{mac} // ''), when => $when }
+            if !$claim{ $r->{addr} } || $when gt $claim{ $r->{addr} }{when};
+        push @rows, $r if $mine{ lc($r->{mac} // '') };
+    }
+
+    if ($family eq 'v4') {
+        my $leases = $dbh->selectall_arrayref(
+            "SELECT mac, ip, last_seen FROM dhcp_leases", { Slice => {} }) || [];
+        my %newest;
+        for my $l (@$leases) {
+            next unless $l->{mac} && $l->{ip};
+            my ($mac, $ls) = (lc $l->{mac}, $l->{last_seen} // '');
+            $newest{$mac} = { ip => $l->{ip}, when => $ls }
+                if !$newest{$mac} || $ls gt $newest{$mac}{when};
+        }
+        for my $mac (keys %newest) {
+            my ($ip, $when) = @{ $newest{$mac} }{qw(ip when)};
+            $claim{$ip} = { mac => $mac, when => $when }
+                if !$claim{$ip} || $when gt $claim{$ip}{when};
+        }
+        # Accept our lease unless somebody else's claim is STRICTLY newer. A tie
+        # must not disqualify us, because lease timestamps are frequently not
+        # comparable at all: the dhcp.master import rewrites last_seen on every
+        # row in one pass, so on this fleet eleven different MACs hold a lease
+        # for 192.168.15.179 bearing the identical second. Requiring us to be
+        # the outright freshest handed those addresses to whichever MAC the hash
+        # happened to yield first — which is to say, at random.
+        my %have = map { ($_->{addr} // '') => 1 } @rows;
+        for my $mac (grep { $mine{$_} } keys %newest) {
+            my ($ip, $when) = @{ $newest{$mac} }{qw(ip when)};
+            next if $have{$ip};
+            next if ($claim{$ip}{when} // '') gt ($when // '');   # strictly newer wins
+            push @rows, { addr => $ip, mac => $mac, last_observed => $when };
+        }
+    }
+    return \@rows;
 }
 
 # Internal: a machine's addresses, best-first for this client.
