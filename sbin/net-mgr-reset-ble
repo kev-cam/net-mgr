@@ -16,14 +16,37 @@
 
 echo "net-mgr-reset-ble: $(date -Is) on $(hostname)"
 
+# Every step is TIME-BOUNDED (STEP_TIMEOUT, default 20s). A wedged controller
+# can hang these commands indefinitely: observed on clevo-lx, where `hciconfig
+# hci0 reset` never returned and left one stuck process behind per attempt
+# (systemd logged four separate "Found left-over process (hciconfig) in control
+# group"). Because the steps ran unbounded and in order, that FIRST step blocked
+# forever and step 2 — restarting bluez, the load-bearing fix for advertising-slot
+# exhaustion — never ran at all. The bridge's own adv-slot self-heal calls this
+# script, so the self-heal defeated itself and sat in "resetting BT stack"
+# indefinitely. A timed-out step is reported and skipped, never fatal.
+# STEP_TIMEOUT is read per call, so each step gets a bound that suits it: a few
+# seconds for a driver poke, but long enough for `systemctl restart` on a unit
+# whose TimeoutStopSec is 90s, which must NOT be cut short.
+_have_timeout=0
+command -v timeout >/dev/null 2>&1 && _have_timeout=1
+
 step() {
     label=$1; shift
+    _t=${STEP_TIMEOUT:-20}
     printf 'step: %s ... ' "$label"
-    if out=$("$@" 2>&1); then
+    if [ "$_have_timeout" = 1 ]; then
+        out=$(timeout "$_t" "$@" 2>&1); rc=$?
+    else
+        out=$("$@" 2>&1); rc=$?
+    fi
+    if [ "$rc" = 0 ]; then
         echo "ok"
         [ -n "$out" ] && echo "  $out" | sed 's/^/  /'
+    elif [ "$rc" = 124 ] && [ "$_have_timeout" = 1 ]; then
+        echo "TIMEOUT after ${_t}s — skipping to the next step"
+        [ -n "$out" ] && echo "$out" | sed 's/^/  /'
     else
-        rc=$?
         echo "FAIL rc=$rc"
         [ -n "$out" ] && echo "$out" | sed 's/^/  /'
     fi
@@ -32,14 +55,17 @@ step() {
 # 1. hciconfig reset — a hard reset of hci0, if available. Some drivers get
 #    wedged in a way that a mere `systemctl restart bluetooth` doesn't clear.
 if command -v hciconfig >/dev/null 2>&1; then
-    step "hciconfig hci0 reset" hciconfig hci0 reset
+    # Short leash: this is the step observed hanging forever on a wedged
+    # adapter, and it is the LEAST important of the three — bluez's restart
+    # below is what actually frees the advertising slots.
+    STEP_TIMEOUT=10 step "hciconfig hci0 reset" hciconfig hci0 reset
 else
     echo "step: hciconfig hci0 reset ... skip (hciconfig not installed)"
 fi
 
 # 2. Restart bluez. This is the load-bearing step for the advertising-slot
 #    exhaustion — bluez holds the slot reservations, restarting drops them.
-step "systemctl restart bluetooth" systemctl restart bluetooth
+STEP_TIMEOUT=60 step "systemctl restart bluetooth" systemctl restart bluetooth
 
 # 3. Give bluez a moment to come back up. Without this, the bridge restart
 #    below can race and immediately fail its advertise() with the same error.
@@ -48,7 +74,9 @@ sleep 2
 # 4. Restart net-bitchat-bridge IFF it's enabled here. Hosts without a bridge
 #    (nas3, laptops, etc.) skip cleanly instead of erroring on "no such unit".
 if systemctl is-enabled net-bitchat-bridge >/dev/null 2>&1; then
-    step "systemctl restart net-bitchat-bridge" systemctl restart net-bitchat-bridge
+    # Generous: a wedged helper can take the unit's full TimeoutStopSec (90s)
+    # to die, and cutting that short would abandon the restart half-done.
+    STEP_TIMEOUT=120 step "systemctl restart net-bitchat-bridge" systemctl restart net-bitchat-bridge
     # A quick liveness check: bridge should reach `active` within ~5s if BLE is
     # healthy. `activating` is not fatal (auto-restart kicks in) but worth
     # surfacing so the caller can decide whether to retry.
