@@ -338,6 +338,20 @@ sub _ipkey { my @o = split /\./, ($_[0] // '0.0.0.0'); (($o[0]*256+$o[1])*256+$o
 # dhcp-host name is the short form: strip the side suffix (-up/-down/-dmz/-home),
 # keep -air (a distinct wifi interface). Suffixed names stay in the hosts file.
 sub _short { my $n = shift // ''; $n =~ s/-(up|down|dmz|home)$//; return $n }
+
+# An adapter marker says WHICH NIC, not which segment, so it stays at the very
+# end of a qualified name: u32u's wifi leg on the dmz is u32u-dmz-air, never
+# u32u-air-dmz. That keeps -air readable off the tail no matter how many
+# zone/index parts the middle grows. -air is the only such marker in this fleet
+# (47 names carry it; the next most common tails, -up/-down, are directional).
+sub _split_iface {
+    my $n = shift // '';
+    return ($n, "-$1") if $n =~ s/-(air)$//i;
+    return ($n, '');
+}
+# reverse of the qualified form, for reporting: strip -air, any index, the zone
+sub _dequal { my $n = shift // ''; $n =~ s/-air$//; $n =~ s/-\d+$//; $n =~ s/-[a-z0-9]+$//; $n }
+sub _rkey { lc($_[0]{mac} // '') . '|' . ($_[0]{ip} // '') }
 sub _dbpath {
     my $base = shift;
     my $dir  = $out_dir // $dnsmasq_cfg{out_dir} // '/usr/local/sgy/conf.d';
@@ -422,72 +436,94 @@ sub gen_from_db {
     # still shadow the delegation. Anything left spanning zones is qualified here
     # regardless of how its legs are recorded.
     #
-    # Names are <base>-<zone>, plus -<n> when a host has SEVERAL legs in one zone
-    # (nas3 has two on .223, so nas3-home-0 and nas3-home-1). The index follows IP
+    # Names are <base>-<zone>[-<n>][-air]: the zone, then an index only when a
+    # host has SEVERAL legs of one adapter kind in that zone (nas3 has two wired
+    # legs on .223, so nas3-home-0 and nas3-home-1), then the adapter marker.
+    # -air stays LAST so it reads off the tail whatever the middle grows to, and
+    # because it distinguishes legs on its own a wired/wireless pair sharing a
+    # zone needs no index: u32u-home and u32u-home-air. The index follows IP
     # order so the mapping is stable between runs rather than shifting with hash
     # order. Note -up/-down are NOT zone names: they describe which way traffic
     # leaves (up = toward the Internet), which is orthogonal to which segment an
     # address is on, so they are not reused here.
     my $qualify = lc($dnsmasq_cfg{multihomed} // 'short') eq 'qualified';
 
+    # $group_of decides which legs are ONE HOST (always the machine record, so
+    # nas3-dwn2 is recognised as an nas3 leg); $emit_of is the name the file
+    # would print if nothing were renamed. They must be separate: pass 2 falls
+    # back to $emit_of, and using the machine there would let a polluted machine
+    # record rename foreign reservations — the Barrel/Beds-1 corruption.
     my $name_map = sub {
-        my ($base_of) = @_;              # ($r) -> the name this file would emit
+        my ($group_of, $emit_of) = @_;
         my %out;                         # "mac|ip" -> name
-        my %legs;                        # base -> zone -> [r]
+        my %sfx;                         # "mac|ip" -> adapter marker ('' or -air)
+
+        # Name one host's legs within one zone. The index distinguishes legs of
+        # the SAME adapter kind only: a wired and a wireless leg on one segment
+        # already read apart as u32u-home and u32u-home-air, so neither should
+        # collect a -0/-1 it does not need.
+        my $assign = sub {
+            my ($stem, $zone, $rs) = @_;
+            my %kind;
+            push @{ $kind{ $sfx{ _rkey($_) } // '' } }, $_ for @$rs;
+            for my $s (keys %kind) {
+                my @k = sort { _ipkey($a->{ip}) <=> _ipkey($b->{ip}) } @{ $kind{$s} };
+                my $i = 0;
+                for my $r (@k) {
+                    $out{ _rkey($r) } = "$stem-$zone" . (@k > 1 ? "-$i" : '') . $s;
+                    $i++;
+                }
+            }
+        };
+
+        # The adapter marker is a property of the LEG, so it can only come from
+        # the reservation's own name: a machine record holds one name for the
+        # whole box and cannot say which of its legs is the wireless one. Taking
+        # it from the machine both dropped the marker (amfpc-air -> amfpc-dmz)
+        # and spread it to wired legs of a machine that happened to be recorded
+        # under an -air name. Computed once here, appended last everywhere.
+        $sfx{ _rkey($_) } = ( _split_iface($_->{name} // '') )[1]
+            for map { @$_ } values %by_zone;
+
+        my %legs;                        # stem -> zone -> [r]
         for my $zone (keys %by_zone) {
             for my $r (@{ $by_zone{$zone} }) {
-                my $b = $base_of->($r);
+                my ($b) = _split_iface($group_of->($r));
                 next unless defined $b && length $b;
                 push @{ $legs{$b}{$zone} }, $r;
             }
         }
-        # pass 1 — machine-grouped legs
+        # pass 1 — machine-grouped legs. Splitting -air off the stem is what
+        # lets a machine recorded as u32u-air group with a plain u32u leg.
         for my $base (grep { keys %{ $legs{$_} } > 1 } keys %legs) {
             for my $zone (keys %{ $legs{$base} }) {
-                my @rs = sort { _ipkey($a->{ip}) <=> _ipkey($b->{ip}) }
-                         @{ $legs{$base}{$zone} };
                 my @own = grep {
-                    my $n = lc($_->{name} // '');
+                    my $n = lc(( _split_iface($_->{name} // '') )[0]);
                     $n eq lc($base) || index($n, lc($base) . '-') == 0
-                } @rs;
-                next unless @own;
-                my $i = 0;
-                for my $r (@own) {
-                    $out{ lc($r->{mac}) . '|' . $r->{ip} } =
-                        "$base-$zone" . (@own > 1 ? "-$i" : '');
-                    $i++;
-                }
+                } @{ $legs{$base}{$zone} };
+                $assign->($base, $zone, \@own) if @own;
             }
         }
         # pass 2 — anything still spanning zones under its emitted name
         my %by_emitted;
         for my $zone (keys %by_zone) {
             for my $r (@{ $by_zone{$zone} }) {
-                my $k = lc($r->{mac}) . '|' . $r->{ip};
-                my $n = $out{$k} // $base_of->($r);
+                my ($n) = _split_iface( $out{ _rkey($r) } // $emit_of->($r) );
                 next unless defined $n && length $n;
                 push @{ $by_emitted{$n}{$zone} }, $r;
             }
         }
         for my $n (grep { keys %{ $by_emitted{$_} } > 1 } keys %by_emitted) {
-            for my $zone (keys %{ $by_emitted{$n} }) {
-                my @rs = sort { _ipkey($a->{ip}) <=> _ipkey($b->{ip}) }
-                         @{ $by_emitted{$n}{$zone} };
-                my $i = 0;
-                for my $r (@rs) {
-                    $out{ lc($r->{mac}) . '|' . $r->{ip} } =
-                        "$n-$zone" . (@rs > 1 ? "-$i" : '');
-                    $i++;
-                }
-            }
+            $assign->($n, $_, $by_emitted{$n}{$_}) for keys %{ $by_emitted{$n} };
         }
         return \%out;
     };
 
-    my $dh_name   = $name_map->(sub { _short($_[0]{name} // '') });
-    my $host_name = $name_map->(sub { $mac2host{ lc $_[0]{mac} } // $_[0]{name} });
+    my $machine_of = sub { $mac2host{ lc $_[0]{mac} } // $_[0]{name} };
+    my $dh_name   = $name_map->($machine_of, sub { _short($_[0]{name} // '') });
+    my $host_name = $name_map->($machine_of, $machine_of);
     if (%$dh_name) {
-        my %hosts = map { s/-[a-z0-9]+(-\d+)?$//r => 1 } values %$dh_name;
+        my %hosts = map { _dequal($_) => 1 } values %$dh_name;
         warn sprintf("net-gen-dnsmasq: %d multi-homed host(s) [%s] — %s
 ",
                      scalar(keys %hosts), join(',', sort keys %hosts),
