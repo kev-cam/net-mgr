@@ -1503,7 +1503,20 @@ sub upsert_lease {
     if (defined $f{expires}) {
         # accept epoch seconds; convert to DATETIME
         if ($f{expires} =~ /^\d+$/) {
-            my @t = localtime($f{expires});
+            my $v = $f{expires} + 0;
+            # dnsmasq writes an ABSOLUTE epoch as the first lease-file column, but
+            # some servers (busybox udhcpd, various AP firmwares) write REMAINING
+            # SECONDS there instead — and the two are indistinguishable by shape,
+            # since every lease parser here matches a bare /^(\d+)/. Passing a
+            # duration to localtime() produced expiries back in 1970 (observed in
+            # the live DB: "1970-01-02 03:01:44" is 27 hours, "1970-01-21 10:46:14"
+            # is 20 days), which makes such a lease look long expired — so
+            # purge_stale drops it and net-reserve renders the address as free
+            # while a device is still holding it. A real expiry can never be below
+            # this threshold (it would predate 2001-09-09) and a plausible lease
+            # duration can never be above it, so the cases separate cleanly.
+            $v = time() + $v if $v > 0 && $v < 1_000_000_000;
+            my @t = localtime($v);
             $exp = sprintf "%04d-%02d-%02d %02d:%02d:%02d",
                 $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0];
         } else { $exp = $f{expires} }
