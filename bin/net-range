@@ -1,0 +1,358 @@
+#!/usr/bin/perl
+# net-range — estimate distance to Bluetooth LE devices from RSSI.
+#
+# WHY RSSI AND NOT CHANNEL SOUNDING: Bluetooth 6.0 adds Channel Sounding, which
+# measures distance by phase rather than signal strength and is accurate to
+# centimetres. The Realtek 0bda:a760 dongles on this fleet are SOLD as
+# "Bluetooth 6.0" but their controllers enumerate as HCI/LMP 5.1 (checked with
+# `hciconfig -a`), and Channel Sounding needs a Core 6.0 controller — so it is
+# not available here, and neither is 5.1's AoA/AoD direction finding, which
+# needs an antenna array. That leaves RSSI, which is a genuinely crude ranging
+# signal: expect tens of percent error, worse through walls or around bodies.
+# Treat the output as "near / mid / far", not as a tape measure.
+#
+# Model: the log-distance path loss law
+#
+#     RSSI(d) = RSSI(d_ref) - 10 * n * log10(d / d_ref)
+#   =>      d = d_ref * 10 ^ ((RSSI(d_ref) - RSSI) / (10 * n))
+#
+# n is the path-loss exponent: 2.0 in free space, ~2.7-3.5 in a house with
+# furniture and walls, 4+ through several rooms. It MUST be calibrated per site
+# or the numbers are fiction — see `net-range calibrate`.
+#
+# Commands:
+#   net-range scan [--node N] [--seconds S] [--samples K]
+#       Scan for BLE devices and print RSSI (median of K reads) + estimated
+#       distance for each. --node runs the scan on another fleet host over ssh.
+#
+#   net-range calibrate ADDR=METRES [ADDR=METRES ...] [--node N]
+#       Measure known-distance devices and solve for the model. One pair sets
+#       the reference; two or more also fit the path-loss exponent n by least
+#       squares. Prints the fitted model and, with --save, stores it in
+#       ~/.config/net-mgr/config under [net-range].
+#
+#   net-range matrix --nodes A,B,C [--seconds S]
+#       Scan from several hosts and cross-tabulate what each one hears, so a
+#       device can be placed by comparing distances from known vantage points.
+#
+# Options: --seconds (scan window, default 20) --samples (RSSI reads, default 5)
+#          --n EXPONENT --ref-rssi DBM --ref-m METRES  (override the model)
+#          --save (calibrate: persist) --json --all (include unnamed devices)
+#
+# Reading RSSI does not require root: it comes from BlueZ's org.bluez.Device1
+# objects over the system bus. The scan itself uses `bluetoothctl scan on`,
+# which coexists with the BitChat bridge's own discovery.
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+my %opt = (seconds => 20, samples => 5);
+GetOptions(\%opt, 'node=s', 'nodes=s', 'seconds=i', 'samples=i',
+           'n=f', 'ref-rssi=f', 'ref-m=f', 'save', 'json', 'all', 'help|h')
+    or usage(2);
+usage(0) if $opt{help};
+my $cmd = shift @ARGV // 'scan';
+
+# ---- model ----------------------------------------------------------------
+# Defaults are a placeholder until calibrated; -53 dBm at 1m is what this
+# fleet's dongles measured against a host one metre away, and 2.6 is a
+# reasonable indoor starting exponent. Both are overridden by config or flags.
+my %MODEL = (ref_rssi => -53, ref_m => 1.0, n => 2.6, source => 'built-in default');
+load_model();
+$MODEL{ref_rssi} = $opt{'ref-rssi'}, $MODEL{source} = 'command line' if defined $opt{'ref-rssi'};
+$MODEL{ref_m}    = $opt{'ref-m'},    $MODEL{source} = 'command line' if defined $opt{'ref-m'};
+$MODEL{n}        = $opt{n},          $MODEL{source} = 'command line' if defined $opt{n};
+
+if    ($cmd eq 'scan')      { cmd_scan() }
+elsif ($cmd eq 'calibrate') { cmd_calibrate() }
+elsif ($cmd eq 'matrix')    { cmd_matrix() }
+else { warn "net-range: unknown command '$cmd'\n"; usage(2) }
+exit 0;
+
+# ---- distance <-> rssi ----------------------------------------------------
+sub dist_for {
+    my ($rssi) = @_;
+    return undef unless defined $rssi;
+    return $MODEL{ref_m} * (10 ** (($MODEL{ref_rssi} - $rssi) / (10 * $MODEL{n})));
+}
+sub rssi_for {
+    my ($d) = @_;
+    return $MODEL{ref_rssi} - 10 * $MODEL{n} * (log($d / $MODEL{ref_m}) / log(10));
+}
+# A coarse band is more honest than a decimal: RSSI ranging simply is not
+# precise, and a reader who sees "3.7 m" will believe it more than they should.
+sub band_for {
+    my ($d) = @_;
+    return '?'                unless defined $d;
+    return 'same room (<2m)'  if $d < 2;
+    return 'near (2-5m)'      if $d < 5;
+    return 'mid (5-12m)'      if $d < 12;
+    return 'far (12-25m)'     if $d < 25;
+    return 'very far (>25m)';
+}
+
+# ---- collection -----------------------------------------------------------
+# The shell we run on the target host: scan, then read each device's RSSI
+# repeatedly so the caller can take a median (a single RSSI read is noisy —
+# multipath and body-blocking swing it by 10+ dB between adjacent samples).
+sub collector_script {
+    my ($seconds, $samples) = @_;
+    # The scan runs in the BACKGROUND and we sample while it is live. BlueZ only
+    # refreshes org.bluez.Device1.RSSI while discovery is active; sampling after
+    # the scan has ended just re-reads one frozen value, which silently turned
+    # the median into a no-op and reported a spread of ±0 for every device.
+    my $gap = $samples > 1 ? int($seconds / $samples) : 1;
+    $gap = 1 if $gap < 1;
+    return <<"SH";
+bluetoothctl scan on >/dev/null 2>&1 &
+SCANPID=\$!
+trap 'kill \$SCANPID 2>/dev/null' EXIT INT TERM
+sleep 2
+for i in \$(seq 1 $samples); do
+  for path in \$(busctl --system tree org.bluez 2>/dev/null | grep -oE '/org/bluez/hci[0-9]/dev_[0-9A-F_]+' | sort -u); do
+    mac=\$(echo "\$path" | sed 's|.*/dev_||; s|_|:|g')
+    rssi=\$(busctl --system get-property org.bluez "\$path" org.bluez.Device1 RSSI 2>/dev/null | awk '{print \$2}')
+    name=\$(busctl --system get-property org.bluez "\$path" org.bluez.Device1 Name 2>/dev/null | sed 's/^s //; s/"//g')
+    [ -z "\$rssi" ] && continue
+    echo "SAMPLE \$mac \$rssi \$name"
+  done
+  sleep $gap
+done
+kill \$SCANPID 2>/dev/null
+SH
+}
+
+# Returns { mac => { rssi => median, n => count, spread => max-min, name => str } }
+sub collect {
+    my ($node) = @_;
+    my $sh = collector_script($opt{seconds}, $opt{samples});
+    my @cmd = defined $node && $node ne '' && lc($node) ne 'local'
+            ? ('ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', $node, 'bash -s')
+            : ('bash', '-s');
+    my ($rd, $wr);
+    my $pid = open2_compat(\$rd, \$wr, @cmd) or die "net-range: cannot run collector\n";
+    print {$wr} $sh; close $wr;
+    my %seen;
+    while (my $line = <$rd>) {
+        next unless $line =~ /^SAMPLE\s+(\S+)\s+(-?\d+)\s*(.*)$/;
+        my ($mac, $rssi, $name) = ($1, $2, $3);
+        $name =~ s/\s+$//;
+        push @{ $seen{$mac}{samples} }, $rssi + 0;
+        $seen{$mac}{name} = $name if defined $name && length $name;
+    }
+    close $rd; waitpid($pid, 0);
+    my %out;
+    for my $mac (keys %seen) {
+        my @s = sort { $a <=> $b } @{ $seen{$mac}{samples} };
+        next unless @s;
+        my $med = @s % 2 ? $s[$#s/2] : ($s[@s/2 - 1] + $s[@s/2]) / 2;
+        $out{$mac} = { rssi => $med, n => scalar(@s),
+                       spread => $s[-1] - $s[0], name => $seen{$mac}{name} // '' };
+    }
+    return \%out;
+}
+
+# Minimal IPC::Open2 without the dependency dance.
+sub open2_compat {
+    my ($rd_ref, $wr_ref, @cmd) = @_;
+    pipe(my $cr, my $cw) or return 0;      # child->parent
+    pipe(my $pr, my $pw) or return 0;      # parent->child
+    my $pid = fork();
+    return 0 unless defined $pid;
+    if ($pid == 0) {
+        close $cr; close $pw;
+        open STDIN,  '<&', $pr or exit 127;
+        open STDOUT, '>&', $cw or exit 127;
+        open STDERR, '>', '/dev/null';
+        exec @cmd;
+        exit 127;
+    }
+    close $cw; close $pr;
+    $$rd_ref = $cr; $$wr_ref = $pw;
+    return $pid;
+}
+
+# ---- commands -------------------------------------------------------------
+sub cmd_scan {
+    my $node = $opt{node} // 'local';
+    printf "net-range: scanning %ss on %s (%d RSSI samples each)\n",
+        $opt{seconds}, $node, $opt{samples};
+    printf "model: %.1f dBm @ %.2fm, path-loss n=%.2f  [%s]\n\n",
+        $MODEL{ref_rssi}, $MODEL{ref_m}, $MODEL{n}, $MODEL{source};
+    my $seen = collect($opt{node});
+    unless (%$seen) { print "no BLE devices with RSSI seen.\n"; return }
+    if ($opt{json}) { print_json($seen); return }
+    printf "%-18s %6s %7s %6s  %-9s %-16s %s\n",
+        'ADDRESS', 'RSSI', 'SPREAD', 'EST_M', 'BAND', 'NAME', '';
+    printf "%-18s %6s %7s %6s  %-9s %-16s %s\n",
+        '-' x 18, '-' x 6, '-' x 7, '-' x 6, '-' x 9, '-' x 16, '';
+    for my $mac (sort { $seen->{$b}{rssi} <=> $seen->{$a}{rssi} } keys %$seen) {
+        my $e = $seen->{$mac};
+        my $d = dist_for($e->{rssi});
+        printf "%-18s %6s %7s %6s  %-9s %-16s\n",
+            $mac, $e->{rssi}, "±" . $e->{spread}, sprintf('%.1f', $d),
+            (band_for($d) =~ s/\s*\(.*//r), ($e->{name} || '');
+    }
+    print "\nRSSI ranging is coarse — see the band, not the metre. A ±10 dB\n",
+          "swing (normal indoors) moves a 10m estimate to roughly 4m or 24m.\n";
+}
+
+sub cmd_calibrate {
+    my @pairs;
+    for my $arg (@ARGV) {
+        my ($mac, $m) = $arg =~ /^([0-9A-Fa-f:]{17})=([\d.]+)$/
+            or die "net-range: calibrate wants ADDR=METRES, got '$arg'\n";
+        push @pairs, { mac => uc $mac, m => $m + 0 };
+    }
+    @pairs or die "net-range: calibrate needs at least one ADDR=METRES\n";
+    printf "measuring %d known-distance device(s) on %s...\n",
+        scalar @pairs, $opt{node} // 'local';
+    my $seen = collect($opt{node});
+    my @obs;
+    for my $p (@pairs) {
+        my $e = $seen->{ $p->{mac} } || $seen->{ lc $p->{mac} };
+        unless ($e) { warn "  $p->{mac}: NOT SEEN in this scan — skipped\n"; next }
+        printf "  %-18s %5.2fm  rssi=%s (±%s over %d samples)\n",
+            $p->{mac}, $p->{m}, $e->{rssi}, $e->{spread}, $e->{n};
+        push @obs, { m => $p->{m}, rssi => $e->{rssi} };
+    }
+    @obs or die "net-range: none of the calibration devices were seen\n";
+
+    if (@obs == 1) {
+        # One point fixes the reference only; keep the existing exponent.
+        $MODEL{ref_rssi} = $obs[0]{rssi};
+        $MODEL{ref_m}    = $obs[0]{m};
+        print "\nOne reference point: anchored the model at that distance and kept\n",
+              "n=$MODEL{n}. Measure a SECOND device at a different distance to fit n —\n",
+              "with one point every estimate away from it is guesswork.\n";
+    } else {
+        # Least squares on rssi = a - 10n*log10(m): slope gives n.
+        my ($sx, $sy, $sxx, $sxy, $k) = (0, 0, 0, 0, scalar @obs);
+        for my $o (@obs) {
+            my $x = log($o->{m}) / log(10);
+            $sx += $x; $sy += $o->{rssi}; $sxx += $x * $x; $sxy += $x * $o->{rssi};
+        }
+        my $den = $k * $sxx - $sx * $sx;
+        die "net-range: calibration points must be at DIFFERENT distances\n"
+            if abs($den) < 1e-9;
+        my $slope = ($k * $sxy - $sx * $sy) / $den;      # = -10n
+        my $inter = ($sy - $slope * $sx) / $k;           # rssi at 1m
+        $MODEL{n}        = -$slope / 10;
+        $MODEL{ref_m}    = 1.0;
+        $MODEL{ref_rssi} = $inter;
+        printf "\nfitted from %d points: n=%.2f, reference %.1f dBm @ 1.00m\n",
+            $k, $MODEL{n}, $MODEL{ref_rssi};
+        for my $o (@obs) {
+            my $pred = dist_for($o->{rssi});
+            printf "  check: %5.2fm actual -> %5.2fm estimated (%+.0f%%)\n",
+                $o->{m}, $pred, 100 * ($pred - $o->{m}) / $o->{m};
+        }
+        print "\nn below ~2 means the fit is being driven by noise rather than\n",
+              "distance — re-measure with the devices further apart.\n" if $MODEL{n} < 2;
+    }
+    $MODEL{source} = 'calibrated';
+    if ($opt{save}) { save_model() } else {
+        printf "\nnot saved. Re-run with --save to persist, or pass:\n";
+        printf "  --ref-rssi %.1f --ref-m %.2f --n %.2f\n",
+            $MODEL{ref_rssi}, $MODEL{ref_m}, $MODEL{n};
+    }
+}
+
+sub cmd_matrix {
+    my @nodes = grep { length } split /[,\s]+/, ($opt{nodes} // '');
+    @nodes or die "net-range: matrix needs --nodes A,B,C\n";
+    my (%by_node, %all);
+    for my $n (@nodes) {
+        print "scanning from $n...\n";
+        my $seen = collect($n eq 'local' ? undef : $n);
+        $by_node{$n} = $seen;
+        $all{$_} = ($seen->{$_}{name} || $all{$_} || '') for keys %$seen;
+    }
+    print "\nRSSI / estimated metres, per vantage point:\n\n";
+    printf "%-18s %-16s", 'ADDRESS', 'NAME';
+    printf " %14s", $_ for @nodes;
+    print "\n";
+    printf "%-18s %-16s", '-' x 18, '-' x 16;
+    printf " %14s", '-' x 14 for @nodes;
+    print "\n";
+    for my $mac (sort keys %all) {
+        printf "%-18s %-16s", $mac, substr($all{$mac} // '', 0, 16);
+        for my $n (@nodes) {
+            my $e = $by_node{$n}{$mac};
+            if ($e) { printf " %6s/%6.1fm", $e->{rssi}, dist_for($e->{rssi}) }
+            else    { printf " %14s", '-' }
+        }
+        print "\n";
+    }
+    print "\nA device heard by several vantage points can be placed by\n",
+          "intersecting those distances — but only as well as the model is\n",
+          "calibrated, and only if the vantage points' own positions are known.\n";
+}
+
+# ---- model persistence ----------------------------------------------------
+sub load_model {
+    my $ok = eval {
+        require NetMgr::Config;
+        for my $p (NetMgr::Config->user_path,
+                   $ENV{NET_MGR_CONF} // '/etc/net-mgr/config') {
+            next unless defined $p && -r $p;
+            my $cfg = eval { NetMgr::Config->load($p) } or next;
+            my $s = $cfg->{'net-range'} or next;
+            $MODEL{ref_rssi} = $s->{ref_rssi} + 0 if defined $s->{ref_rssi};
+            $MODEL{ref_m}    = $s->{ref_m}    + 0 if defined $s->{ref_m};
+            $MODEL{n}        = $s->{n}        + 0 if defined $s->{n};
+            $MODEL{source}   = $p;
+        }
+        1;
+    };
+    return $ok;
+}
+sub save_model {
+    my $ok = eval {
+        require NetMgr::Config;
+        NetMgr::Config->save_user_value('net-range', 'ref_rssi', sprintf('%.1f', $MODEL{ref_rssi}));
+        NetMgr::Config->save_user_value('net-range', 'ref_m',    sprintf('%.2f', $MODEL{ref_m}));
+        NetMgr::Config->save_user_value('net-range', 'n',        sprintf('%.2f', $MODEL{n}));
+        1;
+    };
+    if ($ok) { print "saved to [net-range] in your user config\n" }
+    else     { warn "net-range: could not save model: $@" }
+}
+
+sub print_json {
+    my ($seen) = @_;
+    my @rows;
+    for my $mac (sort keys %$seen) {
+        my $e = $seen->{$mac};
+        my $d = dist_for($e->{rssi});
+        push @rows, sprintf(
+            '{"address":"%s","name":"%s","rssi":%s,"spread":%s,"samples":%d,'
+          . '"est_m":%.2f,"band":"%s"}',
+            $mac, ($e->{name} // ''), $e->{rssi}, $e->{spread}, $e->{n}, $d, band_for($d));
+    }
+    printf "{\"model\":{\"ref_rssi\":%.1f,\"ref_m\":%.2f,\"n\":%.2f},\"devices\":[%s]}\n",
+        $MODEL{ref_rssi}, $MODEL{ref_m}, $MODEL{n}, join(',', @rows);
+}
+
+sub usage {
+    my ($rc) = @_;
+    print STDERR <<'USAGE';
+net-range — estimate distance to BLE devices from RSSI.
+
+  net-range scan [--node HOST] [--seconds S] [--samples K] [--json]
+  net-range calibrate ADDR=METRES [ADDR=METRES ...] [--node HOST] [--save]
+  net-range matrix --nodes A,B,C [--seconds S]
+
+  --node HOST     run the scan on another fleet host over ssh (default: local)
+  --seconds S     scan window, default 20      --samples K  RSSI reads, default 5
+  --n / --ref-rssi / --ref-m   override the path-loss model
+  --save          (calibrate) persist the fitted model to your user config
+
+RSSI ranging is coarse: expect tens of percent error, and calibrate per site.
+These dongles are sold as "Bluetooth 6.0" but report LMP 5.1, so the accurate
+Channel Sounding ranging in Core 6.0 is NOT available.
+USAGE
+    exit $rc;
+}
