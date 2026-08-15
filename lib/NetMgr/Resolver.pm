@@ -18,6 +18,17 @@ package NetMgr::Resolver;
 #   3. Hostname == '<name>' → return the linked machine's addresses,
 #      preferring those in the caller's subnet.
 #   4. Empty list ⇒ caller (e.g. DNS server) forwards to upstream.
+#
+# Within every step the answers are RANKED for the client that asked, rather
+# than returned in whatever order the database produced them. A multi-homed
+# host is the normal case here — nas3 answers on two segments as nas3-up and
+# nas3-down — and the useful answer depends entirely on where the query came
+# from. We cannot read the client's routing table; what we do know is the
+# segment it reached us from and what the fleet has measured about each
+# address, so ranking prefers, in order: an address on the client's own
+# segment (no router in the path), then one recently observed alive, then the
+# lowest measured RTT. An address never observed at all is offered last. See
+# _rank() for the weights.
 
 use strict;
 use warnings;
@@ -53,21 +64,24 @@ sub resolve {
         }
     }
 
-    # 2. <name>-* hostnames whose address sits in caller's subnet.
+    # 2. <name>-* hostnames — the per-segment names. This is what lets a query
+    #    for `nas3` answer with nas3-up's address to a client on the `up`
+    #    segment and nas3-down's to one on the `down` segment: the client never
+    #    has to know which leg it is on. Containment is now decided by mask, not
+    #    by matching the first three octets of the address as a string, so a
+    #    segment that is not a /24 is handled correctly. Results are ranked, so
+    #    among several same-segment addresses the liveliest/fastest leads.
     if ($from_cidr) {
-        my ($net_base) = $from_cidr =~ /^(\d+\.\d+\.\d+)\./;
-        my $like_addr  = "$net_base.%";
         my $rows = $db->{dbh}->selectall_arrayref(
-            "SELECT DISTINCT a.addr
+            "SELECT DISTINCT a.addr, a.last_observed, a.min_rtt_ms, a.last_rtt_ms
                FROM hostnames  h
                JOIN interfaces i ON i.machine_id = h.machine_id
                JOIN addresses  a ON a.mac = i.mac
               WHERE h.name LIKE CONCAT(?, '-%')
-                AND a.family = ?
-                AND a.addr LIKE ?
-              ORDER BY a.addr",
-            { Slice => {} }, $name, $family, $like_addr);
-        push @hits, $_->{addr} for @$rows;
+                AND a.family = ?",
+            { Slice => {} }, $name, $family);
+        my @local = grep { _in_cidr($_->{addr}, $from_cidr) } @$rows;
+        push @hits, _rank(\@local, $from_cidr);
         return _trim(\@hits, $limit) if @hits;
     }
 
@@ -119,23 +133,93 @@ sub reverse_lookup {
     return grep { !$seen{$_}++ } @names;
 }
 
-# Internal: find a machine's addresses, preferring those in $prefer_cidr.
+# Is $ip inside $cidr? Real mask arithmetic, not a string prefix. The previous
+# comparison took the first three octets of the CIDR and matched addresses
+# starting with them, which silently assumes every network is a /24: on a /23 it
+# drops half the range, and on a /16 it matches almost nothing.
+sub _in_cidr {
+    my ($ip, $cidr) = @_;
+    return 0 unless defined $ip && defined $cidr;
+    my ($net, $bits) = $cidr =~ m{^(\d+\.\d+\.\d+\.\d+)/(\d+)$} or return 0;
+    my $to_i = sub {
+        my @o = split /\./, ($_[0] // '');
+        return undef unless @o == 4;
+        return ($o[0] << 24) + ($o[1] << 16) + ($o[2] << 8) + $o[3];
+    };
+    my ($a, $n) = ($to_i->($ip), $to_i->($net));
+    return 0 unless defined $a && defined $n;
+    my $mask = $bits == 0 ? 0 : ((0xFFFFFFFF << (32 - $bits)) & 0xFFFFFFFF);
+    return (($a & $mask) == ($n & $mask)) ? 1 : 0;
+}
+
+sub _age_seconds {
+    my ($dt) = @_;
+    my @t = ($dt // '') =~ /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/
+        or return undef;
+    require Time::Local;
+    my $e = eval { Time::Local::timelocal($t[5], $t[4], $t[3], $t[2], $t[1] - 1, $t[0]) };
+    return defined $e ? (time - $e) : undef;
+}
+
+# Rank candidate addresses for the client that asked.
+#
+# The old order was `ORDER BY a.addr` — alphabetical, so effectively arbitrary —
+# with the caller's subnet floated to the front. That answers "which subnet" but
+# never "which of these actually works", so a long-dead address that happened to
+# sort first was handed out ahead of a live one. We cannot see the client's
+# routing table; we only know which segment it reached us from, plus what the
+# fleet has measured. Both are used:
+#
+#   +8  same subnet as the client — reachable across the local segment with no
+#       router in the path. This is what makes a query for `nas3` answer with
+#       the .15 address for a .15 client and the .223 address for a .223 one.
+#   +3  observed alive within the hour
+#   +1  observed alive within the day
+#   -6  never observed — a paper record from a config import, which may not
+#       exist at all. Still offered, but last, so it is used only when there is
+#       nothing better.
+# Ties break on lowest observed RTT (the "fastest" part of the request), then
+# most recently seen, then the address itself so answers stay stable.
+sub _rank {
+    my ($rows, $from_cidr) = @_;
+    my @scored;
+    for my $r (@$rows) {
+        next unless defined $r->{addr};
+        my $s = 0;
+        $s += 8 if $from_cidr && _in_cidr($r->{addr}, $from_cidr);
+        if (defined $r->{last_observed} && length $r->{last_observed}) {
+            my $age = _age_seconds($r->{last_observed});
+            $s += 3 if defined $age && $age <= 3600;
+            $s += 1 if defined $age && $age <= 86400;
+        } else {
+            $s -= 6;
+        }
+        my $rtt = defined $r->{min_rtt_ms}  ? $r->{min_rtt_ms}
+                : defined $r->{last_rtt_ms} ? $r->{last_rtt_ms}
+                :                             9999;
+        push @scored, [ $s, $rtt, ($r->{last_observed} // ''), $r->{addr} ];
+    }
+    @scored = sort {
+           $b->[0] <=> $a->[0]
+        || $a->[1] <=> $b->[1]
+        || $b->[2] cmp $a->[2]
+        || $a->[3] cmp $b->[3]
+    } @scored;
+    my %seen;
+    return grep { !$seen{$_}++ } map { $_->[3] } @scored;
+}
+
+# Internal: a machine's addresses, best-first for this client.
 sub _addresses_for_machine {
     my ($db, $mid, %opts) = @_;
     my $family = $opts{family} // 'v4';
     my $rows = $db->{dbh}->selectall_arrayref(
-        "SELECT DISTINCT a.addr
+        "SELECT DISTINCT a.addr, a.last_observed, a.min_rtt_ms, a.last_rtt_ms
            FROM interfaces i
            JOIN addresses  a ON a.mac = i.mac
-          WHERE i.machine_id = ? AND a.family = ?
-          ORDER BY a.addr",
+          WHERE i.machine_id = ? AND a.family = ?",
         { Slice => {} }, $mid, $family);
-    my @all = map { $_->{addr} } @$rows;
-    return @all unless $opts{prefer_cidr};
-    my ($net_base) = $opts{prefer_cidr} =~ /^(\d+\.\d+\.\d+)\./;
-    my @in  = grep { /^\Q$net_base\E\./ } @all;
-    my @out = grep { !/^\Q$net_base\E\./ } @all;
-    return (@in, @out);
+    return _rank($rows, $opts{prefer_cidr});
 }
 
 sub _trim {
