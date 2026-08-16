@@ -1,0 +1,89 @@
+#!/usr/bin/perl
+# net-sms — send an SMS through whichever mechanism is currently working.
+#
+#   net-sms send +15551234567 gateway3 lost Comcast, now on T-Mobile
+#   net-sms providers                 what would be tried, in order, and why not
+#   net-sms test +15551234567         send a short "net-sms test from <host>"
+#
+#   --config F      default /etc/net-mgr/sms.conf
+#   --dry-run       pick a provider and stop short of sending
+#   --quiet         only the outcome line
+#   --provider N    use only this provider (still honours availability)
+#
+# Exit status is 0 only if a message was actually handed to a provider that
+# accepted it. A notifier that exits 0 when nothing was sent is worse than one
+# that fails loudly, so every skip and failure is printed unless --quiet.
+#
+# See etc/sms.conf.sample. Credentials never live in the config file; a
+# provider names a secret and NetMgr::Secret reads it from
+# /etc/net-mgr/secrets/<name> (root-owned, mode 600).
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+# no_getopt_compat: without it Getopt::Long treats a leading '+' as an option
+# prefix, so the recipient '+15551234567' is parsed as options and every E.164
+# number fails with "Unknown option: 1".
+# require_order: stop parsing at the first non-option, so words in the message
+# body that happen to start with '-' are message text, not flags.
+use Getopt::Long qw(:config no_ignore_case bundling no_getopt_compat require_order);
+use Sys::Hostname qw(hostname);
+use NetMgr::SMS;
+
+my ($conf, $dry, $quiet, $only, $help);
+GetOptions('config=s' => \$conf, 'dry-run|n' => \$dry, 'quiet|q' => \$quiet,
+           'provider=s' => \$only, 'help|h' => \$help) or usage(2);
+usage(0) if $help;
+my $cmd = shift @ARGV // usage(2);
+
+my $sms = NetMgr::SMS->load(config => $conf, ($dry ? (dry_run => 1) : ()));
+if ($only) {
+    # Keep the named provider only, preserving its configured position so the
+    # ordering semantics are identical to a full run.
+    @{ $sms->{providers} } = grep { $_->{name} eq $only } @{ $sms->{providers} };
+    die "net-sms: no provider named '$only' in " . $sms->{path} . "\n"
+        unless @{ $sms->{providers} };
+}
+
+if ($cmd eq 'providers') {
+    my $rows = $sms->status;
+    unless (@$rows) { print "no providers configured in $sms->{path}\n"; exit 1 }
+    printf "%-14s %-8s %-4s %-5s %s\n", 'PROVIDER', 'TYPE', 'NET', 'READY', 'WHY NOT';
+    for my $r (@$rows) {
+        printf "%-14s %-8s %-4s %-5s %s\n", $r->{name}, $r->{type},
+            ($r->{needs_net} ? 'yes' : 'no'), ($r->{ok} ? 'yes' : 'NO'), $r->{why};
+    }
+    printf "\ninternet reachable: %s\n", $sms->have_net ? 'yes' : 'NO';
+    exit 0;
+}
+
+my $to = shift @ARGV or usage(2);
+my $text = $cmd eq 'test'
+    ? 'net-sms test from ' . hostname()
+    : join(' ', @ARGV);
+usage(2) if $cmd ne 'send' && $cmd ne 'test';
+die "net-sms: empty message\n" unless length $text;
+
+my ($ok, $via, $log) = $sms->send($to, $text);
+unless ($quiet) { print "  $_\n" for @$log }
+if ($ok) {
+    print +($dry ? "would send via $via\n" : "sent via $via\n");
+    exit 0;
+}
+print "NOT SENT - no provider succeeded\n";
+exit 1;
+
+sub usage {
+    my ($rc) = @_;
+    print <<'USAGE';
+net-sms [--config F] [--dry-run] [--quiet] [--provider N] COMMAND
+
+  send TO MESSAGE...   send MESSAGE to TO, trying providers in configured order
+  test TO              send a short test message
+  providers            show each provider, whether it is ready, and why not
+
+Exits 0 only when a provider accepted the message.
+USAGE
+    exit $rc;
+}

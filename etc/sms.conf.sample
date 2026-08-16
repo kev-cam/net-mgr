@@ -1,0 +1,81 @@
+# /etc/net-mgr/sms.conf — providers net-sms will try, in order.
+#
+# Order matters and should be chosen by WHAT STILL WORKS during the outage you
+# are trying to report, not by which is nicest. A web service cannot tell you
+# the internet is down. Put the paths that survive a dark network last so they
+# are the fallback, and first only if you distrust the others.
+#
+# net-sms skips any provider whose prerequisites are not met (no internet, no
+# modem, peer out of BLE range) rather than spending its timeout finding out —
+# five web providers at 15s each is 75s of silence before the modem that would
+# have worked is even tried. `net-sms providers` shows the current verdict.
+
+[sms]
+order   = lterouter, numberbarn, gvoice, modem, bitchat
+dry_run = 0
+
+# ---------------------------------------------------------------------
+# 1. The LTE router on the T-Mobile side (192.168.0.1). LAN-side, so it works
+#    whenever that radio has signal — including with Comcast down. It is an
+#    embedded GoAhead-Webs UI; devices of that class usually send SMS through a
+#    /goform/ endpoint. THE VALUES BELOW ARE A PLACEHOLDER: capture the exact
+#    request from the device's own web UI (browser dev-tools, Network tab, send
+#    one SMS by hand) and paste it here. Do not guess it — a wrong endpoint
+#    fails silently on the night it matters.
+# [provider:lterouter]
+# type       = http
+# needs_net  = 0
+# url        = http://192.168.0.1/goform/goform_set_cmd_process
+# method     = POST
+# body       = goformId=SEND_SMS&Number={to}&MessageBody={text}
+# ok_match   = success
+# timeout    = 20
+
+# ---------------------------------------------------------------------
+# 2. NumberBarn. Fill in from their API docs or by capturing the request their
+#    web UI makes; the shape below is illustrative only.
+#    Credentials go in /etc/net-mgr/secrets/numberbarn as one line "user:pass"
+#    (root-owned, mode 600) — never in this file.
+# [provider:numberbarn]
+# type         = http
+# url          = https://api.numberbarn.com/...
+# method       = POST
+# content_type = application/json
+# body         = {"to":"{to}","from":"{user}","text":"{text}"}
+# header       = Authorization: Bearer {pass}
+# secret       = numberbarn
+# ok_status    = 200,201,202
+
+# ---------------------------------------------------------------------
+# 3. Google Voice. There is no supported public SMS API; if you drive it from
+#    the web you will be pasting a captured request with session cookies here,
+#    and it WILL break when the session expires — which is a poor property for
+#    an alerting path. Prefer it as a convenience channel, not the last resort.
+# [provider:gvoice]
+# type      = http
+# url       = https://...
+# secret    = gvoice
+# ok_status = 200
+
+# ---------------------------------------------------------------------
+# 4. A local USB LTE stick. Needs no network at all, so it works when
+#    everything else is dark. gammu and ModemManager are already installed on
+#    gateway2; only the hardware is missing, and this provider reports itself
+#    unavailable until a stick appears rather than failing at send time.
+# [provider:modem]
+# type    = modem
+# device  = /dev/ttyUSB0
+# timeout = 30
+
+# ---------------------------------------------------------------------
+# 5. BLE relay via a paired phone. Needs neither internet nor a modem, so it is
+#    the true last resort. NOTE: the net-chat-android client cannot send an SMS
+#    today (no SEND_SMS permission, no SmsManager), so this currently delivers a
+#    message to the phone for a human to act on. Useful — nothing else escapes a
+#    total outage — but it is a page, not an automated SMS.
+# [provider:bitchat]
+# type    = bitchat
+# peer    = 92dce4b2d4b5f9cf
+# listen  = 127.0.0.1:7531
+# prefix  = SMS:
+# max_age = 900
