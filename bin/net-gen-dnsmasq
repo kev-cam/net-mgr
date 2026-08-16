@@ -286,7 +286,15 @@ if ($reload) {
 
 sub write_atomic {
     my ($path, $content) = @_;
-    my $tmp = "$path.tmp.$$";
+    # The scratch file is DOT-PREFIXED, not just suffixed. Under layout=dirs the
+    # target sits in a directory dnsmasq watches with inotify, and a visible
+    # scratch file there is read as real config: the watch fires IN_CLOSE_WRITE
+    # on the temp file and IN_MOVED_TO on the rename, so every entry lands twice
+    # and dnsmasq refuses the duplicate dhcp-host IPs. Its filter skips names
+    # beginning '.', so a leading dot makes the temp invisible to it. Harmless
+    # under layout=files too — nothing globs .dnsmasq-*.
+    my ($dir, $base) = $path =~ m{^(.*)/([^/]+)$} ? ($1, $2) : ('.', $path);
+    my $tmp = "$dir/.$base.tmp.$$";
     open my $fh, '>', $tmp or die "open $tmp: $!\n";
     print $fh $content;
     close $fh or die "close $tmp: $!\n";
@@ -352,9 +360,24 @@ sub _split_iface {
 # reverse of the qualified form, for reporting: strip -air, any index, the zone
 sub _dequal { my $n = shift // ''; $n =~ s/-air$//; $n =~ s/-\d+$//; $n =~ s/-[a-z0-9]+$//; $n }
 sub _rkey { lc($_[0]{mac} // '') . '|' . ($_[0]{ip} // '') }
+sub _outdir { $out_dir // $dnsmasq_cfg{out_dir} // '/usr/local/sgy/conf.d' }
+sub _dirs_layout { lc($dnsmasq_cfg{layout} // 'files') eq 'dirs' }
+
+# Where one generated file goes. $kind is 'dhcp' or 'hosts'.
+#   files: <out_dir>/dnsmasq-<zone>   and <out_dir>/hosts-<zone>
+#   dirs : <out_dir>/dhcp.d/<zone>    and <out_dir>/hosts.d/<zone>
+# --test writes beside the real file. Under layout=dirs that lands inside a
+# directory dnsmasq is watching, so the test output is dot-prefixed there:
+# inotify skips dotfiles, and a `dnsmasq --test` run must not be able to load
+# a half-checked config into the live server.
 sub _dbpath {
-    my $base = shift;
-    my $dir  = $out_dir // $dnsmasq_cfg{out_dir} // '/usr/local/sgy/conf.d';
+    my ($kind, $zone) = @_;
+    my $dir = _outdir();
+    if (_dirs_layout()) {
+        my $sub = $kind eq 'dhcp' ? 'dhcp.d' : 'hosts.d';
+        return "$dir/$sub/" . ($test ? ".$zone.new" : $zone);
+    }
+    my $base = ($kind eq 'dhcp' ? 'dnsmasq-' : 'hosts-') . $zone;
     return "$dir/$base" . ($test ? '.new' : '');
 }
 
@@ -601,9 +624,14 @@ sub gen_from_db {
                 next;
             }
             $seenmac{$mac} = "$sn\@" . $r->{ip};
-            push @dh, "dhcp-host=$mac,$sn,$r->{ip},$lease\n";
+            # layout=files -> a conf-file, whose lines are dnsmasq OPTIONS and so
+            # need the `dhcp-host=` keyword. layout=dirs -> a --dhcp-hostsdir
+            # BANK file, whose lines are bare option ARGUMENTS; the keyword there
+            # is a syntax error logged per line, and every reservation is lost.
+            push @dh, _dirs_layout() ? "$mac,$sn,$r->{ip},$lease\n"
+                                     : "dhcp-host=$mac,$sn,$r->{ip},$lease\n";
         }
-        $generated{ _dbpath("dnsmasq-$zone") } = join '', @dh;
+        $generated{ _dbpath('dhcp', $zone) } = join '', @dh;
 
         # hosts-<zone>: suffixed per-side machine name, IP-sort, dedup by IP (keep first + warn)
         my (%seenip, @hl);
@@ -622,9 +650,15 @@ sub gen_from_db {
                 if $qualify && $host_name->{"$mac|$r->{ip}"};
             next unless defined $name && length $name;
             (my $macid = $mac) =~ s/:/_/g;
-            push @hl, sprintf("%-25s%s\t%s\tM%s\n", $r->{ip}, $name, "$name.$domain", $macid);
+            # The MAC annotation is COMMENTED. dnsmasq's hosts parser treats every
+            # whitespace-separated token after the address as another name for it
+            # (cache.c gettok), so an uncommented M<mac> registers ~200 junk names
+            # like M00_d8_61_34_ea_b8.grfx.com. '#' runs to end of line there
+            # (cache.c eatspace), so this keeps the annotation for humans and
+            # hides it from dnsmasq. Nothing in net-mgr parses it back.
+            push @hl, sprintf("%-25s%s\t%s\t#M%s\n", $r->{ip}, $name, "$name.$domain", $macid);
         }
-        $generated{ _dbpath("hosts-$zone") } = join '', @hl;
+        $generated{ _dbpath('hosts', $zone) } = join '', @hl;
     }
 
     _emit_generated(\%generated);
@@ -641,9 +675,37 @@ sub _emit_generated {
         show_diff($_, $gen->{$_}) for sort keys %$gen;
         return;
     }
+    if (_dirs_layout() && !$test) {
+        make_path("$_") for grep { !-d } map { m{^(.*)/[^/]+$} ? $1 : () } keys %$gen;
+    }
     for my $p (sort keys %$gen) {
         write_atomic($p, $gen->{$p});
         print "wrote $p\n";
     }
+    _prune_orphans($gen) if _dirs_layout() && !$test;
     if ($reload) { my $rc = sighup_dnsmasq(); print "reloaded dnsmasq\n" if $rc }
+}
+
+# Under layout=dirs the two subdirectories belong entirely to this generator and
+# dnsmasq reads EVERYTHING in them, so a file we no longer generate is not inert
+# — a renamed or deleted zone would keep being served from its stale file
+# forever, and dnsmasq only ever ADDS from a watched directory. Remove what we
+# did not just write. Deliberately scoped to dhcp.d/hosts.d: out_dir itself also
+# holds hand-maintained fragments (jbh, temp.fixes, dnsmasq) that are none of
+# our business. Dotfiles are skipped so a concurrent run's scratch file survives.
+sub _prune_orphans {
+    my ($gen) = @_;
+    my %keep = map { $_ => 1 } keys %$gen;
+    my $dir  = _outdir();
+    for my $sub (qw(dhcp.d hosts.d)) {
+        opendir(my $dh, "$dir/$sub") or next;
+        for my $f (readdir $dh) {
+            next if $f =~ /^\./;
+            my $p = "$dir/$sub/$f";
+            next if $keep{$p} || !-f $p;
+            if (unlink $p) { print "removed stale $p\n" }
+            else           { warn "net-gen-dnsmasq: cannot remove stale $p: $!\n" }
+        }
+        closedir $dh;
+    }
 }

@@ -117,6 +117,28 @@ my %DEFAULTS = (
         # dnsmasq consults its own hosts/DHCP data before it forwards anything,
         # so until then the bare name would simply stop resolving.
         multihomed => 'short',
+        # How the generated files are laid out, and therefore how dnsmasq has to
+        # be told to read them.
+        #   files (default, historical) — one file per zone in out_dir:
+        #         dnsmasq-<zone> (lines of `dhcp-host=…`) and hosts-<zone>.
+        #         dnsmasq must name EACH of them with its own conf-file= /
+        #         addn-hosts= line, so minting a new zone writes a file that
+        #         NOTHING READS until a human edits dnsmasq.conf on every
+        #         gateway — silently, with no error anywhere.
+        #   dirs  — out_dir/dhcp.d/<zone> holding bare `mac,name,ip,lease` bank
+        #         lines (what --dhcp-hostsdir parses), and out_dir/hosts.d/<zone>.
+        #         dnsmasq then needs exactly two lines, identical on every node
+        #         and never edited again:
+        #             dhcp-hostsdir=<out_dir>/dhcp.d
+        #             hostsdir=<out_dir>/hosts.d
+        #         A new zone is picked up with no config change anywhere.
+        # Switching is two steps: set 'dirs' and regenerate, THEN replace the
+        # per-file lines in dnsmasq.conf. Never let conf-file= and dhcp-hostsdir=
+        # cover the same reservations at once — dnsmasq rejects a duplicate
+        # dhcp-host IP and refuses to start, which is a DHCP outage.
+        # NB dnsmasq only ADDS from a watched dir; removals still need the SIGHUP
+        # that --reload sends, so keep [dnsmasq] mode = auto.
+        layout => 'files',
     },
     # BitChat-to-net-chat BLE bridge (bin/net-bitchat-bridge). Default on:
     # the systemd unit is installed enabled, but the supervisor's preflight
@@ -390,7 +412,7 @@ my %ACTIVE = (
                                               # loopback REFRESH socket
     uplinks    => '*',                        # consumed by net-uplink-probe
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
-    dnsmasq    => [qw(mode out_dir push_aps gateways multihomed)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
+    dnsmasq    => [qw(mode out_dir push_aps gateways multihomed layout)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
     bitchat_bridge => [qw(mode helper_path session_name adapter_index diag_journal diag_journal_lines)], # BLE bridge (bin/net-bitchat-bridge)
     'net-chat' => [qw(key_file key_id last_session bitchat_scope bitchat_geohash)], # auth-dialog "Always" + last-open session + bitchat scope/geohash
     ipv6_vlan  => [qw(type name mode server prefix local_suffix forwarding ext_if
