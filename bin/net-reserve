@@ -21,7 +21,7 @@
 #                                    never-seen net-lookup name (needs --name)
 #   net-reserve release IP           remove a reservation
 #   net-reserve autoname [SUBNET]    fill missing reservation host names
-#   net-reserve add-range CIDR START END [--zone Z]
+#   net-reserve add-range CIDR START END [--zone Z] [--notes 'dnsmasq:<host>']
 #   net-reserve set-zone  CIDR ZONE          # name a subnet ('' clears)
 #   net-reserve del-range CIDR START
 #   net-reserve --push [SUBNET]      push named reservations into net-lookup as
@@ -871,11 +871,20 @@ sub cmd_add_range {
     my $start = shift @ARGV or usage("add-range needs CIDR START END");
     my $end   = shift @ARGV or usage("add-range needs CIDR START END");
     my $cli = connect_client();
+    # --notes was parsed but never forwarded, so a range added from the CLI
+    # arrived with no server tag. That tag ("dnsmasq:<host>") is the only record
+    # of WHICH dnsmasq serves a pool — several may serve one subnet — and it is
+    # not reconstructible from anything else in the DB. It must also be UNIQUE
+    # per pool: NetMgr::Relay deletes any other row carrying the same notes when
+    # it replicates one, on the assumption that a server has a single pool, so
+    # two pools sharing a tag lose one on the next sync.
     my $r = $cli->observe(kind => 'dhcp_range', subnet_cidr => $cidr,
         start_ip => $start, end_ip => $end,
-        (defined $opt_zone ? (zone => $opt_zone) : ()));
+        (defined $opt_zone  ? (zone  => $opt_zone)  : ()),
+        (defined $opt_notes ? (notes => $opt_notes) : ()));
     die "net-reserve: $r\n" if !defined $r || $r =~ /^ERR/;
-    print "added range $cidr $start-$end\n";
+    print "added range $cidr $start-$end"
+        . (defined $opt_notes ? " ($opt_notes)" : '') . "\n";
 }
 
 # net-reserve set-zone CIDR ZONE  (ZONE '' clears)
