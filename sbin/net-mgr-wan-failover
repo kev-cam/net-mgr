@@ -1,0 +1,261 @@
+#!/usr/bin/perl
+# net-mgr-wan-failover — keep this gateway's default route on a working uplink.
+#
+# Tier 1 of the gateway failover plan: when this box's own WAN dies, route out
+# through the OTHER gateway instead, and go back the moment the WAN recovers.
+# Clients are never touched — their option:router keeps pointing here, no DHCP
+# transaction happens, and nothing waits on a lease. (Measured: a router-option
+# change reaches an existing client at lease/2, ~12h at an 86400s lease. That is
+# a migration tool, not a failover tool — see contrib/dualwan-lab.sh.)
+#
+#   net-mgr-wan-failover status          what it would do, and why (read-only)
+#   net-mgr-wan-failover check           one probe cycle, then act if warranted
+#   net-mgr-wan-failover run             loop, one cycle per --interval
+#   net-mgr-wan-failover failover        force onto the backup path now
+#   net-mgr-wan-failover revert          force back onto the primary now
+#
+#   --dry-run     print the ip(8) commands instead of running them
+#   --config F    default /etc/net-mgr/wan-failover.conf
+#
+# Config (INI-ish, one section):
+#   primary_via   = 24.6.36.1              next hop on our own WAN
+#   primary_dev   = enx00e04c680cbe        our WAN device
+#   primary_src   = 24.6.37.247            our WAN address (probe source)
+#   backup_via    = 192.168.15.251         the other gateway's LAN address
+#   backup_dev    = enx00e04c680869        our LAN device
+#   probe_targets = 1.1.1.1,9.9.9.9        pinged via primary_src
+#   table         = 100                    policy table holding the primary
+#   fail_after    = 3                      consecutive failures before failover
+#   ok_after      = 6                      consecutive successes before revert
+#   interval      = 5                      seconds between cycles in `run`
+#
+# WHY A POLICY TABLE IS MANDATORY, not a nicety:
+# the probe has to answer "is the PRIMARY working" while the default route may
+# already point at the backup. A device-bound ping does not do that — it binds
+# to the device but still routes by the main table, so after failover it follows
+# the backup and reports the backup's health under the primary's name. The
+# primary can then never be seen to recover: failover becomes ONE-WAY, stranding
+# the network on a metered link. Only a source-address ping under
+# `ip rule from <primary_src> lookup <table>` escapes the main table.
+# This script refuses to act unless that rule and table exist, because acting
+# without them means it can fail over but never come back.
+#
+# Safety properties, deliberate:
+#   - `ip route replace` (never del+add), so there is no instant with no default
+#     route even if the process dies mid-change.
+#   - the primary route is recorded in the state file at first use and restored
+#     verbatim, so revert does not depend on re-deriving it.
+#   - hysteresis both directions; ok_after > fail_after so a flapping WAN
+#     settles on the primary rather than oscillating.
+#   - refuses to failover when the backup next-hop is not itself reachable —
+#     leaving a dead primary in place beats moving to a second dead path.
+
+use strict;
+use warnings;
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+my $CONF   = '/etc/net-mgr/wan-failover.conf';
+my $STATE  = '/var/lib/net-mgr/wan-failover.state';
+my ($dry, $verbose, $help);
+GetOptions('config=s' => \$CONF, 'state=s' => \$STATE,
+           'dry-run|n' => \$dry, 'verbose|v' => \$verbose, 'help|h' => \$help)
+    or usage(2);
+usage(0) if $help;
+my $cmd = shift @ARGV // 'status';
+
+my %C = read_conf($CONF);
+for my $k (qw(primary_via primary_dev primary_src backup_via backup_dev)) {
+    die "net-mgr-wan-failover: $CONF: '$k' is required\n"
+        unless defined $C{$k} && length $C{$k};
+}
+$C{probe_targets} //= '1.1.1.1,9.9.9.9';
+$C{table}         //= 100;
+$C{fail_after}    //= 3;
+$C{ok_after}      //= 6;
+$C{interval}      //= 5;
+my @TARGETS = grep { length } split /\s*,\s*/, $C{probe_targets};
+
+if    ($cmd eq 'status')   { do_status() }
+elsif ($cmd eq 'check')    { do_cycle() }
+elsif ($cmd eq 'run')      { do_cycle() while sleep_ok($C{interval}) }
+elsif ($cmd eq 'failover') { apply('backup',  'forced') }
+elsif ($cmd eq 'revert')   { apply('primary', 'forced') }
+else { usage(2) }
+exit 0;
+
+# ---- the decision ---------------------------------------------------
+
+sub do_cycle {
+    my $st = read_state();
+    unless (policy_ready()) {
+        warn "net-mgr-wan-failover: no 'ip rule from $C{primary_src} lookup"
+           . " $C{table}' - refusing to act (could fail over but never revert)."
+           . " Create it with:\n"
+           . "  ip route add default via $C{primary_via} dev $C{primary_dev} table $C{table}\n"
+           . "  ip rule  add from $C{primary_src} lookup $C{table}\n";
+        return;
+    }
+    my $ok = probe_primary();
+    if ($ok) { $st->{fails} = 0; $st->{oks}++ }
+    else     { $st->{oks}   = 0; $st->{fails}++ }
+    my $on = current_path();
+
+    if (!$ok && $on eq 'primary' && $st->{fails} >= $C{fail_after}) {
+        if (!backup_reachable()) {
+            warn "net-mgr-wan-failover: primary down ($st->{fails} fails) but"
+               . " backup next-hop $C{backup_via} is unreachable - staying put\n";
+        }
+        else { apply('backup', "primary failed $st->{fails}x"); $st->{fails} = 0 }
+    }
+    elsif ($ok && $on eq 'backup' && $st->{oks} >= $C{ok_after}) {
+        apply('primary', "primary healthy $st->{oks}x");
+        $st->{oks} = 0;
+    }
+    write_state($st);
+    printf "primary=%s on=%s fails=%d oks=%d\n",
+        ($ok ? 'ok' : 'FAIL'), $on, $st->{fails}, $st->{oks} if $verbose;
+}
+
+sub do_status {
+    my $st = read_state();
+    printf "config       : %s\n", $CONF;
+    printf "primary      : via %s dev %s src %s\n",
+        $C{primary_via}, $C{primary_dev}, $C{primary_src};
+    printf "backup       : via %s dev %s\n", $C{backup_via}, $C{backup_dev};
+    printf "policy rule  : %s\n", policy_ready()
+        ? "present (from $C{primary_src} lookup $C{table})"
+        : "MISSING - script will refuse to act";
+    printf "current path : %s\n", current_path();
+    printf "primary probe: %s\n", probe_primary() ? 'ok' : 'FAIL';
+    printf "backup nexthop: %s\n", backup_reachable() ? 'reachable' : 'UNREACHABLE';
+    printf "counters     : fails=%d oks=%d (failover at %d, revert at %d)\n",
+        $st->{fails}, $st->{oks}, $C{fail_after}, $C{ok_after};
+    printf "saved primary: %s\n", $st->{saved} // '(none yet)';
+}
+
+# ---- mechanics ------------------------------------------------------
+
+# Which path is the MAIN table's default currently using?
+sub current_path {
+    my $out = qx{ip -4 route show default 2>/dev/null};
+    return 'backup'  if $out =~ /via \Q$C{backup_via}\E\b/;
+    return 'primary' if $out =~ /via \Q$C{primary_via}\E\b/;
+    return 'other';
+}
+
+# The primary must be probed through its own table, or the answer describes
+# whatever path the main table happens to be using right now.
+sub policy_ready {
+    my $rules = qx{ip -4 rule show 2>/dev/null};
+    return 0 unless $rules =~ m{^\s*\d+:\s+from\s+\Q$C{primary_src}\E(?:/32)?\s+lookup\s+\Q$C{table}\E\s*$}m;
+    my $rt = qx{ip -4 route show table $C{table} 2>/dev/null};
+    return $rt =~ /default\s+via/ ? 1 : 0;
+}
+
+sub probe_primary {
+    for my $t (@TARGETS) {
+        my $rc = run_quiet('ping', '-c', '1', '-W', '2', '-q', '-I',
+                           $C{primary_src}, $t);
+        return 1 if $rc == 0;          # any target answering is enough
+    }
+    return 0;
+}
+
+sub backup_reachable {
+    return run_quiet('ping', '-c', '1', '-W', '2', '-q', '-I',
+                     $C{backup_dev}, $C{backup_via}) == 0 ? 1 : 0;
+}
+
+sub apply {
+    my ($want, $why) = @_;
+    my $st = read_state();
+    # Record the primary default exactly as the system had it, once, so revert
+    # restores it verbatim rather than reconstructing it from config.
+    if (!defined $st->{saved}) {
+        my ($line) = grep { /via \Q$C{primary_via}\E\b/ }
+                     split /\n/, qx{ip -4 route show default 2>/dev/null};
+        $st->{saved} = $line // "default via $C{primary_via} dev $C{primary_dev}";
+    }
+    my @cmd = $want eq 'backup'
+        ? ('ip', 'route', 'replace', 'default', 'via', $C{backup_via},
+           'dev', $C{backup_dev})
+        : ('ip', 'route', 'replace', 'default', 'via', $C{primary_via},
+           'dev', $C{primary_dev});
+    if ($dry) { print "DRY: @cmd   # $why\n"; return }
+    my $rc = system(@cmd);
+    if ($rc != 0) {
+        warn "net-mgr-wan-failover: FAILED to switch to $want (rc="
+           . ($rc >> 8) . "); default route left as-is\n";
+        return;
+    }
+    $st->{path} = $want;
+    write_state($st);
+    my $msg = "net-mgr-wan-failover: switched to $want ($why)";
+    warn "$msg\n";
+    logger($msg);
+}
+
+# Probes are read-only, so they run even under --dry-run: a dry run that
+# invented their results would report a decision nobody measured. Only the
+# route change in apply() is withheld.
+sub run_quiet {
+    my @c = @_;
+    my $rc = system(join(' ', map { quotemeta } @c) . ' >/dev/null 2>&1');
+    return $rc >> 8;
+}
+sub logger {
+    my ($m) = @_;
+    system('logger', '-t', 'net-mgr-wan-failover', $m) if !$dry;
+}
+sub sleep_ok { sleep $_[0]; return 1 }
+
+# ---- config / state -------------------------------------------------
+
+sub read_conf {
+    my ($p) = @_;
+    open my $fh, '<', $p or die "net-mgr-wan-failover: open $p: $!\n";
+    my %c;
+    while (my $l = <$fh>) {
+        next if $l =~ /^\s*[#;]/ || $l =~ /^\s*$/ || $l =~ /^\s*\[/;
+        $c{lc $1} = $2 if $l =~ /^\s*(\w+)\s*=\s*(.*?)\s*$/;
+    }
+    close $fh;
+    return %c;
+}
+sub read_state {
+    my %s = (fails => 0, oks => 0);
+    if (open my $fh, '<', $STATE) {
+        while (my $l = <$fh>) { $s{$1} = $2 if $l =~ /^(\w+)=(.*)$/ }
+        close $fh;
+    }
+    $s{$_} += 0 for qw(fails oks);
+    return \%s;
+}
+sub write_state {
+    my ($s) = @_;
+    return if $dry;
+    (my $dir = $STATE) =~ s{/[^/]+$}{};
+    mkdir $dir unless -d $dir;
+    open my $fh, '>', "$STATE.tmp" or return;
+    print $fh "$_=" . ($s->{$_} // '') . "\n" for sort keys %$s;
+    close $fh;
+    rename "$STATE.tmp", $STATE;
+}
+
+sub usage {
+    my ($rc) = @_;
+    print <<'USAGE';
+net-mgr-wan-failover [--config F] [--dry-run] [-v] COMMAND
+
+  status     show the decision inputs and what path is in use (read-only)
+  check      one probe cycle; switch if the thresholds are crossed
+  run        loop `check` every interval seconds
+  failover   force onto the backup path now
+  revert     force back onto the primary now
+
+Requires a policy table+rule for the primary uplink; `status` says so plainly
+when they are missing. Without them the probe cannot tell a recovered primary
+from the backup it is currently using, and failover would be one-way.
+USAGE
+    exit $rc;
+}

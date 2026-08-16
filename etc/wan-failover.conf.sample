@@ -1,0 +1,56 @@
+# /etc/net-mgr/wan-failover.conf — per-gateway tier-1 WAN failover.
+#
+# Used by sbin/net-mgr-wan-failover. Each gateway keeps its OWN default route
+# on a working uplink; clients are never touched, so no DHCP lease is involved.
+#
+# ---- gateway3 (Comcast primary, falls back through gateway2) ----
+# primary_via   = 24.6.36.1              next hop on our own WAN
+# primary_dev   = enx00e04c680cbe        our WAN device
+# primary_src   = 24.6.37.247            our WAN address — the probe source
+# backup_via    = 192.168.15.251         gateway2's LAN address
+# backup_dev    = enx00e04c680869        our LAN device
+#
+# ---- gateway2 (T-Mobile primary, falls back through gateway3) ----
+# primary_via   = 192.168.0.1
+# primary_dev   = enp4s0
+# primary_src   = 192.168.0.181
+# backup_via    = 192.168.15.252
+# backup_dev    = enp2s0
+#
+# Two targets so one dead anycast node is not read as an outage.
+probe_targets = 1.1.1.1,9.9.9.9
+
+# Policy table holding the primary's own default route (see PREREQUISITE).
+table = 100
+
+# Hysteresis. ok_after > fail_after on purpose: leave slowly, come back
+# carefully, so a flapping WAN settles on the primary rather than oscillating.
+# At interval=5 that is ~15s to fail over and ~30s to revert.
+fail_after = 3
+ok_after   = 6
+interval   = 5
+
+# ---- PREREQUISITE, per gateway ----------------------------------------
+# The probe must be able to test the PRIMARY while the default route already
+# points at the backup. A device-bound ping cannot: it binds to the device but
+# still routes by the main table, so after failover it follows the backup and
+# reports the backup's health under the primary's name — the primary can never
+# be seen to recover and failover becomes ONE-WAY, stranding the network on a
+# metered link. Only a source-address ping under a policy rule escapes that.
+#
+# On gateway3:
+#   ip route add default via 24.6.36.1 dev enx00e04c680cbe table 100
+#   ip rule  add from 24.6.37.247 lookup 100
+# On gateway2:
+#   ip route add default via 192.168.0.1 dev enp4s0 table 100
+#   ip rule  add from 192.168.0.181 lookup 100
+#
+# `net-mgr-wan-failover status` says plainly when these are missing, and the
+# script refuses to act until they exist. Make them persistent the same way the
+# rest of that host's networking is (dispatcher hook / systemd unit / rc.local).
+#
+# ---- ALSO REQUIRED on the box being used as a backup ------------------
+# It must masquerade LAN traffic out its own WAN, or the failover path drops
+# packets that arrive from the other gateway:
+#   net-set NAT_MASQUERADE iface=enp4s0 state=on boot=1     (on gateway2)
+# This is harmless while unused, so set it once and leave it.

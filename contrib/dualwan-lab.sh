@@ -698,5 +698,16 @@ case "${1:-shell}" in
     for f in $(compgen -A function); do export -f "$f"; done
     export LAB LEASE SCALE NS_ALL
     exec bash --norc -i ;;
-  *) say "usage: $0 [shell|test [all|baseline|twin-race|optsdir-flip|anchor|vip]]"; exit 2 ;;
+  exec)
+    # Non-interactive sibling of `shell`: build the topology, export the same
+    # helpers, then run a script inside it. `shell` execs `bash -i`, which wants
+    # a tty and so cannot be driven from a pipe — this is the entry point a test
+    # harness uses to rehearse something against the lab.
+    #   dualwan-lab.sh exec /path/to/script.sh [args...]
+    for f in $(compgen -A function); do export -f "$f"; done
+    export LAB LEASE SCALE NS_ALL
+    shift
+    [ $# -ge 1 ] || { say "usage: $0 exec SCRIPT [args...]"; exit 2; }
+    exec bash --norc "$@" ;;
+  *) say "usage: $0 [shell|exec SCRIPT|test [all|baseline|twin-race|optsdir-flip|anchor|vip]]"; exit 2 ;;
 esac
