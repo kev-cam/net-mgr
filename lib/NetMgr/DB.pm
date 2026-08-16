@@ -2741,17 +2741,33 @@ sub upsert_sms_contact {
         "SELECT * FROM sms_contacts WHERE number = ?", undef, $f{number});
     croak "name required for a new contact"
         if !$was && !(defined $f{name} && length $f{name});
+
+    # Resolve each field against the stored row here rather than with SQL
+    # tricks. An omitted field must keep its stored value (so `--disable` need
+    # not restate the name, and a replicated row carrying part of a record
+    # cannot erase the rest), but `enabled` and `kind` are NOT NULL, so the
+    # INSERT arm cannot simply pass undef and let ON DUPLICATE KEY sort it out —
+    # a first insert would fail with "Column 'enabled' cannot be null".
+    my $pick = sub {
+        my ($k, $default) = @_;
+        return $f{$k} if defined $f{$k} && length $f{$k};
+        return $was->{$k} if $was && defined $was->{$k};
+        return $default;
+    };
+    my $name    = $pick->('name');
+    my $kind    = $pick->('kind', 'mobile');
+    my $service = $pick->('service');
+    my $notes   = $pick->('notes');
+    my $enabled = defined $f{enabled} ? ($f{enabled} ? 1 : 0)
+                : ($was ? ($was->{enabled} ? 1 : 0) : 1);
+
     $self->{dbh}->do(
         "INSERT INTO sms_contacts (number, name, kind, service, enabled, notes)
          VALUES (?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
-            name    = IF(VALUES(name)    IS NULL, name,    VALUES(name)),
-            kind    = IF(VALUES(kind)    IS NULL, kind,    VALUES(kind)),
-            service = IF(VALUES(service) IS NULL, service, NULLIF(VALUES(service), '')),
-            enabled = IF(VALUES(enabled) IS NULL, enabled, VALUES(enabled)),
-            notes   = IF(VALUES(notes)   IS NULL, notes,   NULLIF(VALUES(notes), ''))",
-        undef, $f{number}, $f{name}, $f{kind}, $f{service},
-        (defined $f{enabled} ? ($f{enabled} ? 1 : 0) : undef), $f{notes});
+            name = VALUES(name), kind = VALUES(kind), service = VALUES(service),
+            enabled = VALUES(enabled), notes = VALUES(notes)",
+        undef, $f{number}, $name, $kind, $service, $enabled, $notes);
     my $now = $self->{dbh}->selectrow_hashref(
         "SELECT * FROM sms_contacts WHERE number = ?", undef, $f{number});
     return { op => ($was ? 'update' : 'insert'), now => $now };

@@ -32,16 +32,33 @@ use Sys::Hostname qw(hostname);
 use NetMgr::SMS;
 
 my ($conf, $dry, $quiet, $only, $help);
-my ($listen, $cname, $ckind, $cservice, $cnotes, $cenable);
+my ($listen, $cname, $ckind, $cservice, $cnotes, $cenable, $no_auth);
 $listen = '127.0.0.1:7531';
 GetOptions('config=s' => \$conf, 'dry-run|n' => \$dry, 'quiet|q' => \$quiet,
            'provider=s' => \$only, 'help|h' => \$help,
            'listen=s' => \$listen, 'name=s' => \$cname, 'ctype=s' => \$ckind,
            'service=s' => \$cservice, 'notes=s' => \$cnotes,
            'enable' => sub { $cenable = 1 }, 'disable' => sub { $cenable = 0 },
+           'no-auth' => \$no_auth,
           ) or usage(2);
 usage(0) if $help;
 my $cmd = shift @ARGV // usage(2);
+
+# Second parse, for options that follow the SUBCOMMAND. require_order above
+# stops at the first non-option — which is the subcommand itself — so without
+# this `contact-add +1408... --name 'X'` never sees --name and the daemon is
+# asked to create a nameless contact. Only done for the contact verbs: for
+# `send`, everything after the recipient is deliberately message text and must
+# not be parsed as options.
+if ($cmd =~ /^contact/) {
+    local $SIG{__WARN__} = sub { warn $_[0] };
+    Getopt::Long::Configure('permute');
+    GetOptions('name=s' => \$cname, 'ctype=s' => \$ckind,
+               'service=s' => \$cservice, 'notes=s' => \$cnotes,
+               'listen=s' => \$listen, 'no-auth' => \$no_auth,
+               'enable' => sub { $cenable = 1 }, 'disable' => sub { $cenable = 0 },
+              ) or usage(2);
+}
 
 my $sms;
 unless ($cmd =~ /^contact/) {
@@ -59,7 +76,17 @@ if ($only && $sms) {
 if ($cmd =~ /^contact/) {
     require NetMgr::Client;
     my $cli = NetMgr::Client->new(listen => $listen) or die "net-sms: no daemon\n";
-    $cli->hello(consumer => "net-sms.$$");
+    # Writing a contact is a mutating verb, so a non-loopback connection has to
+    # authenticate — the daemon's _chat_identity returns undef otherwise and the
+    # OBSERVE comes back "not authorized". Loopback is implicitly trusted, so
+    # skip the handshake there (and when --no-auth is given).
+    my ($h) = NetMgr::Client::split_hostport($listen);
+    my $loopback = defined $h && $h =~ /^(?:127\.\d+\.\d+\.\d+|::1|localhost)$/;
+    if (!$loopback && !$no_auth && $cmd ne 'contacts') {
+        eval { $cli->auth() };
+        die "net-sms: AUTH failed: $@" if $@;
+    }
+    $cli->hello(consumer => "net-sms.$$") unless $cli->{greeted};
     if ($cmd eq 'contacts') {
         my $rows = eval { $cli->snapshot(1, 'sms_contacts') } || [];
         eval { $cli->bye };
