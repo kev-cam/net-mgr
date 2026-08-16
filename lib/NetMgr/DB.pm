@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 38;
+our $SCHEMA_VERSION = 39;
 
 sub new {
     my ($class, %args) = @_;
@@ -500,6 +500,30 @@ CREATE TABLE IF NOT EXISTS sms_contacts (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
         $self->{dbh}->do(<<'SQL');
+-- The SMS services net-sms can send THROUGH (as opposed to sms_contacts, who it
+-- sends TO). Deliberately holds no password: this table replicates to every
+-- node, so a credential here would copy itself across the fleet. secret_name
+-- points at a root-owned 0600 file read by NetMgr::Secret, the same split
+-- isp_links/isp_secrets already uses.
+CREATE TABLE IF NOT EXISTS sms_services (
+    name         VARCHAR(64)  NOT NULL PRIMARY KEY,   -- numberbarn | gvoice | lterouter
+    kind         VARCHAR(32)  NOT NULL DEFAULT 'web', -- web | modem | device
+    url          VARCHAR(255) NULL,
+    account      VARCHAR(128) NULL,       -- login/username ONLY, never the password
+    from_number  VARCHAR(32)  NULL,       -- the number this service sends from
+    forwards_to  VARCHAR(32)  NULL,       -- where calls to from_number land
+    secret_name  VARCHAR(64)  NULL,       -- NetMgr::Secret file under /etc/net-mgr/secrets
+    status       VARCHAR(32)  NOT NULL DEFAULT 'unknown', -- active|pending|broken|unknown
+    enabled      TINYINT(1)   NOT NULL DEFAULT 1,
+    notes        TEXT,
+    updated_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                              ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from VARCHAR(64) NULL,
+    KEY idx_sms_services_enabled (enabled),
+    KEY idx_sms_services_repl    (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        $self->{dbh}->do(<<'SQL');
 CREATE TABLE IF NOT EXISTS isp_secrets (
     gateway_machine_id INT          NOT NULL,
     isp_name           VARCHAR(64)  NOT NULL,
@@ -949,6 +973,30 @@ SQL
                  ENUM('agent','human','system','unverified')
                  NOT NULL DEFAULT 'agent'"
         );
+        return;
+    }
+    if ($v == 39) {
+        # sms_services. Same shape of change as v38: a bare CREATE TABLE IF NOT
+        # EXISTS, identical to the bootstrap DDL, touching nothing that exists.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS sms_services (
+    name         VARCHAR(64)  NOT NULL PRIMARY KEY,   -- numberbarn | gvoice | lterouter
+    kind         VARCHAR(32)  NOT NULL DEFAULT 'web', -- web | modem | device
+    url          VARCHAR(255) NULL,
+    account      VARCHAR(128) NULL,       -- login/username ONLY, never the password
+    from_number  VARCHAR(32)  NULL,       -- the number this service sends from
+    forwards_to  VARCHAR(32)  NULL,       -- where calls to from_number land
+    secret_name  VARCHAR(64)  NULL,       -- NetMgr::Secret file under /etc/net-mgr/secrets
+    status       VARCHAR(32)  NOT NULL DEFAULT 'unknown', -- active|pending|broken|unknown
+    enabled      TINYINT(1)   NOT NULL DEFAULT 1,
+    notes        TEXT,
+    updated_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                              ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from VARCHAR(64) NULL,
+    KEY idx_sms_services_enabled (enabled),
+    KEY idx_sms_services_repl    (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
         return;
     }
     if ($v == 38) {
@@ -2773,6 +2821,53 @@ sub upsert_sms_contact {
     return { op => ($was ? 'update' : 'insert'), now => $now };
 }
 
+sub get_sms_services {
+    my ($self, %o) = @_;
+    my $sql = "SELECT * FROM sms_services";
+    $sql .= " WHERE enabled = 1" if $o{enabled_only};
+    return $self->{dbh}->selectall_arrayref($sql . " ORDER BY name", { Slice => {} });
+}
+
+# Same merge rule as upsert_sms_contact: an omitted field keeps its stored
+# value, and NOT NULL columns are resolved in Perl so a first insert works.
+sub upsert_sms_service {
+    my ($self, %f) = @_;
+    croak "name required" unless defined $f{name} && length $f{name};
+    my $was = $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM sms_services WHERE name = ?", undef, $f{name});
+    my $pick = sub {
+        my ($k, $default) = @_;
+        return $f{$k} if defined $f{$k} && length $f{$k};
+        return $was->{$k} if $was && defined $was->{$k};
+        return $default;
+    };
+    my $enabled = defined $f{enabled} ? ($f{enabled} ? 1 : 0)
+                : ($was ? ($was->{enabled} ? 1 : 0) : 1);
+    $self->{dbh}->do(
+        "INSERT INTO sms_services (name, kind, url, account, from_number,
+                                   forwards_to, secret_name, status, enabled, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            kind = VALUES(kind), url = VALUES(url), account = VALUES(account),
+            from_number = VALUES(from_number), forwards_to = VALUES(forwards_to),
+            secret_name = VALUES(secret_name), status = VALUES(status),
+            enabled = VALUES(enabled), notes = VALUES(notes)",
+        undef, $f{name}, $pick->('kind','web'), $pick->('url'), $pick->('account'),
+        $pick->('from_number'), $pick->('forwards_to'), $pick->('secret_name'),
+        $pick->('status','unknown'), $enabled, $pick->('notes'));
+    my $now = $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM sms_services WHERE name = ?", undef, $f{name});
+    return { op => ($was ? 'update' : 'insert'), now => $now };
+}
+
+sub delete_sms_service {
+    my ($self, $name) = @_;
+    my $row = $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM sms_services WHERE name = ?", undef, $name) or return undef;
+    $self->{dbh}->do("DELETE FROM sms_services WHERE name = ?", undef, $name);
+    return $row;
+}
+
 sub delete_sms_contact {
     my ($self, $number) = @_;
     my $row = $self->{dbh}->selectrow_hashref(
@@ -2906,7 +3001,7 @@ sub query_table {
         host_keys dhcp_ranges dhcp_reservations
         mesh_tunnels node_capabilities bitchat_peers
         wan_services wan_service_candidates wan_service_health
-        public_dns_servers sms_contacts
+        public_dns_servers sms_contacts sms_services
     );
     croak "unknown table '$table'" unless $allowed{$table};
     my $cols = $opts{cols};

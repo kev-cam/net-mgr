@@ -30,7 +30,7 @@ my @REPLICATED = qw(
     dhcp_ranges dhcp_reservations
     mesh_tunnels node_capabilities
     wan_services wan_service_candidates wan_service_health
-    sms_contacts
+    sms_contacts sms_services
 );
 
 sub run {
@@ -362,6 +362,20 @@ sub _apply_sms_contacts {
         notes   => $row->{notes},
     );
     _stamp($db, 'sms_contacts', $repl_from, 'number = ?', $row->{number});
+}
+
+sub _apply_sms_services {
+    my ($db, $row, $idmap, $repl_from) = @_;
+    return unless $row->{name};
+    $db->upsert_sms_service(map { $_ => $row->{$_} }
+        qw(name kind url account from_number forwards_to secret_name status enabled notes));
+    _stamp($db, 'sms_services', $repl_from, 'name = ?', $row->{name});
+}
+
+sub _delete_sms_services {
+    my ($db, $row) = @_;
+    return unless $row->{name};
+    $db->delete_sms_service($row->{name});
 }
 
 sub _delete_sms_contacts {

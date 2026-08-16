@@ -46,7 +46,7 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
     mesh_tunnels node_capabilities bitchat_peers
     bitchat_relay_packets
     wan_services wan_service_candidates wan_service_health
-    public_dns_servers sms_contacts
+    public_dns_servers sms_contacts sms_services
 );
 
 # Tables whose contents are sensitive (credentials etc.); SUBSCRIBE
@@ -4914,6 +4914,49 @@ sub _obs_sms_contact {
     return ();
 }
 
+# OBSERVE kind=sms_service name=numberbarn [url=..] [account=..] [svckind=web]
+#                          [from_number=..] [forwards_to=..] [secret_name=..]
+#                          [status=active|pending|broken] [enabled=0|1] [notes=..]
+#
+# A service net-sms can send THROUGH. Holds no password: this table replicates
+# fleet-wide, so a credential here would copy itself to every node. secret_name
+# names a root-owned 0600 file that NetMgr::Secret reads locally instead.
+#
+# `svckind` for the same reason a contact's kind is `ctype` — the protocol's own
+# `kind` field selects the verb and cannot be reused for a payload field.
+sub _obs_sms_service {
+    my ($self, $cli, $kv) = @_;
+    my ($who) = $self->_chat_identity($cli, $kv);
+    die "sms_service: not authorized
+" unless defined $who;
+    my $name = $kv->{name};
+    die "sms_service: name required
+" unless defined $name && length $name;
+    die "sms_service: name must be a short slug
+" unless $name =~ /^[A-Za-z0-9_.-]{1,64}$/;
+    # Refuse anything that looks like a credential: the field does not exist,
+    # and silently dropping it would leave an operator thinking it was stored.
+    for my $bad (qw(password passwd secret pass token api_key)) {
+        die "sms_service: '$bad' is not stored in the DB - put it in "
+          . "/etc/net-mgr/secrets/<name> and set secret_name
+"
+            if exists $kv->{$bad};
+    }
+    my $r = $self->_upsert('sms_services', 'upsert_sms_service',
+        name        => $name,
+        kind        => $kv->{svckind},
+        url         => $kv->{url},
+        account     => $kv->{account},
+        from_number => $kv->{from_number},
+        forwards_to => $kv->{forwards_to},
+        secret_name => $kv->{secret_name},
+        status      => $kv->{status},
+        notes       => $kv->{notes},
+        (exists $kv->{enabled} ? (enabled => ($kv->{enabled} ? 1 : 0)) : ()));
+    $self->_log("sms_service $name ($r->{op}) by $who");
+    return ();
+}
+
 # OBSERVE kind=sms_contact_delete number=+1408...
 sub _obs_sms_contact_delete {
     my ($self, $cli, $kv) = @_;
@@ -5538,6 +5581,7 @@ sub _handle_observe {
         elsif ($kind eq 'dhcp_range_delete')
                                        { @events = $self->_obs_dhcp_range_delete($cli, $kv) }
         elsif ($kind eq 'sms_contact') { @events = $self->_obs_sms_contact($cli, $kv) }
+        elsif ($kind eq 'sms_service') { @events = $self->_obs_sms_service($cli, $kv) }
         elsif ($kind eq 'sms_contact_delete')
                                        { @events = $self->_obs_sms_contact_delete($cli, $kv) }
         elsif ($kind eq 'ap_exclude')  { @events = $self->_obs_ap_exclude($cli, $kv) }

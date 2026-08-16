@@ -33,6 +33,7 @@ use NetMgr::SMS;
 
 my ($conf, $dry, $quiet, $only, $help);
 my ($listen, $cname, $ckind, $cservice, $cnotes, $cenable, $no_auth);
+my (%svc);
 $listen = '127.0.0.1:7531';
 GetOptions('config=s' => \$conf, 'dry-run|n' => \$dry, 'quiet|q' => \$quiet,
            'provider=s' => \$only, 'help|h' => \$help,
@@ -50,18 +51,22 @@ my $cmd = shift @ARGV // usage(2);
 # asked to create a nameless contact. Only done for the contact verbs: for
 # `send`, everything after the recipient is deliberately message text and must
 # not be parsed as options.
-if ($cmd =~ /^contact/) {
+if ($cmd =~ /^contact|^service/) {
     local $SIG{__WARN__} = sub { warn $_[0] };
     Getopt::Long::Configure('permute');
     GetOptions('name=s' => \$cname, 'ctype=s' => \$ckind,
                'service=s' => \$cservice, 'notes=s' => \$cnotes,
                'listen=s' => \$listen, 'no-auth' => \$no_auth,
                'enable' => sub { $cenable = 1 }, 'disable' => sub { $cenable = 0 },
+               'url=s' => \$svc{url}, 'account=s' => \$svc{account},
+               'svckind=s' => \$svc{svckind}, 'from=s' => \$svc{from_number},
+               'forwards-to=s' => \$svc{forwards_to},
+               'secret-name=s' => \$svc{secret_name}, 'status=s' => \$svc{status},
               ) or usage(2);
 }
 
 my $sms;
-unless ($cmd =~ /^contact/) {
+unless ($cmd =~ /^contact|^service/) {
     $sms = NetMgr::SMS->load(config => $conf, ($dry ? (dry_run => 1) : ()));
 }
 if ($only && $sms) {
@@ -73,7 +78,7 @@ if ($only && $sms) {
 }
 
 # ---- contacts (stored in the DB, replicated to every node) ----------
-if ($cmd =~ /^contact/) {
+if ($cmd =~ /^contact|^service/) {
     require NetMgr::Client;
     my $cli = NetMgr::Client->new(listen => $listen) or die "net-sms: no daemon\n";
     # Writing a contact is a mutating verb, so a non-loopback connection has to
@@ -82,11 +87,40 @@ if ($cmd =~ /^contact/) {
     # skip the handshake there (and when --no-auth is given).
     my ($h) = NetMgr::Client::split_hostport($listen);
     my $loopback = defined $h && $h =~ /^(?:127\.\d+\.\d+\.\d+|::1|localhost)$/;
-    if (!$loopback && !$no_auth && $cmd ne 'contacts') {
+    if (!$loopback && !$no_auth && $cmd ne 'contacts' && $cmd ne 'services') {
         eval { $cli->auth() };
         die "net-sms: AUTH failed: $@" if $@;
     }
     $cli->hello(consumer => "net-sms.$$") unless $cli->{greeted};
+    if ($cmd eq 'services') {
+        my $rows = eval { $cli->snapshot(1, 'sms_services') } || [];
+        eval { $cli->bye };
+        unless (@$rows) { print "no services\n"; exit 0 }
+        printf "%-12s %-6s %-16s %-22s %-9s %s
+",
+            'NAME','KIND','FROM','ACCOUNT','STATUS','SECRET';
+        for my $r (sort { ($a->{name}//'') cmp ($b->{name}//'') } @$rows) {
+            printf "%-12s %-6s %-16s %-22s %-9s %s
+", $r->{name}//'?',
+                $r->{kind}//'', $r->{from_number}//'', $r->{account}//'',
+                $r->{status}//'', $r->{secret_name}//'-';
+        }
+        exit 0;
+    }
+    if ($cmd eq 'service-set') {
+        my $n = shift @ARGV or die "net-sms: service-set needs a NAME
+";
+        my $r = $cli->observe(kind => 'sms_service', name => $n,
+            (map { defined ${$svc{$_}} ? ($_ => ${$svc{$_}}) : () }
+                 grep { ref $svc{$_} } keys %svc),
+            (defined $cnotes  ? (notes   => $cnotes)  : ()),
+            (defined $cenable ? (enabled => $cenable) : ()));
+        eval { $cli->bye };
+        die "net-sms: $r
+" if !defined $r || $r =~ /^ERR/;
+        print "ok
+"; exit 0;
+    }
     if ($cmd eq 'contacts') {
         my $rows = eval { $cli->snapshot(1, 'sms_contacts') } || [];
         eval { $cli->bye };
