@@ -23,7 +23,12 @@
 #   net-reserve autoname [SUBNET]    fill missing reservation host names
 #   net-reserve add-range CIDR START END [--zone Z] [--notes 'dnsmasq:<host>']
 #   net-reserve set-zone  CIDR ZONE          # name a subnet ('' clears)
+#   net-reserve whatif MAC [SUBNET]          # what IP would DHCP hand this MAC?
 #   net-reserve del-range CIDR START
+  net-reserve whatif MAC [SUBNET]        what address would DHCP give this
+                                         MAC? Says which rule fired and how
+                                         far to trust it (reservation = exact,
+                                         lease = likely, pool = estimate)
 #   net-reserve --push [SUBNET]      push named reservations into net-lookup as
 #                                    never-seen hosts (kind=host, last_observed
 #                                    NULL); --dry-run previews the observations
@@ -135,6 +140,7 @@ my %DISPATCH = (
     'add-range' => \&cmd_add_range,
     'del-range' => \&cmd_del_range,
     'set-zone'  => \&cmd_set_zone,
+    'whatif'    => \&cmd_whatif,
     gui       => sub { cmd_gui(shift @ARGV) },
 );
 
@@ -895,6 +901,122 @@ sub cmd_add_range {
 # resolver would then union two subnets into one zone without complaining.
 # This applies the name to EVERY pool of the subnet in one go, and re-sends each
 # row's own start/end so no range is moved.
+# net-reserve whatif MAC [SUBNET]
+#
+# "What address would dnsmasq hand this MAC?" — answered without asking
+# dnsmasq, because dnsmasq cannot be asked. Neither stock nor our fork exposes
+# any query for this: the event socket is send-only (it accepts connections and
+# broadcasts lease events, it never reads), and the DBus interface only offers
+# AddDhcpLease / DeleteDhcpLease / GetMetrics / ClearCache — nothing that
+# answers a hypothetical.
+#
+# So this reproduces dnsmasq's own decision order, and says WHICH rule fired so
+# the confidence is visible rather than implied:
+#
+#   1. dhcp-host reservation   — exact. dnsmasq honours it before anything else,
+#                                and it is data we hold authoritatively.
+#   2. existing lease for MAC  — exact-ish. dnsmasq reuses a live lease; ours is
+#                                only as fresh as the last import.
+#   3. dynamic from a pool     — ESTIMATE. Faithful to the algorithm (SDBM hash
+#                                of the hwaddr picks a start offset, then a
+#                                forward scan skipping in-use, statically
+#                                configured, the router, and .0/.255) but NOT
+#                                authoritative: dnsmasq may ICMP-probe each
+#                                candidate and skip anything that answers, and
+#                                consec-ip mode perturbs the start. Neither is
+#                                reproducible from outside.
+# /24 of an address or CIDR, for matching an answer to a requested subnet.
+sub _net24 {
+    my @o = split /\./, ($_[0] // '');
+    return '' unless @o >= 3;
+    return "$o[0].$o[1].$o[2]";
+}
+
+sub cmd_whatif {
+    my $mac = shift @ARGV or usage("whatif needs a MAC [SUBNET]");
+    my $want_subnet = shift @ARGV;
+    $mac = lc $mac;
+    $mac =~ s/[^0-9a-f]//g;
+    usage("whatif: MAC must be 12 hex digits") unless length $mac == 12;
+    my @o = $mac =~ /(..)/g;
+    my $macfmt = join ':', @o;
+
+    my $cli   = connect_client();
+    my $resv  = eval { $cli->snapshot(1, 'dhcp_reservations') } || [];
+    my $rng   = eval { $cli->snapshot(2, 'dhcp_ranges') }       || [];
+    my $lease = eval { $cli->snapshot(3, 'dhcp_leases') }       || [];
+    eval { $cli->bye };
+
+    # 1. Reservation — dnsmasq's dhcp-host, checked before any pool.
+    for my $r (@$resv) {
+        next unless lc($r->{mac} // '') eq $macfmt;
+        next if $want_subnet && _net24($r->{ip}) ne _net24($want_subnet);
+        printf "%s -> %s\n", $macfmt, $r->{ip};
+        printf "  rule      : dhcp-host reservation%s\n",
+            ($r->{name} ? " ($r->{name})" : '');
+        printf "  confidence: EXACT - dnsmasq honours a dhcp-host before it\n"
+             . "              considers any pool\n";
+        return;
+    }
+
+    # 2. Existing lease — dnsmasq hands back the same address if it is still live.
+    for my $l (@$lease) {
+        next unless lc($l->{mac} // '') eq $macfmt;
+        next if $want_subnet && _net24($l->{ip}) ne _net24($want_subnet);
+        printf "%s -> %s\n", $macfmt, $l->{ip};
+        printf "  rule      : existing lease%s\n",
+            ($l->{hostname} ? " ($l->{hostname})" : '');
+        printf "  confidence: LIKELY - dnsmasq reuses a live lease, but this row\n"
+             . "              is only as fresh as the last import (expires=%s)\n",
+            ($l->{expires} // 'unknown');
+        return;
+    }
+
+    # 3. Dynamic — reproduce the algorithm, and label it an estimate.
+    my @pools = grep { $_->{start_ip} && $_->{end_ip} }
+                grep { !$want_subnet || _net24($_->{start_ip}) eq _net24($want_subnet) } @$rng;
+    unless (@pools) {
+        printf "%s -> (no answer)\n", $macfmt;
+        print  "  rule      : no reservation, no lease, and no DHCP pool"
+             . ($want_subnet ? " on $want_subnet" : '') . "\n";
+        print  "  confidence: EXACT - with nothing to allocate from, dnsmasq\n"
+             . "              would not offer this client an address at all\n";
+        return;
+    }
+    # SDBM over the hwaddr, exactly as src/dhcp.c address_allocate() does.
+    my $j = 0;
+    for my $b (@o) {
+        $j = (hex($b) + ($j << 6) + ($j << 16) - $j) & 0xFFFFFFFF;
+    }
+    $j = 1 if $j == 0;                       # 0 is dnsmasq's marker value
+    my %taken = map { $_->{ip} => 1 } @$resv;
+    $taken{ $_->{ip} } = 1 for @$lease;
+    for my $p (@pools) {
+        my ($lo, $hi) = (ip2int($p->{start_ip}), ip2int($p->{end_ip}));
+        my $size = $hi - $lo + 1;
+        next if $size < 1;
+        my $start = $lo + ($j % $size);
+        for my $k (0 .. $size - 1) {
+            my $n = $lo + (($start - $lo + $k) % $size);
+            my $ip = int2ip($n);
+            next if $taken{$ip};
+            next if ($n & 0xff) == 0 || ($n & 0xff) == 0xff;   # .0 / .255
+            printf "%s -> %s\n", $macfmt, $ip;
+            printf "  rule      : dynamic from pool %s-%s%s\n",
+                $p->{start_ip}, $p->{end_ip},
+                ($p->{notes} ? " [$p->{notes}]" : '');
+            print  "  confidence: ESTIMATE - right algorithm (SDBM hash + forward\n"
+                 . "              scan), but dnsmasq may ICMP-probe candidates and\n"
+                 . "              skip any that answer, which cannot be reproduced\n"
+                 . "              from here. Treat as 'probably this'.\n";
+            return;
+        }
+    }
+    printf "%s -> (pool full)\n", $macfmt;
+    print  "  confidence: ESTIMATE - every address in the matching pool(s) is\n"
+         . "              already reserved or leased\n";
+}
+
 sub cmd_set_zone {
     my $cidr = shift @ARGV or usage("set-zone needs CIDR ZONE");
     my $zone = shift @ARGV;
