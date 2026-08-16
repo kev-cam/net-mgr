@@ -25,10 +25,6 @@
 #   net-reserve set-zone  CIDR ZONE          # name a subnet ('' clears)
 #   net-reserve whatif MAC [SUBNET]          # what IP would DHCP hand this MAC?
 #   net-reserve del-range CIDR START
-  net-reserve whatif MAC [SUBNET]        what address would DHCP give this
-                                         MAC? Says which rule fired and how
-                                         far to trust it (reservation = exact,
-                                         lease = likely, pool = estimate)
 #   net-reserve --push [SUBNET]      push named reservations into net-lookup as
 #                                    never-seen hosts (kind=host, last_observed
 #                                    NULL); --dry-run previews the observations
@@ -2630,6 +2626,10 @@ usage:
                                          on every pool of the subnet at once so
                                          they cannot disagree; '' clears it
   net-reserve del-range CIDR START
+  net-reserve whatif MAC [SUBNET]        what address would DHCP give this MAC?
+                                         Says which rule fired and how far to
+                                         trust it: reservation = exact,
+                                         lease = likely, pool = estimate
   net-reserve --push [SUBNET]            push named reservations into net-lookup
                                          as never-seen hosts (--dry-run previews)
   net-reserve --gui [SUBNET]             Perl/Tk map (click a cell to select it,
