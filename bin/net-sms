@@ -32,18 +32,65 @@ use Sys::Hostname qw(hostname);
 use NetMgr::SMS;
 
 my ($conf, $dry, $quiet, $only, $help);
+my ($listen, $cname, $ckind, $cservice, $cnotes, $cenable);
+$listen = '127.0.0.1:7531';
 GetOptions('config=s' => \$conf, 'dry-run|n' => \$dry, 'quiet|q' => \$quiet,
-           'provider=s' => \$only, 'help|h' => \$help) or usage(2);
+           'provider=s' => \$only, 'help|h' => \$help,
+           'listen=s' => \$listen, 'name=s' => \$cname, 'ctype=s' => \$ckind,
+           'service=s' => \$cservice, 'notes=s' => \$cnotes,
+           'enable' => sub { $cenable = 1 }, 'disable' => sub { $cenable = 0 },
+          ) or usage(2);
 usage(0) if $help;
 my $cmd = shift @ARGV // usage(2);
 
-my $sms = NetMgr::SMS->load(config => $conf, ($dry ? (dry_run => 1) : ()));
-if ($only) {
+my $sms;
+unless ($cmd =~ /^contact/) {
+    $sms = NetMgr::SMS->load(config => $conf, ($dry ? (dry_run => 1) : ()));
+}
+if ($only && $sms) {
     # Keep the named provider only, preserving its configured position so the
     # ordering semantics are identical to a full run.
     @{ $sms->{providers} } = grep { $_->{name} eq $only } @{ $sms->{providers} };
     die "net-sms: no provider named '$only' in " . $sms->{path} . "\n"
         unless @{ $sms->{providers} };
+}
+
+# ---- contacts (stored in the DB, replicated to every node) ----------
+if ($cmd =~ /^contact/) {
+    require NetMgr::Client;
+    my $cli = NetMgr::Client->new(listen => $listen) or die "net-sms: no daemon\n";
+    $cli->hello(consumer => "net-sms.$$");
+    if ($cmd eq 'contacts') {
+        my $rows = eval { $cli->snapshot(1, 'sms_contacts') } || [];
+        eval { $cli->bye };
+        unless (@$rows) { print "no contacts\n"; exit 0 }
+        printf "%-17s %-22s %-9s %-12s %s\n", 'NUMBER','NAME','KIND','SERVICE','ON';
+        for my $r (sort { ($a->{name}//'') cmp ($b->{name}//'') } @$rows) {
+            printf "%-17s %-22s %-9s %-12s %s\n", $r->{number}//'?', $r->{name}//'',
+                $r->{kind}//'', $r->{service}//'',
+                (defined $r->{enabled} && !$r->{enabled} ? 'no' : 'yes');
+        }
+        exit 0;
+    }
+    my $num = shift @ARGV or die "net-sms: $cmd needs a number\n";
+    my $r;
+    if ($cmd eq 'contact-del') {
+        $r = $cli->observe(kind => 'sms_contact_delete', number => $num);
+    }
+    else {   # contact-add / contact-set
+        # A contact's kind travels as ctype: the protocol's own `kind` selects
+        # the verb, so sending kind=mobile would re-dispatch the OBSERVE.
+        $r = $cli->observe(kind => 'sms_contact', number => $num,
+            (defined $cname   ? (name    => $cname)   : ()),
+            (defined $ckind   ? (ctype   => $ckind)   : ()),
+            (defined $cservice? (service => $cservice): ()),
+            (defined $cnotes  ? (notes   => $cnotes)  : ()),
+            (defined $cenable ? (enabled => $cenable) : ()));
+    }
+    eval { $cli->bye };
+    die "net-sms: $r\n" if !defined $r || $r =~ /^ERR/;
+    print "ok\n";
+    exit 0;
 }
 
 if ($cmd eq 'providers') {
@@ -82,6 +129,16 @@ net-sms [--config F] [--dry-run] [--quiet] [--provider N] COMMAND
   send TO MESSAGE...   send MESSAGE to TO, trying providers in configured order
   test TO              send a short test message
   providers            show each provider, whether it is ready, and why not
+
+  contacts                         list notification contacts (from the DB)
+  contact-add NUMBER --name N [--ctype mobile|voip|landline]
+                              [--service numberbarn|gvoice|...] [--notes '..']
+  contact-set NUMBER [--name N] [--enable|--disable] [...]
+  contact-del NUMBER
+
+Contacts live in the replicated sms_contacts table, not in sms.conf, so every
+node has the list. A contact's kind is --ctype because the protocol's own
+`kind` field selects the verb.
 
 Exits 0 only when a provider accepted the message.
 USAGE

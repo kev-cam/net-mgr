@@ -46,7 +46,7 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
     mesh_tunnels node_capabilities bitchat_peers
     bitchat_relay_packets
     wan_services wan_service_candidates wan_service_health
-    public_dns_servers
+    public_dns_servers sms_contacts
 );
 
 # Tables whose contents are sensitive (credentials etc.); SUBSCRIBE
@@ -4881,6 +4881,54 @@ sub _obs_dhcp_range_delete {
     return ();
 }
 
+# OBSERVE kind=sms_contact number=+1408... name=".." [kind=..] [service=..]
+#                           [enabled=0|1] [notes=".."]
+#
+# Who net-sms notifies. Stored in the DB rather than a per-host config file so
+# every node has the list — the node that needs to raise an alarm is not
+# necessarily one an operator configured, and in an outage it may be the only
+# one still able to reach a radio.
+#
+# NOTE the field name collision: the protocol's own `kind` selects the verb, so
+# a contact's kind (mobile/voip/landline) travels as `ctype` to avoid shadowing
+# it. Learned the hard way — `kind=voip` would have re-dispatched the OBSERVE.
+sub _obs_sms_contact {
+    my ($self, $cli, $kv) = @_;
+    my ($who) = $self->_chat_identity($cli, $kv);
+    die "sms_contact: not authorized
+" unless defined $who;
+    my $number = $kv->{number};
+    die "sms_contact: number required
+" unless defined $number && length $number;
+    die "sms_contact: number must be E.164, e.g. +14085551234
+"
+        unless $number =~ /^\+[1-9]\d{7,14}$/;
+    my $r = $self->_upsert('sms_contacts', 'upsert_sms_contact',
+        number  => $number,
+        name    => $kv->{name},
+        kind    => $kv->{ctype},
+        service => $kv->{service},
+        notes   => $kv->{notes},
+        (exists $kv->{enabled} ? (enabled => ($kv->{enabled} ? 1 : 0)) : ()));
+    $self->_log("sms_contact $number ($r->{op}) by $who");
+    return ();
+}
+
+# OBSERVE kind=sms_contact_delete number=+1408...
+sub _obs_sms_contact_delete {
+    my ($self, $cli, $kv) = @_;
+    my ($who) = $self->_chat_identity($cli, $kv);
+    die "sms_contact_delete: not authorized
+" unless defined $who;
+    my $number = $kv->{number};
+    die "sms_contact_delete: number required
+" unless defined $number && length $number;
+    my $row = $self->{db}->delete_sms_contact($number);
+    $self->_emit_change(table => 'sms_contacts', op => 'delete', row => $row) if $row;
+    $self->_log("sms_contact delete $number by $who") if $row;
+    return ();
+}
+
 # kind=regen_dnsmasq — the master (or an operator, e.g. `net-cluster regen`)
 # tells this node to regenerate its own dnsmasq config from its DB replica and
 # reload. Honoured only if [dnsmasq] mode isn't 'off' (i.e. this node manages a
@@ -5489,6 +5537,9 @@ sub _handle_observe {
         elsif ($kind eq 'dhcp_range')  { @events = $self->_obs_dhcp_range($cli, $kv) }
         elsif ($kind eq 'dhcp_range_delete')
                                        { @events = $self->_obs_dhcp_range_delete($cli, $kv) }
+        elsif ($kind eq 'sms_contact') { @events = $self->_obs_sms_contact($cli, $kv) }
+        elsif ($kind eq 'sms_contact_delete')
+                                       { @events = $self->_obs_sms_contact_delete($cli, $kv) }
         elsif ($kind eq 'ap_exclude')  { @events = $self->_obs_ap_exclude($cli, $kv) }
         elsif ($kind eq 'regen_dnsmasq'){ @events = $self->_obs_regen_dnsmasq($cli, $kv) }
         elsif ($kind eq 'self_update') { @events = $self->_obs_self_update($cli, $kv) }

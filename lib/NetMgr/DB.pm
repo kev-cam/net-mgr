@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 37;
+our $SCHEMA_VERSION = 38;
 
 sub new {
     my ($class, %args) = @_;
@@ -481,6 +481,25 @@ CREATE TABLE IF NOT EXISTS isp_links (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
         $self->{dbh}->do(<<'SQL');
+-- Who net-sms notifies. Kept in the DB rather than a config file so every node
+-- has the list: the node that needs to raise an alarm is not necessarily the
+-- one an operator configured, and during an outage it may be the only one
+-- still able to reach a radio.
+CREATE TABLE IF NOT EXISTS sms_contacts (
+    number      VARCHAR(32)  NOT NULL PRIMARY KEY,   -- E.164, e.g. +14085551234
+    name        VARCHAR(128) NOT NULL,
+    kind        VARCHAR(32)  NOT NULL DEFAULT 'mobile',  -- mobile | voip | landline
+    service     VARCHAR(64)  NULL,        -- numberbarn | gvoice | carrier | ...
+    enabled     TINYINT(1)   NOT NULL DEFAULT 1,
+    notes       TEXT,
+    updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                             ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from VARCHAR(64) NULL,
+    KEY idx_sms_contacts_enabled (enabled),
+    KEY idx_sms_contacts_repl    (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        $self->{dbh}->do(<<'SQL');
 CREATE TABLE IF NOT EXISTS isp_secrets (
     gateway_machine_id INT          NOT NULL,
     isp_name           VARCHAR(64)  NOT NULL,
@@ -930,6 +949,28 @@ SQL
                  ENUM('agent','human','system','unverified')
                  NOT NULL DEFAULT 'agent'"
         );
+        return;
+    }
+    if ($v == 38) {
+        # sms_contacts — who net-sms notifies. A pure CREATE TABLE IF NOT
+        # EXISTS: no existing table is touched, no data is transformed, and
+        # re-running is a no-op, so this cannot fail against live data the way
+        # an ALTER can. Kept identical to the bootstrap DDL above.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS sms_contacts (
+    number      VARCHAR(32)  NOT NULL PRIMARY KEY,
+    name        VARCHAR(128) NOT NULL,
+    kind        VARCHAR(32)  NOT NULL DEFAULT 'mobile',
+    service     VARCHAR(64)  NULL,
+    enabled     TINYINT(1)   NOT NULL DEFAULT 1,
+    notes       TEXT,
+    updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                             ON UPDATE CURRENT_TIMESTAMP,
+    replicated_from VARCHAR(64) NULL,
+    KEY idx_sms_contacts_enabled (enabled),
+    KEY idx_sms_contacts_repl    (replicated_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
         return;
     }
     croak "no migration for schema v$v";
@@ -2677,6 +2718,51 @@ sub upsert_dhcp_range {
         "SELECT * FROM dhcp_ranges WHERE subnet_cidr = ? AND start_ip = ?",
         undef, $f{subnet_cidr}, $f{start_ip});
     return { op => ($was ? 'update' : 'insert'), now => $now };
+}
+
+# ---- sms_contacts ---------------------------------------------------
+
+sub get_sms_contacts {
+    my ($self, %o) = @_;
+    my $sql = "SELECT * FROM sms_contacts";
+    $sql .= " WHERE enabled = 1" if $o{enabled_only};
+    $sql .= " ORDER BY name, number";
+    return $self->{dbh}->selectall_arrayref($sql, { Slice => {} });
+}
+
+# Upsert one contact. name is required on insert; on update, fields that are
+# undef are LEFT ALONE rather than nulled, so `--enable` need not restate the
+# name and a replicated row carrying only part of the record cannot erase the
+# rest. Same merge rule as upsert_dhcp_range, for the same reason.
+sub upsert_sms_contact {
+    my ($self, %f) = @_;
+    croak "number required" unless defined $f{number} && length $f{number};
+    my $was = $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM sms_contacts WHERE number = ?", undef, $f{number});
+    croak "name required for a new contact"
+        if !$was && !(defined $f{name} && length $f{name});
+    $self->{dbh}->do(
+        "INSERT INTO sms_contacts (number, name, kind, service, enabled, notes)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            name    = IF(VALUES(name)    IS NULL, name,    VALUES(name)),
+            kind    = IF(VALUES(kind)    IS NULL, kind,    VALUES(kind)),
+            service = IF(VALUES(service) IS NULL, service, NULLIF(VALUES(service), '')),
+            enabled = IF(VALUES(enabled) IS NULL, enabled, VALUES(enabled)),
+            notes   = IF(VALUES(notes)   IS NULL, notes,   NULLIF(VALUES(notes), ''))",
+        undef, $f{number}, $f{name}, $f{kind}, $f{service},
+        (defined $f{enabled} ? ($f{enabled} ? 1 : 0) : undef), $f{notes});
+    my $now = $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM sms_contacts WHERE number = ?", undef, $f{number});
+    return { op => ($was ? 'update' : 'insert'), now => $now };
+}
+
+sub delete_sms_contact {
+    my ($self, $number) = @_;
+    my $row = $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM sms_contacts WHERE number = ?", undef, $number) or return undef;
+    $self->{dbh}->do("DELETE FROM sms_contacts WHERE number = ?", undef, $number);
+    return $row;
 }
 
 # Remove one dynamic range. Returns the deleted row (for a delete emit) or undef.

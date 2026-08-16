@@ -30,6 +30,7 @@ my @REPLICATED = qw(
     dhcp_ranges dhcp_reservations
     mesh_tunnels node_capabilities
     wan_services wan_service_candidates wan_service_health
+    sms_contacts
 );
 
 sub run {
@@ -345,6 +346,28 @@ sub _apply_dhcp_ranges {
     _stamp($db, 'dhcp_ranges', $repl_from,
            'subnet_cidr = ? AND start_ip = ?',
            $row->{subnet_cidr}, $row->{start_ip});
+}
+
+# Notification contacts. Keyed by number, no machine-id remap needed, so they
+# replicate verbatim like the DHCP plan does.
+sub _apply_sms_contacts {
+    my ($db, $row, $idmap, $repl_from) = @_;
+    return unless $row->{number} && $row->{name};
+    $db->upsert_sms_contact(
+        number  => $row->{number},
+        name    => $row->{name},
+        kind    => $row->{kind},
+        service => $row->{service},
+        enabled => $row->{enabled},
+        notes   => $row->{notes},
+    );
+    _stamp($db, 'sms_contacts', $repl_from, 'number = ?', $row->{number});
+}
+
+sub _delete_sms_contacts {
+    my ($db, $row) = @_;
+    return unless $row->{number};
+    $db->delete_sms_contact($row->{number});
 }
 
 sub _delete_dhcp_ranges {
