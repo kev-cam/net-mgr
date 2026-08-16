@@ -324,6 +324,12 @@ install: .version
 	             $(DESTDIR)$(SYSCONFDIR)/net-mgr/shared-wifi.conf; \
 	fi
 	@$(INSTALL) -d $(DESTDIR)$(SYSCONFDIR)/net-mgr/shared-wifi.d
+	@if [ -f etc/dnsmasq.conf.sample ] \
+	     && [ ! -f $(DESTDIR)$(SYSCONFDIR)/net-mgr/dnsmasq.conf ]; then \
+	  echo "  etc/dnsmasq.conf.sample -> $(DESTDIR)$(SYSCONFDIR)/net-mgr/dnsmasq.conf"; \
+	  $(INSTALL) -m 644 etc/dnsmasq.conf.sample \
+	             $(DESTDIR)$(SYSCONFDIR)/net-mgr/dnsmasq.conf; \
+	fi
 	@CFG=$(DESTDIR)$(SYSCONFDIR)/net-mgr/config; \
 	  perl -Ilib -MNetMgr::Config -e 'my @d = NetMgr::Config::dead_keys($$ARGV[0]); exit unless @d; print STDERR "\nWARN: $$ARGV[0] has keys no longer read by the daemon:\n"; print STDERR "  $$_\n" for @d; print STDERR "(harmless, but you can delete them.)\n"' "$$CFG"
 	@echo

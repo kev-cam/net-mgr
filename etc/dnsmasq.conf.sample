@@ -1,0 +1,62 @@
+# /etc/net-mgr/dnsmasq.conf — net-mgr's overlay for the patched dnsmasq.
+#
+# The patched dnsmasq (the kev-cam fork) reads THIS FILE BEFORE its normal
+# /etc/dnsmasq.conf. That ordering is the whole point: it means net-mgr can
+# configure dnsmasq on a gateway WITHOUT ever editing the hand-maintained
+# /etc/dnsmasq.conf, which is the file whose breakage takes DNS and DHCP down
+# for the whole network. Nothing here is required for stock dnsmasq, which does
+# not know about this path and simply ignores it.
+#
+# Read BEFORE, not instead of: options here are additive (dhcp-hostsdir,
+# hostsdir, server=, address= all accumulate), and for anything single-valued
+# the operator's own /etc/dnsmasq.conf still gets the last word. net-mgr adds;
+# it does not override what you wrote by hand.
+#
+# Missing file is not an error — dnsmasq treats it as optional — so an install
+# that never populates this is exactly as it was before.
+
+# ---------------------------------------------------------------------
+# Reservation and hosts data, straight from the replicated DB.
+#
+# These two directories are what net-gen-dnsmasq writes under
+# [dnsmasq] layout = dirs. Naming DIRECTORIES rather than files is what removes
+# the per-zone maintenance: a new zone appears as a new file inside them and is
+# picked up with no config change on any node. Under the older layout=files each
+# generated file had to be named individually in /etc/dnsmasq.conf, so minting a
+# zone silently wrote a file nothing read until a human edited three gateways.
+#
+# Only ADDS records at runtime — dnsmasq re-reads a watched directory on change
+# but never removes from it — so keep [dnsmasq] mode = auto, whose --reload
+# sends the SIGHUP that processes deletions.
+dhcp-hostsdir=/usr/local/sgy/conf.d/dhcp.d
+hostsdir=/usr/local/sgy/conf.d/hosts.d
+
+# ---------------------------------------------------------------------
+# Talking to net-mgr directly (not yet implemented — see below)
+#
+# The intended end state, and the reason this file exists rather than a
+# generated fragment: our dnsmasq asks the LOCAL net-mgr daemon for its
+# reservation and host data over the protocol, and the file layer above goes
+# away entirely. Every gateway already runs a net-mgr node with a full replica,
+# so this is a loopback conversation — it does not depend on nas3 being up, and
+# a dead DB degrades to whatever is still on disk rather than to no service.
+#
+#   netmgr=127.0.0.1:7531
+#
+# Left commented until the C side lands. When it does, the two *dir lines above
+# become the FALLBACK: dnsmasq uses them when net-mgr cannot be reached at
+# startup, which is the behaviour worth keeping — a resolver that refuses to
+# start because a daemon is down is worse than one serving slightly stale data.
+
+# ---------------------------------------------------------------------
+# Notes for whoever edits this next
+#
+# * This file is installed once and never overwritten by `make install`, the
+#   same rule the other net-mgr sample configs follow. Local edits survive.
+# * It is read by the PATCHED dnsmasq only. `net-mgr-dnsmasq-switch stock`
+#   returns the box to the distro binary, which ignores this file completely —
+#   so the switch back is a genuine escape hatch, not a partial one.
+# * Do not put `conf-file=/etc/dnsmasq.conf` here. dnsmasq reads that itself
+#   immediately afterwards, and naming it again would parse it twice — which is
+#   a hard startup failure on any option that rejects duplicates, notably a
+#   repeated dhcp-host IP.
