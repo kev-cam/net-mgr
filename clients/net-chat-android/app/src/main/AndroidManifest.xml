@@ -62,5 +62,27 @@
             android:name=".BitChatService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <!-- Reads NumberBarn's message list via the accessibility tree.
+             NumberBarn exposes no intent, no scheme and no exported service, so
+             this is the only way another app can observe it at all. The service
+             is pinned to that one package (see numberbarn_accessibility.xml) and
+             this build only READS - it performs no clicks and enters no text.
+
+             BIND_ACCESSIBILITY_SERVICE must be held by the SYSTEM to bind us, so
+             it is declared as the service's permission rather than a
+             uses-permission. Enabling still requires an explicit operator
+             action; it cannot be self-granted. -->
+        <service
+            android:name=".smsbridge.NumberBarnReader"
+            android:exported="true"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/numberbarn_accessibility" />
+        </service>
     </application>
 </manifest>
