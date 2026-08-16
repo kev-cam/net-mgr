@@ -59,7 +59,7 @@ if ($cmd =~ /^contact|^service/) {
                'listen=s' => \$listen, 'no-auth' => \$no_auth,
                'enable' => sub { $cenable = 1 }, 'disable' => sub { $cenable = 0 },
                'url=s' => \$svc{url}, 'account=s' => \$svc{account},
-               'svckind=s' => \$svc{svckind}, 'from=s' => \$svc{from_number},
+               'svckind=s' => \$svc{svckind}, 'direction=s' => \$svc{direction}, 'from=s' => \$svc{from_number},
                'forwards-to=s' => \$svc{forwards_to},
                'secret-name=s' => \$svc{secret_name}, 'status=s' => \$svc{status},
               ) or usage(2);
@@ -96,13 +96,13 @@ if ($cmd =~ /^contact|^service/) {
         my $rows = eval { $cli->snapshot(1, 'sms_services') } || [];
         eval { $cli->bye };
         unless (@$rows) { print "no services\n"; exit 0 }
-        printf "%-12s %-6s %-16s %-22s %-9s %s
+        printf "%-12s %-6s %-4s %-16s %-22s %-9s %s
 ",
-            'NAME','KIND','FROM','ACCOUNT','STATUS','SECRET';
+            'NAME','KIND','DIR','FROM','ACCOUNT','STATUS','SECRET';
         for my $r (sort { ($a->{name}//'') cmp ($b->{name}//'') } @$rows) {
-            printf "%-12s %-6s %-16s %-22s %-9s %s
+            printf "%-12s %-6s %-4s %-16s %-22s %-9s %s
 ", $r->{name}//'?',
-                $r->{kind}//'', $r->{from_number}//'', $r->{account}//'',
+                $r->{kind}//'', $r->{direction}//'', $r->{from_number}//'', $r->{account}//'',
                 $r->{status}//'', $r->{secret_name}//'-';
         }
         exit 0;

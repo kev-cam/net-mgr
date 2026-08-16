@@ -4945,6 +4945,7 @@ sub _obs_sms_service {
     my $r = $self->_upsert('sms_services', 'upsert_sms_service',
         name        => $name,
         kind        => $kv->{svckind},
+        direction   => $kv->{direction},
         url         => $kv->{url},
         account     => $kv->{account},
         from_number => $kv->{from_number},

@@ -508,6 +508,12 @@ SQL
 CREATE TABLE IF NOT EXISTS sms_services (
     name         VARCHAR(64)  NOT NULL PRIMARY KEY,   -- numberbarn | gvoice | lterouter
     kind         VARCHAR(32)  NOT NULL DEFAULT 'web', -- web | modem | device
+    direction    VARCHAR(16)  NOT NULL DEFAULT 'out',  -- out | in | both
+                                                       -- 'in' means it can only
+                                                       -- RECEIVE: NumberBarn needs
+                                                       -- its Android app to send,
+                                                       -- but messages can be read
+                                                       -- from the web.
     url          VARCHAR(255) NULL,
     account      VARCHAR(128) NULL,       -- login/username ONLY, never the password
     from_number  VARCHAR(32)  NULL,       -- the number this service sends from
@@ -982,6 +988,12 @@ SQL
 CREATE TABLE IF NOT EXISTS sms_services (
     name         VARCHAR(64)  NOT NULL PRIMARY KEY,   -- numberbarn | gvoice | lterouter
     kind         VARCHAR(32)  NOT NULL DEFAULT 'web', -- web | modem | device
+    direction    VARCHAR(16)  NOT NULL DEFAULT 'out',  -- out | in | both
+                                                       -- 'in' means it can only
+                                                       -- RECEIVE: NumberBarn needs
+                                                       -- its Android app to send,
+                                                       -- but messages can be read
+                                                       -- from the web.
     url          VARCHAR(255) NULL,
     account      VARCHAR(128) NULL,       -- login/username ONLY, never the password
     from_number  VARCHAR(32)  NULL,       -- the number this service sends from
@@ -2844,15 +2856,17 @@ sub upsert_sms_service {
     my $enabled = defined $f{enabled} ? ($f{enabled} ? 1 : 0)
                 : ($was ? ($was->{enabled} ? 1 : 0) : 1);
     $self->{dbh}->do(
-        "INSERT INTO sms_services (name, kind, url, account, from_number,
+        "INSERT INTO sms_services (name, kind, direction, url, account, from_number,
                                    forwards_to, secret_name, status, enabled, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
-            kind = VALUES(kind), url = VALUES(url), account = VALUES(account),
+            kind = VALUES(kind), direction = VALUES(direction),
+            url = VALUES(url), account = VALUES(account),
             from_number = VALUES(from_number), forwards_to = VALUES(forwards_to),
             secret_name = VALUES(secret_name), status = VALUES(status),
             enabled = VALUES(enabled), notes = VALUES(notes)",
-        undef, $f{name}, $pick->('kind','web'), $pick->('url'), $pick->('account'),
+        undef, $f{name}, $pick->('kind','web'), $pick->('direction','out'),
+        $pick->('url'), $pick->('account'),
         $pick->('from_number'), $pick->('forwards_to'), $pick->('secret_name'),
         $pick->('status','unknown'), $enabled, $pick->('notes'));
     my $now = $self->{dbh}->selectrow_hashref(

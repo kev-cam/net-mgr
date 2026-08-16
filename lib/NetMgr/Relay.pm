@@ -368,7 +368,7 @@ sub _apply_sms_services {
     my ($db, $row, $idmap, $repl_from) = @_;
     return unless $row->{name};
     $db->upsert_sms_service(map { $_ => $row->{$_} }
-        qw(name kind url account from_number forwards_to secret_name status enabled notes));
+        qw(name kind direction url account from_number forwards_to secret_name status enabled notes));
     _stamp($db, 'sms_services', $repl_from, 'name = ?', $row->{name});
 }
 
