@@ -441,10 +441,11 @@ sub gen_from_db {
            . "\n  name them with: net-reserve set-zone <cidr> <name>\n";
     }
     # A zone lookup that resolves nothing must not be mistaken for "no hosts".
-    # Every reservation is filtered through the zone map, so an untagged DB would
-    # otherwise produce an empty file set, and _emit_generated would happily write
-    # it and reload dnsmasq — silently deleting every static mapping on the
-    # network. Refuse instead: exit non-zero with nothing written.
+    # Every reservation is filtered through the zone map, so an untagged DB
+    # yields an empty file set. _emit_generated already refuses to write or
+    # SIGHUP in that case, so nothing is destroyed — but it only warns and exits
+    # 0, which reads as success to the daemon's regen trigger and to any script
+    # driving this. Fail loudly instead, and name the command that fixes it.
     die "net-gen-dnsmasq: none of the " . scalar(@$resv) . " reservation(s) fall in"
       . " a zoned subnet — refusing to write an empty config set.\n"
       . "  Tag the subnets first, e.g. net-reserve set-zone 192.168.15.0/24 dmz\n"
