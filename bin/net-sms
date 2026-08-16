@@ -111,8 +111,13 @@ if ($cmd =~ /^contact|^service/) {
         my $n = shift @ARGV or die "net-sms: service-set needs a NAME
 ";
         my $r = $cli->observe(kind => 'sms_service', name => $n,
-            (map { defined ${$svc{$_}} ? ($_ => ${$svc{$_}}) : () }
-                 grep { ref $svc{$_} } keys %svc),
+            # \$svc{k} is a ref to the HASH ELEMENT, so GetOptions writes
+            # through it and the element ends up holding the VALUE. Reading it
+            # back as ${$svc{k}} therefore dies on any option actually supplied,
+            # and filtering on ref() silently drops precisely those. Read the
+            # element directly; unsupplied keys are autovivified undef and are
+            # skipped by the defined check.
+            (map { defined $svc{$_} ? ($_ => $svc{$_}) : () } sort keys %svc),
             (defined $cnotes  ? (notes   => $cnotes)  : ()),
             (defined $cenable ? (enabled => $cenable) : ()));
         eval { $cli->bye };
