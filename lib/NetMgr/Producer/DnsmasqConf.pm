@@ -51,6 +51,23 @@ sub _split_iface {
 sub _dequal { my $n = shift // ''; $n =~ s/-air$//; $n =~ s/-\d+$//; $n =~ s/-[a-z0-9]+$//; $n }
 sub _rkey { lc($_[0]{mac} // '') . '|' . ($_[0]{ip} // '') }
 
+# Is $own the name of a LEG of the machine recorded as $mach? Same test pass 1
+# uses to decide a rename: equal bases, or the machine's base plus a suffix
+# (nas3-dwn2 is an nas3 leg; wc13 is not an lg-g4 leg). Identity here hangs off
+# the MAC — a machine record is only a grouping of MACs, and this fleet's
+# grouping is polluted by hostname collisions, so it may not overrule the name
+# the MAC's own reservation carries.
+sub _same_host {
+    my ($own, $mach) = @_;
+    return 0 unless defined $own  && length $own
+                 && defined $mach && length $mach;
+    my $o = lc(( _split_iface($own)  )[0]);
+    my $m = lc(( _split_iface($mach) )[0]);
+    return 1 if $o eq $m;
+    return 1 if index($o, "$m-") == 0;
+    return 0;
+}
+
 sub render {
     my (%a) = @_;
     my $resv   = $a{reservations} || [];
@@ -264,8 +281,24 @@ sub render {
     };
 
     my $machine_of = sub { $mac2host{ lc $_[0]{mac} } // $_[0]{name} };
+
+    # The hosts/DNS name: the MACHINE's name, so every leg of one box answers to
+    # the bare name (nas3-up, nas3-dwn2 -> nas3) — but ONLY when this MAC's own
+    # reservation name is a leg of that machine. Machine records here are
+    # polluted by hostname collisions: machine 323 holds both an LG G4 phone and
+    # wc13, so the unguarded form printed wc13's reservation as lg-g4 and wc13
+    # resolved nowhere, while the dhcp-host line above still said wc13 — the same
+    # MAC named two different things in the two halves of one render. When the
+    # machine disagrees with the MAC, the MAC wins; identity is per-MAC here and
+    # a merged machine record is not evidence about who a MAC belongs to.
+    my $host_of = sub {
+        my $r = shift;
+        my $m = $mac2host{ lc $r->{mac} };
+        return $m if defined $m && _same_host($r->{name}, $m);
+        return $r->{name} // $m;      # unnamed reservation still gets the machine's
+    };
     my $dh_name   = $name_map->($machine_of, sub { _short($_[0]{name} // '') });
-    my $host_name = $name_map->($machine_of, $machine_of);
+    my $host_name = $name_map->($machine_of, $host_of);
     if (%$dh_name) {
         my %hosts = map { _dequal($_) => 1 } values %$dh_name;
         $warn->(sprintf("net-gen-dnsmasq: %d multi-homed host(s) [%s] — %s
@@ -309,7 +342,7 @@ sub render {
             }
             $seenip{ $r->{ip} } = ($r->{name} // '?');
             my $mac  = lc $r->{mac};
-            my $name = $mac2host{$mac} // $r->{name};
+            my $name = $host_of->($r);
             # Same rule as the dhcp-host line above: a multi-homed host must not
             # appear here under its bare name either, or the hosts file shadows
             # the delegation just as effectively as the DHCP entry would.
