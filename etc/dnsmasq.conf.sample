@@ -56,6 +56,16 @@ netmgr=127.0.0.1:7531
 # host_lease so the two paths agree; dnsmasq reads a bare number as SECONDS.
 #netmgr-lease=1440
 
+# How often to re-fetch regardless of doorbells. Do not set this to 0 on a
+# gateway: the stream doorbell only rings on the node where a change is MADE,
+# because NetMgr::Relay applies replicated rows without going through the
+# emit_change pipeline (which is what stops replication loops). A gateway's
+# changes all arrive by replication from nas3, so it hears no doorbell at all
+# and this timer is the only thing that keeps it current. Editing directly on
+# the gateway is not the answer either — net-reserve warns that non-master
+# edits revert on replication.
+#netmgr-refresh=30
+
 # The *dir lines above remain as the FALLBACK. If net-mgr cannot be reached at
 # startup dnsmasq keeps whatever the files gave it and retries with backoff,
 # because a resolver that refuses to serve when a database is down is worse than
