@@ -100,6 +100,15 @@ sub _run_session {
                 if (my $del = __PACKAGE__->can("_delete_$table")) {
                     eval { $del->($db, $kv) };
                     _log($log, "[relay] delete $table: $@") if $@;
+                } else {
+                    # A table with an _apply_ but no _delete_ silently diverges:
+                    # the row lives on this node forever, and the scoped REFRESH
+                    # below cannot save us because it upserts what the master HAS
+                    # and never prunes what it no longer has. That is invisible
+                    # until someone notices a released address still resolving,
+                    # so say it out loud rather than dropping the event.
+                    _log($log, "[relay] no _delete_$table handler - "
+                             . "deletion NOT replicated (row kept locally)");
                 }
             } else {
                 my $apply = __PACKAGE__->can("_apply_$table") or next;
@@ -388,6 +397,17 @@ sub _delete_dhcp_ranges {
     my ($db, $row) = @_;
     return unless $row->{subnet_cidr} && $row->{start_ip};
     $db->delete_dhcp_range($row->{subnet_cidr}, $row->{start_ip});
+}
+
+# Keyed on ip alone, which is the table's primary key - deliberately NOT on
+# (ip, mac). A release followed by a re-reservation of the same address to a
+# different device is two events, and matching the mac as well would make the
+# delete miss whenever the follower's copy had already taken the new mac,
+# leaving the old row behind for good.
+sub _delete_dhcp_reservations {
+    my ($db, $row) = @_;
+    return unless $row->{ip};
+    $db->delete_dhcp_reservation($row->{ip});
 }
 
 sub _apply_dhcp_reservations {
