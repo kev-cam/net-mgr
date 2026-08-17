@@ -83,6 +83,7 @@ my %GLYPH = (
 
 my ($listen, $server, $force_auth, $no_auth, $key_id, $key_file);
 my ($gui, $describe, $opt_name, $opt_group, $opt_notes, $opt_zone, $limit, $opt_force);
+my ($opt_dnsmasq, $opt_no_dnsmasq);
 my ($opt_push, $opt_dry, $opt_new);
 GetOptions(
     'listen=s'   => \$listen,
@@ -100,6 +101,8 @@ GetOptions(
     'name=s'     => \$opt_name,
     'group=s'    => \$opt_group,
     'notes=s'    => \$opt_notes,
+    'dnsmasq=s'  => \$opt_dnsmasq,
+    'no-dnsmasq' => \$opt_no_dnsmasq,
     'zone=s'     => \$opt_zone,
     'n=i'        => \$limit,
 ) or die "bad options\n";
@@ -928,6 +931,36 @@ sub _net24 {
     return "$o[0].$o[1].$o[2]";
 }
 
+# Query the patched dnsmasq's event socket. Returns ($ip, $rule, $why) or ().
+# Deliberately quiet on failure: "dnsmasq did not answer" is a normal state
+# (stock build, not running, firewalled) and the caller has a real fallback.
+sub _ask_dnsmasq {
+    my ($mac, $subnet) = @_;
+    my $spec = $opt_dnsmasq || $ENV{NET_MGR_DNSMASQ} || '127.0.0.1:7532';
+    my ($host, $port) = $spec =~ /^(.*):(\d+)$/ ? ($1, $2) : ($spec, 7532);
+    require IO::Socket::INET;
+    my $s = IO::Socket::INET->new(PeerAddr => $host, PeerPort => $port,
+                                  Proto => 'tcp', Timeout => 3) or return ();
+    my $q = "WHATIF mac=$mac" . ($subnet ? " subnet=$subnet" : '') . "
+";
+    print $s $q;
+    my $deadline = time + 5;
+    while (time < $deadline) {
+        my $l = <$s>;
+        last unless defined $l;
+        next unless $l =~ /^WHATIF/;
+        close $s;
+        return (undef, undef, $1) if $l =~ /\berror=(.+?)\s*$/;
+        my ($ip)   = $l =~ /\bip=(\S+)/;
+        my ($rule) = $l =~ /\brule=(\S+)/;
+        my ($why)  = $l =~ /\breason=(.+?)\s*$/;
+        return ($ip, $rule, $why) if $rule;
+        last;
+    }
+    close $s;
+    return ();
+}
+
 sub cmd_whatif {
     my $mac = shift @ARGV or usage("whatif needs a MAC [SUBNET]");
     my $want_subnet = shift @ARGV;
@@ -936,6 +969,26 @@ sub cmd_whatif {
     usage("whatif: MAC must be 12 hex digits") unless length $mac == 12;
     my @o = $mac =~ /(..)/g;
     my $macfmt = join ':', @o;
+
+    # Ask dnsmasq first. It is the only thing that can answer the dynamic case
+    # authoritatively - the address depends on its own lease table and on ICMP
+    # probing, neither of which is reproducible from here. Falls through to the
+    # DB below when it is not reachable or not the patched build, so this keeps
+    # working on a host with no dnsmasq at all.
+    unless ($opt_no_dnsmasq) {
+        my ($ip, $rule, $why) = _ask_dnsmasq($macfmt, $want_subnet);
+        if ($rule) {
+            printf "%s -> %s
+", $macfmt, ($ip // '(no answer)');
+            printf "  rule      : %s%s
+", $rule, ($why ? " ($why)" : '');
+            print  "  confidence: EXACT - answered by the running dnsmasq using its
+"
+                 . "              own lease table and allocator
+";
+            return;
+        }
+    }
 
     my $cli   = connect_client();
     my $resv  = eval { $cli->snapshot(1, 'dhcp_reservations') } || [];
