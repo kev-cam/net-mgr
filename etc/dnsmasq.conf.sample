@@ -32,21 +32,35 @@ dhcp-hostsdir=/usr/local/sgy/conf.d/dhcp.d
 hostsdir=/usr/local/sgy/conf.d/hosts.d
 
 # ---------------------------------------------------------------------
-# Talking to net-mgr directly (not yet implemented — see below)
+# Talking to net-mgr directly.
 #
-# The intended end state, and the reason this file exists rather than a
-# generated fragment: our dnsmasq asks the LOCAL net-mgr daemon for its
-# reservation and host data over the protocol, and the file layer above goes
-# away entirely. Every gateway already runs a net-mgr node with a full replica,
-# so this is a loopback conversation — it does not depend on nas3 being up, and
-# a dead DB degrades to whatever is still on disk rather than to no service.
+# dnsmasq asks the LOCAL net-mgr daemon for its reservation and host data over
+# the protocol, and the file layer above becomes a fallback rather than the
+# source. Every gateway already runs a net-mgr node with a full replica, so this
+# is a loopback conversation: it does not make nas3 a dependency, and it keeps
+# working while the wider network does not.
 #
-#   netmgr=127.0.0.1:7531
-#
-# Left commented until the C side lands. When it does, the two *dir lines above
-# become the FALLBACK: dnsmasq uses them when net-mgr cannot be reached at
-# startup, which is the behaviour worth keeping — a resolver that refuses to
-# start because a daemon is down is worse than one serving slightly stale data.
+# What this buys over the files:
+#   - Deletions. A watched --dhcp-hostsdir is ADD-ONLY, so a removed
+#     reservation survives until something sends a SIGHUP. Over the protocol the
+#     records are rebuilt from scratch each time, so a deletion just happens.
+#   - Names that match the generated files exactly, because the daemon renders
+#     them with the same NetMgr::Producer::DnsmasqConf the files come from -
+#     including the machine-name join, so bare `nas3` resolves and not only
+#     `nas3-up`.
+#   - Updates within a couple of seconds of `net-reserve` writing a change,
+#     with no regen, no SIGHUP and no file on disk.
+netmgr=127.0.0.1:7531
+
+# How long a lease pulled reservations are offered with. Matches [dhcp]
+# host_lease so the two paths agree; dnsmasq reads a bare number as SECONDS.
+#netmgr-lease=1440
+
+# The *dir lines above remain as the FALLBACK. If net-mgr cannot be reached at
+# startup dnsmasq keeps whatever the files gave it and retries with backoff,
+# because a resolver that refuses to serve when a database is down is worse than
+# one serving slightly stale data - on a gateway that is the difference between
+# "DNS is a bit behind" and "the network is off".
 
 # ---------------------------------------------------------------------
 # Notes for whoever edits this next
