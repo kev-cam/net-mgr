@@ -3496,6 +3496,51 @@ SH
 # state, e.g. the cluster's peer_caps table). Keyed identically to
 # %POLL_SCRIPTS; checked first.
 my %POLL_METHODS = (
+    # Rendered dnsmasq data, for the patched dnsmasq to pull over the
+    # protocol instead of reading generated files.
+    #
+    # A POLL_METHOD, NOT a POLL_SCRIPT running net-gen-dnsmasq. A shell probe
+    # would DEADLOCK: _handle_poll slurps the child's stdout with local $/,
+    # while this single-threaded daemon is itself the process that has to answer
+    # that child's SUBSCRIBE. Going straight to $self->{db} avoids the child
+    # entirely.
+    #
+    # The naming policy is NOT reimplemented here - it is the same
+    # NetMgr::Producer::DnsmasqConf::render() that net-gen-dnsmasq writes files
+    # from, so the file path and the protocol path cannot disagree about DNS.
+    #
+    # '#' is a comment to both of dnsmasq's parsers, so the section markers are
+    # inert if one ever leaks into a bank file.
+    'dnsmasq-conf' => sub {
+        my ($self) = @_;
+        require NetMgr::Producer::DnsmasqConf;
+        my $cfg  = $self->{config} || {};
+        my $dn   = $cfg->{dnsmasq} || {};
+        my $dh   = $cfg->{dhcp}    || {};
+        my $db   = $self->{db};
+        my $r = NetMgr::Producer::DnsmasqConf::render(
+            reservations => $db->query_table('dhcp_reservations'),
+            machines     => $db->query_table('machines'),
+            interfaces   => $db->query_table('interfaces'),
+            ranges       => $db->query_table('dhcp_ranges'),
+            domain       => ($dh->{domain} // 'grfx.com'),
+            lease        => ($dh->{host_lease} // 1440),
+            qualify      => (lc($dn->{multihomed} // 'short') eq 'qualified'),
+            bare_bank    => 1,      # the client feeds these to the BANK parser
+            warn         => sub { $self->_log("dnsmasq-conf: $_[0]") },
+        );
+        my (@dhcp, @hosts);
+        for my $zone (sort keys %{ $r->{zones} }) {
+            push @dhcp,  $r->{zones}{$zone}{dhcp}  // '';
+            push @hosts, $r->{zones}{$zone}{hosts} // '';
+        }
+        return "#=== dhcp ===
+" . join('', @dhcp)
+             . "#=== hosts ===
+" . join('', @hosts)
+             . "#=== end ===
+";
+    },
     'peer-caps' => sub {
         my ($self) = @_;
         my $caps = $self->{cluster}{peer_caps} || {};
