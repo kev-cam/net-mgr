@@ -52,7 +52,8 @@ LIBS  = NetMgr/Where.pm NetMgr/Protocol.pm NetMgr/Addr.pm NetMgr/Vlan.pm NetMgr/
         NetMgr/Relay.pm NetMgr/Vendor.pm NetMgr/Subnets.pm \
         NetMgr/HostDebug.pm NetMgr/Auth.pm NetMgr/ChatArchive.pm NetMgr/Caps.pm \
         NetMgr/Producer/AP.pm NetMgr/Producer/Scan.pm \
-        NetMgr/Producer/DhcpMaster.pm NetMgr/Producer/Fingerprint.pm
+        NetMgr/Producer/DhcpMaster.pm NetMgr/Producer/Fingerprint.pm \
+        NetMgr/Producer/DnsmasqConf.pm
 
 INSTALL ?= install
 
