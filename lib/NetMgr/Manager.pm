@@ -6440,10 +6440,21 @@ sub _process_dnsmasq_event {
             mac => $mac, family => ($ip =~ /:/ ? 'v6' : 'v4'),
             addr => $ip, live => 1, source => "$key:dnsmasq");
         push @ev, _events_for_addr_op($a, $mac, $ip);
+        # expires, not ts: ts is when dnsmasq emitted the line, the lease's own
+        # expiry is a separate field. Omitted when 0/absent, which is dnsmasq's
+        # encoding of an INFINITE lease and the same thing net-import-dnsmasq
+        # does with the identical value from the lease file — a NULL expires is
+        # then read as a static binding rather than as "expired".
+        #
+        # This was missing entirely, so every lease learned from the event socket
+        # was immortal: NULL expiry means gather() never ages the address out of
+        # net-reserve's map and purge_expired_leases (WHERE expires IS NOT NULL)
+        # can never remove the row.
         $self->_upsert('dhcp_leases', 'upsert_lease',
             mac      => $mac,
             ip       => $ip,
             hostname => $kv{hostname},
+            ($kv{expires} ? (expires => $kv{expires}) : ()),
         );
         $self->_associate_machine($mac, $kv{hostname}, 'dhcp')
             if $kv{hostname};
