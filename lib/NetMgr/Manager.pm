@@ -3469,6 +3469,44 @@ grep -H . /proc/sys/net/ipv6/conf/*/disable_ipv6 2>/dev/null | sed 's|/proc/sys/
 echo "=== v6 neighbors ==="
 ip -6 neigh show 2>/dev/null | grep -vi fe80 | head -10
 SH
+    # BLE radio state plus a SHORT unfiltered advertising-report capture, so a
+    # node's Bluetooth can be inspected - and RSSI sampled for ranging - on a
+    # host there is no ssh to. nas3 is the case in point: its dongle sits off
+    # the axis the other stations share, which is where a fourth vantage is
+    # worth most, and this protocol is the only way in.
+    #
+    # btmon, not bluetoothctl: BlueZ's discovery filter DEDUPLICATES, so the
+    # console reports RSSI only when it changes. That gives a handful of
+    # irregular samples and made a static 1 m link read -50, -57 and -76 on
+    # consecutive runs. btmon reads LE Advertising Reports off the HCI socket,
+    # so the rate is the beacon's advertising interval. A scan must be running
+    # for reports to flow, hence the backgrounded scan.
+    #
+    # KEPT SHORT DELIBERATELY. _handle_poll slurps the child's stdout with
+    # local $/ and this daemon is single-threaded, so the whole node stops
+    # answering for as long as a probe runs - an earlier 26s version wedged it.
+    # 8s is enough for several adverts per beacon at typical 100-1000ms
+    # intervals; sample longer by polling repeatedly rather than by blocking.
+    ble => <<'SH',
+echo "=== adapters ==="
+timeout 3 hciconfig -a 2>/dev/null | grep -E "^hci|BD Address|UP RUNNING|DOWN|LMP Version"
+echo "=== controller settings (advertising? privacy?) ==="
+# EVERY command here must be individually bounded: _handle_poll reads the
+# child to EOF on a single-threaded daemon, so one command that never
+# returns freezes POLL for the whole node. btmgmt does exactly that on
+# some adapters - it opens the mgmt socket and blocks - which wedged this
+# node until the timeout was added.
+timeout 3 btmgmt info 2>/dev/null | grep -E "addr |current settings" || echo "  (btmgmt unavailable/blocked)"
+echo "=== 8s advertising-report capture (best rssi per address) ==="
+setsid timeout 10 bluetoothctl --timeout 9 scan on >/dev/null 2>&1 </dev/null &
+sleep 1
+timeout 8 btmon 2>/dev/null | awk '
+  /Address: [0-9A-F:]{17}/ { for(i=1;i<=NF;i++) if($i ~ /^[0-9A-F:]{17}$/) a=$i }
+  /RSSI: -?[0-9]+ dBm/ { for(i=1;i<=NF;i++) if($i=="RSSI:") { r=$(i+1)+0;
+      if(a!=""){ if(!(a in mx) || r>mx[a]) mx[a]=r; c[a]++; a="" } } }
+  END { for(k in c) printf "  %-18s best=%-6s n=%s
+", k, mx[k], c[k] }' | sort -k2
+SH
     ifaces => 'ip -br addr show 2>/dev/null',
     routes => 'echo "== v4 =="; ip -4 route show 2>/dev/null; echo "== v6 =="; ip -6 route show 2>/dev/null',
     # The active /etc/net-mgr/config. Plain text, no creds (creds live in
