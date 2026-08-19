@@ -3498,8 +3498,20 @@ echo "=== controller settings (advertising? privacy?) ==="
 # node until the timeout was added.
 timeout 3 btmgmt info 2>/dev/null | grep -E "addr |current settings" || echo "  (btmgmt unavailable/blocked)"
 echo "=== 8s advertising-report capture (best rssi per address) ==="
-setsid timeout 10 bluetoothctl --timeout 9 scan on >/dev/null 2>&1 </dev/null &
-sleep 1
+# PASSIVE ONLY. An earlier version started its own `bluetoothctl scan on` to
+# make reports flow, and that broke the thing it was meant to observe: BlueZ
+# allows one discovery session per adapter, so nas3's bitchat helper died on
+# "Failed to start device discovery: Operation already in progress" every 30s
+# while this probe's scan was live. A diagnostic must never contend for the
+# resource it reports on. We therefore read whatever discovery is ALREADY
+# running - which on a bridge node is continuous anyway - and say so plainly
+# when there is none, rather than manufacturing traffic.
+if hciconfig 2>/dev/null | grep -q INQUIRY; then
+  :
+else
+  echo "  (no discovery active on this adapter - state only, no samples;"
+  echo "   start a scan on the host if you want RSSI from here)"
+fi
 timeout 8 btmon 2>/dev/null | awk '
   /Address: [0-9A-F:]{17}/ { for(i=1;i<=NF;i++) if($i ~ /^[0-9A-F:]{17}$/) a=$i }
   /RSSI: -?[0-9]+ dBm/ { for(i=1;i<=NF;i++) if($i=="RSSI:") { r=$(i+1)+0;
