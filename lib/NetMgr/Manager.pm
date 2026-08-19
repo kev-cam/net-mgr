@@ -425,6 +425,33 @@ sub _register_self_interfaces {
 # and `ip -br -4 addr show` for the v4 addresses each iface carries. Returns a
 # hashref { host, ifaces => [{ name, mac, kind, online, addrs => [v4...] }] }
 # or undef when the hostname is empty. Pure (one fork+exec per `ip` call).
+# Locally-observed listening TCP sockets: what this host is actually SERVING.
+#
+# A host knows its own listeners exactly and instantly; a remote port scan only
+# guesses, goes stale, and cannot see a service at all when the device does not
+# answer probes. That gap is why net-connect's target list has been driven by
+# scan data that was weeks old. Self-declaration fixes it at the source.
+#
+# Loopback-only listeners are skipped deliberately: nothing else can reach them,
+# so publishing them would advertise targets that cannot be attached to.
+sub _collect_self_ports {
+    my ($self) = @_;
+    my @out;
+    my $ss = eval { `ss -H -ltn 2>/dev/null` } // '';
+    for my $line (split /
+/, $ss) {
+        my @f = split /\s+/, $line;
+        my $local = $f[3] // next;                 # e.g. 0.0.0.0:22, [::]:7531
+        my ($addr, $port) = $local =~ /^(.*):(\d+)$/ or next;
+        $addr =~ s/^\[|\]$//g;
+        next if $addr eq '127.0.0.1' || $addr eq '::1';
+        next unless $port =~ /^\d+$/ && $port > 0;
+        push @out, { port => $port + 0, proto => 'tcp' };
+    }
+    my %seen;
+    return [ grep { !$seen{ $_->{port} }++ } @out ];
+}
+
 sub _collect_self_inventory {
     my ($self) = @_;
     require Sys::Hostname;
@@ -493,7 +520,11 @@ sub _collect_self_inventory {
             addrs_v6  => $iface_addrs6{$name} // [],   # v6 (new in this rev)
         };
     }
-    return { host => $host, ifaces => \@ifaces };
+    # Ports ride the same blob so one publish carries identity, reachability
+    # and services together - a consumer never has to correlate three
+    # separately-timed sources to answer "what is here and how do I attach".
+    return { host => $host, ifaces => \@ifaces,
+             ports => $self->_collect_self_ports };
 }
 
 # Write the inventory to the local DB: machines + hostnames + interfaces +
@@ -523,6 +554,26 @@ sub _apply_self_inventory {
     # in Relay::_apply_hostnames never fires on the follower.
     $self->_upsert('hostnames', 'upsert_hostname',
         machine_id => $mid, name => $host, source => 'self');
+
+    # Self-declared services. Attributed to the host's FIRST non-loopback mac
+    # purely because the ports table is keyed that way; the authority for the
+    # row is the publishing host itself, which is why source says so. A machine
+    # that renumbers its NIC re-publishes and the rows follow, since identity
+    # here is the hostname, not the hardware address.
+    if (ref($inv->{ports}) eq 'ARRAY' && @{ $inv->{ports} }) {
+        my ($anchor) = grep { defined && length }
+                       map  { $_->{mac} } @{ $inv->{ifaces} || [] };
+        if (defined $anchor) {
+            for my $p (@{ $inv->{ports} }) {
+                next unless defined $p->{port} && $p->{port} =~ /^\d+$/;
+                $self->_upsert('ports', 'upsert_port',
+                    mac     => $anchor,
+                    port    => $p->{port} + 0,
+                    proto   => ($p->{proto} // 'tcp'),
+                    service => 'self');
+            }
+        }
+    }
     # Local dedup: a self-registration is authoritative for this machine's
     # name, so make it the SOLE attestation:
     #   (1) drop other-mid bindings for $host (clevo-lx accidentally bound
@@ -2973,6 +3024,16 @@ sub _check_periodic_triggers {
         # restarts each generated a fresh Noise key + fresh peer_id row.
         $interval ||= 60 if $name eq 'bitchat-sweep'
             && $self->{db}->current_schema_version >= 33;
+        # register-self: re-publish this host's identity, interfaces and
+        # listening services every 5 minutes. Registration already happens on
+        # startup and on netif rescan, which covers "an interface came up" - the
+        # beacon covers everything those miss: a service started or stopped long
+        # after boot, a row aged out elsewhere, a master that was down when we
+        # first announced, or a node whose publish raced the mesh forming. It is
+        # cheap and idempotent (every upsert is keyed), so the failure mode of
+        # running it too often is a bumped last_seen, while the failure mode of
+        # not running it is the fleet quietly not knowing what a host serves.
+        $interval ||= 300 if $name eq 'register-self';
         next unless $interval && $interval > 0;
         my $last = $self->{periodic_last}{$name} // 0;
         next if ($now - $last) < $interval;
@@ -2989,6 +3050,7 @@ sub _check_periodic_triggers {
 sub _fire_periodic {
     my ($self, $name) = @_;
     if ($name eq 'push-dnsmasq') { $self->_sync_dnsmasq; return }
+    if ($name eq 'register-self') { $self->_register_self_interfaces; return }
     if ($name eq 'bitchat-sweep') {
         # Two-stage sweep: peers with is_connected=1 that haven't been
         # refreshed by the supervisor's poll for 90s go to is_connected=0.
