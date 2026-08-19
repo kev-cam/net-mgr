@@ -1,0 +1,57 @@
+# Build the native Windows net-chat client and publish it as a release asset.
+#
+# Why cgo + mingw rather than a plain cross-compile: the Fyne GUI renders
+# through OpenGL via go-gl, which is a C binding. With CGO_ENABLED=0 (the
+# default when cross-compiling) every file in that package is excluded by build
+# constraints and the build fails with "build constraints exclude all Go files"
+# - which reads like a broken dependency but is really just cgo being off.
+#
+# The result imports only Windows system DLLs (KERNEL32/USER32/GDI32/SHELL32/
+# OPENGL32/msvcrt), so it is a single self-contained .exe: no installer, no
+# admin rights, no runtime to ship alongside it.
+name: net-chat windows
+
+on:
+  push:
+    tags: ['net-chat-v*']
+  workflow_dispatch:          # so a build can be cut without tagging
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: clients/net-chat-go/go.mod
+
+      - name: Install the Windows C toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - name: Build net-chat.exe
+        working-directory: clients/net-chat-go
+        env:
+          CGO_ENABLED: 1
+          GOOS: windows
+          GOARCH: amd64
+          CC: x86_64-w64-mingw32-gcc
+          CXX: x86_64-w64-mingw32-g++
+        run: |
+          go build -trimpath -ldflags "-s -w" -o net-chat.exe ./cmd/net-chat
+          ls -l net-chat.exe
+          # Fail loudly if a non-system DLL crept in: that would turn a
+          # copy-and-run binary into something needing an install.
+          sudo apt-get install -y binutils-mingw-w64-x86-64
+          x86_64-w64-mingw32-objdump -p net-chat.exe | grep -i 'DLL Name' | sort -u
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: net-chat-windows-amd64
+          path: clients/net-chat-go/net-chat.exe
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: clients/net-chat-go/net-chat.exe
