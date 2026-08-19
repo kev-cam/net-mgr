@@ -34,4 +34,23 @@ public final class BitChatConstants {
     public static final String LOCAL_NAME_PREFIX = "bc-";
 
     private BitChatConstants() {}
+
+    /**
+     * Capability hint bits, advertised as one byte after the peer id.
+     *
+     * A coarse "what kind of thing am I" so a nearby viewer can rank and filter
+     * before resolving anything. Bit values are a wire format: only ever APPEND,
+     * never renumber, and treat unknown bits as "some capability I do not
+     * understand" rather than an error - an old client must stay useful next to
+     * a newer peer.
+     */
+    public static final byte CAP_NONE    = 0x00;
+    public static final byte CAP_CHAT    = 0x01;  // speaks net-chat/BitChat
+    public static final byte CAP_DISPLAY = 0x02;  // has a screen worth attaching to
+    public static final byte CAP_SESSION = 0x04;  // hosts attachable sessions (xpra/vnc)
+    public static final byte CAP_RELAY   = 0x08;  // bridges to infrastructure
+    public static final byte CAP_SENSOR  = 0x10;  // reports measurements
+
+    /** What THIS build advertises: a chat-speaking device with a screen. */
+    public static final byte CAP_SELF = (byte) (CAP_CHAT | CAP_DISPLAY);
 }

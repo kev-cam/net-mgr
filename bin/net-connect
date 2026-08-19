@@ -80,6 +80,7 @@ use NetMgr::Client;
 
 # ---- args -----------------------------------------------------------
 
+my ($near_src, $near_only);   # proximity ranking (see load_proximity)
 my ($list_mode, $pick_mode, $yes_mode, $help, $verbose, $dry_run);
 my ($daemon, $login, $ssh_port, $proxy_jump);
 my ($pool_spec, $socket_dir, $config_path);
@@ -100,6 +101,8 @@ GetOptions(
     'socket-dir=s'  => \$socket_dir,
     'config=s'      => \$config_path,
     'listen=s'      => \$listen,
+    'near=s'        => \$near_src,
+    'near-only'     => \$near_only,
     'all|a'         => \$include_loose,
     'verbose|v'     => \$verbose,
     'dry-run|n'     => \$dry_run,
@@ -223,6 +226,26 @@ for my $f (@named_fwds) {
 # ---- fetch list ------------------------------------------------------
 
 my @targets = fetch_remote_list($nm, $filter_arg, $include_loose);
+
+# ---- proximity ranking ----------------------------------------------
+#
+# Applied CLIENT-side, because proximity is a property of where the operator is
+# standing, not of the fleet. The daemon's view is the same from everywhere; the
+# radio in your hand is what makes "this room" meaningful. The TUI gets the
+# ranked list too, so the picker opens with the nearest thing already on top.
+if (defined $near_src) {
+    my %args; $args{listen} = $listen if defined $listen;
+    my $pcli = NetMgr::Client->new(%args, timeout => 5);
+    $pcli->hello(consumer => "net-connect.near.$$");
+    my $near = load_proximity($near_src, $pcli);
+    $pcli->bye;
+    @targets = @{ rank_by_proximity(\@targets, $near) };
+    if ($near_only) {
+        @targets = grep { defined $_->{rssi} } @targets;
+        print STDERR "no targets heard nearby
+" unless @targets;
+    }
+}
 
 # ---- mode-specific behaviour ----------------------------------------
 
@@ -364,6 +387,81 @@ sub fetch_remote_list {
     }
     close $fh;
     return @rows;
+}
+
+
+# =====================================================================
+# Proximity
+# =====================================================================
+
+# Rank targets by how strong they are RIGHT HERE, so "what can I attach to in
+# this room" stops being a scan of the whole estate.
+#
+# Input is <key>	<rssi> lines - whatever did the observing. A key may be:
+#   * a 16-hex BitChat peer id   (what the Android scanner reports)
+#   * a BLE address              (what btmon / the `ble` POLL report)
+#   * a bare hostname            (if the caller already resolved it)
+#
+# peer id -> host goes through bitchat_peers, which is the only join the fleet
+# actually has between a radio identity and a machine: BLE addresses are NOT in
+# the interfaces table, and on phones/tablets they are rotating privacy
+# addresses that identify nothing across time. The advertised peer id is stable
+# precisely because it was designed to be - hence resolving through it.
+sub load_proximity {
+    my ($src, $cli) = @_;
+    my $fh;
+    if ($src eq '-') { $fh = \*STDIN }
+    else { open $fh, '<', $src or die "near: $src: $!
+" }
+    my %rssi;
+    while (my $line = <$fh>) {
+        chomp $line;
+        next if $line =~ /^\s*(#|$)/;
+        my ($key, $v) = split /\s+/, $line, 2;
+        next unless defined $key && defined $v && $v =~ /^-?\d+$/;
+        $key = lc $key;
+        # keep the STRONGEST reading per key: fading is one-sided, so the best
+        # sample is the least-obstructed one and the closest to line of sight.
+        $rssi{$key} = $v if !exists $rssi{$key} || $v > $rssi{$key};
+    }
+    close $fh unless $src eq '-';
+
+    # peer id -> nickname -> host. Nicknames are conventionally "<host>-bridge"
+    # or "android-<4hex>"; only the first form names a machine we can attach to.
+    my %by_host;
+    my $peers = eval { $cli->snapshot(9, 'bitchat_peers') } || [];
+    for my $p (@$peers) {
+        my $pid  = lc($p->{peer_id}  // '');
+        my $nick = $p->{nickname} // '';
+        next unless length $pid && exists $rssi{$pid};
+        my $host = $nick;
+        $host =~ s/-bridge$//;
+        next unless length $host;
+        $by_host{lc $host} = $rssi{$pid}
+            if !exists $by_host{lc $host} || $rssi{$pid} > $by_host{lc $host};
+    }
+    # bare hostnames pass straight through
+    for my $k (keys %rssi) {
+        next if $k =~ /^[0-9a-f]{16}$/ || $k =~ /^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/;
+        $by_host{$k} = $rssi{$k} if !exists $by_host{$k} || $rssi{$k} > $by_host{$k};
+    }
+    return \%by_host;
+}
+
+# Strongest first; anything not heard keeps its existing order behind them,
+# because "not heard" is not the same as "far" - it may simply not advertise.
+sub rank_by_proximity {
+    my ($rows, $near) = @_;
+    my $i = 0;
+    for my $r (@$rows) { $r->{_ord} = $i++; $r->{rssi} = $near->{ lc($r->{name} // '') } }
+    my @sorted = sort {
+        my $ra = defined $a->{rssi}; my $rb = defined $b->{rssi};
+        return -1 if  $ra && !$rb;
+        return  1 if !$ra &&  $rb;
+        return $b->{rssi} <=> $a->{rssi} if $ra && $rb && $a->{rssi} != $b->{rssi};
+        return $a->{_ord} <=> $b->{_ord};
+    } @$rows;
+    return \@sorted;
 }
 
 # =====================================================================
@@ -987,6 +1085,16 @@ Options (laptop mode):
 
 Options (--list mode):
   --listen HOST:PORT   net-mgr daemon to query (default 127.0.0.1:7531)
+  --near FILE          rank targets by measured signal ("what is in this
+                       room"). FILE holds <key> <rssi> lines, key being a
+                       16-hex BitChat peer id, a BLE address, or a hostname;
+                       '-' reads stdin. Peer ids resolve to hosts through
+                       bitchat_peers - the only join between a radio identity
+                       and a machine, since BLE addresses on phones rotate and
+                       are absent from the interfaces table. Strongest first;
+                       hosts not heard keep their order behind them, because
+                       "not heard" only means "did not advertise".
+  --near-only          drop targets that were not heard at all
   --all / -a           include 5900-5999 / 14500-15000 ports even
                        when service is unknown
 

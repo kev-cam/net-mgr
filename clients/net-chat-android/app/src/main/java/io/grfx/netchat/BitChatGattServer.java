@@ -139,9 +139,24 @@ public final class BitChatGattServer {
                 .addServiceUuid(BitChatConstants.SERVICE_PARCEL_UUID)
                 .build();
         byte[] pidRaw = BitChatScanner.peerIdFromName(localName);   // 8 bytes
+        // Capability HINT, one byte appended to the peer id (2 + 16 + 8 + 1 = 27,
+        // still inside the 31-byte limit that this advertisement has already been
+        // burned by once).
+        //
+        // A hint, deliberately, not a description: 31 bytes cannot hold "xpra on
+        // 14501" and should not try. It says only WHAT KIND of thing this is, so
+        // a viewer can rank and filter what is nearby without a round trip; the
+        // actual connection details are resolved from the peer id through
+        // net-mgr (net-connect already emits proto/host/port/label per target).
+        // That split is what keeps discovery working away from infrastructure -
+        // the advert is a pointer, and the mesh carries the resolution when the
+        // network cannot.
+        byte[] sd = new byte[pidRaw.length + 1];
+        System.arraycopy(pidRaw, 0, sd, 0, pidRaw.length);
+        sd[pidRaw.length] = BitChatConstants.CAP_SELF;
         AdvertiseData scanResponse = new AdvertiseData.Builder()
                 .setIncludeDeviceName(false)
-                .addServiceData(BitChatConstants.SERVICE_PARCEL_UUID, pidRaw)
+                .addServiceData(BitChatConstants.SERVICE_PARCEL_UUID, sd)
                 .build();
         advertiser.startAdvertising(settings, data, scanResponse, advertiseCallback);
         Log.i(TAG, "BitChat peripheral started, localName=" + localName);

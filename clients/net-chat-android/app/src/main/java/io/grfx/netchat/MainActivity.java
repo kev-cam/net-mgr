@@ -76,6 +76,7 @@ public class MainActivity extends AppCompatActivity
     private final Map<String, List<String>> pendingDMs = new HashMap<>();
     private Identity identity;
     private String nickname;
+    private LocationShare locationShare;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final SimpleDateFormat ts = new SimpleDateFormat("HH:mm:ss", Locale.US);
@@ -93,8 +94,10 @@ public class MainActivity extends AppCompatActivity
         Button startBtn = findViewById(R.id.start);
         Button stopBtn = findViewById(R.id.stop);
         Button postBtn = findViewById(R.id.post);
+        Button locBtn = findViewById(R.id.loc);
         startBtn.setOnClickListener(v -> requestAndStart());
         stopBtn.setOnClickListener(v -> stopService());
+        locBtn.setOnClickListener(v -> shareLocation());
         postBtn.setOnClickListener(v -> {
             String txt = compose.getText().toString().trim();
             if (!txt.isEmpty()) {
@@ -298,7 +301,32 @@ public class MainActivity extends AppCompatActivity
     // ---- Compose dispatch --------------------------------------
 
     /** {@code @<16hex> body} → DM; anything else → public broadcast. */
+    /**
+     * Share this device's position with the mesh, as an ordinary broadcast.
+     *
+     * Deliberately not a new MessageType: a location is just text that happens
+     * to parse, so it rides the existing MESSAGE path and therefore reaches
+     * every bridge, net-chat and roster that already handles chat — no protocol
+     * version bump, no bridge-side change, and older peers still see something
+     * readable rather than dropping an unknown type.
+     *
+     * Fires only on an explicit tap or /loc; there is no timer anywhere in this
+     * path.
+     */
+    private void shareLocation() {
+        if (locationShare == null) locationShare = new LocationShare(this);
+        append("(you) requesting location …");
+        locationShare.request(new LocationShare.Sink() {
+            @Override public void onStatus(String msg) { ui.post(() -> append(msg)); }
+            @Override public void onFix(String line, android.location.Location loc) {
+                if (line == null) return;          // status already explained why
+                ui.post(() -> broadcastText(line));
+            }
+        });
+    }
+
     private void dispatchCompose(String text) {
+        if (text.equalsIgnoreCase("/loc")) { shareLocation(); return; }
         if (text.startsWith("@") && text.length() > 17 && text.charAt(17) == ' ') {
             String pidHex = text.substring(1, 17).toLowerCase();
             if (isHex(pidHex)) {

@@ -105,7 +105,13 @@ public final class BitChatScanner {
         // 16 hex characters cannot fit alongside the UUID (see
         // BitChatGattServer). Only used when the string path found nothing, so
         // an advertiser that does send hex keeps its existing interpretation.
-        if (sd != null && sd.length == 8 && isZero(pid)) pid = sd.clone();
+        // Accept 8 (peer id alone) or 9 (peer id + capability hint) bytes. The
+        // exact-8 test this replaces would have rejected every advert from a
+        // newer peer outright, losing the peer id as well as the hint.
+        if (sd != null && sd.length >= 8 && isZero(pid)) {
+            pid = java.util.Arrays.copyOfRange(sd, 0, 8);
+        }
+        int caps = (sd != null && sd.length >= 9) ? (sd[8] & 0xff) : 0;
         Log.i(TAG, "scan hit: addr=" + result.getDevice().getAddress()
                 + " name=" + (name == null ? "(none)" : name)
                 + " rssi=" + result.getRssi());
