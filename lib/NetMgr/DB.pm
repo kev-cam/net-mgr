@@ -102,15 +102,40 @@ sub bootstrap_schema {
 
 # Per-version DDL migrations. Inline rather than separate files for now —
 # add a sql/migrations/ tree if/when the count justifies it.
+# Apply schema ALTERs that may already have been applied.
+#
+# A database can arrive at a given version by two overlapping routes: loading
+# sql/schema.sql wholesale (which already carries every column recent enough to
+# be in the base schema), or stepping through _apply_migration one version at a
+# time. Where those routes overlap, an ADD COLUMN re-runs against a column that
+# already exists — MySQL raises "Duplicate column name" and, uncaught, that
+# kills the daemon on EVERY start, not just once. It is a crash loop with no
+# way out short of hand-editing the DB (seen on spectre-vbox at 4075 restarts).
+#
+# v20 and v21 always did this inline, describing themselves as "re-run safe";
+# this is that same rule factored out so later migrations inherit it. Only
+# already-applied errors are swallowed — anything else still dies, because a
+# genuinely broken migration must not be papered over.
+sub _alter_idempotent {
+    my ($self, @alters) = @_;
+    for my $alter (@alters) {
+        eval { $self->{dbh}->do($alter) };
+        if ($@ && $@ !~ /duplicate column|Duplicate column|Duplicate key name/i) {
+            die $@;
+        }
+    }
+    return;
+}
+
 sub _apply_migration {
     my ($self, $v) = @_;
     if ($v == 2) {
         # Add addresses.source so we can track where each (mac, addr)
         # assignment came from (DHCP server, dhcp.master, dhcp.extra, nmap).
-        $self->{dbh}->do(
+        $self->_alter_idempotent(
             "ALTER TABLE addresses ADD COLUMN source VARCHAR(64) AFTER addr"
         );
-        $self->{dbh}->do(
+        $self->_alter_idempotent(
             "ALTER TABLE addresses ADD KEY idx_source (source)"
         );
         return;
@@ -119,16 +144,16 @@ sub _apply_migration {
         # Add last_observed to track *live* observations, separate from
         # last_seen (any DB touch). NULL = never observed live (paper-only
         # entries from dhcp.master). interfaces and addresses both get it.
-        $self->{dbh}->do(
+        $self->_alter_idempotent(
             "ALTER TABLE interfaces ADD COLUMN last_observed DATETIME NULL"
         );
-        $self->{dbh}->do(
+        $self->_alter_idempotent(
             "ALTER TABLE interfaces ADD KEY idx_last_observed (last_observed)"
         );
-        $self->{dbh}->do(
+        $self->_alter_idempotent(
             "ALTER TABLE addresses ADD COLUMN last_observed DATETIME NULL"
         );
-        $self->{dbh}->do(
+        $self->_alter_idempotent(
             "ALTER TABLE addresses ADD KEY idx_last_observed (last_observed)"
         );
         return;
@@ -137,10 +162,10 @@ sub _apply_migration {
         # Per-(mac,addr) ping RTT tracking. min_rtt_ms is monotone-
         # decreasing, reset_rtt() clears it. last_rtt_ms is the most-
         # recent fping reading, used by the ping_slow event detector.
-        $self->{dbh}->do(
+        $self->_alter_idempotent(
             "ALTER TABLE addresses ADD COLUMN min_rtt_ms FLOAT NULL"
         );
-        $self->{dbh}->do(
+        $self->_alter_idempotent(
             "ALTER TABLE addresses ADD COLUMN last_rtt_ms FLOAT NULL"
         );
         return;
@@ -150,7 +175,7 @@ sub _apply_migration {
         # Captured by net-poll-ap from `wl -i <iface> ssid`. Lets
         # net-roam --list show "scorpius" instead of the AP's full
         # joined SSID list.
-        $self->{dbh}->do(
+        $self->_alter_idempotent(
             "ALTER TABLE associations ADD COLUMN ssid VARCHAR(64) NULL AFTER iface"
         );
         return;
@@ -728,7 +753,7 @@ SQL
         # aps.exclude: per-AP globs of hosts NOT to push to that AP's DHCP
         # static leases (net-push-ap). Set via OBSERVE kind=ap_exclude; AP
         # rescans (upsert_ap) leave it untouched. See sql/schema.sql.
-        $self->{dbh}->do(
+        $self->_alter_idempotent(
             "ALTER TABLE aps ADD COLUMN exclude TEXT NULL AFTER board"
         );
         return;
@@ -736,10 +761,10 @@ SQL
     if ($v == 28) {
         # Durable chat-key auth: persist the requester's SSH pubkey through the
         # see-and-request approval flow. See sql/schema.sql for the rationale.
-        $self->{dbh}->do(
+        $self->_alter_idempotent(
             "ALTER TABLE chat_members ADD COLUMN request_pubkey TEXT NULL"
         );
-        $self->{dbh}->do(
+        $self->_alter_idempotent(
             "ALTER TABLE chat_authorized_keys ADD COLUMN pubkey TEXT NULL"
         );
         return;
@@ -747,7 +772,7 @@ SQL
     if ($v == 29) {
         # mesh_tunnels.secret_name: per-tunnel pointer to the credential needed
         # for provider DDNS (HE tunnelbroker). See sql/schema.sql.
-        $self->{dbh}->do(
+        $self->_alter_idempotent(
             "ALTER TABLE mesh_tunnels ADD COLUMN secret_name VARCHAR(64) NULL"
         );
         return;
@@ -755,7 +780,7 @@ SQL
     if ($v == 30) {
         # peers.cluster_member: peer's STATUS-reported cluster_member name, so
         # AutoDiscover can resolve peers without machines table data.
-        $self->{dbh}->do(
+        $self->_alter_idempotent(
             "ALTER TABLE peers ADD COLUMN cluster_member VARCHAR(64) NULL"
         );
         return;
@@ -765,7 +790,7 @@ SQL
         # on, so an approver can see WHERE the request originated, not just
         # WHO claimed to send it. Especially useful for unverified joins
         # (the principal is a self-asserted name; the source addr is real).
-        $self->{dbh}->do(
+        $self->_alter_idempotent(
             "ALTER TABLE chat_members ADD COLUMN requested_from VARCHAR(64) NULL"
         );
         return;
@@ -961,7 +986,7 @@ SQL
         # instead of the LAN control plane — extending the BLE mesh across
         # the Internet. NULL = LAN relay (the default). See sql/schema.sql
         # and Manager::_bitchat_relay_fanout.
-        $self->{dbh}->do(
+        $self->_alter_idempotent(
             "ALTER TABLE chat_sessions ADD COLUMN ipv6_vlan VARCHAR(64) NULL"
         );
         return;
