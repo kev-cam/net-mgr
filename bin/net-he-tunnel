@@ -26,6 +26,9 @@
 #       iface with config, optionally re-register the WAN with HE, re-verify.
 #       No-op (exit 0) if the uplink is already healthy.
 #
+#   net-he-tunnel pops    [--servers IP,IP,...]
+#       Rank candidate HE PoPs by ICMP RTT and print the closest.
+#
 #   net-he-tunnel setup   --owner NAME --server IP --tunnel-prefix CIDR
 #                         --routed-prefix CIDR [--tunnel-id ID] [--secret NAME]
 #                         [--node N] [--persist] [--ddns] [--yes] [--dry-run]
@@ -52,7 +55,7 @@ my %opt = (name => 'he_net');
 GetOptions(\%opt,
     'node=s', 'name=s', 'owner=s', 'server=s', 'tunnel-prefix=s',
     'routed-prefix=s', 'tunnel-id=s', 'secret=s', 'suffix=s',
-    'persist', 'ddns', 'yes', 'dry-run', 'help|h',
+    'persist', 'ddns', 'yes', 'dry-run', 'help|h', 'servers=s', 'closest',
 ) or usage(2);
 usage(0) if $opt{help};
 
@@ -65,7 +68,67 @@ my ($hp, $need_auth, $label) = resolve_node($opt{node} // 'local');
 if    ($cmd eq 'status') { exit cmd_status() }
 elsif ($cmd eq 'repair') { exit cmd_repair() }
 elsif ($cmd eq 'setup')  { exit cmd_setup()  }
+elsif ($cmd eq 'pops')   { exit cmd_pops()   }
 else  { warn "net-he-tunnel: unknown command '$cmd'\n"; usage(2) }
+
+# ---- PoP selection ----------------------------------------------------
+# HE terminates 6in4 at ~30 PoPs and the closest one materially affects latency,
+# since every v6 packet is encapsulated to it. There is no published API listing
+# them, and guessing tserv1.<pop>.he.net names does NOT work — of fmt2/lax1/chi1/
+# dal1/nyc4/ash1/tor1/sea1/den1/kcm1/mia1/lon1/ams1/fra1/par1/tyo1/syd1/sin1/
+# hkg1/zrh1/sto1/prg1, only syd1 resolves. So the candidate list is DATA, not a
+# guess: seeded with addresses we have actually confirmed, extended from the
+# fleet's own mesh_tunnels rows, and overridable. Get the authoritative list from
+# the tunnelbroker "Create Regular Tunnel" page and drop it in config as:
+#     [he]
+#     servers = 72.52.104.74, 216.66.88.98, ...
+# A sub, not a `my` array: file-scope assignments run in order, and the command
+# dispatch above executes BEFORE this point — a `my @POP_SEED = (...)` here is
+# still empty when cmd_pops() runs, which made every candidate silently vanish.
+sub pop_seed {
+    return (
+        '72.52.104.74',    # confirmed: current tunnel 953133 server (mesh_tunnels)
+        '216.66.88.98',    # confirmed: server the gateway3 iface was built against
+        '216.218.142.50',  # confirmed: tserv1.syd1.he.net
+    );
+}
+
+sub cmd_pops {
+    my @cand = pop_seed();
+    if (defined $opt{servers} && length $opt{servers}) {
+        @cand = grep { length } map { s/^\s+|\s+$//gr } split /,/, $opt{servers};
+    }
+    my %seen; @cand = grep { !$seen{$_}++ } @cand;
+    print "== HE PoP latency from " . ($opt{node} // 'local') . " ==\n";
+    my @ranked;
+    for my $s (@cand) {
+        my $rtt = ping_rtt($s);
+        push @ranked, [ $s, $rtt ];
+        printf "  %-18s %s\n", $s, defined $rtt ? sprintf("%.1f ms", $rtt) : "unreachable";
+    }
+    my @ok = sort { $a->[1] <=> $b->[1] } grep { defined $_->[1] } @ranked;
+    unless (@ok) { print "  no candidate answered — is ICMP blocked outbound?\n"; return 1 }
+    printf "\n  closest: %s (%.1f ms)\n", $ok[0][0], $ok[0][1];
+    print "  use it:  net-he-tunnel setup --owner NODE --server $ok[0][0] \\\n"
+        . "             --tunnel-prefix ... --routed-prefix ... --persist --yes\n";
+    print "\n  NOTE: HE does not let you move an existing tunnel between PoPs —\n"
+        . "  create a new tunnel at the chosen PoP in tunnelbroker, then point\n"
+        . "  this node at it with `setup`. Only the CLIENT endpoint is dynamic.\n";
+    return 0;
+}
+
+# Median-of-3 ICMP RTT. Returns undef when nothing comes back.
+sub ping_rtt {
+    my ($host) = @_;
+    my @t;
+    for (1 .. 3) {
+        my $out = run_capture('ping', ($^O =~ /MSWin|cygwin/i ? ('-n', '1') : ('-c', '1', '-W', '2')), $host);
+        push @t, $1 if $out =~ /[=<]\s*([\d.]+)\s*ms/i;
+    }
+    return undef unless @t;
+    @t = sort { $a <=> $b } @t;
+    return $t[ int(@t / 2) ];
+}
 
 # ---- target resolution ------------------------------------------------
 sub resolve_node {
@@ -119,9 +182,16 @@ sub diag {
     my $out = observe(kind => 'he_diag', name => $tname);
     unless (obs_ok($out)) { die "net-he-tunnel: he_diag on $label failed: "
                                 . obs_err($out) . "\n" }
+    # The daemon emits report_b64 UNQUOTED (report_b64=PT0gaGVf...), so matching
+    # only the quoted form silently produced an EMPTY report. That left
+    # _cfg_server empty, and `repair` then refused every correctly-provisioned
+    # tunnel with "no configured server (DB/config empty)" — a guard meant for
+    # unprovisioned nodes firing on healthy ones. Accept both forms.
     my $report = '';
-    $report = decode_base64($1) if $out =~ /report_b64="([^"]*)"/;
+    if    ($out =~ /report_b64="([^"]*)"/)          { $report = decode_base64($1) }
+    elsif ($out =~ m{report_b64=([A-Za-z0-9+/=]+)}) { $report = decode_base64($1) }
     (my $flat = $out) =~ s/report_b64="[^"]*"//;
+    $flat =~ s{report_b64=[A-Za-z0-9+/=]+}{};   # else the base64 lands in %f
     my %f;
     while ($flat =~ /(\w+)=(\S+)/g) { $f{$1} = $2 }
     my ($cfg_server)  = $report =~ /config:\s*server=(\S+)/;

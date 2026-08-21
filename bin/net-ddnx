@@ -1,0 +1,320 @@
+#!/usr/bin/perl
+# net-ddnx — manage Hurricane Electric hosted-DNS records from the command line.
+#
+#   net-ddnx --account grfx zones
+#   net-ddnx --account grfx list
+#   net-ddnx --account grfx get gateway.grfx.com
+#   net-ddnx --account grfx set gateway.grfx.com A 24.6.37.247 --commit
+#   net-ddnx --account grfx delete test.grfx.com --commit
+#
+# WHY THIS EXISTS
+# ---------------
+# HE's hosted DNS is edited through admin.he.net, a CGI/session web UI, and
+# admin.he.net is reachable only from inside HE's network — from anywhere else
+# the connection returns nothing at all (verified: a direct fetch gets no
+# response, the same fetch through an HE-exit SOCKS proxy returns 200). That is
+# why zone edits have only ever been possible by hand from one machine. This
+# drives the same forms over a SOCKS proxy, so any node can do it:
+#
+#   ssh vms@bravo.he.net -D 1080      # the proxy this expects by default
+#
+# WRITES ARE OPT-IN. Without --commit, set/delete print exactly what they would
+# POST and change nothing. This edits live DNS for real domains, and a typo in a
+# zone is not a cheap mistake.
+#
+# CREDENTIALS come from ~/.netrc keyed by machine admin.he.net PLUS login, so
+# several HE accounts coexist:
+#     machine admin.he.net login grfx password ...
+#     machine admin.he.net login vms  password ...
+# --account picks which. Nothing is echoed, and the password reaches curl via a
+# 0600 temp file rather than argv (argv is world-readable through ps).
+#
+# RELATED: NetMgr::HE::update_record() pushes an address to a record that has
+# "dynamic DNS" enabled, through dyn.dns.he.net — no session, no proxy, and the
+# right tool for a periodic refresh. Use THIS to create or restructure records,
+# and that one to keep an address current.
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Temp ();
+
+my $ACCOUNT = '';
+my $PROXY   = '127.0.0.1:1080';
+my $NETRC   = ($ENV{HOME} // '') . '/.netrc';
+my $TTL     = 86400;
+my $PRIO    = '';
+my $COMMIT  = 0;
+my $VERBOSE = 0;
+my $NOPROXY = 0;
+
+GetOptions(
+    'account=s'  => \$ACCOUNT,
+    'proxy=s'    => \$PROXY,
+    'netrc=s'    => \$NETRC,
+    'ttl=i'      => \$TTL,
+    'priority=s' => \$PRIO,
+    'commit'     => \$COMMIT,
+    'verbose'    => \$VERBOSE,
+    'no-proxy'   => \$NOPROXY,
+) or usage();
+
+my $cmd = shift(@ARGV);
+$cmd = '' unless defined $cmd;
+usage() unless $cmd =~ /^(list|get|set|delete|zones)$/;
+die "net-ddnx: --account is required (which admin.he.net login)\n" unless length $ACCOUNT;
+
+# Cygwin's PATH curl is usually the WINDOWS curl.exe, which cannot write to
+# /cygdrive/... paths — it fails silently, leaving an empty cookie jar and no
+# output file. Translate any path handed to curl when that is the case.
+my $CYGWIN = ($^O =~ /cygwin/i) ? 1 : 0;
+sub wpath {
+    my ($p) = @_;
+    return $p unless $CYGWIN;
+    my $w = `cygpath -w "$p" 2>/dev/null`;
+    chomp $w;
+    return length($w) ? $w : $p;
+}
+
+my $TMPDIR = File::Temp::tempdir('net-ddnx.XXXXXX', TMPDIR => 1, CLEANUP => 1);
+my $JAR    = "$TMPDIR/cookies";
+
+sub usage {
+    print <<'USAGE';
+usage: net-ddnx --account NAME [options] <command>
+
+commands:
+  zones                       list zones in the account (with zone ids)
+  list                        list every record in the account's zone
+  get NAME                    show one record
+  set NAME TYPE CONTENT       create or update a record   (needs --commit)
+  delete NAME                 remove a record             (needs --commit)
+
+options:
+  --account NAME    admin.he.net login to use (matched in ~/.netrc)
+  --proxy H:P       SOCKS5 proxy (default 127.0.0.1:1080); admin.he.net is
+                    only reachable from inside HE's network
+  --no-proxy        connect directly (hangs unless you ARE inside HE)
+  --ttl N           TTL for set (default 86400)
+  --priority N      priority for MX/SRV
+  --commit          actually perform the write
+  --verbose         show each curl invocation
+USAGE
+    exit 2;
+}
+
+sub netrc_creds {
+    my ($login) = @_;
+    open my $fh, '<', $NETRC or die "net-ddnx: open $NETRC: $!\n";
+    while (my $l = <$fh>) {
+        my @t = split ' ', $l;
+        my %f;
+        for my $i (0 .. $#t - 1) {
+            $f{$t[$i]} = $t[$i + 1] if $t[$i] =~ /^(machine|login|password)$/;
+        }
+        next unless defined $f{machine} && $f{machine} eq 'admin.he.net';
+        next unless defined $f{login}   && $f{login}   eq $login;
+        close $fh;
+        return ($f{login}, $f{password});
+    }
+    close $fh;
+    die "net-ddnx: no ~/.netrc entry for machine admin.he.net login $login\n";
+}
+
+sub urlenc {
+    my $s = shift;
+    $s = '' unless defined $s;
+    $s =~ s/([^A-Za-z0-9._~-])/sprintf('%%%02X', ord($1))/ge;
+    return $s;
+}
+
+sub curl_run {
+    my (@args) = @_;
+    my @cmd = ('curl', '-sS', '-L', '--max-time', '60');
+    push @cmd, '--socks5-hostname', $PROXY unless $NOPROXY;
+    push @cmd, '-b', wpath($JAR), '-c', wpath($JAR);
+    push @cmd, @args;
+    warn "  + curl @args\n" if $VERBOSE;
+    # LIST-form open, not backticks: interpolating @cmd into a string hands it
+    # to the shell, which eats the backslashes in a Windows path (cygpath gives
+    # C:\cygwin64\tmp\post.X, the shell delivers C:cygwin64tmppost.X) and curl
+    # then fails with rc=26 "failed to open local data". List form skips the
+    # shell entirely, so arguments arrive verbatim on every platform.
+    my $out = '';
+    if (open my $ph, '-|', @cmd) {
+        local $/;
+        $out = <$ph>;
+        $out = '' unless defined $out;
+        close $ph;
+    } else {
+        return (127, "cannot run curl: $!");
+    }
+    return ($? >> 8, $out);
+}
+
+# The POST body goes in a 0600 file, never on the command line: argv is visible
+# to every user on the box through ps, and the login POST carries the password.
+sub curl_post {
+    my ($url, %form) = @_;
+    my ($fh, $body) = File::Temp::tempfile('post.XXXXXX', DIR => $TMPDIR);
+    chmod 0600, $body;
+    print $fh join('&', map { urlenc($_) . '=' . urlenc($form{$_}) } sort keys %form);
+    close $fh;
+    my ($rc, $out) = curl_run('--data', '@' . wpath($body), $url);
+    unlink $body;
+    return ($rc, $out);
+}
+
+sub login {
+    my ($user, $pass) = netrc_creds($ACCOUNT);
+    # GET first: we need both the session cookie and the per-form CSRF validator.
+    my ($rc, $page) = curl_run('https://admin.he.net/');
+    if ($rc != 0 || $page !~ /validator/) {
+        die "net-ddnx: cannot reach admin.he.net (rc=$rc).\n"
+          . "  admin.he.net only answers from inside HE's network — start the proxy:\n"
+          . "    ssh vms\@bravo.he.net -D 1080\n";
+    }
+    my ($val) = $page =~ /name="validator" value="([^"]*)"/;
+    my ($rc2, $land) = curl_post('https://admin.he.net/index.cgi',
+        user => $user, auth => $pass, validator => (defined $val ? $val : ''));
+    die "net-ddnx: login POST failed rc=$rc2\n" if $rc2 != 0;
+    die "net-ddnx: login rejected for account '$ACCOUNT'\n"
+        if $land =~ /Administration Login/i;
+    return $land;
+}
+
+# Zones live in the landing page's hosted-dns panel; the edit link carries the id
+# and the adjacent window.open() carries the name.
+sub zones_from {
+    my ($html) = @_;
+    my (@ids, @names, %seen);
+    while ($html =~ /hosted_dns_zoneid=(\d+)/g) { push @ids, $1 unless $seen{$1}++ }
+    @names = $html =~ /window\.open\('http:\/\/([^']+)'/g;
+    my @out;
+    for my $i (0 .. $#ids) {
+        push @out, { id => $ids[$i], name => (defined $names[$i] ? $names[$i] : '?') };
+    }
+    return @out;
+}
+
+sub fetch_zone {
+    my ($zid) = @_;
+    my ($rc, $html) = curl_run(
+        "https://admin.he.net/index.cgi?hosted_dns_editzone&hosted_dns_zoneid=$zid"
+      . "&account=$ACCOUNT&menu=edit_zone");
+    die "net-ddnx: cannot fetch zone $zid (rc=$rc)\n" if $rc != 0;
+    return $html;
+}
+
+sub records_from {
+    my ($html) = @_;
+    my @recs;
+    while ($html =~ /<tr[^>]*class="dns_tr"[^>]*id="(\d+)"[^>]*>(.*?)<\/tr>/gs) {
+        my ($id, $row) = ($1, $2);
+        my @cells = $row =~ /<td[^>]*>(.*?)<\/td>/gs;
+        for my $c (@cells) { $c =~ s/<[^>]+>//g; $c =~ s/^\s+//; $c =~ s/\s+$//; }
+        next unless @cells >= 5;
+        push @recs, { id => $id, name => $cells[0], type => $cells[1],
+                      ttl => $cells[2], prio => $cells[3], content => $cells[4] };
+    }
+    return @recs;
+}
+
+# ------------------------------------------------------------------- main ---
+my $landing = login();
+my @zones   = zones_from($landing);
+die "net-ddnx: no DNS zones visible in account '$ACCOUNT'\n" unless @zones;
+
+if ($cmd eq 'zones') {
+    printf("  %-10s %s\n", $_->{id}, $_->{name}) for @zones;
+    exit 0;
+}
+
+my $zone = $zones[0];              # these accounts hold one zone each
+my $html = fetch_zone($zone->{id});
+my @recs = records_from($html);
+
+if ($cmd eq 'list') {
+    printf("zone %s (id %s), %d records\n", $zone->{name}, $zone->{id}, scalar @recs);
+    printf("  %-30s %-7s %-7s %s\n", $_->{name}, $_->{type}, $_->{ttl}, $_->{content})
+        for @recs;
+    exit 0;
+}
+
+my $name = shift(@ARGV);
+usage() unless defined $name && length $name;
+my ($match) = grep { lc($_->{name}) eq lc($name) } @recs;
+
+if ($cmd eq 'get') {
+    die "net-ddnx: no record '$name' in $zone->{name}\n" unless $match;
+    printf("  id=%s  %s %s ttl=%s prio=%s -> %s\n",
+        $match->{id}, $match->{name}, $match->{type},
+        $match->{ttl}, $match->{prio}, $match->{content});
+    exit 0;
+}
+
+if ($cmd eq 'delete') {
+    die "net-ddnx: no record '$name' to delete\n" unless $match;
+    printf("  DELETE %s %s -> %s (id %s)\n",
+        $match->{name}, $match->{type}, $match->{content}, $match->{id});
+    unless ($COMMIT) { print "  (dry run — pass --commit to apply)\n"; exit 0 }
+    my ($rc) = curl_post('https://admin.he.net/index.cgi',
+        hosted_dns_zoneid   => $zone->{id},
+        hosted_dns_recordid => $match->{id},
+        hosted_dns_zonename => $zone->{name},
+        account             => $ACCOUNT,
+        menu                => 'edit_zone',
+        hosted_dns_delconfirm => 'delete',
+        hosted_dns_editzone => 1,
+        hosted_dns_delrecord => 1);
+    die "net-ddnx: delete failed rc=$rc\n" if $rc != 0;
+    my ($still) = grep { lc($_->{name}) eq lc($name) } records_from(fetch_zone($zone->{id}));
+    if ($still) { print "  VERIFY FAILED — record still present\n"; exit 1 }
+    print "  deleted\n";
+    exit 0;
+}
+
+# set NAME TYPE CONTENT
+my $type    = shift(@ARGV);
+my $content = shift(@ARGV);
+usage() unless defined $type && defined $content;
+$type = uc $type;
+
+if ($match) {
+    printf("  UPDATE %s: %s %s  ->  %s %s (id %s)\n",
+        $name, $match->{type}, $match->{content}, $type, $content, $match->{id});
+} else {
+    printf("  CREATE %s: %s %s\n", $name, $type, $content);
+}
+unless ($COMMIT) { print "  (dry run — pass --commit to apply)\n"; exit 0 }
+
+my %form = (
+    account             => $ACCOUNT,
+    menu                => 'edit_zone',
+    hosted_dns_zoneid   => $zone->{id},
+    hosted_dns_editzone => 1,
+    Name                => $name,
+    Type                => $type,
+    Content             => $content,
+    TTL                 => $TTL,
+    Priority            => $PRIO,
+);
+if ($match) {
+    $form{hosted_dns_recordid}  = $match->{id};
+    $form{hosted_dns_editrecord} = 'Submit';
+} else {
+    $form{hosted_dns_addrecord}  = 'Submit';
+}
+
+my ($rc) = curl_post('https://admin.he.net/index.cgi', %form);
+die "net-ddnx: write failed rc=$rc\n" if $rc != 0;
+
+# Re-read the zone and confirm rather than trusting the POST: HE returns 200
+# with the zone page whether or not it accepted the edit.
+my ($now) = grep { lc($_->{name}) eq lc($name) } records_from(fetch_zone($zone->{id}));
+if ($now && uc($now->{type}) eq $type && $now->{content} eq $content) {
+    printf("  OK: %s %s %s (ttl %s)\n", $now->{name}, $now->{type}, $now->{content}, $now->{ttl});
+    exit 0;
+}
+printf("  VERIFY FAILED — zone now shows: %s\n",
+    $now ? "$now->{name} $now->{type} $now->{content}" : "(record absent)");
+exit 1;
