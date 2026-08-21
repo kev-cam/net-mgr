@@ -1,0 +1,45 @@
+#!/bin/sh
+# /etc/net-mgr/ddns/he-dns — push a changed WAN IPv4 into Hurricane Electric DNS.
+#
+# Install:  cp contrib/ddns/he-dns /etc/net-mgr/ddns/ && chmod +x
+#
+# The [ddns] periodic detects a WAN IPv4 change and runs every hook here as
+#     <hook> <new_ip> <old_ip> <iface>
+# with NET_MGR_WAN_IP / NET_MGR_WAN_IP_OLD / NET_MGR_WAN_IF in the environment.
+#
+# This is the EVENT-driven half of keeping HE DNS correct. The he-dns periodic
+# is the other half: it reconciles on a schedule and covers IPv6 and any drift
+# that did not coincide with a WAN change. Neither replaces the other — a WAN
+# change is the only moment we learn the new v4 address authoritatively (it is
+# handed to us), while the periodic is the only thing that notices a record that
+# quietly went wrong.
+#
+# The new address arrives as $1, so this does NOT have to ask the Internet what
+# our IP is — which matters, because asking through a SOCKS proxy returns the
+# proxy's exit address, not ours.
+set -e
+NEW="${1:-$NET_MGR_WAN_IP}"
+[ -n "$NEW" ] || { echo "he-dns: no new IP given" >&2; exit 1; }
+
+CONF=/etc/net-mgr/ddnx.conf
+ACCOUNT="${NETDDNX_ACCOUNT:-}"
+RECORD="${NETDDNX_A_RECORD:-}"
+
+[ -r "$CONF" ] || { echo "he-dns: $CONF absent — nothing configured, skipping"; exit 0; }
+[ -n "$ACCOUNT" ] || { echo "he-dns: set NETDDNX_ACCOUNT (which admin.he.net login)"; exit 0; }
+
+# Preferred: the record has dynamic DNS enabled, so this needs no session and no
+# proxy — just the per-record key in /etc/net-mgr/secrets/. Falls back to the
+# zone-editing path when no key is configured.
+if [ -n "$RECORD" ] && [ -r "/etc/net-mgr/secrets/hedns-$RECORD" ]; then
+    exec perl -MNetMgr::HE -e '
+        my ($host, $ip) = @ARGV;
+        my ($ok, $msg) = NetMgr::HE::update_record(
+            hostname => $host, secret_name => "hedns-$host", ip => $ip,
+            log => sub { print "he-dns: $_[0]\n" });
+        exit($ok ? 0 : 1);
+    ' "$RECORD" "$NEW"
+fi
+
+# Fallback: full zone edit. Needs the SOCKS proxy to admin.he.net to be up.
+exec net-ddnx --account "$ACCOUNT" --map "$CONF" sync --commit

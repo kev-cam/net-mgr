@@ -46,6 +46,10 @@ my $PRIO    = '';
 my $COMMIT  = 0;
 my $VERBOSE = 0;
 my $NOPROXY = 0;
+my $MAP     = undef;        # sync: record->source map (default /etc/net-mgr/ddnx.conf)
+my $NODE    = undef;        # sync: node to read live tunnel state from via he_diag
+my $HE_NAME = 'he_net';     # sync: tunnel name inside that node
+my $TUNNEL_PREFIX_CACHE;    # memoised: one he_diag per run, not per record
 
 GetOptions(
     'account=s'  => \$ACCOUNT,
@@ -56,11 +60,14 @@ GetOptions(
     'commit'     => \$COMMIT,
     'verbose'    => \$VERBOSE,
     'no-proxy'   => \$NOPROXY,
+    'map=s'      => \$MAP,
+    'node=s'     => \$NODE,
+    'he-name=s'  => \$HE_NAME,
 ) or usage();
 
 my $cmd = shift(@ARGV);
 $cmd = '' unless defined $cmd;
-usage() unless $cmd =~ /^(list|get|set|delete|zones)$/;
+usage() unless $cmd =~ /^(list|get|set|delete|zones|sync)$/;
 die "net-ddnx: --account is required (which admin.he.net login)\n" unless length $ACCOUNT;
 
 # Cygwin's PATH curl is usually the WINDOWS curl.exe, which cannot write to
@@ -240,6 +247,8 @@ if ($cmd eq 'list') {
     exit 0;
 }
 
+if ($cmd eq 'sync') { exit cmd_sync($zone, \@recs) }
+
 my $name = shift(@ARGV);
 usage() unless defined $name && length $name;
 my ($match) = grep { lc($_->{name}) eq lc($name) } @recs;
@@ -318,3 +327,144 @@ if ($now && uc($now->{type}) eq $type && $now->{content} eq $content) {
 printf("  VERIFY FAILED — zone now shows: %s\n",
     $now ? "$now->{name} $now->{type} $now->{content}" : "(record absent)");
 exit 1;
+
+# ---------------------------------------------------------------- sync ------
+# `sync` reconciles the zone against LIVE state for both address families, so
+# drift is caught on a schedule rather than only at the moment something
+# changes. The existing [ddns] periodic fires hooks when the WAN IPv4 changes,
+# which is ideal for v4 but has two gaps this closes: it has no IPv6 equivalent,
+# and a record that drifts for any other reason (a hand-edit, a failed earlier
+# update, a tunnel rebuilt at a new PoP) is never noticed.
+#
+# The map lives in /etc/net-mgr/ddnx.conf (override with --map), one record per
+# line, '#' comments:
+#
+#     # record                source
+#     gateway.grfx.com        wan4          # current public IPv4  -> A
+#     gateway3-6.grfx.com     he6:2         # tunnel prefix ::2    -> AAAA
+#     tunnel3-6.grfx.com      he6:1         # tunnel prefix ::1    -> AAAA
+#     net-chat.grfx.com       literal:2001:470:1f05:1f9::ca7
+#
+# Comparison is against the ZONE ITSELF, not a DNS lookup: the zone is
+# authoritative and cache-free, and this box's resolver hijacks NXDOMAIN (any
+# nonexistent name answers with the firewall's address), so resolution here
+# proves nothing.
+#
+# Read-only by default — exits 1 when drift is found and 0 when clean, so it can
+# gate a periodic. --commit applies the fixes.
+
+sub map_path { return $MAP // '/etc/net-mgr/ddnx.conf' }
+
+sub load_map {
+    my $p = map_path();
+    open my $fh, '<', $p or die "net-ddnx: open $p: $!\n"
+                              . "  (create it, or pass --map FILE; see `sync` docs in this script)\n";
+    my @m;
+    while (my $l = <$fh>) {
+        $l =~ s/#.*//; $l =~ s/^\s+//; $l =~ s/\s+$//;
+        next unless length $l;
+        my ($rec, $src) = split /\s+/, $l, 2;
+        next unless defined $src && length $src;
+        push @m, { record => $rec, source => $src };
+    }
+    close $fh;
+    return @m;
+}
+
+# Current public IPv4, asked of an outside observer. Deliberately NOT the local
+# interface address: on a NATed gateway those differ, and the record must carry
+# what the world sees.
+#
+# MUST NOT go through the SOCKS proxy. curl_run() sends everything via
+# admin.he.net's proxy, whose exit is inside Hurricane Electric — asking it "what
+# is my IP" answers 74.82.39.2 (HE), not our Comcast address. That is a silent,
+# plausible-looking wrong answer that would have overwritten gateway.grfx.com
+# with an HE address. This deliberately builds its own direct invocation.
+sub live_wan4 {
+    for my $u ('https://api.ipify.org', 'https://ifconfig.co') {
+        my @cmd = ('curl', '-sS', '--max-time', '15', $u);   # NO --socks5-hostname
+        my $out = '';
+        if (open my $ph, '-|', @cmd) { local $/; $out = <$ph> // ''; close $ph }
+        next if ($? >> 8) != 0;
+        $out =~ s/\s+//g;
+        return $out if $out =~ /^\d{1,3}(?:\.\d{1,3}){3}$/;
+    }
+    return undef;
+}
+
+# The live 6in4 tunnel prefix, read from he_diag on --node. Uses the ACTUAL
+# interface address rather than the configured prefix: after a PoP change those
+# disagree until the config drop-in is written, and the interface is what the
+# world can reach.
+sub live_tunnel_prefix {
+    return $TUNNEL_PREFIX_CACHE if defined $TUNNEL_PREFIX_CACHE;
+    my $node = $NODE // '127.0.0.1:7531';
+    my @a = ('net-cluster', '--peers', "node=$node");
+    push @a, '--auth' unless $node =~ /^(?:127\.|localhost|::1)/;
+    push @a, 'observe', 'kind=he_diag', "name=$HE_NAME";
+    my ($rc, $out) = (0, '');
+    if (open my $ph, '-|', @a) { local $/; $out = <$ph> // ''; close $ph; $rc = $? >> 8 }
+    my $b64 = ($out =~ m{report_b64="([^"]*)"}) ? $1
+            : ($out =~ m{report_b64=([A-Za-z0-9+/=]+)}) ? $1 : undef;
+    return ($TUNNEL_PREFIX_CACHE = undef) unless defined $b64;
+    require MIME::Base64;
+    my $rep = MIME::Base64::decode_base64($b64);
+    # "22: he_net    inet6 2001:470:1f04:1f9::2/64 scope global"
+    if ($rep =~ /\b\Q$HE_NAME\E\s+inet6\s+([0-9a-f:]+)::\d+\/\d+/i) {
+        return ($TUNNEL_PREFIX_CACHE = $1);
+    }
+    return ($TUNNEL_PREFIX_CACHE = undef);
+}
+
+sub resolve_source {
+    my ($src) = @_;
+    if ($src eq 'wan4')                { return (live_wan4(), 'A') }
+    if ($src =~ /^literal:(.+)$/i)     { my $v = $1; return ($v, ($v =~ /:/ ? 'AAAA' : 'A')) }
+    if ($src =~ /^he6:([0-9a-f:]+)$/i) {
+        my $suffix = $1;
+        my $pfx = live_tunnel_prefix();
+        return (undef, 'AAAA') unless defined $pfx;
+        return ("$pfx\::$suffix", 'AAAA');
+    }
+    return (undef, undef);
+}
+
+sub cmd_sync {
+    my ($zone, $recs) = @_;
+    my @map = load_map();
+    unless (@map) { print "  no entries in " . map_path() . " — nothing to sync\n"; return 0 }
+    my %have = map { lc($_->{name}) => $_ } @$recs;
+
+    my ($drift, $failed, $ok) = (0, 0, 0);
+    for my $m (@map) {
+        my ($want, $type) = resolve_source($m->{source});
+        unless (defined $want && length $want) {
+            printf("  %-28s %-10s SKIP  cannot determine live value\n", $m->{record}, $m->{source});
+            $failed++; next;
+        }
+        my $cur = $have{ lc $m->{record} };
+        my $now = $cur ? $cur->{content} : '(absent)';
+        if ($cur && uc($cur->{type}) eq $type && $cur->{content} eq $want) {
+            printf("  %-28s %-6s ok    %s\n", $m->{record}, $type, $want);
+            $ok++; next;
+        }
+        $drift++;
+        printf("  %-28s %-6s DRIFT %s -> %s\n", $m->{record}, $type, $now, $want);
+        next unless $COMMIT;
+
+        my %form = (account => $ACCOUNT, menu => 'edit_zone',
+                    hosted_dns_zoneid => $zone->{id}, hosted_dns_editzone => 1,
+                    Name => $m->{record}, Type => $type, Content => $want,
+                    TTL => $TTL, Priority => $PRIO);
+        if ($cur) { $form{hosted_dns_recordid} = $cur->{id}; $form{hosted_dns_editrecord} = 'Submit' }
+        else      { $form{hosted_dns_addrecord} = 'Submit' }
+        my ($rc) = curl_post('https://admin.he.net/index.cgi', %form);
+        if ($rc != 0) { print "      write failed rc=$rc\n"; $failed++; next }
+        my ($chk) = grep { lc($_->{name}) eq lc($m->{record}) } records_from(fetch_zone($zone->{id}));
+        if ($chk && $chk->{content} eq $want) { print "      updated\n" }
+        else { print "      VERIFY FAILED\n"; $failed++ }
+    }
+    printf("\n  %d ok, %d drifted, %d failed%s\n",
+           $ok, $drift, $failed, ($drift && !$COMMIT) ? "  (--commit to fix)" : "");
+    return ($failed || ($drift && !$COMMIT)) ? 1 : 0;
+}

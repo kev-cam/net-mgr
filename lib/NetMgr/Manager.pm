@@ -978,6 +978,51 @@ sub _he_update_endpoints {
 # Periodic DDNS check: if the WAN IP changed, run the /etc/net-mgr/ddns hooks
 # (NetMgr::Ddns) AND push the new IP to HE for every he6in4 with tunnel_id set.
 # Fired by _check_periodic_triggers at the [ddns] interval.
+# Reconcile the HE zone against live state. CHECK ONLY — it never writes.
+#
+# Deliberately not an auto-updater: determining the "live" value can itself be
+# wrong in ways that look plausible (asking "what is my public IP" through a
+# SOCKS proxy answers with the proxy's exit, not ours), and a wrong write to a
+# zone takes the domain down until someone notices. So the daemon reports drift
+# and a human runs `net-ddnx sync --commit`. Event-driven v4 updates belong in
+# an /etc/net-mgr/ddns hook, where the new address is handed to us directly.
+sub _check_he_dns {
+    my ($self) = @_;
+    my $cfg  = $self->{config}{he_dns} || {};
+    my $map  = $cfg->{map} || '/etc/net-mgr/ddnx.conf';
+    return unless -r $map;
+    my $acct = $cfg->{account};
+    unless (defined $acct && length $acct) {
+        $self->_log("he-dns: [he_dns] account not set — skipping");
+        return;
+    }
+    my $bin = '/usr/local/bin/net-ddnx';
+    return unless -x $bin;
+    my @cmd = ($bin, '--account', $acct, '--map', $map, 'sync');
+    push @cmd, '--node',  $cfg->{node}  if defined $cfg->{node}  && length $cfg->{node};
+    push @cmd, '--proxy', $cfg->{proxy} if defined $cfg->{proxy} && length $cfg->{proxy};
+    my $out = '';
+    if (open my $ph, '-|', @cmd) { local $/; $out = <$ph> // ''; close $ph }
+    my $rc = $? >> 8;
+    # A zone we cannot reach is not drift — admin.he.net only answers from
+    # inside HE's network, so a node without the proxy will always fail here.
+    # Say so once per run rather than reporting phantom drift.
+    if ($out =~ /cannot reach admin\.he\.net/) {
+        $self->_log("he-dns: admin.he.net unreachable (SOCKS proxy down?) — no check made");
+        return;
+    }
+    for my $l (grep { /DRIFT|SKIP/ } split /
+/, $out) {
+        $l =~ s/^\s+//; $l =~ s/\s+$//;
+        $self->_log("he-dns: $l");
+    }
+    my ($ok, $drift, $failed) = $out =~ /(\d+) ok, (\d+) drifted, (\d+) failed/;
+    $self->_log(sprintf("he-dns: %s ok, %s drifted, %s failed",
+                        $ok // '?', $drift // '?', $failed // '?'))
+        if defined $drift && ($drift || $failed);
+    return;
+}
+
 sub _check_ddns {
     my ($self) = @_;
     my $dc = $self->{config}{ddns} || {};
@@ -2967,7 +3012,7 @@ sub _check_periodic_triggers {
     my $now   = time();
     $self->{periodic_last} //= {};
 
-    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq ddns ipv6_vlan netif register-self bitchat-sweep)) {
+    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq ddns he-dns ipv6_vlan netif register-self bitchat-sweep)) {
         my $interval = $sched->{$name} // 0;
         # netif: track interface changes (WiFi/USB up/down) and rebind the
         # 'all'/'auto' listeners. Auto-enable at 30s for those specs (an explicit
@@ -3002,6 +3047,18 @@ sub _check_periodic_triggers {
         # ddns: watch the WAN IP and run /etc/net-mgr/ddns hooks on change. Cadence
         # from [ddns] interval; auto-enable at 120s when that dir has hooks, so
         # dropping a script in activates it without extra config.
+        # he-dns: reconcile the Hurricane Electric zone against LIVE state for
+        # BOTH families. The [ddns] periodic above fires hooks when the WAN IPv4
+        # changes, which covers v4 at the instant it moves but has no IPv6
+        # equivalent and never notices a record that drifted for some other
+        # reason (a hand-edit, an update that failed, a tunnel rebuilt at a new
+        # PoP). Check-only here — it logs drift and does not write, so a wrong
+        # live reading can never silently overwrite a zone. Auto-enables at 15min
+        # ONLY when a map exists, so nodes without one never run it.
+        if ($name eq 'he-dns' && !$interval) {
+            my $map = $self->{config}{he_dns}{map} || '/etc/net-mgr/ddnx.conf';
+            $interval = 900 if -r $map;
+        }
         if ($name eq 'ddns') {
             $interval = $self->{config}{ddns}{interval} // 0;
             $interval ||= 120 if NetMgr::Ddns::hooks($self->{config}{ddns}{dir}
@@ -3063,6 +3120,7 @@ sub _fire_periodic {
         return;
     }
     if ($name eq 'ddns')         { $self->_check_ddns;   return }
+    if ($name eq 'he-dns')       { $self->_check_he_dns; return }
     if ($name eq 'ipv6_vlan')    { $self->_check_ipv6_vlans; return }
     if ($name eq 'netif')        { $self->_recheck_listeners; return }
     if ($name eq 'register-self'){ $self->_register_self_interfaces; return }
