@@ -22,9 +22,42 @@ repo=${NET_MGR_REPO:?set NET_MGR_REPO to the net-mgr checkout path}
 owner=$(stat -c %U "$repo")
 echo "net-mgr-self-update: repo=$repo owner=$owner"
 
-before=$(su - "$owner" -c "git -C '$repo' rev-parse --short HEAD")
-su - "$owner" -c "git -C '$repo' pull --ff-only"
-after=$(su - "$owner" -c "git -C '$repo' rev-parse --short HEAD")
+# Drop to the repo owner with runuser, NOT `su -`, when it is available.
+#
+# `su` runs the full PAM stack and a login shell. From an interactive root shell
+# that is fine; from the DAEMON it can fail outright — no controlling terminal,
+# no login session, and PAM modules (pam_systemd, securetty) or a profile that
+# expects a tty will refuse. Under `set -e` that aborts the script, the daemon
+# sees a non-zero exit and correctly declines to re-exec, while the OBSERVE has
+# already returned OK because the fork itself succeeded. The result is a
+# self_update that reports success and silently does nothing — which is exactly
+# what nas3 did while the same script run by hand worked every time.
+#
+# runuser is root-only by design, skips pam_authenticate and does not need a
+# tty. Falls back to `su -` where runuser is absent (older/busybox systems).
+# Resolve runuser by absolute path as well as PATH: it lives in /usr/sbin, and
+# a daemon whose PATH omits that would silently fall back to the `su` path this
+# exists to avoid — the failure would look identical to the bug being fixed.
+RUNUSER=$(command -v runuser 2>/dev/null || true)
+if [ -z "$RUNUSER" ]; then
+    for c in /usr/sbin/runuser /sbin/runuser /usr/bin/runuser; do
+        [ -x "$c" ] && { RUNUSER=$c; break; }
+    done
+fi
+
+as_owner() {
+    if [ -n "$RUNUSER" ]; then
+        "$RUNUSER" -u "$owner" -- "$@"
+    else
+        echo "net-mgr-self-update: runuser not found, falling back to su" >&2
+        # shellcheck disable=SC2145
+        su - "$owner" -c "$*"
+    fi
+}
+
+before=$(as_owner git -C "$repo" rev-parse --short HEAD)
+as_owner git -C "$repo" pull --ff-only
+after=$(as_owner git -C "$repo" rev-parse --short HEAD)
 
 make -C "$repo" install
 perl -c /usr/local/sbin/net-mgr >/dev/null
