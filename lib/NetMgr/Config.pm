@@ -242,7 +242,7 @@ my %DURATION_KEYS = (
     dns        => { ttl => 1 },
     scheduling => { 'scan-ap' => 1, presence => 1, discover => 1,
                     'find-peers' => 1, 'import-leases' => 1, 'push-dnsmasq' => 1,
-                    ipv6_vlan => 1, netif => 1 },
+                    ipv6_vlan => 1, netif => 1, 'he-dns' => 1 },
     ddns       => { interval => 1 },
 );
 
@@ -394,7 +394,12 @@ my %ACTIVE = (
     mysql      => [qw(db defaults section)],
     scanner    => [qw(presence_interval
                        dnsmasq_event_port dnsmasq_event_check_interval)],
-    scheduling => [qw(scan-ap presence discover find-peers import-leases push-dnsmasq ipv6_vlan netif)],
+    # Every name in Manager's periodic loop belongs here, or setting a cadence
+    # for it is reported as a dead key and the operator is invited to delete
+    # working config. ddns/register-self/bitchat-sweep were already missing.
+    scheduling => [qw(scan-ap presence discover find-peers import-leases
+                      push-dnsmasq ddns he-dns ipv6_vlan netif register-self
+                      bitchat-sweep)],
     paths      => '*',
     dns        => '*',
     bindings   => '*',                        # parsed for future use
@@ -421,6 +426,8 @@ my %ACTIVE = (
                                                  # tunnel_id+update_secret = HE DDNS
                                                  # endpoint update (NetMgr::HE/Secret)
     ddns       => [qw(dir statefile interval ext_if)], # WAN-IP-change hooks (NetMgr::Ddns)
+    he_dns     => [qw(map account node proxy interval)], # HE DNS reconcile
+                                              # (he-dns periodic; see bin/net-ddnx)
     forward    => [qw(method allow_peers)],   # net-connect FORWARD backend
     servers    => '*',                        # client server list (see servers())
     chat       => [qw(archive_dir)],          # net-chat archive location
