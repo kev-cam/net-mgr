@@ -561,16 +561,40 @@ sub _apply_self_inventory {
     # that renumbers its NIC re-publishes and the rows follow, since identity
     # here is the hostname, not the hardware address.
     if (ref($inv->{ports}) eq 'ARRAY' && @{ $inv->{ports} }) {
-        my ($anchor) = grep { defined && length }
-                       map  { $_->{mac} } @{ $inv->{ifaces} || [] };
-        if (defined $anchor) {
+        my ($anchor_if) = grep { defined $_->{mac} && length $_->{mac} }
+                          @{ $inv->{ifaces} || [] };
+        if ($anchor_if) {
+            my $anchor = $anchor_if->{mac};
+            # ports.mac is a FOREIGN KEY onto interfaces.mac, and the interface
+            # loop further down is what creates that row — so on a FRESH node
+            # the parent does not exist yet and this INSERT dies with
+            #   Cannot add or update a child row: a foreign key constraint
+            #   fails (`netmgr`.`ports`, CONSTRAINT `fk_ports_iface` ...)
+            # killing the daemon at startup, every time, unrecoverably. An
+            # established node never hits it because an earlier scan already
+            # recorded the interface — which is why it only shows up on a new
+            # install (found on spectre-vbox). Create the parent row first.
+            eval {
+                $db->upsert_interface(
+                    mac => $anchor, machine_id => $mid,
+                    kind => ($anchor_if->{kind} // 'ethernet'),
+                    online => ($anchor_if->{online} ? 1 : 0), live => 1,
+                );
+            };
+            $self->_log("register_self: anchor upsert_interface $anchor failed: $@") if $@;
             for my $p (@{ $inv->{ports} }) {
                 next unless defined $p->{port} && $p->{port} =~ /^\d+$/;
-                $self->_upsert('ports', 'upsert_port',
-                    mac     => $anchor,
-                    port    => $p->{port} + 0,
-                    proto   => ($p->{proto} // 'tcp'),
-                    service => 'self');
+                # Guarded for the same reason the interface loop below is: a
+                # self-inventory row is a convenience and is never worth
+                # aborting startup over.
+                eval {
+                    $self->_upsert('ports', 'upsert_port',
+                        mac     => $anchor,
+                        port    => $p->{port} + 0,
+                        proto   => ($p->{proto} // 'tcp'),
+                        service => 'self');
+                };
+                $self->_log("register_self: upsert_port $anchor/$p->{port} failed: $@") if $@;
             }
         }
     }
