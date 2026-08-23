@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 39;
+our $SCHEMA_VERSION = 40;
 
 sub new {
     my ($class, %args) = @_;
@@ -1034,6 +1034,47 @@ CREATE TABLE IF NOT EXISTS sms_services (
     KEY idx_sms_services_repl    (replicated_from)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
+        return;
+    }
+    if ($v == 40) {
+        # bitchat_locations: position CLAIMS made by BLE peers over the chat
+        # channel (the Android client's "LOC lat,lon acc=..m src=gps" line).
+        #
+        # A claim, not a measurement — deliberately. A peer asserts where it
+        # thinks it is; that is attributable (peer_id is SHA-256(noise_pk)[:8],
+        # key-derived rather than self-asserted) but not verifiable. Corroborating
+        # it against who physically heard the claimant is a separate job, and
+        # needs per-sighting RSSI which the BitChat helper does not currently
+        # emit — so this table stores the claim side only and the evidence side
+        # joins on peer_id later.
+        #
+        # HISTORY, not current-value: one row per claim, keyed (peer_id,
+        # recorded_at). Movement over time is the whole point — a single
+        # last-known-position column would throw away the trail that makes a
+        # claim checkable against its own past.
+        #
+        # NO foreign key to bitchat_peers, on purpose. A claim can arrive from a
+        # peer this site has not upserted yet, and an FK would reject it at the
+        # exact moment the information is most interesting. (See the fresh-node
+        # crash in register_self: ports.mac -> interfaces.mac killed the daemon
+        # for precisely this reason.) An orphan row is recoverable; a rejected
+        # insert is lost.
+        $self->_alter_idempotent(
+            "CREATE TABLE IF NOT EXISTS bitchat_locations (
+                peer_id     VARCHAR(16)   NOT NULL,
+                recorded_at DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                lat         DECIMAL(9,6)  NOT NULL,
+                lon         DECIMAL(9,6)  NOT NULL,
+                accuracy_m  SMALLINT      NULL,
+                altitude_m  SMALLINT      NULL,
+                source      VARCHAR(16)   NULL,
+                fix_age_s   INT           NULL,
+                nickname    VARCHAR(64)   NULL,
+                via_node    VARCHAR(64)   NULL,
+                PRIMARY KEY (peer_id, recorded_at),
+                KEY idx_bcloc_time (recorded_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        );
         return;
     }
     if ($v == 38) {
@@ -3183,6 +3224,36 @@ sub count_stale_addresses {
 # ---- bitchat_peers (schema v33) ----------------------------------------
 
 # Upsert one BitChat peer row (per-bridge-site view of the BLE mesh).
+# add_bitchat_location(peer_id=>, lat=>, lon=>, ...) — record one position claim.
+# Returns the inserted row, or undef when the coordinates are out of range.
+#
+# Range-checks lat/lon here rather than trusting the caller: the value came off
+# a chat channel from a peer we do not control, and a bad pair silently poisons
+# every later distance calculation. Out-of-range is dropped, not clamped —
+# clamping would invent a plausible-looking position that was never claimed.
+sub add_bitchat_location {
+    my ($self, %f) = @_;
+    my $pid = $f{peer_id};
+    return undef unless defined $pid && $pid =~ /^[0-9a-fA-F]{1,16}$/;
+    return undef unless defined $f{lat} && defined $f{lon};
+    return undef unless $f{lat} =~ /^-?\d+(?:\.\d+)?$/ && $f{lon} =~ /^-?\d+(?:\.\d+)?$/;
+    return undef if $f{lat} < -90  || $f{lat} > 90;
+    return undef if $f{lon} < -180 || $f{lon} > 180;
+    $self->{dbh}->do(
+        "INSERT INTO bitchat_locations
+             (peer_id, lat, lon, accuracy_m, altitude_m, source, fix_age_s,
+              nickname, via_node)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        undef, lc($pid), $f{lat}, $f{lon},
+        $f{accuracy_m}, $f{altitude_m}, $f{source}, $f{fix_age_s},
+        $f{nickname}, $f{via_node}
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM bitchat_locations
+          WHERE peer_id = ? ORDER BY recorded_at DESC LIMIT 1",
+        undef, lc($pid));
+}
+
 sub set_bitchat_peer {
     my ($self, %f) = @_;
     croak "peer_id required" unless defined $f{peer_id} && length $f{peer_id};

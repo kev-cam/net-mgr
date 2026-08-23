@@ -605,6 +605,48 @@ sub run_once {
                         warn "[bridge] per-msg peer upsert failed: $@" if $@;
                     }
 
+                    # LOC claim: the Android client posts its GPS fix as
+                    #   LOC <lat>,<lon> [acc=Nm] [alt=Nm] [src=gps] [age=Ns]
+                    # Record it against the SENDER's peer_id, never against a
+                    # name in the text — the peer_id is key-derived
+                    # (SHA-256(noise_pk)[:8]) and is the only part of an
+                    # incoming message the sender cannot choose. A body that
+                    # claims to be someone else is therefore just a body.
+                    #
+                    # Parsed here rather than in the daemon because this is the
+                    # only place that knows WHICH BLE peer said it; by the time
+                    # a line reaches chat_messages that binding is gone.
+                    if ($peer_cli
+                        && $sender_peer_id =~ /^[0-9a-fA-F]{16}$/
+                        && $sender ne 'System'
+                        && $sender ne $as
+                        && $body =~ /^\s*LOC\s+(-?\d{1,3}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)/i)
+                    {
+                        my ($lat, $lon) = ($1, $2);
+                        my ($acc) = $body =~ /acc=(\d+)\s*m/i;
+                        my ($alt) = $body =~ /alt=(-?\d+)\s*m/i;
+                        my ($src) = $body =~ /src=([A-Za-z0-9_-]+)/i;
+                        my ($age) = $body =~ /age=(\d+)\s*s/i;
+                        # Range-check before sending. The daemon checks too, but
+                        # a bad pair should not cost a round trip, and refusing
+                        # here keeps the reason next to the text that caused it.
+                        if ($lat >= -90 && $lat <= 90 && $lon >= -180 && $lon <= 180) {
+                            my $lc = 'BITCHAT_LOC '
+                                   . 'peer_id=' . lc($sender_peer_id)
+                                   . " lat=$lat lon=$lon"
+                                   . (defined $acc ? " acc=$acc" : '')
+                                   . (defined $alt ? " alt=$alt" : '')
+                                   . (defined $src ? " src=$src" : '')
+                                   . (defined $age ? " age=$age" : '')
+                                   . (length $sender ? " nickname=$sender" : '');
+                            eval { $peer_cli->send_recv($lc) };
+                            warn "[bridge] LOC record failed: $@" if $@;
+                        } else {
+                            warn "[bridge] LOC from $sender_peer_id out of range: $lat,$lon
+";
+                        }
+                    }
+
                     # WiFi onramp: match "WiFi?" (case-insensitive, tolerant
                     # of hyphen/space in "Wi-Fi?"). Respond with a WIFI: URI
                     # DM straight to the asker via helper stdin (bypass

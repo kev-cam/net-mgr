@@ -350,6 +350,27 @@ CREATE TABLE IF NOT EXISTS wifi_zones (
         REFERENCES zone_classes(name) ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- bitchat_locations: position CLAIMS made by BLE peers over the chat channel
+-- (the Android client posts "LOC <lat>,<lon> acc=Nm src=gps"). Recorded against
+-- the sender's key-derived peer_id, so a claim is attributable — NOT verified.
+-- History rather than current-value: the trail is what makes a claim checkable.
+-- Deliberately no FK to bitchat_peers; a claim can arrive before the peer row
+-- exists, and rejecting it then would lose the information at its most useful.
+CREATE TABLE IF NOT EXISTS bitchat_locations (
+    peer_id     VARCHAR(16)   NOT NULL,          -- SHA-256(noise_pk)[:8]
+    recorded_at DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    lat         DECIMAL(9,6)  NOT NULL,
+    lon         DECIMAL(9,6)  NOT NULL,
+    accuracy_m  SMALLINT      NULL,
+    altitude_m  SMALLINT      NULL,
+    source      VARCHAR(16)   NULL,              -- gps / network / fused
+    fix_age_s   INT           NULL,              -- how stale the fix was when claimed
+    nickname    VARCHAR(64)   NULL,              -- claimant's nickname at the time
+    via_node    VARCHAR(64)   NULL,              -- which bridge site heard it
+    PRIMARY KEY (peer_id, recorded_at),
+    KEY idx_bcloc_time (recorded_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 INSERT IGNORE INTO schema_version (version) VALUES (1);
 INSERT IGNORE INTO schema_version (version) VALUES (2);
 INSERT IGNORE INTO schema_version (version) VALUES (3);

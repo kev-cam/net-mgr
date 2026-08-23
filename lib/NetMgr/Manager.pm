@@ -1651,6 +1651,7 @@ sub _handle_line {
     elsif ($verb eq 'CHAT_DEMOTE')        { $self->_handle_chat_role_op($cli, $cmd, 'demote') }
     elsif ($verb eq 'CHAT_MEMBER_DELETE') { $self->_handle_chat_member_delete($cli, $cmd) }
     elsif ($verb eq 'BITCHAT_PEER_UPSERT') { $self->_handle_bitchat_peer_upsert($cli, $cmd) }
+    elsif ($verb eq 'BITCHAT_LOC') { $self->_handle_bitchat_loc($cli, $cmd) }
     elsif ($verb eq 'BITCHAT_PACKET_RELAY') { $self->_handle_bitchat_packet_relay($cli, $cmd) }
     elsif ($verb eq 'REPAIR')     { $self->_handle_repair($cli, $cmd) }
     elsif ($verb eq 'TRACEROUTE') { $self->_handle_traceroute($cli, $cmd) }
@@ -6875,6 +6876,74 @@ sub _handle_bitchat_peer_upsert {
     }
     $self->_emit_change(table => 'bitchat_peers', op => 'update', row => $row)
         if $row;
+    return $self->_send($cli, format_ok(peer_id => $peer_id));
+}
+
+# ---- BITCHAT_LOC (loopback-only) ----------------------------------------
+#
+# Records a position CLAIM a BLE peer made on the chat channel. Loopback-only
+# for the same reason as BITCHAT_PEER_UPSERT: only this host's bridge saw the
+# BLE traffic, so only this host can honestly say who said it. Accepting a
+# remote claim would let any mesh member assert a position on another peer's
+# behalf — the one thing that would make the whole location picture worthless.
+#
+# What this is NOT: verification. peer_id is key-derived (SHA-256(noise_pk)[:8])
+# so the claim is ATTRIBUTABLE, but a peer that lies produces a perfectly
+# well-attributed wrong answer. Corroboration against who physically heard the
+# claimant is a separate layer; this one just preserves the claim, with the
+# receiving node recorded so a later check knows where it entered the mesh.
+#
+# Wire format kv:
+#   BITCHAT_LOC peer_id=HEX16 lat=<deg> lon=<deg>
+#     [acc=<m>] [alt=<m>] [src=gps|network|fused] [age=<s>] [nickname="..."]
+sub _handle_bitchat_loc {
+    my ($self, $cli, $cmd) = @_;
+    return $self->_send($cli, format_err("BITCHAT_LOC: loopback-only"))
+        unless _peer_is_loopback($cli);
+    my $kv = $cmd->{kv} || {};
+    my $peer_id = $kv->{peer_id};
+    return $self->_send($cli, format_err("BITCHAT_LOC: missing peer_id"))
+        unless defined $peer_id && $peer_id =~ /^[0-9a-fA-F]{1,16}$/;
+    return $self->_send($cli, format_err("BITCHAT_LOC: missing lat/lon"))
+        unless defined $kv->{lat} && defined $kv->{lon};
+
+    require Sys::Hostname;
+    my $via = $self->{cluster}{self_name} || Sys::Hostname::hostname();
+    $via =~ s/\..*// if defined $via;      # short name; the zone is implied
+
+    my $row = eval {
+        $self->{db}->add_bitchat_location(
+            peer_id    => $peer_id,
+            lat        => $kv->{lat},
+            lon        => $kv->{lon},
+            accuracy_m => $kv->{acc},
+            altitude_m => $kv->{alt},
+            source     => $kv->{src},
+            fix_age_s  => $kv->{age},
+            nickname   => $kv->{nickname},
+            # Which node received the claim. Matters for corroboration later:
+            # a claim is only as good as the site that heard it, and a site
+            # that never had BLE range on the claimant is a red flag.
+            via_node   => $via,
+        );
+    };
+    if ($@) {
+        my $e = $@; chomp $e;
+        $self->_log("BITCHAT_LOC $peer_id: $e");
+        return $self->_send($cli, format_err("BITCHAT_LOC: $e"));
+    }
+    # add_bitchat_location returns undef for an out-of-range pair rather than
+    # storing nonsense. Say so plainly — a silently dropped claim is worse than
+    # a rejected one, because the sender keeps believing it was recorded.
+    unless ($row) {
+        return $self->_send($cli, format_err("BITCHAT_LOC: rejected (lat/lon out of range)"));
+    }
+    $self->_log(sprintf("bitchat-loc: %s%s at %s,%s%s",
+        $peer_id,
+        (defined $kv->{nickname} && length $kv->{nickname}) ? " ($kv->{nickname})" : '',
+        $kv->{lat}, $kv->{lon},
+        (defined $kv->{acc} && length $kv->{acc}) ? " acc=$kv->{acc}m" : ''));
+    $self->_emit_change(table => 'bitchat_locations', op => 'insert', row => $row);
     return $self->_send($cli, format_ok(peer_id => $peer_id));
 }
 
