@@ -7,6 +7,34 @@ keeps working; IPv6 is added alongside, then the roster can be cut over.
 **Not in this spec** (separate follow-ups): the VLAN / RA / DHCPv6 network setup,
 cutting the cluster to v6-only, and the general-comms "node query" verbs.
 
+## Exposure model (constraint)
+
+nas3 holds the fleet database and **must not be directly reachable from the
+Internet**. It must still sit on control VLANs that span sites. Those two
+requirements are met at different layers, and keeping them separate is what
+makes the property hold:
+
+- **Network layer — ULA only.** `control_prefix` is a ULA (`fd00::/8`), which no
+  upstream will route. nas3's non-exposure is therefore *structural*: there is no
+  address an outside host can reach, so it does not rest on a firewall rule
+  staying correct. This matters more under IPv6 than IPv4 because there is no
+  NAT — "it is on the LAN" no longer implies "unreachable", and a global address
+  on nas3 would be reachable the moment a rule was wrong.
+- **Application layer — outbound only.** Wide-area reach comes from net-chat
+  sessions relayed through the Internet-facing nodes (bigsony, zmc1). nas3
+  *connects out* to a relay; no remote peer ever dials nas3. A ULA cannot span
+  the Internet by itself, so that relay is precisely what allows a cross-site
+  VLAN without exposing the node.
+
+Three changes would silently undo this, and review should reject them:
+
+1. a global (non-ULA) address on nas3;
+2. `V6Only => 0` on a v6 listener — it also accepts v4-mapped connections;
+3. a listener bound to any address outside `control_prefix`.
+
+Internet-facing nodes (bigsony, zmc1) are exempt by design: they carry global
+addresses and accept inbound, because they are the relay endpoints.
+
 ## Current state
 
 - **`NetMgr::Client`** already uses `IO::Socket::IP` and parses IPv6 listen
@@ -48,8 +76,11 @@ copies.
 ### 4. `lib/NetMgr/Config.pm`
 - Document IPv6 in `[manager] listen` (comma list may mix v4 + `[v6]:port`).
 - `[cluster] members` entries may be `[v6]` / `[v6]:port` / name.
-- NEW (optional) `[cluster] control_prefix = fd…::/64` — scopes which v6 `'auto'`
-  binds + which address a node advertises as its control-plane address.
+- NEW `[cluster] control_prefix = fd…::/64` — scopes which v6 `'auto'` binds +
+  which address a node advertises as its control-plane address. **Required for
+  v6 `'auto'`**: with decision 1 settled, absence of `control_prefix` means no
+  v6 auto binds at all — fail closed, rather than binding every global address
+  the host happens to have.
 
 ## Config model (proposed)
 
@@ -84,12 +115,16 @@ members        = nas3, [fd12:3456:789a:1::10], [fd12:3456:789a:1::20]
 6. **Live (zmc1, I have root)** — add a ULA to zmc1, bind, connect a client over
    it, mesh-connect — all without a real VLAN.
 
-## Decisions for you (before I code)
+## Decisions
 
-1. **'auto' v6 scope** — bind *all* global v6 a node has, or only addresses in a
-   configured `control_prefix`? (Recommend: `control_prefix`, for isolation.)
-2. **V6Only** — separate v4/v6 sockets (`V6Only=1`, recommend) vs dual-stack
-   v4-mapped (`V6Only=0`)?
+1. **`'auto'` v6 scope — DECIDED: `control_prefix` only.** Bind only addresses
+   inside the configured prefix, never every global v6 the host happens to hold.
+   This is the boundary described in *Exposure model*, not merely tidiness: it is
+   what stops a node answering on an address the operator never intended to
+   serve.
+2. **V6Only — DECIDED: `V6Only => 1`.** Separate v4/v6 sockets. Under
+   `V6Only => 0` a v6 listener also accepts v4-mapped v4 connections, widening
+   what the socket answers beyond what the config appears to say.
 3. **Mesh port** — keep the single `7531` on v6, or a distinct control port?
 4. **Member spec** — `[v6]:port` brackets (consistent with Client) — confirm.
 5. **Naming** — `Addr` vs folding into an existing util module; `control_prefix`
