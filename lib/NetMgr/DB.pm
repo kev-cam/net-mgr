@@ -3079,7 +3079,7 @@ sub query_table {
         chat_sessions chat_members chat_messages chat_presence
         chat_authorized_keys
         host_keys dhcp_ranges dhcp_reservations
-        mesh_tunnels node_capabilities bitchat_peers
+        mesh_tunnels node_capabilities bitchat_peers bitchat_locations
         wan_services wan_service_candidates wan_service_health
         public_dns_servers sms_contacts sms_services
     );

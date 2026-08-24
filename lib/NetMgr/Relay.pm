@@ -544,6 +544,45 @@ sub _apply_node_capabilities {
     );
 }
 
+# ---- BitChat position claims (schema v40) ---------------------------
+#
+# bitchat_locations is the ONE BitChat table that should cross sites.
+# bitchat_peers deliberately does not — see its schema comment: each bridge
+# sees its own BLE neighbourhood and merging those adds distance/RSSI
+# ambiguity. A position claim is different in kind: it is about where the
+# CLAIMANT says it is, not about who happened to hear it, so it means the
+# same thing on every node.
+#
+# via_node is preserved as received, never restamped with the local node.
+# It records which bridge site heard the claim, and that is the only thing
+# that later lets a claim be checked against who was physically in range to
+# hear it — rewriting it locally would destroy the evidence side of a table
+# whose whole point is that claims are attributable but unverified.
+#
+# INSERT IGNORE rather than ON DUPLICATE KEY UPDATE: the table is an
+# append-only trail keyed (peer_id, recorded_at), and a replayed event must
+# not be able to rewrite a claim already on record, or the history stops
+# being evidence. Two sites hearing the same claim within one second collide
+# on the primary key and the first recorded wins — correct, since they are
+# the same claim.
+sub _apply_bitchat_locations {
+    my ($db, $row, $idmap, $repl_from) = @_;
+    return unless defined $row->{peer_id} && $row->{peer_id} =~ /^[0-9a-fA-F]{1,16}$/;
+    return unless defined $row->{lat} && length $row->{lat}
+               && defined $row->{lon} && length $row->{lon};
+    $db->dbh->do(<<'SQL', undef,
+INSERT IGNORE INTO bitchat_locations
+    (peer_id, recorded_at, lat, lon, accuracy_m, altitude_m,
+     source, fix_age_s, nickname, via_node)
+VALUES (?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?, ?, ?)
+SQL
+        $row->{peer_id}, $row->{recorded_at},
+        $row->{lat},        $row->{lon},
+        $row->{accuracy_m}, $row->{altitude_m},
+        $row->{source},     $row->{fix_age_s},
+        $row->{nickname},   $row->{via_node});
+}
+
 # ---- wan-failover replication (schema v34) --------------------------
 #
 # No upsert helpers on the DB yet — those arrive in commit B. Until then

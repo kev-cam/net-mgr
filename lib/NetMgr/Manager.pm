@@ -34,6 +34,18 @@ use NetMgr::Election ();
 use NetMgr::AutoDiscover ();
 
 # Logical tables a SUBSCRIBE may target.
+# NOTE: this is a qw() list — '#' does NOT start a comment inside it, so any
+# prose added between the parens silently becomes an allowed table name.
+# Keep commentary out here, above the list.
+#
+# bitchat_locations is position HISTORY, the most sensitive data this daemon
+# carries, and it sits in this OPEN list rather than %SUBSCRIBABLE_AUTH for a
+# structural reason rather than a judgement that it is harmless: no
+# SUBSCRIBABLE_AUTH table has a Relay _apply_ handler, so AUTH-gated tables do
+# not replicate at all, and gating this one would confine every claim to the
+# bridge that happened to hear it. Revisit alongside an authenticating relay;
+# until then the protection is that the fleet is private and nas3 is not
+# Internet-reachable (see IPV6-TRANSPORT-SPEC.md, "Exposure model").
 my %SUBSCRIBABLE = map { $_ => 1 } qw(
     machines hostnames interfaces addresses ports aps
     associations dhcp_leases events aliases dhcp_vars
@@ -45,6 +57,7 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
     host_keys dhcp_ranges dhcp_reservations
     mesh_tunnels node_capabilities bitchat_peers
     bitchat_relay_packets
+    bitchat_locations
     wan_services wan_service_candidates wan_service_health
     public_dns_servers sms_contacts sms_services
 );
