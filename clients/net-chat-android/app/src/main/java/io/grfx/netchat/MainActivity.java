@@ -78,6 +78,15 @@ public class MainActivity extends AppCompatActivity
     private String nickname;
     private LocationShare locationShare;
 
+    /**
+     * Operator-set position beacon. {@code null} means off, which is both the
+     * default and the state after every app start — a beacon never resumes by
+     * itself, so a device cannot end up quietly reporting its position because
+     * of something switched on weeks ago. Re-arming is one command.
+     */
+    private Long locBeaconMs;
+    private Runnable locBeacon;
+
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final SimpleDateFormat ts = new SimpleDateFormat("HH:mm:ss", Locale.US);
 
@@ -291,6 +300,7 @@ public class MainActivity extends AppCompatActivity
     }
 
     private void stopAll() {
+        stopLocBeacon();          // an armed beacon must not outlive the mesh
         if (ticker != null) { ticker.shutdownNow(); ticker = null; }
         if (peripheral != null) { peripheral.stop(); peripheral = null; }
         if (scanner != null) { scanner.stop(); scanner = null; }
@@ -310,8 +320,9 @@ public class MainActivity extends AppCompatActivity
      * version bump, no bridge-side change, and older peers still see something
      * readable rather than dropping an unknown type.
      *
-     * Fires only on an explicit tap or /loc; there is no timer anywhere in this
-     * path.
+     * Fires on an explicit tap, on /loc, or on a tick of the operator-armed
+     * beacon (see startLocBeacon). The beacon is off unless someone turns it
+     * on for this run; nothing here starts one by default.
      */
     private void shareLocation() {
         if (locationShare == null) locationShare = new LocationShare(this);
@@ -325,8 +336,85 @@ public class MainActivity extends AppCompatActivity
         });
     }
 
+    /**
+     * Below this, a beacon costs a GNSS wake plus a mesh broadcast to re-report
+     * a position that has not meaningfully changed. Two tablets reporting every
+     * few minutes is enough to fix the survey frame; faster only spends battery.
+     */
+    private static final long LOC_BEACON_MIN_MS = 60_000L;
+
+    /**
+     * Arm the position beacon at {@code spec} ("5m", "90s", bare "5" = minutes).
+     *
+     * Deliberately NOT persisted across restarts. The class comment on
+     * LocationShare argues position should never go out on a timer the operator
+     * did not set; a preference that survives reboots is exactly such a timer,
+     * six months later, when nobody remembers setting it. Keeping the arming
+     * in-process means the worst case is a beacon that stops, never one that
+     * runs unnoticed.
+     *
+     * The timer lives here rather than inside LocationShare so that class stays
+     * genuinely one-shot: every fix it takes is still one explicit request, and
+     * only the caller repeats.
+     */
+    private void startLocBeacon(String spec) {
+        long ms = parseInterval(spec);
+        if (ms <= 0) { append("usage: /loc every <n>[s|m]   e.g. /loc every 5m"); return; }
+        if (ms < LOC_BEACON_MIN_MS) {
+            append("location beacon: clamped to the "
+                 + (LOC_BEACON_MIN_MS / 1000L) + "s minimum interval");
+            ms = LOC_BEACON_MIN_MS;
+        }
+        stopLocBeacon();
+        locBeaconMs = ms;
+        locBeacon = new Runnable() {
+            @Override public void run() {
+                Long every = locBeaconMs;
+                if (every == null) return;      // stopped while this tick was queued
+                shareLocation();
+                ui.postDelayed(this, every);
+            }
+        };
+        append("location beacon: every " + describeInterval(ms)
+             + " — until /loc off, stop, or app restart");
+        ui.post(locBeacon);                     // first fix now, not one interval from now
+    }
+
+    private void stopLocBeacon() {
+        if (locBeacon != null) ui.removeCallbacks(locBeacon);
+        boolean wasOn = locBeaconMs != null;
+        locBeacon = null;
+        locBeaconMs = null;
+        if (wasOn) append("location beacon: off");
+    }
+
+    /** "5m" / "90s" / bare "5" (minutes). 0 when unparseable. */
+    private static long parseInterval(String s) {
+        if (s == null) return 0L;
+        s = s.trim().toLowerCase(Locale.US);
+        if (s.isEmpty()) return 0L;
+        long mult = 60_000L;                    // a bare number means minutes
+        if (s.endsWith("s"))      { mult = 1_000L;  s = s.substring(0, s.length() - 1); }
+        else if (s.endsWith("m")) { mult = 60_000L; s = s.substring(0, s.length() - 1); }
+        try { return Long.parseLong(s.trim()) * mult; }
+        catch (NumberFormatException e) { return 0L; }
+    }
+
+    private static String describeInterval(long ms) {
+        return ms % 60_000L == 0 ? (ms / 60_000L) + "m" : (ms / 1000L) + "s";
+    }
+
     private void dispatchCompose(String text) {
-        if (text.equalsIgnoreCase("/loc")) { shareLocation(); return; }
+        if (text.regionMatches(true, 0, "/loc", 0, 4)
+            && (text.length() == 4 || text.charAt(4) == ' ')) {
+            String arg = text.length() > 4 ? text.substring(4).trim() : "";
+            if (arg.isEmpty()) { shareLocation(); return; }
+            String low = arg.toLowerCase(Locale.US);
+            if (low.equals("off") || low.equals("stop")) { stopLocBeacon(); return; }
+            if (low.startsWith("every")) { startLocBeacon(arg.substring(5)); return; }
+            append("usage: /loc | /loc every <n>[s|m] | /loc off");
+            return;
+        }
         if (text.startsWith("@") && text.length() > 17 && text.charAt(17) == ' ') {
             String pidHex = text.substring(1, 17).toLowerCase();
             if (isHex(pidHex)) {
