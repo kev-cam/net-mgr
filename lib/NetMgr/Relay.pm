@@ -193,9 +193,37 @@ sub _apply_machines {
     _stamp($db, 'machines', $repl_from, 'id = ?', $lid);
 }
 
+# Resolve a peer machine_id to a LOCAL id that still exists.
+#
+# %idmap is populated by _apply_machines and then trusted for the rest of the
+# session — but the daemon shares this database and can delete a machines row
+# underneath us (purge, dedup, a machine going away). The mapping then points
+# at an id that is gone, and every subsequent child insert for that machine
+# dies on its foreign key. That is how a couple of stale mappings turned into
+# 308 `apply hostnames` FK failures in one relay log: the entry is never
+# invalidated, so it poisons every row that follows.
+#
+# Verifying costs one indexed lookup per child row and converts a thrown
+# exception plus a lost row into a clean skip. Dropping the stale entry is the
+# part that stops the cascade: the next _apply_machines re-resolves it by
+# primary_name, and the snapshot half of the next reconnect re-delivers the
+# children. We cannot recreate the parent here — a child row carries only the
+# id, never the primary_name that machines are keyed on.
+sub _live_machine_id {
+    my ($db, $idmap, $peer_mid) = @_;
+    return undef unless defined $peer_mid && length $peer_mid;
+    my $lid = $idmap->{$peer_mid};
+    return undef unless $lid;
+    my ($ok) = $db->dbh->selectrow_array(
+        "SELECT 1 FROM machines WHERE id = ?", undef, $lid);
+    return $lid if $ok;
+    delete $idmap->{$peer_mid};      # stale — stop it poisoning later rows
+    return undef;
+}
+
 sub _apply_hostnames {
     my ($db, $row, $idmap, $repl_from) = @_;
-    my $mid = $idmap->{ $row->{machine_id} // '' };
+    my $mid = _live_machine_id($db, $idmap, $row->{machine_id});
     return unless $mid && $row->{name} && $row->{source};
     $db->upsert_hostname(
         machine_id => $mid,
@@ -241,7 +269,11 @@ sub _apply_interfaces {
     $args{last_observed} = $row->{last_observed}
         if defined $row->{last_observed} && length $row->{last_observed};
     if (defined $row->{machine_id} && $row->{machine_id} ne '') {
-        my $lmid = $idmap->{ $row->{machine_id} };
+        # Same staleness check as hostnames. An interface whose machine has
+        # gone is still worth recording — it keeps its MAC identity, which is
+        # what names actually bind to — so this omits machine_id rather than
+        # dropping the row.
+        my $lmid = _live_machine_id($db, $idmap, $row->{machine_id});
         $args{machine_id} = $lmid if $lmid;
     }
     $db->upsert_interface(%args);
