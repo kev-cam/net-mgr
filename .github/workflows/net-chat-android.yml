@@ -1,0 +1,95 @@
+# Build the Android net-chat client and publish the APK as a release asset.
+#
+# Mirrors net-chat-windows.yml: tag to cut a release, workflow_dispatch to get a
+# build without tagging.
+#
+# SIGNING: debug-signed, on purpose. This is a private fleet client that is
+# sideloaded, never shipped through Play, so a release keystore would buy
+# nothing but a secret to manage and lose. The trade is real and worth knowing:
+# a debug-signed APK cannot upgrade over one signed with a different key, so
+# switching to a release key later means uninstall-then-install on every device.
+# If that day comes, add a keystore secret and swap assembleDebug for
+# assembleRelease -- do not quietly mix the two.
+#
+# PRIVATE REPO: release assets on a private repo need an authenticated
+# download, which is awkward on a phone browser. Either fetch it on a desktop
+# with a token and copy it over, or `gh release download` from a machine that
+# is already authenticated. A phone cannot simply tap the release URL.
+#
+# No local.properties is committed (it is gitignored, being machine-local), so
+# Gradle finds the SDK through ANDROID_HOME, which the GitHub runner image
+# already sets. That is why there is no SDK setup step here.
+name: net-chat android
+
+on:
+  push:
+    tags: ['net-chat-android-v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 17 matches the toolchain the client is developed against; the Android
+      # Gradle Plugin rejects older JDKs outright.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # Run before packaging: the crypto and protocol tests (Noise, framing,
+      # padding, fragmentation) are exactly the parts where a silent regression
+      # would produce an APK that installs fine and then cannot talk to peers.
+      - name: Unit tests
+        working-directory: clients/net-chat-android
+        run: ./gradlew testDebugUnitTest --console=plain
+
+      - name: Build the APK
+        working-directory: clients/net-chat-android
+        run: ./gradlew assembleDebug --console=plain
+
+      # Name the artefact after the tag so a downloaded file is identifiable
+      # once it is off the release page and sitting in someone's Downloads.
+      - name: Name the APK
+        id: name
+        working-directory: clients/net-chat-android
+        run: |
+          ver="${GITHUB_REF_NAME}"
+          case "$ver" in refs/*|"") ver="$(git rev-parse --short HEAD)";; esac
+          out="net-chat-${ver}.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "$out"
+          ls -l "$out"
+          echo "apk=clients/net-chat-android/$out" >> "$GITHUB_OUTPUT"
+
+      # Fail loudly if the permissions the client depends on went missing: BLE
+      # scanning needs ACCESS_FINE_LOCATION on Android 11+, and the position
+      # beacon reuses that same grant. An APK without it installs and then
+      # silently finds no peers, which is a miserable thing to debug on a
+      # tablet in another room.
+      - name: Assert required permissions survived the build
+        working-directory: clients/net-chat-android
+        run: |
+          aapt="$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | tail -1)"
+          perms="$("$aapt" dump permissions app/build/outputs/apk/debug/app-debug.apk || true)"
+          echo "$perms"
+          for p in android.permission.ACCESS_FINE_LOCATION \
+                   android.permission.BLUETOOTH_SCAN \
+                   android.permission.BLUETOOTH_ADVERTISE \
+                   android.permission.BLUETOOTH_CONNECT; do
+            echo "$perms" | grep -q "$p" || { echo "MISSING: $p"; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: net-chat-android-debug
+          path: ${{ steps.name.outputs.apk }}
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.name.outputs.apk }}
