@@ -31,7 +31,27 @@ my @REPLICATED = qw(
     mesh_tunnels node_capabilities
     wan_services wan_service_candidates wan_service_health
     sms_contacts sms_services
+    zone_classes wifi_zones interface_zones
+    bitchat_locations
 );
+
+# ORDER IN @REPLICATED MATTERS for the three zone tables: wifi_zones.zone_class
+# and interface_zones.zone_class are FOREIGN KEYs onto zone_classes(name), so
+# the parent is subscribed first. That alone is not sufficient — the stream can
+# still deliver a child row before the parent's snapshot has been applied — so
+# each child handler also INSERT IGNOREs its parent class. An FK rejection here
+# is exactly the failure that killed the daemon in register_self
+# (ports.mac -> interfaces.mac), and a lost zone row is worse than a redundant
+# INSERT IGNORE.
+#
+# NOTE on latency: net-zones writes DIRECT DBI and never calls _emit_change, so
+# zone edits do NOT stream. They reach followers via the snapshot half of the
+# relay's snapshot+stream SUBSCRIBE, i.e. on the next relay (re)connect — not
+# within seconds of the edit. Do not treat a follower's zone view as live.
+#
+# NOTE on bitchat_locations: it is HISTORY and grows without bound, and a
+# follower re-snapshots it on every relay reconnect. Fine while it is small;
+# revisit with a WHERE clause or a retention cut if the trail gets long.
 
 sub run {
     my (%args) = @_;
@@ -543,6 +563,86 @@ sub _apply_node_capabilities {
         replicated_from => $repl_from,
     );
 }
+
+# ---- zone model replication (zone_classes / wifi_zones / interface_zones) ---
+#
+# These carry the SSID -> security-domain mapping (scorpius = DMZ .15,
+# pegasus = Private .223), which the firewall emitter and any AP-steering
+# logic both read. A follower that cannot see them cannot decide whether a
+# roam would cross a security boundary, which is why they replicate at all.
+
+sub _ensure_zone_class {
+    my ($db, $class) = @_;
+    return unless defined $class && length $class;
+    $db->dbh->do("INSERT IGNORE INTO zone_classes (name) VALUES (?)", undef, $class);
+}
+
+sub _apply_zone_classes {
+    my ($db, $row) = @_;
+    return unless defined $row->{name} && length $row->{name};
+    $db->dbh->do(<<'SQL', undef, $row->{name}, $row->{sort_order} // 0, $row->{notes});
+INSERT INTO zone_classes (name, sort_order, notes)
+VALUES (?, ?, ?)
+ON DUPLICATE KEY UPDATE sort_order = VALUES(sort_order), notes = VALUES(notes)
+SQL
+}
+
+sub _apply_wifi_zones {
+    my ($db, $row) = @_;
+    return unless defined $row->{ssid}       && length $row->{ssid};
+    return unless defined $row->{zone_class} && length $row->{zone_class};
+    _ensure_zone_class($db, $row->{zone_class});
+    $db->dbh->do(<<'SQL', undef, $row->{ssid}, $row->{zone_class},
+INSERT INTO wifi_zones (ssid, zone_class, zone_name, notes)
+VALUES (?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE zone_class = VALUES(zone_class),
+                        zone_name  = VALUES(zone_name),
+                        notes      = VALUES(notes)
+SQL
+        $row->{zone_name} // '', $row->{notes});
+}
+
+sub _apply_interface_zones {
+    my ($db, $row) = @_;
+    for my $k (qw(host iface cidr zone_class)) {
+        return unless defined $row->{$k} && length $row->{$k};
+    }
+    _ensure_zone_class($db, $row->{zone_class});
+    $db->dbh->do(<<'SQL', undef, @{$row}{qw(host iface cidr zone_class)},
+INSERT INTO interface_zones (host, iface, cidr, zone_class, zone_name, notes)
+VALUES (?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE zone_class = VALUES(zone_class),
+                        zone_name  = VALUES(zone_name),
+                        notes      = VALUES(notes)
+SQL
+        $row->{zone_name} // '', $row->{notes});
+}
+
+# A zone REMOVED on the master must go away here too. Without these the relay
+# logs "no _delete_<table> handler" and the row lives on forever — worse for a
+# zone than for a stale lease, because the firewall emitter and the steering
+# logic would keep honouring a classification the operator deleted.
+sub _delete_wifi_zones {
+    my ($db, $row) = @_;
+    return unless defined $row->{ssid} && length $row->{ssid};
+    $db->dbh->do("DELETE FROM wifi_zones WHERE ssid = ?", undef, $row->{ssid});
+}
+
+sub _delete_interface_zones {
+    my ($db, $row) = @_;
+    for my $k (qw(host iface cidr)) {
+        return unless defined $row->{$k} && length $row->{$k};
+    }
+    $db->dbh->do("DELETE FROM interface_zones WHERE host = ? AND iface = ? AND cidr = ?",
+                 undef, @{$row}{qw(host iface cidr)});
+}
+
+# No _delete_zone_classes, deliberately. Dropping a class still referenced by
+# wifi_zones or interface_zones would fail its FK anyway, and cascading it
+# silently would unclassify every SSID and interface underneath — turning one
+# deliberate deletion on the master into a fleet-wide loss of the security
+# mapping. Relay will log "no _delete_zone_classes handler" for it; that
+# warning is the intended behaviour here, not an oversight.
 
 # ---- BitChat position claims (schema v40) ---------------------------
 #
