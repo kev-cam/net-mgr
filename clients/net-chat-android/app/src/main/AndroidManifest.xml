@@ -4,8 +4,9 @@
 
     <!-- BLE runtime permissions, split by API level:
          Android 12+ (API 31): BLUETOOTH_SCAN / _CONNECT / _ADVERTISE are
-         runtime perms. neverForLocation on SCAN so we don't get pushed
-         into needing ACCESS_FINE_LOCATION on modern devices.
+         runtime perms. neverForLocation on SCAN so SCANNING is not pushed
+         into needing ACCESS_FINE_LOCATION on modern devices. (Position
+         sharing needs it regardless — requested separately, see below.)
          Android 11 and below: fall back to legacy BLUETOOTH + BLUETOOTH_ADMIN
          plus ACCESS_FINE_LOCATION (which BLE scan needs pre-12). -->
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
@@ -20,8 +21,13 @@
         android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
         android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
-        android:maxSdkVersion="30" />
+    <!-- Needed for two unrelated reasons, which is why it carries no
+         maxSdkVersion: BLE scanning requires it pre-12, AND the position
+         beacon (/loc) requires it on every version. BLUETOOTH_SCAN keeps
+         neverForLocation above, so scanning still does not derive location on
+         12+; the grant is requested at the moment someone shares a position,
+         not at startup, so chat-only users are never prompted. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
 
     <!-- Foreground service — Android 14+ needs the connectedDevice
          type declaration BOTH here and on startForeground(). -->

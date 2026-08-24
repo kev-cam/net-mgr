@@ -60,6 +60,8 @@ public class MainActivity extends AppCompatActivity
         implements BitChatService.Bridge {
 
     private static final int REQ_PERMISSIONS = 42;
+    /** Location is requested separately, and late — see shareLocation(). */
+    private static final int REQ_LOCATION = 43;
     private static final long ANNOUNCE_INTERVAL_MS = 30_000L;
 
     private TextView log;
@@ -214,6 +216,19 @@ public class MainActivity extends AppCompatActivity
     public void onRequestPermissionsResult(int requestCode, String[] permissions,
                                            int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_LOCATION) {
+            boolean granted = grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            if (granted) {
+                shareLocation();        // retry the request that triggered the prompt
+            } else {
+                // Disarm rather than let an armed beacon re-prompt on every
+                // tick — a repeating permission dialog is worse than no beacon.
+                append("location: permission denied");
+                stopLocBeacon();
+            }
+            return;
+        }
         if (requestCode != REQ_PERMISSIONS) return;
         for (int r : grantResults) {
             if (r != PackageManager.PERMISSION_GRANTED) {
@@ -325,6 +340,19 @@ public class MainActivity extends AppCompatActivity
      * on for this run; nothing here starts one by default.
      */
     private void shareLocation() {
+        // On Android 12+ this app holds no location permission by design —
+        // BLUETOOTH_SCAN declares neverForLocation precisely so BLE does not
+        // drag one in. Sharing a position is the single feature that genuinely
+        // needs it, so the grant is asked for HERE, when the operator asks to
+        // be located, rather than at startup where it would put a location
+        // prompt in front of people who only ever wanted chat.
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            append("location: requesting permission …");
+            ActivityCompat.requestPermissions(this,
+                    new String[]{ Manifest.permission.ACCESS_FINE_LOCATION }, REQ_LOCATION);
+            return;                     // resumes in onRequestPermissionsResult
+        }
         if (locationShare == null) locationShare = new LocationShare(this);
         append("(you) requesting location …");
         locationShare.request(new LocationShare.Sink() {
