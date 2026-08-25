@@ -11,10 +11,10 @@
 # If that day comes, add a keystore secret and swap assembleDebug for
 # assembleRelease -- do not quietly mix the two.
 #
-# PRIVATE REPO: release assets on a private repo need an authenticated
-# download, which is awkward on a phone browser. Either fetch it on a desktop
-# with a token and copy it over, or `gh release download` from a machine that
-# is already authenticated. A phone cannot simply tap the release URL.
+# DOWNLOADING: kev-cam/net-mgr is a PUBLIC repo, so release assets are
+# anonymously downloadable — a phone can fetch the APK straight from the
+# release URL with no token and no LAN access to any machine here. That is the
+# whole point of publishing it this way rather than serving it locally.
 #
 # No local.properties is committed (it is gitignored, being machine-local), so
 # Gradle finds the SDK through ANDROID_HOME, which the GitHub runner image
@@ -52,18 +52,21 @@ jobs:
         working-directory: clients/net-chat-android
         run: ./gradlew assembleDebug --console=plain
 
-      # Name the artefact after the tag so a downloaded file is identifiable
-      # once it is off the release page and sitting in someone's Downloads.
+      # The asset is named net-chat.apk with NO version in it, deliberately.
+      # That makes this URL permanent and always current:
+      #
+      #   https://github.com/kev-cam/net-mgr/releases/latest/download/net-chat.apk
+      #
+      # so a printed QR code keeps working across every future release instead
+      # of needing to be regenerated per tag. The release page still shows which
+      # tag it came from, and the app carries its own version internally.
       - name: Name the APK
         id: name
         working-directory: clients/net-chat-android
         run: |
-          ver="${GITHUB_REF_NAME}"
-          case "$ver" in refs/*|"") ver="$(git rev-parse --short HEAD)";; esac
-          out="net-chat-${ver}.apk"
-          cp app/build/outputs/apk/debug/app-debug.apk "$out"
-          ls -l "$out"
-          echo "apk=clients/net-chat-android/$out" >> "$GITHUB_OUTPUT"
+          cp app/build/outputs/apk/debug/app-debug.apk net-chat.apk
+          ls -l net-chat.apk
+          echo "apk=clients/net-chat-android/net-chat.apk" >> "$GITHUB_OUTPUT"
 
       # Fail loudly if the permissions the client depends on went missing: BLE
       # scanning needs ACCESS_FINE_LOCATION on Android 11+, and the position
