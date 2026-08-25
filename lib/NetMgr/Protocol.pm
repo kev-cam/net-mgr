@@ -172,6 +172,7 @@ sub parse_line {
     elsif ($verb eq 'CHAT_MEMBER_DELETE') { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'BITCHAT_PEER_UPSERT') { $cmd->{kv} = _parse_kv_only(\@toks) }
     elsif ($verb eq 'BITCHAT_PACKET_RELAY') { $cmd->{kv} = _parse_kv_only(\@toks) }
+    elsif ($verb eq 'BITCHAT_LOC')          { $cmd->{kv} = _parse_kv_only(\@toks) }
     # Loopback-only host maintenance (link/DHCP cycle, nmcli conn up/down).
     # Client side is bin/net-diag under --repair when running non-root.
     elsif ($verb eq 'REPAIR')     { $cmd->{kv} = _parse_kv_only(\@toks) }

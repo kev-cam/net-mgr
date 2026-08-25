@@ -639,8 +639,17 @@ sub run_once {
                                    . (defined $src ? " src=$src" : '')
                                    . (defined $age ? " age=$age" : '')
                                    . (length $sender ? " nickname=$sender" : '');
-                            eval { $peer_cli->send_recv($lc) };
-                            warn "[bridge] LOC record failed: $@" if $@;
+                            # send_recv returns the daemon's REPLY; an ERR is an
+                            # ordinary return value, not an exception. Checking
+                            # only $@ made a rejected verb completely silent:
+                            # BITCHAT_LOC was dispatched in Manager.pm but never
+                            # registered in Protocol.pm, so every claim came back
+                            # "ERR parse: unknown verb 'BITCHAT_LOC'" and was
+                            # dropped without a line in the log. The phone was
+                            # beaconing correctly the whole time.
+                            my $rep = eval { $peer_cli->send_recv($lc) };
+                            if ($@)                        { warn "[bridge] LOC record failed: $@" }
+                            elsif (($rep // '') =~ /^ERR/) { warn "[bridge] LOC rejected: $rep\n" }
                         } else {
                             warn "[bridge] LOC from $sender_peer_id out of range: $lat,$lon
 ";
