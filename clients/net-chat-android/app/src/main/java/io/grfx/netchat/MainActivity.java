@@ -404,7 +404,13 @@ public class MainActivity extends AppCompatActivity
         else if (locLastFixAt == 0)                              { c = LOC_WAITING; t = "Loc …"; }
         else if (System.currentTimeMillis() - locLastFixAt > LOC_FRESH_MS) { c = LOC_WAITING; t = "Loc ~"; }
         else                                                     { c = LOC_LIVE;    t = "Loc on"; }
-        locBtn.setBackgroundColor(c);
+        // setBackgroundColor() does NOT work here. The theme is
+        // Theme.AppCompat.DayNight, so a plain <Button> inflates as
+        // AppCompatButton, which applies its own background TINT from the
+        // theme and paints straight over any colour set on the drawable — the
+        // text changes and the colour silently does not. Tint is the knob
+        // AppCompat actually honours.
+        locBtn.setBackgroundTintList(android.content.res.ColorStateList.valueOf(c));
         locBtn.setText(t);
     }
 
