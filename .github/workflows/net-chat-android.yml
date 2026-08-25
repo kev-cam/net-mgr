@@ -29,6 +29,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Creating a release is a WRITE to repository contents, and GITHUB_TOKEN is
+    # read-only by default. Without this the whole build succeeds — tests, APK,
+    # permission assertion, artifact upload — and only the final "Attach to the
+    # release" step fails, which reads like a flaky action rather than a
+    # missing grant. Scoped to this job, and to contents alone.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
