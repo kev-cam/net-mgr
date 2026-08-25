@@ -639,9 +639,15 @@ sub run_once {
                                    . (defined $src ? " src=$src" : '')
                                    . (defined $age ? " age=$age" : '')
                                    . (length $sender ? " nickname=$sender" : '');
+                            # Log the exact line we send. A position claim is
+                            # rare and consequential enough to be worth one line
+                            # each, and it is the only way to tell a claim that
+                            # arrived without metadata from one whose metadata we
+                            # dropped in parsing — the stored row looks identical
+                            # either way, and the tagged copy in chat_messages is
+                            # NOT what was parsed.
+                            warn "[bridge] LOC send: $lc\n";
                             # send_recv returns the daemon's REPLY; an ERR is an
-                            # ordinary return value, not an exception. Checking
-                            # only $@ made a rejected verb completely silent:
                             # BITCHAT_LOC was dispatched in Manager.pm but never
                             # registered in Protocol.pm, so every claim came back
                             # "ERR parse: unknown verb 'BITCHAT_LOC'" and was

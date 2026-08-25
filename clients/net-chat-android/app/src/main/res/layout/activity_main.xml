@@ -24,6 +24,16 @@
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:text="Stop" />
+
+        <!-- Position sharing. Colour IS the state: a chat command that stops
+             silently is exactly how the earlier beacon kept dying unnoticed. -->
+        <Button
+            android:id="@+id/loc"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:textColor="#FFFFFF"
+            android:text="Loc off" />
     </LinearLayout>
 
     <LinearLayout

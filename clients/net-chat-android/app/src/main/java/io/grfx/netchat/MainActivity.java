@@ -81,13 +81,24 @@ public class MainActivity extends AppCompatActivity
     private LocationShare locationShare;
 
     /**
-     * Operator-set position beacon. {@code null} means off, which is both the
-     * default and the state after every app start — a beacon never resumes by
-     * itself, so a device cannot end up quietly reporting its position because
-     * of something switched on weeks ago. Re-arming is one command.
+     * Position sharing. Movement-driven, not scheduled: the platform emits a
+     * fix only when the device has actually moved minDistance, subject to a
+     * minTime floor. A stationary phone therefore costs nothing.
+     *
+     * OFF at every app start, still deliberately — a device must not resume
+     * reporting its position because of something switched on weeks ago. What
+     * changed is that the state is now VISIBLE: the button is colour-coded, so
+     * "it stopped" is legible at a glance instead of buried in the log, which
+     * is how the old /loc beacon kept dying unnoticed.
+     *
+     * The thresholds DO persist (they are configuration, not consent); the
+     * on/off state does not.
      */
-    private Long locBeaconMs;
-    private Runnable locBeacon;
+    private Button  locBtn;
+    private boolean locOn;
+    private long    locMinTimeMs  = 5 * 60_000L;   // never more often than this
+    private float   locMinDistM   = 25f;           // must move this far first
+    private long    locLastFixAt;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final SimpleDateFormat ts = new SimpleDateFormat("HH:mm:ss", Locale.US);
@@ -102,6 +113,10 @@ public class MainActivity extends AppCompatActivity
         peersView.setMovementMethod(new ScrollingMovementMethod());
         compose = findViewById(R.id.compose);
 
+        locBtn = findViewById(R.id.loc);
+        loadLocPrefs();
+        locBtn.setOnClickListener(v -> toggleLocation());
+        paintLocButton();
         Button startBtn = findViewById(R.id.start);
         Button stopBtn = findViewById(R.id.stop);
         Button postBtn = findViewById(R.id.post);
@@ -220,12 +235,14 @@ public class MainActivity extends AppCompatActivity
             boolean granted = grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED;
             if (granted) {
-                shareLocation();        // retry the request that triggered the prompt
+                if (locOn) startLocation();   // the button asked for this
+                else shareLocation();         // a bare /loc asked for one fix
             } else {
                 // Disarm rather than let an armed beacon re-prompt on every
                 // tick — a repeating permission dialog is worse than no beacon.
                 append("location: permission denied");
-                stopLocBeacon();
+                locOn = false;
+                paintLocButton();
             }
             return;
         }
@@ -315,7 +332,7 @@ public class MainActivity extends AppCompatActivity
     }
 
     private void stopAll() {
-        stopLocBeacon();          // an armed beacon must not outlive the mesh
+        if (locOn) stopLocation("off (mesh stopped)");          // an armed beacon must not outlive the mesh
         if (ticker != null) { ticker.shutdownNow(); ticker = null; }
         if (peripheral != null) { peripheral.stop(); peripheral = null; }
         if (scanner != null) { scanner.stop(); scanner = null; }
@@ -335,9 +352,10 @@ public class MainActivity extends AppCompatActivity
      * version bump, no bridge-side change, and older peers still see something
      * readable rather than dropping an unknown type.
      *
-     * Fires on an explicit tap, on /loc, or on a tick of the operator-armed
-     * beacon (see startLocBeacon). The beacon is off unless someone turns it
-     * on for this run; nothing here starts one by default.
+     * One-shot: an explicit tap or a bare /loc. Continuous sharing does NOT
+     * come through here — startLocation() registers a movement-filtered
+     * listener with the platform instead, so nothing in this path is on a
+     * timer.
      */
     private void shareLocation() {
         // On Android 12+ this app holds no location permission by design —
@@ -369,51 +387,70 @@ public class MainActivity extends AppCompatActivity
      * a position that has not meaningfully changed. Two tablets reporting every
      * few minutes is enough to fix the survey frame; faster only spends battery.
      */
-    private static final long LOC_BEACON_MIN_MS = 60_000L;
+    // Colour IS the state. Grey = off, amber = on but no fix yet, green = on
+    // with a recent fix, red = wanted but blocked (permission or provider).
+    private static final int LOC_OFF     = 0xFF555555;
+    private static final int LOC_WAITING = 0xFFB8860B;
+    private static final int LOC_LIVE    = 0xFF2E7D32;
+    private static final int LOC_BLOCKED = 0xFFB71C1C;
+    /** A fix older than this stops counting as "live" on the button. */
+    private static final long LOC_FRESH_MS = 15 * 60_000L;
 
-    /**
-     * Arm the position beacon at {@code spec} ("5m", "90s", bare "5" = minutes).
-     *
-     * Deliberately NOT persisted across restarts. The class comment on
-     * LocationShare argues position should never go out on a timer the operator
-     * did not set; a preference that survives reboots is exactly such a timer,
-     * six months later, when nobody remembers setting it. Keeping the arming
-     * in-process means the worst case is a beacon that stops, never one that
-     * runs unnoticed.
-     *
-     * The timer lives here rather than inside LocationShare so that class stays
-     * genuinely one-shot: every fix it takes is still one explicit request, and
-     * only the caller repeats.
-     */
-    private void startLocBeacon(String spec) {
-        long ms = parseInterval(spec);
-        if (ms <= 0) { append("usage: /loc every <n>[s|m]   e.g. /loc every 5m"); return; }
-        if (ms < LOC_BEACON_MIN_MS) {
-            append("location beacon: clamped to the "
-                 + (LOC_BEACON_MIN_MS / 1000L) + "s minimum interval");
-            ms = LOC_BEACON_MIN_MS;
-        }
-        stopLocBeacon();
-        locBeaconMs = ms;
-        locBeacon = new Runnable() {
-            @Override public void run() {
-                Long every = locBeaconMs;
-                if (every == null) return;      // stopped while this tick was queued
-                shareLocation();
-                ui.postDelayed(this, every);
-            }
-        };
-        append("location beacon: every " + describeInterval(ms)
-             + " — until /loc off, stop, or app restart");
-        ui.post(locBeacon);                     // first fix now, not one interval from now
+    private void paintLocButton() {
+        if (locBtn == null) return;
+        int c; String t;
+        if (!locOn)                                              { c = LOC_OFF;     t = "Loc off"; }
+        else if (locationShare == null || !locationShare.isRunning()) { c = LOC_BLOCKED; t = "Loc !"; }
+        else if (locLastFixAt == 0)                              { c = LOC_WAITING; t = "Loc …"; }
+        else if (System.currentTimeMillis() - locLastFixAt > LOC_FRESH_MS) { c = LOC_WAITING; t = "Loc ~"; }
+        else                                                     { c = LOC_LIVE;    t = "Loc on"; }
+        locBtn.setBackgroundColor(c);
+        locBtn.setText(t);
     }
 
-    private void stopLocBeacon() {
-        if (locBeacon != null) ui.removeCallbacks(locBeacon);
-        boolean wasOn = locBeaconMs != null;
-        locBeacon = null;
-        locBeaconMs = null;
-        if (wasOn) append("location beacon: off");
+    /** Toggle from the button. */
+    private void toggleLocation() {
+        if (locOn) { stopLocation("off (button)"); return; }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            append("location: requesting permission …");
+            locOn = true;                 // remember the intent across the prompt
+            paintLocButton();
+            ActivityCompat.requestPermissions(this,
+                    new String[]{ Manifest.permission.ACCESS_FINE_LOCATION }, REQ_LOCATION);
+            return;
+        }
+        startLocation();
+    }
+
+    private void startLocation() {
+        if (locationShare == null) locationShare = new LocationShare(this);
+        locOn = true;
+        locLastFixAt = 0;
+        boolean ok = locationShare.startUpdates(locMinTimeMs, locMinDistM, new LocationShare.Sink() {
+            @Override public void onStatus(String msg) { ui.post(() -> append(msg)); }
+            @Override public void onFix(String line, android.location.Location loc) {
+                if (line == null) return;
+                ui.post(() -> {
+                    locLastFixAt = System.currentTimeMillis();
+                    paintLocButton();
+                    broadcastText(line);
+                });
+            }
+        });
+        append(ok ? "location: sharing on movement (min " + (locMinTimeMs / 60_000L)
+                    + "m, " + (int) locMinDistM + "m)"
+                  : "location: could not start");
+        if (!ok) locOn = false;
+        paintLocButton();
+    }
+
+    private void stopLocation(String why) {
+        if (locationShare != null) locationShare.stopUpdates();
+        locOn = false;
+        locLastFixAt = 0;
+        append("location: " + why);
+        paintLocButton();
     }
 
     /** "5m" / "90s" / bare "5" (minutes). 0 when unparseable. */
@@ -421,26 +458,50 @@ public class MainActivity extends AppCompatActivity
         if (s == null) return 0L;
         s = s.trim().toLowerCase(Locale.US);
         if (s.isEmpty()) return 0L;
-        long mult = 60_000L;                    // a bare number means minutes
+        long mult = 60_000L;
         if (s.endsWith("s"))      { mult = 1_000L;  s = s.substring(0, s.length() - 1); }
         else if (s.endsWith("m")) { mult = 60_000L; s = s.substring(0, s.length() - 1); }
         try { return Long.parseLong(s.trim()) * mult; }
         catch (NumberFormatException e) { return 0L; }
     }
 
-    private static String describeInterval(long ms) {
-        return ms % 60_000L == 0 ? (ms / 60_000L) + "m" : (ms / 1000L) + "s";
-    }
-
     private void dispatchCompose(String text) {
         if (text.regionMatches(true, 0, "/loc", 0, 4)
             && (text.length() == 4 || text.charAt(4) == ' ')) {
             String arg = text.length() > 4 ? text.substring(4).trim() : "";
-            if (arg.isEmpty()) { shareLocation(); return; }
             String low = arg.toLowerCase(Locale.US);
-            if (low.equals("off") || low.equals("stop")) { stopLocBeacon(); return; }
-            if (low.startsWith("every")) { startLocBeacon(arg.substring(5)); return; }
-            append("usage: /loc | /loc every <n>[s|m] | /loc off");
+            if (arg.isEmpty())                       { shareLocation(); return; }
+            if (low.equals("on"))                    { if (!locOn) toggleLocation(); return; }
+            if (low.equals("off") || low.equals("stop")) { if (locOn) stopLocation("off"); return; }
+            if (low.startsWith("every")) {            // minimum interval
+                long ms = parseInterval(arg.substring(5));
+                if (ms <= 0) { append("usage: /loc every <n>[s|m]"); return; }
+                locMinTimeMs = ms;
+                saveLocPrefs();
+                append("location: min interval " + (ms / 60_000L) + "m"
+                       + (locOn ? " (restarting)" : ""));
+                if (locOn) startLocation();
+                return;
+            }
+            if (low.startsWith("move")) {             // minimum distance
+                String d = arg.substring(4).trim().replaceAll("(?i)m$", "");
+                try {
+                    float m = Float.parseFloat(d);
+                    if (m <= 0) throw new NumberFormatException();
+                    locMinDistM = m;
+                    saveLocPrefs();
+                    // Say so rather than silently accepting a useless value: a
+                    // threshold under the fix accuracy makes a stationary phone
+                    // emit continuously as the position jitters.
+                    if (m < 20f) append("location: " + (int) m
+                            + "m is below typical fix accuracy — expect jitter");
+                    append("location: move threshold " + (int) m + "m"
+                           + (locOn ? " (restarting)" : ""));
+                    if (locOn) startLocation();
+                } catch (NumberFormatException e) { append("usage: /loc move <metres>"); }
+                return;
+            }
+            append("usage: /loc | /loc on | /loc off | /loc every <n>[s|m] | /loc move <m>");
             return;
         }
         if (text.startsWith("@") && text.length() > 17 && text.charAt(17) == ' ') {
@@ -452,6 +513,20 @@ public class MainActivity extends AppCompatActivity
             }
         }
         broadcastText(text);
+    }
+
+    // Thresholds persist; the on/off state deliberately does not.
+    private static final String LOC_PREFS = "loc";
+    private void saveLocPrefs() {
+        getSharedPreferences(LOC_PREFS, MODE_PRIVATE).edit()
+            .putLong("minTimeMs", locMinTimeMs)
+            .putFloat("minDistM", locMinDistM)
+            .apply();
+    }
+    private void loadLocPrefs() {
+        android.content.SharedPreferences p = getSharedPreferences(LOC_PREFS, MODE_PRIVATE);
+        locMinTimeMs = p.getLong("minTimeMs", locMinTimeMs);
+        locMinDistM  = p.getFloat("minDistM",  locMinDistM);
     }
 
     // ---- Wire helpers ------------------------------------------

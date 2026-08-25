@@ -48,6 +48,8 @@ public final class LocationShare {
     private final Context ctx;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private LocationListener live;
+    /** Long-lived, movement-filtered listener (startUpdates/stopUpdates). */
+    private LocationListener continuous;
 
     public LocationShare(Context ctx) { this.ctx = ctx.getApplicationContext(); }
 
@@ -134,6 +136,72 @@ public final class LocationShare {
             }
         }, LIVE_FIX_TIMEOUT_MS);
     }
+
+    /**
+     * Start movement-driven updates and keep them running until stopUpdates().
+     *
+     * This replaces the caller-side timer. The platform does the filtering:
+     * {@code minTimeMs} is the floor between updates and {@code minDistanceM}
+     * the distance that must be covered before one is emitted, so a phone
+     * sitting on a desk costs nothing and a moving one reports as it goes. A
+     * Handler loop could only ever approximate that, and had to wake the GNSS
+     * engine to discover the device had not moved.
+     *
+     * On the distance floor: a good fix here reports acc=8m, so a threshold
+     * below about 20m sits under the noise and a stationary phone will emit
+     * continuously as the fix jitters. 25m is the default for that reason, not
+     * an arbitrary round number.
+     *
+     * @return true if updates were actually registered
+     */
+    public boolean startUpdates(long minTimeMs, float minDistanceM, Sink sink) {
+        if (!granted()) {
+            sink.onStatus("location: permission not granted");
+            return false;
+        }
+        LocationManager lm = (LocationManager) ctx.getSystemService(Context.LOCATION_SERVICE);
+        if (lm == null) { sink.onStatus("location: no LocationManager"); return false; }
+        stopUpdates();
+        String provider = lm.isProviderEnabled(LocationManager.GPS_PROVIDER)
+                ? LocationManager.GPS_PROVIDER
+                : (lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+                        ? LocationManager.NETWORK_PROVIDER : null);
+        if (provider == null) { sink.onStatus("location: no provider enabled"); return false; }
+        continuous = new LocationListener() {
+            @Override public void onLocationChanged(Location location) {
+                sink.onFix(format(location), location);
+            }
+            @Override public void onStatusChanged(String p, int s, Bundle e) { }
+            @Override public void onProviderEnabled(String p) { }
+            @Override public void onProviderDisabled(String p) {
+                // Worth saying out loud: the updates stay registered but will
+                // never fire, which otherwise looks identical to "not moving".
+                sink.onStatus("location: provider " + p + " turned off");
+            }
+        };
+        try {
+            lm.requestLocationUpdates(provider, minTimeMs, minDistanceM,
+                                      continuous, Looper.getMainLooper());
+        } catch (SecurityException se) {
+            sink.onStatus("location: denied at request time: " + se.getMessage());
+            continuous = null;
+            return false;
+        }
+        // Seed with whatever is already known so the caller has something to
+        // show immediately rather than waiting for the first movement.
+        Location best = bestCached(lm);
+        if (best != null) sink.onFix(format(best), best);
+        return true;
+    }
+
+    public void stopUpdates() {
+        if (continuous == null) return;
+        LocationManager lm = (LocationManager) ctx.getSystemService(Context.LOCATION_SERVICE);
+        if (lm != null) { try { lm.removeUpdates(continuous); } catch (SecurityException ignored) { } }
+        continuous = null;
+    }
+
+    public boolean isRunning() { return continuous != null; }
 
     private void stopLive(LocationManager lm) {
         if (live == null) return;
