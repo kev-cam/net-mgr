@@ -12,6 +12,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.text.method.ScrollingMovementMethod;
 import android.widget.Button;
+import android.widget.ImageButton;
 import android.widget.EditText;
 import android.widget.TextView;
 
@@ -94,7 +95,7 @@ public class MainActivity extends AppCompatActivity
      * The thresholds DO persist (they are configuration, not consent); the
      * on/off state does not.
      */
-    private Button  locBtn;
+    private ImageButton locBtn;
     private boolean locOn;
     private long    locMinTimeMs  = 5 * 60_000L;   // never more often than this
     private float   locMinDistM   = 25f;           // must move this far first
@@ -113,17 +114,15 @@ public class MainActivity extends AppCompatActivity
         peersView.setMovementMethod(new ScrollingMovementMethod());
         compose = findViewById(R.id.compose);
 
-        locBtn = findViewById(R.id.loc);
+        locBtn = findViewById(R.id.loc_toggle);
         loadLocPrefs();
         locBtn.setOnClickListener(v -> toggleLocation());
         paintLocButton();
         Button startBtn = findViewById(R.id.start);
         Button stopBtn = findViewById(R.id.stop);
-        Button postBtn = findViewById(R.id.post);
-        Button locBtn = findViewById(R.id.loc);
+        ImageButton postBtn = findViewById(R.id.post);
         startBtn.setOnClickListener(v -> requestAndStart());
         stopBtn.setOnClickListener(v -> stopService());
-        locBtn.setOnClickListener(v -> shareLocation());
         postBtn.setOnClickListener(v -> {
             String txt = compose.getText().toString().trim();
             if (!txt.isEmpty()) {
@@ -411,7 +410,9 @@ public class MainActivity extends AppCompatActivity
         // text changes and the colour silently does not. Tint is the knob
         // AppCompat actually honours.
         locBtn.setBackgroundTintList(android.content.res.ColorStateList.valueOf(c));
-        locBtn.setText(t);
+        // Icon-only button: colour alone is not an accessible state signal, so
+        // the same information goes to the screen reader here.
+        locBtn.setContentDescription(t);
     }
 
     /** Toggle from the button. */

@@ -25,15 +25,18 @@
             android:layout_weight="1"
             android:text="Stop" />
 
-        <!-- Position sharing. Colour IS the state: a chat command that stops
-             silently is exactly how the earlier beacon kept dying unnoticed. -->
-        <Button
-            android:id="@+id/loc"
+        <!-- Position sharing. Colour IS the state: a command that stops
+             silently is how the earlier beacon kept dying unnoticed. Icon-only,
+             so contentDescription carries the state for screen readers —
+             colour alone is not an accessible signal. -->
+        <ImageButton
+            android:id="@+id/loc_toggle"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:textColor="#FFFFFF"
-            android:text="Loc off" />
+            android:src="@drawable/ic_my_location"
+            android:scaleType="centerInside"
+            android:contentDescription="Location sharing off" />
     </LinearLayout>
 
     <LinearLayout
@@ -84,16 +87,12 @@
             android:inputType="text"
             android:autofillHints="" />
 
-        <Button
-            android:id="@+id/loc"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Loc" />
-
-        <Button
+        <ImageButton
             android:id="@+id/post"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Post" />
+            android:src="@drawable/ic_return"
+            android:scaleType="centerInside"
+            android:contentDescription="Send" />
     </LinearLayout>
 </LinearLayout>
