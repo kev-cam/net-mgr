@@ -406,7 +406,7 @@ sub gather {
         next if length $exp && $exp lt $now_iso;       # expired -> not in-use
         my $ip  = canon_ip($l->{ip});
         my $cur = $leased{$ip};
-        $leased{$ip} = $l if !$cur || $exp gt ($cur->{expires} // '');
+        $leased{$ip} = $l if !$cur || _lease_supersedes($l, $cur);
     }
     # Recency guard: an `addresses` row whose last_observed is older than this
     # cutoff is treated as stale and dropped from the in-use view. The daemon's
@@ -565,6 +565,29 @@ sub _state_offers_release {
 # address, whereas an observation can be an older ARP/nmap trace. Returns undef
 # when nothing live is there, or when the record carries no MAC (in which case
 # callers must NOT infer a conflict — absence of evidence is not a squatter).
+# Which of two leases for the SAME address describes the current occupant.
+#
+# This used to compare `expires` alone, which silently failed whenever neither
+# row had one: '' gt '' is false, so the first row encountered won and was never
+# replaced. Snapshot order is effectively MAC order, so an address that had
+# changed hands showed whichever ex-tenant sorted lowest — .180 reported
+# sockit-netan (02:53:4f…) while the camera actually there, f4:1c:26…, sat in
+# the same table unread. Most leases here carry no expiry at all, so that was
+# the common case rather than an edge case.
+#
+# last_seen is the primary key now: the most recently seen row is the current
+# occupant, which is the same rule the DHCP server itself follows. `expires`
+# only breaks ties, since a live lease with a future expiry is better evidence
+# than an equally-recent sighting without one.
+sub _lease_supersedes {
+    my ($new, $cur) = @_;
+    my $ns = $new->{last_seen} // '';
+    my $cs = $cur->{last_seen} // '';
+    return 1 if $ns gt $cs;
+    return 0 if $ns lt $cs;
+    return (($new->{expires} // '') gt ($cur->{expires} // '')) ? 1 : 0;
+}
+
 sub _occupant_mac {
     my ($model, $ip) = @_;
     if (my $l = $model->{leased}{$ip}) {
