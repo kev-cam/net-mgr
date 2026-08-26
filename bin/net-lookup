@@ -4,7 +4,12 @@
 # returns the host's name(s).
 #
 # Usage:
-#   net-lookup [--all] [--family v4|v6] [--listen HOST:PORT|--server NAME] <name-regex|IP>
+#   net-lookup [--all] [--mac] [--family v4|v6] [--listen HOST:PORT|--server NAME] <name-regex|IP>
+#
+# --mac appends the MAC as a second tab-separated field. Forward, that is the
+# MAC the chosen address sits on; reverse, it is the MAC(s) the name was
+# resolved through. Worth having because the MAC is the stable identity here
+# and the IP is only a lease — see the identity tiers below.
 #
 # Forward (name → IP): the pattern is a Perl regex; net-lookup wraps
 # it as ^(?:...)$ before matching, so 'nas3(|-.*)' matches nas3,
@@ -65,6 +70,7 @@ use NetMgr::Config;
 my $listen;
 my $server;
 my $all;
+my $show_mac;
 my $family = 'v4';
 my $verify;
 my $ping_only;
@@ -79,6 +85,7 @@ GetOptions(
     'listen=s'      => \$listen,
     'server=s'      => \$server,
     'all|a'         => \$all,
+    'mac|m'         => \$show_mac,
     'family=s'      => \$family,
     'verify|v'      => \$verify,
     'ping-only'     => \$ping_only,
@@ -360,8 +367,10 @@ my $add_cand = sub {
     return if $seen{$ip}++;
     my $score = _score($ip, \@prefer_cidrs, \%kind_by_mac, \%meta_by_addr);
     my $meta  = $meta_by_addr{$ip} || {};
+    # $mac was already an argument and was being discarded; --mac needs it, and
+    # it is the field that actually identifies the host — the IP is a lease.
     push @candidates, [ $trust, $score, ($meta->{min_rtt_ms} // 9999),
-                        $ip, $mid, ($meta->{last_observed} // '') ];
+                        $ip, $mid, ($meta->{last_observed} // ''), $mac ];
 };
 
 # Registered MACs first — literally, before the name-correlated machines below,
@@ -443,9 +452,11 @@ for my $c (@to_print) {
             my $rtt = $ping_ms{ $c->[3] };
             $line .= defined $rtt ? sprintf("\t# %s ms", $rtt) : "\t# fresh";
         }
+        $line .= "\t" . ($c->[6] // '-') if $show_mac;
         print "$line\n";
     } else {
-        print "$c->[3]\n";
+        print $show_mac ? "$c->[3]\t" . ($c->[6] // '-') . "\n"
+                        : "$c->[3]\n";
     }
 }
 exit 0;
@@ -840,8 +851,13 @@ sub do_reverse {
     @names = grep { length && !$seen{$_}++ } @names;
 
     if (@names) {
-        if ($all) { print "$_\n" for @names }
-        else      { print "$names[0]\n" }
+        # On reverse the MAC is what the answer was resolved THROUGH, so it is
+        # worth showing: it says which interface at this address produced the
+        # name. More than one can appear when an address has changed hands and
+        # both sightings are still on file.
+        my $macs = $show_mac ? join(',', sort keys %macs) : undef;
+        if ($all) { print $show_mac ? "$_\t$macs\n" : "$_\n" for @names }
+        else      { print $show_mac ? "$names[0]\t$macs\n" : "$names[0]\n" }
         exit 0;
     }
 
