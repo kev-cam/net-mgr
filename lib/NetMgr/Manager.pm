@@ -5547,8 +5547,11 @@ sub _obs_purge_stale {
     my %got;
     eval {
         if ($want{leases}) {
-            $got{leases} = $dry ? $db->count_expired_leases
-                                : $db->purge_expired_leases;
+            # days= reaches leases too now: without it the null-expiry rows
+            # (most of the table, until every gateway emits expires=) are
+            # unreachable and the lease purge silently does nothing.
+            $got{leases} = $dry ? $db->count_expired_leases(days => $days)
+                                : $db->purge_expired_leases(days => $days);
         }
         if ($want{hostnames}) {
             $got{hostnames} = $dry ? $db->count_stale_hostnames(days => $days)

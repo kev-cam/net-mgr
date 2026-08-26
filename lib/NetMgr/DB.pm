@@ -3111,15 +3111,44 @@ sub purge_events {
     );
 }
 
-# Drop DHCP leases past their `expires`. NULL/empty expires (static binding)
-# is kept. Returns the count of rows deleted.
+# Drop DHCP leases that are past their `expires`, OR that carry no expiry and
+# have not been seen for $days.
+#
+# The second clause exists because the first cannot reach most of the table.
+# A lease imported from a dnsmasq EVENT that does not carry expires= is stored
+# with expires = NULL, and "NULL means static binding, keep forever" then makes
+# it immortal: net-reserve reads it as an occupant and purge_expired_leases
+# skips it. On this fleet that is 125 of 130 lease rows, so lease purging was
+# effectively inert and addresses accumulated every device that had ever held
+# them — .180 was showing five occupants at once.
+#
+# Ageing on last_seen is the same rule already used for hostnames and
+# addresses: a row no producer has refreshed in $days is stale whether or not
+# it ever declared an expiry. Genuine static bindings live in
+# dhcp_reservations, a different table, so nothing durable is lost here — and
+# a lease that is still real gets re-learned from the DHCP server anyway.
+#
+# The underlying fix is the dnsmasq fork emitting expires= (kev-cam/dnsmasq
+# ebb01c8); until every gateway runs that binary, this keeps the map honest.
 sub purge_expired_leases {
-    my ($self) = @_;
+    my ($self, %f) = @_;
+    my $days = $f{days};
     my $n = $self->{dbh}->do(
         "DELETE FROM dhcp_leases
           WHERE expires IS NOT NULL AND expires < NOW()"
     );
-    return ($n && $n > 0) ? $n + 0 : 0;
+    $n = ($n && $n > 0) ? $n + 0 : 0;
+    if (defined $days && $days > 0) {
+        my $m = $self->{dbh}->do(
+            "DELETE FROM dhcp_leases
+              WHERE expires IS NULL
+                AND last_seen IS NOT NULL
+                AND last_seen < (NOW() - INTERVAL ? DAY)",
+            undef, $days
+        );
+        $n += $m if $m && $m > 0;
+    }
+    return $n;
 }
 
 # Drop hostname rows whose last_seen is older than $days. Returns the count.
@@ -3185,11 +3214,22 @@ sub purge_stale_addresses {
 # Dry-run variants: same predicates as the purge_* above, but return a count
 # without deleting. Used by net-purge to preview impact before --commit.
 sub count_expired_leases {
-    my ($self) = @_;
+    my ($self, %f) = @_;
+    my $days = $f{days};
     my ($n) = $self->{dbh}->selectrow_array(
         "SELECT COUNT(*) FROM dhcp_leases
           WHERE expires IS NOT NULL AND expires < NOW()");
-    return $n // 0;
+    $n //= 0;
+    if (defined $days && $days > 0) {
+        my ($m) = $self->{dbh}->selectrow_array(
+            "SELECT COUNT(*) FROM dhcp_leases
+              WHERE expires IS NULL
+                AND last_seen IS NOT NULL
+                AND last_seen < (NOW() - INTERVAL ? DAY)",
+            undef, $days);
+        $n += $m // 0;
+    }
+    return $n;
 }
 sub count_stale_hostnames {
     my ($self, %f) = @_;
