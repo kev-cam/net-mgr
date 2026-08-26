@@ -1733,8 +1733,65 @@ sub upsert_lease {
         "SELECT * FROM dhcp_leases WHERE mac = ? AND ip = ?",
         undef, $f{mac}, $f{ip}
     );
+    # An address has ONE current occupant. The primary key is (mac, ip), so a
+    # new MAC at an existing address adds a ROW rather than replacing one, and
+    # the old tenant lingers forever — .180 accumulated five, .181 four, and
+    # net-reserve reported all of them as occupants.
+    #
+    # Seeing a different MAC at an address is itself the evidence that the
+    # previous sighting is obsolete: two hosts cannot hold the same IPv4
+    # address on a subnet at once. That is stronger than ageing, and it acts
+    # immediately instead of after a timeout — which matters because most
+    # leases here carry no expiry to age against.
+    #
+    # Guarded on last_seen so this can only ever remove rows OLDER than the one
+    # just written. Replication can deliver leases out of order, and without
+    # the guard a late-arriving stale row would evict the current tenant.
+    if ($now && $now->{last_seen}) {
+        $self->{dbh}->do(
+            "DELETE FROM dhcp_leases
+              WHERE ip = ? AND mac <> ? AND last_seen <= ?",
+            undef, $f{ip}, $f{mac}, $now->{last_seen}
+        );
+    }
     return { op => 'insert', changed_fields => [qw(mac ip hostname expires ap_mac)],
              was => undef, now => $now };
+}
+
+# Clean up addresses that already carry several MACs: keep the most recently
+# seen row per IP, drop the rest. Same rule as the supersession above, applied
+# retrospectively to data that accumulated before it existed.
+#
+# Ties on last_seen keep the lexically-highest MAC purely so the choice is
+# deterministic and a re-run is idempotent — with identical timestamps there is
+# no evidence favouring either, and picking arbitrarily would make repeated
+# purges flap between them.
+sub purge_superseded_leases {
+    my ($self) = @_;
+    my $rows = $self->{dbh}->selectall_arrayref(
+        "SELECT ip, mac, last_seen FROM dhcp_leases ORDER BY ip, last_seen DESC, mac DESC",
+        { Slice => {} });
+    my (%keep, @drop);
+    for my $r (@$rows) {
+        if (!exists $keep{ $r->{ip} }) { $keep{ $r->{ip} } = $r->{mac}; next }
+        push @drop, [ $r->{ip}, $r->{mac} ];
+    }
+    my $n = 0;
+    for my $d (@drop) {
+        my $c = $self->{dbh}->do(
+            "DELETE FROM dhcp_leases WHERE ip = ? AND mac = ?", undef, @$d);
+        $n += $c if $c && $c > 0;
+    }
+    return $n;
+}
+
+sub count_superseded_leases {
+    my ($self) = @_;
+    my ($n) = $self->{dbh}->selectrow_array(
+        "SELECT COALESCE(SUM(c - 1), 0) FROM (
+            SELECT COUNT(*) AS c FROM dhcp_leases GROUP BY ip
+         ) t WHERE c > 1");
+    return $n // 0;
 }
 
 sub log_event {

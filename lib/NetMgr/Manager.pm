@@ -5552,6 +5552,12 @@ sub _obs_purge_stale {
             # unreachable and the lease purge silently does nothing.
             $got{leases} = $dry ? $db->count_expired_leases(days => $days)
                                 : $db->purge_expired_leases(days => $days);
+            # Superseded rows are counted separately: they are removed on the
+            # evidence of a newer MAC at the address, not on age, so folding
+            # them into the same number would misreport what the age threshold
+            # actually did.
+            $got{leases_superseded} = $dry ? $db->count_superseded_leases
+                                           : $db->purge_superseded_leases;
         }
         if ($want{hostnames}) {
             $got{hostnames} = $dry ? $db->count_stale_hostnames(days => $days)
