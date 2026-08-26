@@ -25,7 +25,14 @@
 #   --fast         discover with a wide camera/ONVIF port SET, not all 65535
 #   --full         force an all-ports (-p-) scan even in --ports/fast defaults
 #   --timeout SEC  per-probe connect/read timeout (default 3)
-#   --user U --pass P   creds to note for RTSP/ONVIF URLs (default admin / blank)
+#   --user U --pass P   credentials for ONVIF auth and for the printed RTSP
+#                       URLs (default admin / blank). These are now used to
+#                       AUTHENTICATE (GetProfiles/GetStreamUri are auth-gated),
+#                       not merely echoed into the URL.
+#   --pass-file FILE    read the password from FILE (first line) instead
+#   --ask               prompt for it on the terminal, with echo off
+#                       (or set NET_ONVIF_PASS in the environment)
+#                       — any of these keeps it out of ps and shell history
 #   --listen H:P   net-mgr daemon for name resolution (passed to net-lookup)
 #   -v             verbose: dump the raw protocol responses
 #
@@ -44,9 +51,39 @@ use IO::Select;
 
 my %opt = (timeout => 2, user => 'admin', pass => '');
 GetOptions(\%opt, 'ports=s', 'fast', 'full', 'timeout=i',
-           'user=s', 'pass=s', 'listen=s', 'verbose|v', 'help|h')
+           'user=s', 'pass=s', 'pass-file=s', 'ask', 'listen=s',
+           'verbose|v', 'help|h')
     or usage(2);
 usage(0) if $opt{help};
+
+# Where the password comes from, most explicit first.
+#
+# --pass is kept because it is convenient, but it puts the credential in `ps`
+# output and in shell history, which mattered little when these creds were only
+# printed into a URL and matters now that they actually authenticate. The other
+# three routes exist so there is a way not to do that.
+if (!defined $opt{pass} || $opt{pass} eq '') {
+    if (defined $opt{'pass-file'}) {
+        open my $fh, '<', $opt{'pass-file'}
+            or die "net-onvif: cannot read $opt{'pass-file'}: $!\n";
+        my $p = <$fh>;
+        close $fh;
+        $p = '' unless defined $p;
+        chomp $p;                     # a trailing newline is not part of it
+        $opt{pass} = $p;
+    } elsif ($opt{ask}) {
+        print STDERR "password for $opt{user}: ";
+        my $echo_off = system('stty -echo 2>/dev/null') == 0;
+        my $p = <STDIN>;
+        system('stty echo 2>/dev/null') if $echo_off;
+        print STDERR "\n";
+        $p = '' unless defined $p;
+        chomp $p;
+        $opt{pass} = $p;
+    } elsif (defined $ENV{NET_ONVIF_PASS}) {
+        $opt{pass} = $ENV{NET_ONVIF_PASS};
+    }
+}
 my $target = shift @ARGV or usage(2);
 
 # A broad set of ports these cameras are known to wander onto — used for --fast
@@ -126,8 +163,14 @@ if (@onvif_hits) {
             }
         } else {
             printf "  no stream URI: %s\n", $why // 'GetProfiles returned none';
-            printf "  creds tried: user=%s pass=%s — set --user/--pass if the camera differs\n",
-                   $opt{user}, ($opt{pass} ne '' ? $opt{pass} : '(blank)');
+            # Never echo the password. --pass-file and --ask exist to keep it
+            # out of ps and shell history; printing it here would put it in
+            # terminal scrollback and any captured output instead, which is no
+            # better. Say whether one was supplied, not what it was.
+            printf "  creds tried: user=%s, password %s — set --user and one of "
+                 . "--pass/--pass-file/--ask if the camera differs\n",
+                   $opt{user},
+                   ($opt{pass} ne '' ? 'supplied (' . length($opt{pass}) . ' chars)' : 'BLANK');
         }
     }
 } elsif ($xaddr) {
@@ -461,16 +504,29 @@ sub usage {
 net-onvif — find a camera's ONVIF / RTSP services, even on non-standard ports.
 
   net-onvif <name|ip> [--fast|--full] [--ports LIST] [--timeout SEC]
-            [--user U --pass P] [--listen H:P] [-v]
+            [--user U] [--pass P | --pass-file F | --ask]
+            [--listen H:P] [-v]
 
-  <name|ip>     camera to probe; a name is resolved via net-lookup
-  --fast        scan a wide camera-port SET instead of all 65535 (quicker)
-  --ports LIST  probe only these ports (e.g. 80,554,8000-8100); skips scanning
-  --timeout N   per-probe timeout seconds (default 3)   -v  dump raw responses
+  <name|ip>       camera to probe; a name is resolved via net-lookup
+  --fast          scan a wide camera-port SET instead of all 65535 (quicker)
+  --ports LIST    probe only these ports (e.g. 80,554,8000-8100); skips scanning
+  --timeout N     per-probe timeout seconds (default 3)  -v  dump raw responses
+  --user U        ONVIF username (default admin)
+  --pass P        password on the command line — visible in ps and shell history
+  --pass-file F   read it from F instead (first line)
+  --ask           prompt for it, echo off      (or set NET_ONVIF_PASS)
 
 Discovers every open TCP port, then speaks ONVIF (SOAP GetSystemDateAndTime),
 RTSP (OPTIONS), and HTTP to each, plus a UDP WS-Discovery probe. Run it from a
 host on the camera's own subnet for accurate results.
+
+Credentials are used to AUTHENTICATE, not just to decorate the printed URL:
+GetProfiles/GetStreamUri are auth-gated, and those are what yield the camera's
+real RTSP stream paths. A camera that rejects them says so ("Sender not
+Authorized") rather than silently returning nothing.
+
+Note the printed RTSP URLs can embed the camera's password, because that is the
+URL format these cameras publish — mind where you paste the output.
 USAGE
     exit $rc;
 }
