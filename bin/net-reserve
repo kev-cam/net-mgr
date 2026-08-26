@@ -478,12 +478,61 @@ sub gather {
 # Is $ip_int inside any dynamic range of $cidr?
 sub in_pool {
     my ($model, $ip_int) = @_;
+    return pool_row($model, $ip_int) ? 1 : 0;
+}
+
+# WHICH pool contains $ip_int, as the dhcp_ranges row (undef outside every
+# pool). in_pool() answered only yes/no and threw the row away, but which pool
+# an address falls in is exactly what the operator needs when deciding whether
+# an address is theirs to reserve: inside a pool the DHCP server may hand it to
+# someone else tomorrow, and the reservation has to be one the server honours.
+sub pool_row {
+    my ($model, $ip_int) = @_;
+    my @r = pool_rows($model, $ip_int);
+    return @r ? $r[0] : undef;
+}
+
+# EVERY pool containing the address, not just the first. These ranges overlap
+# in practice — 192.168.15.100-199 overlaps 119-139, and 223.10-70 overlaps
+# 60-79 — so reporting only the first would quietly pick one of several true
+# answers, and the overlap is itself worth seeing.
+sub pool_rows {
+    my ($model, $ip_int) = @_;
+    return () unless defined $ip_int;
+    my @hit;
     for my $r (@{ $model->{ranges} }) {
         my $lo = ip2int($r->{start_ip}); my $hi = ip2int($r->{end_ip});
         next unless defined $lo && defined $hi;
-        return 1 if $ip_int >= $lo && $ip_int <= $hi;
+        push @hit, $r if $ip_int >= $lo && $ip_int <= $hi;
     }
-    return 0;
+    return @hit;
+}
+
+# One-line description of the pool an address sits in, for display.
+# Says so explicitly when the address is OUTSIDE every pool, rather than
+# printing nothing: "no pool" is the answer that means "safe to reserve", and
+# a blank line would read as missing data instead.
+sub pool_desc {
+    my ($model, $ip) = @_;
+    my $n = ip2int(canon_ip($ip));
+    return 'n/a' unless defined $n;
+    my @r = pool_rows($model, $n);
+    unless (@r) {
+        return @{ $model->{ranges} || [] }
+             ? 'outside every pool (static area)'
+             : 'no pools defined for this subnet';
+    }
+    my @d;
+    for my $r (@r) {
+        my $d = sprintf('%s-%s', $r->{start_ip} // '?', $r->{end_ip} // '?');
+        $d .= sprintf(' [%s]', $r->{zone}) if defined $r->{zone} && length $r->{zone};
+        push @d, $d;
+    }
+    my $out = ($r[0]{subnet_cidr} // '?') . '  ' . join(' + ', @d);
+    # Overlap is a configuration smell, not just a display detail: the same
+    # address is claimed by two pools, so say so where it is noticed.
+    $out .= sprintf('  (%d overlapping pools)', scalar @d) if @d > 1;
+    return $out;
 }
 
 # Classify one host address → state keyword. An address inside a DHCP
@@ -2359,6 +2408,15 @@ sub reserve_dialog {
         my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
         $row->Label(-text => 'seen:', -width => 7, -anchor => 'w')->pack(-side => 'left');
         $row->Label(-text => "$ip last seen $seen", -anchor => 'w')->pack(-side => 'left');
+    }
+    # Which DHCP pool this address falls in. Shown unconditionally, including
+    # when it is outside every pool, because that is the case where reserving
+    # is straightforwardly safe — and an absent line would be indistinguishable
+    # from the lookup having failed.
+    {
+        my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
+        $row->Label(-text => 'pool:', -width => 7, -anchor => 'w')->pack(-side => 'left');
+        $row->Label(-text => pool_desc($S->{model}, $ip), -anchor => 'w')->pack(-side => 'left');
     }
     # Cross-ref: if this MAC already has a reservation at a DIFFERENT IP, or is
     # currently live at a different IP, surface it BEFORE the user commits, with
