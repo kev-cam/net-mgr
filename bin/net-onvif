@@ -52,6 +52,7 @@ use IO::Select;
 my %opt = (timeout => 2, user => 'admin', pass => '');
 GetOptions(\%opt, 'ports=s', 'fast', 'full', 'timeout=i',
            'user=s', 'pass=s', 'pass-file=s', 'ask', 'listen=s',
+           'ptz', 'ptz-speed=f', 'ptz-dwell=f',
            'verbose|v', 'help|h')
     or usage(2);
 usage(0) if $opt{help};
@@ -148,6 +149,20 @@ for my $port (@ports) {
 my $xaddr = ws_discovery($ip);
 
 print "\n";
+# --ptz takes over as soon as an ONVIF endpoint is known: steering is what the
+# operator asked for, and printing the stream table first would scroll it away.
+if ($opt{ptz}) {
+    unless (@onvif_hits) {
+        print "PTZ needs ONVIF, and no endpoint answered on the probed ports.\n";
+        print "  Try --ports with the camera's ONVIF port (often 8899 or 8000),\n";
+        print "  or --fast to sweep the camera port set.\n";
+        exit 1;
+    }
+    my ($pport, $ppath) = @{ $onvif_hits[0] };
+    exit ptz_drive($ip, $pport, $ppath, $opt{user}, $opt{pass},
+                   ($opt{'ptz-speed'} // 0.5), ($opt{'ptz-dwell'} // 0.35));
+}
+
 if (@onvif_hits) {
     for my $h (@onvif_hits) {
         my ($port, $path) = @$h;
@@ -434,6 +449,128 @@ sub onvif_stream_uris {
     return (\@out, $why);
 }
 
+# ---- PTZ ------------------------------------------------------------------
+#
+# ContinuousMove + Stop rather than RelativeMove: continuous is far more widely
+# implemented on cheap cameras, and a keypress maps onto it cleanly as "move
+# while held" approximated by a short dwell. A terminal cannot see key RELEASE,
+# so each press moves for --ptz-dwell seconds and then stops. Without the
+# explicit Stop the camera keeps panning until it hits its limit, which is the
+# single most alarming way to get this wrong.
+sub ptz_soap {
+    my ($host, $port, $path, $action, $body, $user, $pass) = @_;
+    my $env = '<?xml version="1.0" encoding="UTF-8"?>'
+            . '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+            . ' xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"'
+            . ' xmlns:tt="http://www.onvif.org/ver10/schema">'
+            . wsse_header($user, $pass)
+            . '<s:Body>' . $body . '</s:Body></s:Envelope>';
+    my $req = "POST $path HTTP/1.1\r\nHost: $host:$port\r\n"
+            . "Content-Type: application/soap+xml; charset=utf-8; action=\"$action\"\r\n"
+            . "Content-Length: " . length($env) . "\r\nConnection: close\r\n\r\n" . $env;
+    return send_recv($host, $port, $req, 65536);
+}
+
+sub ptz_move {
+    my ($h, $p, $path, $tok, $x, $y, $z, $u, $pw) = @_;
+    my $vel = '<tt:PanTilt x="' . $x . '" y="' . $y . '"/>'
+            . '<tt:Zoom x="' . $z . '"/>';
+    return ptz_soap($h, $p, $path,
+        'http://www.onvif.org/ver20/ptz/wsdl/ContinuousMove',
+        '<tptz:ContinuousMove><tptz:ProfileToken>' . _xml($tok) . '</tptz:ProfileToken>'
+      . '<tptz:Velocity>' . $vel . '</tptz:Velocity></tptz:ContinuousMove>', $u, $pw);
+}
+
+sub ptz_stop {
+    my ($h, $p, $path, $tok, $u, $pw) = @_;
+    return ptz_soap($h, $p, $path,
+        'http://www.onvif.org/ver20/ptz/wsdl/Stop',
+        '<tptz:Stop><tptz:ProfileToken>' . _xml($tok) . '</tptz:ProfileToken>'
+      . '<tptz:PanTilt>true</tptz:PanTilt><tptz:Zoom>true</tptz:Zoom></tptz:Stop>', $u, $pw);
+}
+
+# Interactive steering. Returns 0 on clean exit, non-zero if PTZ was unusable.
+sub ptz_drive {
+    my ($h, $p, $dev_path, $u, $pw, $speed, $dwell) = @_;
+
+    my ($profiles) = onvif_stream_uris($h, $p, $dev_path, $u, $pw);
+    my $tok;
+    $tok = $profiles->[0][1] if @$profiles;
+    unless ($tok) {
+        # Fall back to GetProfiles alone: a camera can have PTZ without giving
+        # up a stream URI (auth scoped differently, or no media profile).
+        for my $mp ($dev_path, '/onvif/ptz_service', '/onvif/media_service', '/onvif/services') {
+            my $r = soap_post($h, $p, $mp,
+                    'http://www.onvif.org/ver10/media/wsdl/GetProfiles',
+                    '<trt:GetProfiles/>', $u, $pw);
+            next unless defined $r && $r !~ /<[^>]*Fault>/i;
+            ($tok) = $r =~ /\btoken="([^"]+)"/i;
+            last if $tok;
+        }
+    }
+    unless ($tok) {
+        print "PTZ: no profile token — camera did not answer GetProfiles"
+            . " (credentials?).\n";
+        return 1;
+    }
+
+    # The PTZ service usually lives on its own path.
+    my $ptz_path;
+    for my $cand ('/onvif/ptz_service', $dev_path, '/onvif/ptz', '/onvif/services') {
+        my $r = ptz_soap($h, $p, $cand,
+                'http://www.onvif.org/ver20/ptz/wsdl/Stop',
+                '<tptz:Stop><tptz:ProfileToken>' . _xml($tok) . '</tptz:ProfileToken>'
+              . '<tptz:PanTilt>true</tptz:PanTilt></tptz:Stop>', $u, $pw);
+        next unless defined $r && length $r;
+        # A fault still proves the verb reached a PTZ service; a 404 or silence
+        # does not. Take the first path that speaks PTZ at all.
+        if ($r =~ /StopResponse/i || $r =~ /ver20\/ptz/i) { $ptz_path = $cand; last }
+    }
+    unless ($ptz_path) {
+        print "PTZ: no PTZ service responded (this camera may be fixed-mount).\n";
+        return 1;
+    }
+
+    printf "PTZ ready on %s  profile=%s  speed=%.2f dwell=%.1fs\n",
+           $ptz_path, $tok, $speed, $dwell;
+    print "  arrows = pan/tilt   + / - = zoom   . = stop   q = quit\n";
+
+    my $raw = system('stty raw -echo min 1 time 0 2>/dev/null') == 0;
+    my $rc  = 0;
+    local $SIG{INT} = sub { };          # Ctrl-C should restore the terminal, not skip it
+    eval {
+        while (1) {
+            my $c;
+            last unless defined sysread(\*STDIN, $c, 1);
+            my ($x, $y, $z) = (0, 0, 0);
+            if ($c eq "\e") {           # arrow keys arrive as ESC [ A..D
+                my $rest = '';
+                sysread(\*STDIN, $rest, 2);
+                my $k = substr($rest, 1, 1);
+                $y =  $speed if $k eq 'A';
+                $y = -$speed if $k eq 'B';
+                $x =  $speed if $k eq 'C';
+                $x = -$speed if $k eq 'D';
+            }
+            elsif ($c eq '+' || $c eq '=') { $z =  $speed }
+            elsif ($c eq '-' || $c eq '_') { $z = -$speed }
+            elsif (lc $c eq 'q')           { last }
+            elsif ($c eq '.')              { ptz_stop($h,$p,$ptz_path,$tok,$u,$pw); next }
+            else                           { next }
+            next unless $x || $y || $z;
+            ptz_move($h, $p, $ptz_path, $tok, $x, $y, $z, $u, $pw);
+            select(undef, undef, undef, $dwell);
+            ptz_stop($h, $p, $ptz_path, $tok, $u, $pw);
+        }
+        1;
+    } or do { $rc = 1 };
+    system('stty sane 2>/dev/null') if $raw;
+    print "\nPTZ: stopped.\n";
+    # Belt and braces: whatever happened above, leave the camera stationary.
+    ptz_stop($h, $p, $ptz_path, $tok, $u, $pw);
+    return $rc;
+}
+
 # Cameras publish the URL without credentials; a player needs them inline.
 sub with_creds {
     my ($uri, $user, $pass) = @_;
@@ -515,6 +652,10 @@ net-onvif — find a camera's ONVIF / RTSP services, even on non-standard ports.
   --pass P        password on the command line — visible in ps and shell history
   --pass-file F   read it from F instead (first line)
   --ask           prompt for it, echo off      (or set NET_ONVIF_PASS)
+  --ptz           steer the camera from the keyboard (needs ONVIF + PTZ):
+                    arrows pan/tilt   + / -  zoom   .  stop   q  quit
+  --ptz-speed F   velocity 0..1 (default 0.5)
+  --ptz-dwell S   seconds to move per keypress (default 0.35)
 
 Discovers every open TCP port, then speaks ONVIF (SOAP GetSystemDateAndTime),
 RTSP (OPTIONS), and HTTP to each, plus a UDP WS-Discovery probe. Run it from a
