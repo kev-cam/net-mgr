@@ -38,6 +38,8 @@ use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
 use IO::Socket::INET;
+use Digest::SHA  qw(sha1);
+use MIME::Base64 qw(encode_base64);
 use IO::Select;
 
 my %opt = (timeout => 2, user => 'admin', pass => '');
@@ -81,6 +83,8 @@ unless (@ports) {
 printf "open TCP ports: %s\n\n", join(', ', @ports);
 
 my @onvif_hits;
+my @rtsp_ports;
+my $found_uri = 0;
 printf "%-7s  %-9s  %-9s  %s\n", 'PORT', 'ONVIF', 'RTSP', 'HTTP / notes';
 printf "%-7s  %-9s  %-9s  %s\n", '-------','---------','---------','------------';
 for my $port (@ports) {
@@ -100,6 +104,7 @@ for my $port (@ports) {
 
     printf "%-7s  %-9s  %-9s  %s\n", $port, $onvif_col, $rtsp_col, join(' | ', @notes);
     push @onvif_hits, [$port, $opath] if $onvif == 2;
+    push @rtsp_ports, $port if $rtsp;
 }
 
 # UDP WS-Discovery (unicast) — a camera may announce its service URL directly.
@@ -110,7 +115,20 @@ if (@onvif_hits) {
     for my $h (@onvif_hits) {
         my ($port, $path) = @$h;
         printf "ONVIF service: http://%s:%s%s\n", $ip, $port, $path;
-        printf "  media/RTSP creds to try: user=%s pass=%s\n", $opt{user}, ($opt{pass} ne '' ? $opt{pass} : '(blank)');
+        my ($uris, $why) = onvif_stream_uris($ip, $port, $path, $opt{user}, $opt{pass});
+        if (@$uris) {
+            $found_uri = 1;
+            for my $u (@$uris) {
+                my ($nm, $tok, $uri) = @$u;
+                printf "  RTSP [%s]: %s\n", $nm, with_creds($uri, $opt{user}, $opt{pass});
+                printf "        (as published, no credentials: %s)\n", $uri
+                    if defined $opt{user} && length $opt{user};
+            }
+        } else {
+            printf "  no stream URI: %s\n", $why // 'GetProfiles returned none';
+            printf "  creds tried: user=%s pass=%s — set --user/--pass if the camera differs\n",
+                   $opt{user}, ($opt{pass} ne '' ? $opt{pass} : '(blank)');
+        }
     }
 } elsif ($xaddr) {
     print "ONVIF (via WS-Discovery): $xaddr\n";
@@ -119,7 +137,20 @@ if (@onvif_hits) {
     print "  (If the only open port is 53/dnsmasq and nothing else, the camera is\n";
     print "   likely in setup/SoftAP mode — its service stack isn't running yet.)\n";
 }
-exit(@onvif_hits || $xaddr ? 0 : 1);
+# RTSP is answering but ONVIF could not tell us the path. Print the base URL so
+# there is something to work with, and be explicit that the path is unknown —
+# a bare rtsp://host:port/ that a player rejects otherwise looks like a
+# credentials problem rather than a missing path.
+if (!$found_uri && @rtsp_ports) {
+    print "\n";
+    for my $p (@rtsp_ports) {
+        printf "RTSP server: %s\n",
+            with_creds("rtsp://$ip:$p/", $opt{user}, $opt{pass});
+    }
+    print "  stream path unknown — ONVIF did not answer GetStreamUri.\n"
+        . "  Try -v to see the SOAP, or --user/--pass if credentials differ.\n";
+}
+exit(@onvif_hits || $xaddr || @rtsp_ports ? 0 : 1);
 
 # ---- target resolution ----------------------------------------------------
 sub resolve_target {
@@ -242,6 +273,131 @@ sub onvif_check {
         last unless $http_seen;
     }
     return (0, undef, undef);
+}
+
+# ---- ONVIF media: ask the camera for its own stream URLs -------------------
+#
+# GetStreamUri is the authoritative answer. Guessing RTSP paths is the usual
+# approach and it is wrong often enough to be useless: the path varies by
+# firmware, by channel, and by substream, and a wrong guess fails identically
+# to a wrong password. The camera already knows; this asks it.
+#
+# Unlike GetSystemDateAndTime, these verbs are auth-gated, so they carry a
+# WS-Security UsernameToken. A camera with different credentials returns a
+# SOAP fault, which is reported as such rather than silently yielding nothing.
+sub wsse_header {
+    my ($user, $pass) = @_;
+    return '' unless defined $user && length $user;
+    # Nonce must be raw bytes for the digest and base64 on the wire.
+    my $nonce = join '', map { chr(int(rand(256))) } 1 .. 16;
+    my @t = gmtime(time);
+    my $created = sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ',
+                          $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
+    my $digest = encode_base64(sha1($nonce . $created . (defined $pass ? $pass : '')), '');
+    my $n64    = encode_base64($nonce, '');
+    return '<s:Header><Security s:mustUnderstand="1"'
+         . ' xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">'
+         . '<UsernameToken><Username>' . _xml($user) . '</Username>'
+         . '<Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">'
+         . $digest . '</Password>'
+         . '<Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">'
+         . $n64 . '</Nonce>'
+         . '<Created xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">'
+         . $created . '</Created>'
+         . '</UsernameToken></Security></s:Header>';
+}
+
+sub _xml { my $s = shift; $s =~ s/&/&amp;/g; $s =~ s/</&lt;/g; $s =~ s/>/&gt;/g; return $s }
+
+sub soap_post {
+    my ($host, $port, $path, $action, $body, $user, $pass) = @_;
+    my $env = '<?xml version="1.0" encoding="UTF-8"?>'
+            . '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+            . ' xmlns:trt="http://www.onvif.org/ver10/media/wsdl"'
+            . ' xmlns:tt="http://www.onvif.org/ver10/schema">'
+            . wsse_header($user, $pass)
+            . '<s:Body>' . $body . '</s:Body></s:Envelope>';
+    my $req = "POST $path HTTP/1.1\r\nHost: $host:$port\r\n"
+            . "Content-Type: application/soap+xml; charset=utf-8; action=\"$action\"\r\n"
+            . "Content-Length: " . length($env) . "\r\nConnection: close\r\n\r\n" . $env;
+    # 64K, not the 8K default: a GetProfiles response carries every profile's
+    # full video/audio/PTZ configuration and overruns 8K easily. Truncating it
+    # does not fail loudly — it silently cuts the stream URI mid-string, which
+    # then looks like a camera returning a malformed URL.
+    return send_recv($host, $port, $req, 65536);
+}
+
+# Camera XML is entity-encoded, and some firmwares DOUBLE-encode: the wire
+# carries &amp;amp; for a single &. Decode repeatedly until it settles so the
+# printed URL is the one a player actually needs, but cap the passes so a URL
+# legitimately containing "&amp;" cannot loop.
+sub xml_decode {
+    my ($s) = @_;
+    return $s unless defined $s;
+    for (1 .. 3) {
+        my $before = $s;
+        $s =~ s/&lt;/</g;
+        $s =~ s/&gt;/>/g;
+        $s =~ s/&quot;/"/g;
+        $s =~ s/&apos;/'/g;
+        $s =~ s/&#(\d+);/chr($1)/ge;
+        $s =~ s/&amp;/&/g;
+        last if $s eq $before;
+    }
+    return $s;
+}
+
+# Returns ( [ name, token, uri ], ... ) plus a diagnostic string.
+sub onvif_stream_uris {
+    my ($host, $port, $path, $user, $pass) = @_;
+    my @out;
+    my $why;
+    # The media service often lives at its own path; try the device path too,
+    # since plenty of firmwares serve every service from one endpoint.
+    for my $mpath ($path, '/onvif/media_service', '/onvif/media', '/onvif/services') {
+        my $resp = soap_post($host, $port, $mpath,
+                             'http://www.onvif.org/ver10/media/wsdl/GetProfiles',
+                             '<trt:GetProfiles/>', $user, $pass);
+        next unless defined $resp && length $resp;
+        warn "  [media $port$mpath GetProfiles]\n$resp\n" if $opt{verbose};
+        if ($resp =~ /<[^>]*Fault>/i) {
+            my ($t) = $resp =~ m{<[^>]*(?:Text|faultstring)[^>]*>([^<]+)}i;
+            $why = 'GetProfiles refused' . ($t ? ": $t" : ' (credentials?)');
+            next;
+        }
+        my @tokens = $resp =~ /<[^>]*Profiles[^>]*\btoken="([^"]+)"/gi;
+        @tokens    = $resp =~ /\btoken="([^"]+)"/gi unless @tokens;
+        my @names  = $resp =~ m{<[^>]*:?Name>([^<]+)</[^>]*:?Name>}gi;
+        next unless @tokens;
+        my $i = 0;
+        for my $tok (@tokens) {
+            my $nm = $names[$i++] // $tok;
+            my $sr = soap_post($host, $port, $mpath,
+                        'http://www.onvif.org/ver10/media/wsdl/GetStreamUri',
+                        '<trt:GetStreamUri><trt:StreamSetup>'
+                      . '<tt:Stream>RTP-Unicast</tt:Stream>'
+                      . '<tt:Transport><tt:Protocol>RTSP</tt:Protocol></tt:Transport>'
+                      . '</trt:StreamSetup>'
+                      . '<trt:ProfileToken>' . _xml($tok) . '</trt:ProfileToken>'
+                      . '</trt:GetStreamUri>', $user, $pass);
+            next unless defined $sr;
+            warn "  [media $port GetStreamUri $tok]\n$sr\n" if $opt{verbose};
+            my ($uri) = $sr =~ m{<[^>]*:?Uri>([^<]+)</[^>]*:?Uri>}i;
+            $uri = xml_decode($uri);
+            push @out, [ $nm, $tok, $uri ] if $uri;
+        }
+        last if @out;
+    }
+    return (\@out, $why);
+}
+
+# Cameras publish the URL without credentials; a player needs them inline.
+sub with_creds {
+    my ($uri, $user, $pass) = @_;
+    return $uri unless defined $user && length $user;
+    return $uri if $uri =~ m{^rtsp://[^/@]*@};       # already carries some
+    $uri =~ s{^rtsp://}{rtsp://$user:$pass\@};
+    return $uri;
 }
 
 sub rtsp_options {
