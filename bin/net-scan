@@ -18,11 +18,42 @@ use NetMgr::Client;
 my $listen;
 my $quick;
 my $discover;
+my $help;
 GetOptions(
     'listen=s' => \$listen,
     'quick'    => \$quick,
     'discover' => \$discover,
-) or die "bad options\n";
+    'help|h'   => \$help,
+) or usage("bad options");
+usage() if $help;
+
+# Kept next to GetOptions deliberately: a usage block that lives far from the
+# option list is the one that goes stale. Note pass_through is set above, so an
+# unknown option is NOT an error here — it falls through to the daemon address
+# check and fails later with something less obvious. --help at least gives the
+# reader the real list.
+sub usage {
+    my ($msg) = @_;
+    my $fh = $msg ? *STDERR : *STDOUT;
+    print $fh "net-scan: $msg\n\n" if $msg;
+    print $fh <<'USAGE';
+net-scan — list known hosts (interfaces + addresses + ports + names).
+
+usage:
+  net-scan                    snapshot known hosts from the daemon
+  net-scan --quick            same (alias; -quick also accepted)
+  net-scan --discover         TRIGGER a discover sweep first, then snapshot
+  net-scan --listen HOST:PORT talk to a specific manager (default: config)
+  net-scan --help             this text
+
+notes:
+  Reads what the daemon already knows; it does not scan by itself.
+  --discover asks the daemon to run its nmap sweep first, which takes
+  time and touches the network — the plain form does neither.
+  The active scanning producer is net-discover.
+USAGE
+    exit($msg ? 2 : 0);
+}
 
 my $cli = NetMgr::Client->new(listen => $listen);
 $cli->hello(consumer => "net-scan.$$");

@@ -623,6 +623,8 @@ sub run_once {
                         && $body =~ /^\s*LOC\s+(-?\d{1,3}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)/i)
                     {
                         my ($lat, $lon) = ($1, $2);
+                        warn "[bridge] LOC body: <$body>
+";   # raw, as parsed
                         my ($acc) = $body =~ /acc=(\d+)\s*m/i;
                         my ($alt) = $body =~ /alt=(-?\d+)\s*m/i;
                         my ($src) = $body =~ /src=([A-Za-z0-9_-]+)/i;
