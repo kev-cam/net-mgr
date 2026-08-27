@@ -3129,9 +3129,18 @@ sub move_dhcp_reservation {
     return undef if $old eq $new;     # no-op handled by caller as success
     my $row = $self->get_dhcp_reservation($old) or return undef;
     my $at_new = $self->get_dhcp_reservation($new);
-    return { error => 'occupied', new => $at_new } if $at_new;
+    # Refusing an occupied target is right by default — silently overwriting
+    # someone else's reservation is how a working device loses its address.
+    # But there was NO way to say "yes, replace it", so a stale entry blocked
+    # the move permanently and the only route round it was editing the DB by
+    # hand. force => 1 is that route, and the displaced row is returned so the
+    # caller can report exactly what it removed rather than just succeeding.
+    return { error => 'occupied', new => $at_new } if $at_new && !$opts{force};
     $self->{dbh}->begin_work;
     eval {
+        if ($at_new) {
+            $self->{dbh}->do("DELETE FROM dhcp_reservations WHERE ip = ?", undef, $new);
+        }
         $self->{dbh}->do(
             "INSERT INTO dhcp_reservations
                 (ip, mac, name, subnet_cidr, grp, notes, updated_by)
@@ -3143,7 +3152,8 @@ sub move_dhcp_reservation {
         $self->{dbh}->commit;
         1;
     } or do { my $e = $@; eval { $self->{dbh}->rollback }; croak "move failed: $e"; };
-    return { old => $row, new => $self->get_dhcp_reservation($new) };
+    return { old => $row, new => $self->get_dhcp_reservation($new),
+             replaced => $at_new };
 }
 
 sub query_table {

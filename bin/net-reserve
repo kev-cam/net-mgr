@@ -1070,9 +1070,12 @@ sub cmd_move {
     my $model = gather($cli);
     warn "net-reserve: note: $new is inside a DHCP dynamic range\n"
         if classify($model, $new) eq 'assigned';
-    my $r = $cli->observe(kind => 'dhcp_reservation_move', ip => $old, new_ip => $new);
+    my $r = $cli->observe(kind => 'dhcp_reservation_move', ip => $old, new_ip => $new,
+                          ($opt_force ? (force => 1) : ()));
+    # The daemon names the occupant in its refusal; pass it through verbatim
+    # and say how to proceed, rather than making the operator go and look.
     die "net-reserve: $r\n" if !defined $r || $r =~ /^ERR/;
-    print "moved $old -> $new\n";
+    print "moved $old -> $new" . ($opt_force ? " (replaced any existing reservation)" : '') . "\n";
 }
 
 # Backfill host names on reservations that lack one: re-observe each nameless
@@ -2706,6 +2709,22 @@ sub reserve_dialog {
         if ($ans eq 'yes') {
             my $resp = $cli->observe(kind => 'dhcp_reservation_move',
                 ip => $dup->{ip}, new_ip => $v{ip});
+            # "Yes" here means move the device's existing reservation onto this
+            # address — which fails if the address is itself reserved. Ask
+            # again rather than reporting a dead end: this is exactly the case
+            # where the entry in the way is usually the stale one.
+            if (defined $resp && $resp =~ /already reserved/) {
+                my $occ = $S->{model}{resv}{ canon_ip($v{ip}) } || {};
+                my $desc = join ' ', grep { defined && length } ($occ->{name}, $occ->{mac});
+                my $a2 = lc(($S->{anchor} // $status)->messageBox(
+                    -type => 'yesno', -icon => 'warning', -title => 'Target already reserved',
+                    -message => "$v{ip} is already reserved"
+                        . ($desc ? " by $desc" : '') . ".\n\n"
+                        . "Replace it with $v{mac}?\n\nThe existing reservation will be deleted."));
+                return unless $a2 eq 'yes';
+                $resp = $cli->observe(kind => 'dhcp_reservation_move',
+                    ip => $dup->{ip}, new_ip => $v{ip}, force => 1);
+            }
             if (!defined $resp || $resp =~ /^ERR/) { $status->configure(-text => " $resp"); return }
             $S->{model} = gather($cli); $redraw->();
             $status->configure(-text => " moved $dup->{ip} -> $v{ip}");
@@ -2882,7 +2901,24 @@ sub move_dialog {
     return unless $ans eq 'Move';
     unless (defined ip2int($newip)) { $status->configure(-text => " bad IP '$newip'"); return }
     # Match the stored record by its own IP (may be non-canonical; see canon_ip).
-    my $resp = $cli->observe(kind => 'dhcp_reservation_move', ip => ($r->{ip} // $ip), new_ip => $newip);
+    my $resp = $cli->observe(kind => 'dhcp_reservation_move',
+                             ip => ($r->{ip} // $ip), new_ip => $newip);
+    # The target may already be reserved. Offer to replace it, naming what is
+    # there — previously this failed with a message in the status bar and no
+    # way forward, so a stale entry blocked the move permanently.
+    if (defined $resp && $resp =~ /already reserved/) {
+        my $occ = $S->{model}{resv}{ canon_ip($newip) } || {};
+        my $desc = join ' ', grep { defined && length } ($occ->{name}, $occ->{mac});
+        my $ans2 = lc(($S->{anchor} // $status)->messageBox(
+            -type => 'yesno', -icon => 'warning', -title => 'Target already reserved',
+            -message => "$newip is already reserved"
+                . ($desc ? " by $desc" : '') . ".\n\n"
+                . "Replace it with $ip ($r->{mac})?\n\n"
+                . "The existing reservation will be deleted."));
+        return unless $ans2 eq 'yes';
+        $resp = $cli->observe(kind => 'dhcp_reservation_move',
+                              ip => ($r->{ip} // $ip), new_ip => $newip, force => 1);
+    }
     if (!defined $resp || $resp =~ /^ERR/) { $status->configure(-text => " $resp"); return }
     $S->{model} = gather($cli); $redraw->();
     $status->configure(-text => " moved $ip -> $newip");

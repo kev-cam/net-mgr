@@ -5083,13 +5083,34 @@ sub _obs_dhcp_reservation_move {
     die "dhcp_reservation_move: bad new_ip '$new'\n"
         unless $new =~ /\A\d+\.\d+\.\d+\.\d+\z/;
     my $res = $self->{db}->move_dhcp_reservation($old, $new,
-        subnet_cidr => _dhcp_subnet_of($new), updated_by => $who);
+        subnet_cidr => _dhcp_subnet_of($new), updated_by => $who,
+        ($kv->{force} ? (force => 1) : ()));
     die "dhcp_reservation_move: no reservation at '$old'\n" unless $res;
-    die "dhcp_reservation_move: '$new' is already reserved\n" if $res->{error};
+    # Name the occupant in the refusal. "already reserved" alone leaves the
+    # operator to go and look up what is in the way before they can decide
+    # whether replacing it is safe.
+    if ($res->{error}) {
+        my $at = $res->{new} || {};
+        my $who_has = join ' ', grep { defined && length }
+                      ($at->{name}, $at->{mac});
+        die "dhcp_reservation_move: '$new' is already reserved"
+          . ($who_has ? " by $who_has" : '')
+          . " — pass force=1 to replace it\n";
+    }
     $self->_emit_change(table => 'dhcp_reservations', op => 'delete', row => $res->{old})
         if $res->{old};
     $self->_emit_change(table => 'dhcp_reservations', op => 'insert', row => $res->{new})
         if $res->{new};
+    # A replacement removed somebody else's reservation; that must be in the
+    # log even though the operator confirmed it, because the owner of the
+    # displaced entry did not.
+    if ($res->{replaced}) {
+        $self->_emit_change(table => 'dhcp_reservations', op => 'delete',
+                            row => $res->{replaced});
+        $self->_log(sprintf('dhcp reservation move %s -> %s REPLACED %s (%s) by %s',
+            $old, $new, ($res->{replaced}{name} // '?'),
+            ($res->{replaced}{mac} // '?'), $who));
+    }
     $self->_log("dhcp reservation move $old -> $new by $who");
     $self->_broadcast_regen_dnsmasq;
     return ();
