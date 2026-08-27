@@ -6191,6 +6191,21 @@ sub _obs_host {
                 $mac, $kv->{name}, $kv->{name_source} // 'config');
         }
     }
+    # A pushed reservation name changes what the DHCP servers should SERVE —
+    # the dnsmasq payload carries a hosts section as well as a dhcp one — but
+    # nothing told them, so a push landed in the database and the servers kept
+    # serving the old names until something else happened to trigger a regen.
+    # Reservation create/delete/move already broadcast; push did not.
+    #
+    # Scoped to name-bearing pushes from net-reserve rather than every host
+    # observation: _obs_host is also the scanners' entry point, and firing a
+    # fleet-wide regen per discovered host would be a storm. The broadcast
+    # debounces at 2s, which is protection against a bulk push, not against
+    # wiring it to the wrong caller.
+    if (defined $kv->{name} && length $kv->{name}
+        && ($kv->{name_source} // '') eq 'dhcp_reservation') {
+        $self->_broadcast_regen_dnsmasq;
+    }
     return @ev;
 }
 
