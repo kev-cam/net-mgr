@@ -2794,7 +2794,13 @@ sub reserve_dialog {
     # duplicate. The post-Reserve "duplicate?" dialog further down still fires
     # as a safety net; this just makes the common case visible up front.
     {
-        my $m = lc($mac // '');
+        # $v{mac}, not the raw $mac parameter. The caller prefills from leased /
+        # observed data at THIS address, which is empty for a reservation whose
+        # device is elsewhere — so keying on it skipped the entire cross-
+        # reference in exactly the case it exists for: a drifted reservation,
+        # where the operator most needs to be told where the device actually is.
+        # The MAC field was already resolved this way; this block was missed.
+        my $m = lc($v{mac} // '');
         my $other_resv = $m ? $S->{model}{mac_resv_ip}{$m} : undef;
         my $other_cur  = $m ? $S->{model}{mac_cur_ip}{$m}  : undef;
         $other_resv = undef if defined $other_resv && $other_resv eq $ip;
