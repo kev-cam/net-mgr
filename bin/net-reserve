@@ -25,6 +25,10 @@
 #   net-reserve set-zone  CIDR ZONE          # name a subnet ('' clears)
 #   net-reserve whatif MAC [SUBNET]          # what IP would DHCP hand this MAC?
 #   net-reserve del-range CIDR START
+#   net-reserve overlaps                   pools that collide, and how to fix
+#   net-reserve trim-range CIDR START --start IP --end IP
+#                                          move a pool's boundaries, keeping
+#                                          its zone and dnsmasq:<host> tag
 #   net-reserve --push [SUBNET]      push named reservations into net-lookup as
 #                                    never-seen hosts (kind=host, last_observed
 #                                    NULL); --dry-run previews the observations
@@ -85,6 +89,7 @@ my %GLYPH = (
 
 my ($listen, $server, $force_auth, $no_auth, $key_id, $key_file);
 my ($gui, $describe, $opt_name, $opt_group, $opt_notes, $opt_zone, $limit, $opt_force);
+my ($opt_start, $opt_end);          # trim-range boundaries
 my ($opt_dnsmasq, $opt_no_dnsmasq);
 my ($opt_push, $opt_dry, $opt_new);
 GetOptions(
@@ -107,6 +112,8 @@ GetOptions(
     'no-dnsmasq' => \$opt_no_dnsmasq,
     'zone=s'     => \$opt_zone,
     'n=i'        => \$limit,
+    'start=s'    => \$opt_start,     # trim-range
+    'end=s'      => \$opt_end,       # trim-range
 ) or die "bad options\n";
 
 if ($describe) {
@@ -138,8 +145,10 @@ my %DISPATCH = (
     move       => \&cmd_move,
     reallocate => \&cmd_move,   # alias
     autoname   => \&cmd_autoname,
-    'add-range' => \&cmd_add_range,
-    'del-range' => \&cmd_del_range,
+    'add-range'  => \&cmd_add_range,
+    'del-range'  => \&cmd_del_range,
+    'overlaps'   => \&cmd_overlaps,
+    'trim-range' => \&cmd_trim_range,
     'set-zone'  => \&cmd_set_zone,
     'whatif'    => \&cmd_whatif,
     gui       => sub { cmd_gui(shift @ARGV) },
@@ -791,11 +800,170 @@ sub cmd_ranges {
     my $cli = connect_client(want_auth => 0);
     my $rows = eval { $cli->snapshot(1, 'dhcp_ranges') } || [];
     unless (@$rows) { print "no dynamic ranges defined\n"; return }
-    printf "%-20s %-15s %-15s %s\n", 'SUBNET', 'START', 'END', 'ZONE';
-    for my $r (sort { $a->{subnet_cidr} cmp $b->{subnet_cidr} } @$rows) {
-        printf "%-20s %-15s %-15s %s\n",
-            $r->{subnet_cidr}, $r->{start_ip}, $r->{end_ip}, ($r->{zone} // '');
+    # Mark rows that collide with another pool. `ranges` is where an operator
+    # actually looks, so the warning belongs here and not only behind a
+    # dedicated subcommand nobody knows to run.
+    my @ov = find_overlaps($rows);
+    my %bad;
+    for my $o (@ov) {
+        $bad{ ($o->{a}{subnet_cidr} // '') . '|' . ($o->{a}{start_ip} // '') } = 1;
+        $bad{ ($o->{b}{subnet_cidr} // '') . '|' . ($o->{b}{start_ip} // '') } = 1;
     }
+    printf "%-20s %-15s %-15s %-8s %s\n", 'SUBNET', 'START', 'END', 'ZONE', 'SERVER';
+    for my $r (sort { $a->{subnet_cidr} cmp $b->{subnet_cidr}
+                   || (ip2int($a->{start_ip}) // 0) <=> (ip2int($b->{start_ip}) // 0) } @$rows) {
+        my $mark = $bad{ ($r->{subnet_cidr} // '') . '|' . ($r->{start_ip} // '') }
+                 ? '  !! OVERLAPS' : '';
+        printf "%-20s %-15s %-15s %-8s %s%s\n",
+            $r->{subnet_cidr}, $r->{start_ip}, $r->{end_ip},
+            ($r->{zone} // ''), _srv($r), $mark;
+    }
+    if (@ov) {
+        printf "\n%d overlapping pair(s): two DHCP servers can hand out the same\n"
+             . "address. `net-reserve overlaps` shows the contested spans and how\n"
+             . "to resolve each one.\n", scalar @ov;
+    }
+}
+
+# ---- overlapping DHCP pools -----------------------------------------------
+#
+# Two pools covering the same address is not a bookkeeping wrinkle: each pool
+# carries "dnsmasq:<host>" in notes, so an overlap means TWO DHCP SERVERS can
+# hand out the same address. The second client to ask gets an address already
+# in use, and the resulting duplicate-IP fault looks like a flaky host rather
+# than a server misconfiguration.
+#
+# Returns a list of { a, b, lo, hi, n } — the two range rows, the contested
+# span, and how many addresses it covers.
+sub find_overlaps {
+    my ($rows) = @_;
+    my @r = grep { defined $_->{start_ip} && defined $_->{end_ip} } @$rows;
+    my @out;
+    for my $i (0 .. $#r) {
+        for my $j ($i + 1 .. $#r) {
+            my ($a, $b) = ($r[$i], $r[$j]);
+            next unless ($a->{subnet_cidr} // '') eq ($b->{subnet_cidr} // '');
+            my ($alo, $ahi) = (ip2int($a->{start_ip}), ip2int($a->{end_ip}));
+            my ($blo, $bhi) = (ip2int($b->{start_ip}), ip2int($b->{end_ip}));
+            next unless defined $alo && defined $ahi && defined $blo && defined $bhi;
+            my $lo = $alo > $blo ? $alo : $blo;
+            my $hi = $ahi < $bhi ? $ahi : $bhi;
+            next if $lo > $hi;                      # disjoint
+            push @out, { a => $a, b => $b, lo => $lo, hi => $hi, n => $hi - $lo + 1 };
+        }
+    }
+    return @out;
+}
+
+sub _srv { my $r = shift; my $n = $r->{notes} // ''; $n =~ s/^dnsmasq://; $n || '?' }
+
+sub cmd_overlaps {
+    my $cli  = connect_client(want_auth => 0);
+    my $rows = eval { $cli->snapshot(1, 'dhcp_ranges') } || [];
+    my @ov   = find_overlaps($rows);
+    unless (@ov) { print "no overlapping DHCP pools\n"; return }
+
+    # Occupancy of the contested span is what turns a latent misconfiguration
+    # into an active one, so count it rather than leaving the reader to guess.
+    my $leases = eval { $cli->snapshot(2, 'dhcp_leases') } || [];
+    my %held;
+    for my $l (@$leases) {
+        my $n = ip2int(canon_ip($l->{ip} // '')) or next;
+        $held{$n} = $l->{mac} // '?';
+    }
+
+    printf "%d overlapping pool pair(s):\n\n", scalar @ov;
+    for my $o (@ov) {
+        my ($ra, $rb) = ($o->{a}, $o->{b});
+        printf "  %s\n", $ra->{subnet_cidr} // '?';
+        printf "    %-31s  %s\n", "$ra->{start_ip}-$ra->{end_ip}", _srv($ra);
+        printf "    %-31s  %s\n", "$rb->{start_ip}-$rb->{end_ip}", _srv($rb);
+        printf "    contested: %s-%s  (%d addresses)\n",
+               int2ip($o->{lo}), int2ip($o->{hi}), $o->{n};
+        my @in = grep { $_ >= $o->{lo} && $_ <= $o->{hi} } keys %held;
+        printf "    currently leased in that span: %d%s\n", scalar @in,
+               @in ? ' — ' . join(', ', map { int2ip($_) } (sort { $a <=> $b } @in)[0 .. ($#in > 4 ? 4 : $#in)])
+                   . ($#in > 4 ? ', …' : '')
+                   : '';
+        # Containment and partial overlap want different remedies, so say which
+        # this is instead of offering one generic suggestion.
+        my ($alo, $ahi) = (ip2int($ra->{start_ip}), ip2int($ra->{end_ip}));
+        my ($blo, $bhi) = (ip2int($rb->{start_ip}), ip2int($rb->{end_ip}));
+        if ($blo >= $alo && $bhi <= $ahi) {
+            printf "    %s's pool sits entirely inside %s's.\n", _srv($rb), _srv($ra);
+            printf "    fix (simplest): %s gives up the contested span —\n", _srv($rb);
+            printf "      net-reserve del-range %s %s\n",
+                   $rb->{subnet_cidr}, $rb->{start_ip};
+            # The other direction is NOT a trim. Pulling the outer pool back to
+            # end below the inner one abandons everything ABOVE the inner pool,
+            # which nothing would then serve. It takes two ranges, so spell both
+            # out rather than offering a one-liner that quietly drops addresses.
+            printf "    or %s yields, which needs a SPLIT (a trim alone would\n", _srv($ra);
+            printf "    abandon %s-%s, which nothing else serves):\n",
+                   int2ip($bhi + 1), $ra->{end_ip};
+            printf "      net-reserve trim-range %s %s --start %s --end %s\n",
+                   $ra->{subnet_cidr}, $ra->{start_ip}, $ra->{start_ip}, int2ip($blo - 1);
+            printf "      net-reserve add-range  %s %s %s --zone %s --notes '%s'\n",
+                   $ra->{subnet_cidr}, int2ip($bhi + 1), $ra->{end_ip},
+                   ($ra->{zone} // ''), ($ra->{notes} // '');
+        } else {
+            my $yield = $ahi < $bhi ? $ra : $rb;      # trim the one ending sooner
+            my $keep  = $ahi < $bhi ? $rb : $ra;
+            printf "    partial overlap.\n";
+            printf "    fix: pull one boundary back, e.g.\n";
+            printf "      net-reserve trim-range %s %s --start %s --end %s   # %s yields\n",
+                   $yield->{subnet_cidr}, $yield->{start_ip}, $yield->{start_ip},
+                   int2ip(ip2int($keep->{start_ip}) - 1), _srv($yield);
+        }
+        print "\n";
+    }
+    print "Nothing is changed by this command. Each fix is a single explicit\n"
+        . "command above, because WHICH server should yield is an operational\n"
+        . "decision — the tool cannot know which pool is authoritative.\n";
+}
+
+# Move a pool's boundaries, preserving its zone and its dnsmasq:<host> tag.
+# Implemented as delete+add because start_ip is part of the primary key. The
+# tag must survive: it is the only record of which server owns the pool, and
+# NetMgr::Relay uses it for identity — a re-added pool without it becomes an
+# orphan, and one with the WRONG tag can delete another server's row on sync.
+sub cmd_trim_range {
+    my $cidr  = shift @ARGV or usage("trim-range needs CIDR START");
+    my $start = shift @ARGV or usage("trim-range needs CIDR START");
+    my $cli   = connect_client();
+    my $rows  = eval { $cli->snapshot(1, 'dhcp_ranges') } || [];
+    my ($row) = grep { ($_->{subnet_cidr} // '') eq $cidr
+                    && ($_->{start_ip}    // '') eq $start } @$rows;
+    die "net-reserve: no pool $cidr starting $start\n" unless $row;
+
+    my $ns = defined $opt_start ? $opt_start : $row->{start_ip};
+    my $ne = defined $opt_end   ? $opt_end   : $row->{end_ip};
+    my ($lo, $hi) = (ip2int($ns), ip2int($ne));
+    die "net-reserve: bad --start/--end\n" unless defined $lo && defined $hi;
+    die "net-reserve: --start is above --end ($ns > $ne)\n" if $lo > $hi;
+
+    printf "trim %s %s-%s  ->  %s-%s   (server %s, zone %s)\n",
+        $cidr, $row->{start_ip}, $row->{end_ip}, $ns, $ne,
+        _srv($row), ($row->{zone} // '-');
+
+    my $r = $cli->observe(kind => 'dhcp_range_delete',
+                          subnet_cidr => $cidr, start_ip => $row->{start_ip});
+    die "net-reserve: delete failed: $r\n" if !defined $r || $r =~ /^ERR/;
+    $r = $cli->observe(kind => 'dhcp_range', subnet_cidr => $cidr,
+        start_ip => $ns, end_ip => $ne,
+        (defined $row->{zone}  && length $row->{zone}  ? (zone  => $row->{zone})  : ()),
+        (defined $row->{notes} && length $row->{notes} ? (notes => $row->{notes}) : ()));
+    if (!defined $r || $r =~ /^ERR/) {
+        # Put it back rather than leaving the pool deleted: a subnet with no
+        # pool stops handing out addresses entirely, which is far worse than
+        # the overlap being fixed.
+        $cli->observe(kind => 'dhcp_range', subnet_cidr => $cidr,
+            start_ip => $row->{start_ip}, end_ip => $row->{end_ip},
+            (defined $row->{zone}  ? (zone  => $row->{zone})  : ()),
+            (defined $row->{notes} ? (notes => $row->{notes}) : ()));
+        die "net-reserve: re-add failed ($r); original pool restored\n";
+    }
+    print "ok\n";
 }
 
 sub cmd_reserve {
