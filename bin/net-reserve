@@ -536,8 +536,12 @@ sub pool_desc {
     }
     my @d;
     for my $r (@r) {
-        my $d = sprintf('%s-%s', $r->{start_ip} // '?', $r->{end_ip} // '?');
-        $d .= sprintf(' [%s]', $r->{zone}) if defined $r->{zone} && length $r->{zone};
+        # Annotated with the SERVER, not the zone. The zone names the subnet, so
+        # it is the same for every pool on it and says nothing about which pool
+        # you are looking at — whereas which dnsmasq serves this range is the
+        # fact that decides whether a reservation here will be honoured, and it
+        # is what makes an overlap comprehensible.
+        my $d = sprintf('%s-%s %s', $r->{start_ip} // '?', $r->{end_ip} // '?', _srv($r));
         my $st = $r->{status} // 'active';
         $d .= " ($st)" if $st ne 'active';
         push @d, $d;
@@ -2890,7 +2894,11 @@ sub release_dialog {
 # free static in the same subnet).
 sub move_dialog {
     my ($cli, $S, $ip, $r, $redraw, $status) = @_;
-    my $suggest = next_free($S->{model}, subnet_of($ip)) // '';
+    # Prefer the slot this device's own naming implies over the lowest free
+    # address — for wc12 that is .132, not .2.
+    my $suggest = sequence_hint($S->{model}, $r->{name})
+               // next_free($S->{model}, subnet_of($ip))
+               // '';
     my $newip = $suggest;
     my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Move $ip",
         -buttons => ['Move', 'Cancel']);
@@ -2922,6 +2930,63 @@ sub move_dialog {
     if (!defined $resp || $resp =~ /^ERR/) { $status->configure(-text => " $resp"); return }
     $S->{model} = gather($cli); $redraw->();
     $status->configure(-text => " moved $ip -> $newip");
+}
+
+# Where a NAMED device belongs, if its siblings already imply a pattern.
+#
+# wc1..wc11 sit at .121...131 — eleven reservations agreeing that wcN lives at
+# N+120. Given that, offering wc12 the "lowest free static" (.2) is unhelpful:
+# the operator then types the real answer by hand every time, and a typo puts a
+# camera in the wrong slot.
+#
+# Derived from the data rather than configured, and only when the evidence is
+# unanimous: every existing sibling must agree on one offset, and there must be
+# at least three of them. A single sibling is a coincidence, and disagreement
+# means there is no sequence to follow — in both cases this returns undef and
+# the caller falls back to next_free.
+sub sequence_hint {
+    my ($model, $name) = @_;
+    return undef unless defined $name && length $name;
+    # Names arrive both bare (wc11) and qualified (wc12.grfx.com) depending on
+    # which producer wrote them, and the sequence is the same either way. Match
+    # on the host part alone, on both sides of the comparison, or a qualified
+    # name silently finds no siblings.
+    my $host = $name; $host =~ s/\..*\z//;
+    return undef unless $host =~ /\A([A-Za-z][A-Za-z_-]*?)(\d+)\z/;
+    my ($prefix, $n) = ($1, $2 + 0);
+    my %offset;
+    my $siblings = 0;
+    my $sib_subnet;
+    for my $r (values %{ $model->{resv} }) {
+        my $rn = $r->{name} // '';
+        $rn =~ s/\..*\z//;
+        next unless $rn =~ /\A\Q$prefix\E(\d+)\z/;
+        my $rnum = $1 + 0;
+        next if $rnum == $n;                      # not evidence about itself
+        my $ip = ip2int($r->{ip}) or next;
+        $offset{ $ip - $rnum }++;
+        $siblings++;
+        $sib_subnet //= subnet_of($r->{ip});
+    }
+    return undef if $siblings < 3;
+    # The DOMINANT offset, not a unanimous one. Real sequences have strays:
+    # wc1..wc11 sit at N+120, but wc15 and wc16 live at .165 and .167, so
+    # requiring unanimity rejected a pattern eleven reservations agree on.
+    # Require a clear winner — at least three supporters and strictly more than
+    # any rival — so a handful of unrelated names cannot invent a sequence.
+    my @by = sort { $offset{$b} <=> $offset{$a} } keys %offset;
+    my $off   = $by[0];
+    my $votes = $offset{$off};
+    return undef if $votes < 3;
+    return undef if @by > 1 && $offset{$by[1]} >= $votes;
+    my $want = int2ip($off + $n);
+    return undef unless defined $want;
+    # Must land in the SIBLINGS' subnet — compare against one of them, not
+    # against an arbitrary reservation from elsewhere in the fleet, or the
+    # check rejects every valid answer depending on hash order.
+    return undef unless defined $sib_subnet
+                     && (subnet_of($want) // '') eq $sib_subnet;
+    return $want;
 }
 
 # Lowest free static IP in $cidr, or undef.
