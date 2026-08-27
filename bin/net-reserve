@@ -148,6 +148,7 @@ my %DISPATCH = (
     'add-range'  => \&cmd_add_range,
     'del-range'  => \&cmd_del_range,
     'overlaps'   => \&cmd_overlaps,
+    'duplicates' => \&cmd_duplicates,
     'trim-range' => \&cmd_trim_range,
     'set-zone'  => \&cmd_set_zone,
     'whatif'    => \&cmd_whatif,
@@ -482,6 +483,38 @@ sub gather {
         $mac_cur_ip{lc $m} //= $ip if $m;
     }
     for my $ip (keys %resv)          { my $m=$resv{$ip}{mac};     $mac_resv_ip{lc $m} //= $ip if $m }
+    # MACs carrying MORE THAN ONE reservation. dnsmasq can only honour one
+    # address per MAC, so the config generator silently keeps the first and
+    # drops the rest — the only trace is a WARN in the gateway's log, which
+    # nobody reads. wc12 currently has reservations at .132 and .181 and the
+    # generator has been discarding .181 unannounced.
+    #
+    # Ordered the same way the generator orders them (short name, then IP) so
+    # the first entry here is the one actually SERVED, and the UI can say which
+    # rather than only that there is a clash.
+    my %dup_resv;
+    {
+        # Keyed on MAC *and subnet*, because the generator's dedup is per zone:
+        # %seenmac is reset for each zone, so one MAC holding an address in two
+        # different subnets is a MULTI-HOMED HOST, not a clash — gateway3 counts
+        # 24 of them here, opti03 (.223.219 / .15.219) among them. Keying on MAC
+        # alone reported every one of those as a duplicate, which is both wrong
+        # and exactly the kind of noise that trains people to ignore a warning.
+        my %by_mac;
+        for my $ip (keys %resv) {
+            my $m = $resv{$ip}{mac} or next;
+            my $sub = $resv{$ip}{subnet_cidr} // subnet_of($ip) // '?';
+            push @{ $by_mac{ lc($m) . '|' . $sub } }, $resv{$ip};
+        }
+        for my $k (keys %by_mac) {
+            my @r = @{ $by_mac{$k} };
+            next unless @r > 1;
+            my ($m) = split /\|/, $k;
+            $dup_resv{$m} = [ map { $_->{ip} }
+                sort { (bare_name($a->{name} // '') cmp bare_name($b->{name} // ''))
+                    || ((ip2int($a->{ip}) // 0) <=> (ip2int($b->{ip}) // 0)) } @r ];
+        }
+    }
 
     my %subnets;
     $subnets{ $_->{subnet_cidr} } = 1 for @$ranges;
@@ -500,6 +533,7 @@ sub gather {
         ranges => $ranges, resv => \%resv, leased => \%leased,
         observed => \%observed, mac_name => \%mac_name,
         mac_cur_ip => \%mac_cur_ip, mac_resv_ip => \%mac_resv_ip,
+        dup_resv => \%dup_resv,
         subnets => \@subnets,
         ifaces => $ifaces,   # raw interface rows (mac/first_seen/kind/vendor) for --new
     };
@@ -907,6 +941,29 @@ sub find_overlaps {
 }
 
 sub _srv { my $r = shift; my $n = $r->{notes} // ''; $n =~ s/^dnsmasq://; $n || '?' }
+
+# Reservations sharing a MAC. dnsmasq honours one address per MAC, so the rest
+# are dropped at config-generation time with only a WARN on the gateway.
+sub cmd_duplicates {
+    my $cli   = connect_client(want_auth => 0);
+    my $model = gather($cli);
+    my $dup   = $model->{dup_resv} || {};
+    unless (%$dup) { print "no duplicate-MAC reservations\n"; return }
+    printf "%d MAC(s) with more than one reservation:\n\n", scalar keys %$dup;
+    for my $mac (sort keys %$dup) {
+        my @ips = @{ $dup->{$mac} };
+        printf "  %s\n", $mac;
+        for my $ip (@ips) {
+            my $r = $model->{resv}{$ip} || {};
+            printf "    %-16s %-20s %s\n", $ip, ($r->{name} // '-'),
+                   ($ip eq $ips[0] ? 'SERVED' : 'dropped at config generation');
+        }
+        print "\n";
+    }
+    print "dnsmasq honours one address per MAC. The generator keeps the first by\n"
+        . "(name, address) and discards the rest — visible only as a WARN in the\n"
+        . "serving gateway's log. Release the ones you do not want.\n";
+}
 
 sub cmd_overlaps {
     my $cli  = connect_client(want_auth => 0);
@@ -2782,6 +2839,20 @@ sub reserve_dialog {
     # moving one is not like moving a laptop: a statically-addressed AP ignores
     # the reservation entirely, so the operator needs to know that the real
     # change is on the device.
+    # Duplicate-MAC warning, before the AP line: it changes whether this
+    # reservation does anything at all.
+    if (my $d = $S->{model}{dup_resv}{ lc($v{mac} // '') }) {
+        my @others = grep { $_ ne $ip } @$d;
+        if (@others) {
+            my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
+            $row->Label(-text => 'dup:', -width => 7, -anchor => 'w')->pack(-side => 'left');
+            $row->Label(-foreground => '#c00000', -anchor => 'w',
+                -text => 'same MAC also reserved at ' . join(', ', @others)
+                       . ($d->[0] eq $ip ? ' — this one is served'
+                                         : " — $d->[0] is served, this one is DROPPED"))
+                ->pack(-side => 'left');
+        }
+    }
     if (my $ap = ap_at($S->{model}, $ip)) {
         my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
         $row->Label(-text => 'AP:', -width => 7, -anchor => 'w')->pack(-side => 'left');
@@ -3282,6 +3353,16 @@ sub occupant {
         # ...and is somebody ELSE on it? Without this the line merely echoes the
         # reservation, so a squatted address describes itself as the device that
         # is NOT there and the operator has nothing to notice.
+        # More than one reservation for this MAC: say so, and say which address
+        # actually gets served, because the other is being discarded silently.
+        if (my $d = $model->{dup_resv}{ lc($r->{mac} // '') }) {
+            my @others = grep { $_ ne $ip } @$d;
+            if (@others) {
+                $s .= ' !! DUPLICATE MAC also at ' . join(', ', @others)
+                    . ($d->[0] eq $ip ? ' (this one is served)'
+                                      : " (served: $d->[0])");
+            }
+        }
         my $om = _occupant_mac($model, $ip);
         if (defined $om && length $om && lc($om) ne lc($r->{mac} // '')) {
             my $who = $model->{mac_name}{ lc $om };
