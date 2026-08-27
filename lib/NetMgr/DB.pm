@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 40;
+our $SCHEMA_VERSION = 41;
 
 sub new {
     my ($class, %args) = @_;
@@ -1034,6 +1034,28 @@ CREATE TABLE IF NOT EXISTS sms_services (
     KEY idx_sms_services_repl    (replicated_from)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 SQL
+        return;
+    }
+    if ($v == 41) {
+        # dhcp_ranges.status — is this pool's server actually answering?
+        #
+        # A standby server's pool overlapping the active one is INTENT, not a
+        # fault: gateway2 holds 192.168.15.119-139 inside gateway3's 100-199 so
+        # that failover is a flag flip. Until now the only way to stop that
+        # reading as a duplicate-assignment conflict was to delete the standby's
+        # pool, which throws away the very configuration failover needs.
+        #
+        # Reuses isp_links' vocabulary (active | standby | broken | unknown)
+        # rather than a boolean: "deliberately dormant" and "server is down"
+        # are different facts about an overlap, and only the first one means
+        # the configuration is correct as it stands.
+        #
+        # Defaults to 'active': every existing pool is assumed live, which is
+        # the behaviour before this column existed.
+        $self->_alter_idempotent(
+            "ALTER TABLE dhcp_ranges
+               ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'active'"
+        );
         return;
     }
     if ($v == 40) {

@@ -633,6 +633,10 @@ CREATE TABLE IF NOT EXISTS dhcp_ranges (
     start_ip     VARCHAR(45)  NOT NULL,        -- first auto-assigned address
     end_ip       VARCHAR(45)  NOT NULL,        -- last auto-assigned address
     zone         VARCHAR(64)  NULL,            -- subnet `# zone=` annotation
+    status       VARCHAR(16)  NOT NULL DEFAULT 'active',
+                                              -- active | standby | broken | unknown
+                                              -- standby: pool defined and kept
+                                              -- for failover, server not answering
     notes        TEXT         NULL,
     updated_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
                               ON UPDATE CURRENT_TIMESTAMP,

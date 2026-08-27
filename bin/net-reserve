@@ -509,6 +509,9 @@ sub pool_rows {
     my ($model, $ip_int) = @_;
     return () unless defined $ip_int;
     my @hit;
+    # Includes dormant pools deliberately: for "which pool is this address in?"
+    # the answer is still that pool, and pool_desc labels its status. Only
+    # CONFLICT detection cares whether it is serving.
     for my $r (@{ $model->{ranges} }) {
         my $lo = ip2int($r->{start_ip}); my $hi = ip2int($r->{end_ip});
         next unless defined $lo && defined $hi;
@@ -535,6 +538,8 @@ sub pool_desc {
     for my $r (@r) {
         my $d = sprintf('%s-%s', $r->{start_ip} // '?', $r->{end_ip} // '?');
         $d .= sprintf(' [%s]', $r->{zone}) if defined $r->{zone} && length $r->{zone};
+        my $st = $r->{status} // 'active';
+        $d .= " ($st)" if $st ne 'active';
         push @d, $d;
     }
     my $out = ($r[0]{subnet_cidr} // '?') . '  ' . join(' + ', @d);
@@ -814,6 +819,11 @@ sub cmd_ranges {
                    || (ip2int($a->{start_ip}) // 0) <=> (ip2int($b->{start_ip}) // 0) } @$rows) {
         my $mark = $bad{ ($r->{subnet_cidr} // '') . '|' . ($r->{start_ip} // '') }
                  ? '  !! OVERLAPS' : '';
+        # A dormant pool is shown as such rather than silently omitted: it is
+        # still allocated address space, and the reason it is NOT flagged as an
+        # overlap should be visible on the same line.
+        my $st = $r->{status} // 'active';
+        $mark = "  [$st]" . $mark if $st ne 'active';
         printf "%-20s %-15s %-15s %-8s %s%s\n",
             $r->{subnet_cidr}, $r->{start_ip}, $r->{end_ip},
             ($r->{zone} // ''), _srv($r), $mark;
@@ -835,9 +845,17 @@ sub cmd_ranges {
 #
 # Returns a list of { a, b, lo, hi, n } — the two range rows, the contested
 # span, and how many addresses it covers.
+sub _pool_live { my $r = shift; ($r->{status} // 'active') eq 'active' }
+
 sub find_overlaps {
     my ($rows) = @_;
-    my @r = grep { defined $_->{start_ip} && defined $_->{end_ip} } @$rows;
+    # Only LIVE pools can collide. A standby's pool deliberately shadows the
+    # active one — gateway2 holds 119-139 inside gateway3's 100-199 precisely
+    # so failover is a flag flip — and reporting that as a duplicate-assignment
+    # fault would push the operator to delete the configuration failover needs.
+    # A pool marked 'broken' or 'unknown' still counts: those are not
+    # deliberate, and an overlap with one is worth surfacing.
+    my @r = grep { defined $_->{start_ip} && defined $_->{end_ip} && _pool_live($_) } @$rows;
     my @out;
     for my $i (0 .. $#r) {
         for my $j ($i + 1 .. $#r) {

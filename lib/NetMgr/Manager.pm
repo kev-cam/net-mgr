@@ -3742,7 +3742,18 @@ my %POLL_METHODS = (
             push @dhcp,  $r->{zones}{$zone}{dhcp}  // '';
             push @hosts, $r->{zones}{$zone}{hosts} // '';
         }
-        return "#=== dhcp ===
+        # Control section: steers the dnsmasq PROCESS rather than configuring
+        # it. Emitted first so a standby stops answering before it is handed a
+        # config, not after.
+        #
+        # A standby holds its sockets, config and lease file and simply does
+        # not answer, so failover is a flag flip rather than a restart — and
+        # the fleet can tell "deliberately dormant" from "dead", which it
+        # cannot when the service is stopped.
+        my $standby = ($self->{config}{dnsmasq}{standby} // 0) ? 1 : 0;
+        return "#=== control ===
+standby $standby
+" .          "#=== dhcp ===
 " . join('', @dhcp)
              . "#=== hosts ===
 " . join('', @hosts)
