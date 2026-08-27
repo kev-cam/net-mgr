@@ -393,6 +393,11 @@ sub gather {
     # MAC -> machine name, so observed/leased addresses can show who's there
     # (the same name net-lookup gives), not just a bare MAC.
     my $ifaces   = eval { $cli->snapshot(5, 'interfaces') } || [];
+    # Which MACs are access points we can actually log into. Reserving or
+    # moving an AP's address is a different act from doing it to a laptop: an
+    # AP with a STATIC address will never ask DHCP for the new one, so the
+    # reservation alone changes nothing until the AP itself is reconfigured.
+    my $aps      = eval { $cli->snapshot(7, 'aps') } || [];
     my $machines = eval { $cli->snapshot(6, 'machines') }   || [];
 
     # Key by the canonical address (see canon_ip): the DB may store a
@@ -441,10 +446,23 @@ sub gather {
     my %name_of_mid = map { ($_->{id} => $_->{primary_name}) }
                       grep { defined $_->{primary_name} && length $_->{primary_name} } @$machines;
     my %mac_name;
+    my %mid_of_mac;
     for my $i (@$ifaces) {
         next unless $i->{mac} && $i->{machine_id};
+        $mid_of_mac{ lc $i->{mac} } = $i->{machine_id};
         my $n = $name_of_mid{ $i->{machine_id} } or next;
         $mac_name{ lc $i->{mac} } = $n;
+    }
+    # An AP has several interfaces and only ONE of them lands in the aps table:
+    # the wndr6400 is recorded there as 10:da:43:8f:5a:1d while its reservation
+    # carries 10:da:43:8f:5a:1c, a digit apart on the same router. Matching the
+    # aps row by exact MAC therefore misses the address the operator is actually
+    # looking at, so map every MAC of a machine that owns an AP interface.
+    my %ap_of_mid;
+    for my $a (@$aps) {
+        next unless $a->{mac};
+        my $mid = $mid_of_mac{ lc $a->{mac} } or next;
+        $ap_of_mid{$mid} = $a;
     }
     # MAC -> where it currently is (lease/observed) and where it's reserved, so
     # the UI can flag a device that's been given a new address but hasn't moved
@@ -476,6 +494,9 @@ sub gather {
     } keys %subnets;
 
     return {
+        aps        => { map { lc($_->{mac} // '') => $_ } grep { $_->{mac} } @$aps },
+        ap_of_mid  => \%ap_of_mid,
+        mid_of_mac => \%mid_of_mac,
         ranges => $ranges, resv => \%resv, leased => \%leased,
         observed => \%observed, mac_name => \%mac_name,
         mac_cur_ip => \%mac_cur_ip, mac_resv_ip => \%mac_resv_ip,
@@ -2577,6 +2598,99 @@ sub bare_name {
     return $n;
 }
 
+# The aps row for whatever MAC is at $ip, or undef. Checks the reservation
+# first and then what is actually there, so a moved-but-not-yet-relocated AP
+# is still recognised at both addresses.
+sub ap_at {
+    my ($model, $ip) = @_;
+    my $mac = ($model->{resv}{$ip} && $model->{resv}{$ip}{mac})
+            || _occupant_mac($model, $ip);
+    return undef unless defined $mac && length $mac;
+    # Direct hit first, then via the machine: the MAC on the reservation is
+    # often a different interface of the same AP than the one aps recorded.
+    return $model->{aps}{ lc $mac }
+        // ($model->{ap_of_mid}{ $model->{mid_of_mac}{ lc $mac } // '' });
+}
+
+sub ap_label {
+    my ($ap) = @_;
+    return '' unless $ap;
+    my $d = join ' ', grep { defined && length } ($ap->{board}, $ap->{model});
+    $d ||= 'access point';
+    my $ssid = $ap->{ssid} // '';
+    $ssid =~ s/,.*//;                       # first SSID is enough for a label
+    return $d . (length $ssid ? " ($ssid…)" : '');
+}
+
+# Run one command on a DD-WRT AP over ssh. Mirrors Producer::AP::poll_ap's
+# invocation deliberately — same user, same BatchMode/ConnectTimeout options —
+# so an AP that polls successfully is one this can reach, rather than a second
+# access path that can drift out of step with the first.
+sub ap_ssh {
+    my ($ip, $cmd, %o) = @_;
+    my $user = $o{user} // 'root';
+    my $to   = $o{timeout} // 10;
+    my @c = ('ssh', '-o', 'BatchMode=yes', '-o', "ConnectTimeout=$to",
+             '-o', 'StrictHostKeyChecking=accept-new', '-n', "$user\@$ip", $cmd);
+    my $pid = open(my $fh, '-|');
+    return { ok => 0, error => "fork: $!" } unless defined $pid;
+    if ($pid == 0) { open STDERR, '>&', \*STDOUT; exec @c; exit 127 }
+    my @out = <$fh>;
+    close $fh;
+    my $exit = $? >> 8;
+    return { ok => ($exit == 0 || $exit == 255) ? 1 : 0,
+             exit => $exit, out => join('', @out) };
+}
+
+# Actions on an AP at $ip: reboot, or move its STATIC LAN address.
+sub ap_dialog {
+    my ($cli, $S, $ip, $ap, $redraw, $status) = @_;
+    my $dlg = ($S->{anchor} // $status)->DialogBox(
+        -title => "Access point $ip",
+        -buttons => ['Reboot', 'Set LAN IP', 'Close']);
+    my $f = $dlg->add('Frame')->pack(-fill => 'x', -padx => 6, -pady => 4);
+    $f->Label(-text => ap_label($ap), -anchor => 'w')->pack(-side => 'left');
+    my $newip = '';
+    my $f2 = $dlg->add('Frame')->pack(-fill => 'x', -padx => 6, -pady => 2);
+    $f2->Label(-text => 'new LAN IP:')->pack(-side => 'left');
+    $f2->Entry(-textvariable => \$newip, -width => 16)->pack(-side => 'left');
+    $dlg->add('Label', -justify => 'left', -anchor => 'w',
+        -text => "An AP with a static address ignores DHCP reservations —\n"
+               . "changing it here is what actually moves the device.\n"
+               . "Both actions reboot the AP and drop its clients.")->pack(-fill => 'x', -padx => 6);
+    my $ans = $dlg->Show // 'Close';
+    return if $ans eq 'Close';
+
+    if ($ans eq 'Reboot') {
+        my $ok = lc(($S->{anchor} // $status)->messageBox(
+            -type => 'yesno', -icon => 'warning', -title => 'Reboot AP',
+            -message => "Reboot $ip (" . ap_label($ap) . ")?\n\n"
+                      . "Every client associated with it will drop."));
+        return unless $ok eq 'yes';
+        my $r = ap_ssh($ip, 'reboot');
+        # A reboot kills the connection mid-command, so a non-zero exit is the
+        # NORMAL outcome and must not be reported as failure.
+        $status->configure(-text => $r->{ok} || $r->{exit} == 255
+            ? " rebooting $ip" : " reboot failed: $r->{out}");
+        return;
+    }
+
+    unless (defined ip2int($newip)) {
+        $status->configure(-text => " bad IP '$newip'"); return;
+    }
+    my $ok = lc(($S->{anchor} // $status)->messageBox(
+        -type => 'yesno', -icon => 'warning', -title => 'Change AP address',
+        -message => "Set $ip (" . ap_label($ap) . ") to $newip?\n\n"
+                  . "nvram set lan_ipaddr, commit, reboot.\n"
+                  . "The AP will come back on $newip — if that address is wrong\n"
+                  . "or unreachable you will need physical access to recover it."));
+    return unless $ok eq 'yes';
+    # commit before reboot, or the change is lost: nvram set is RAM-only.
+    my $r = ap_ssh($ip, "nvram set lan_ipaddr=$newip && nvram commit && reboot");
+    $status->configure(-text => ($r->{ok} || $r->{exit} == 255)
+        ? " $ip -> $newip (rebooting)" : " failed: $r->{out}");
+}
+
 sub reserve_dialog {
     my ($cli, $S, $ip, $mac, $redraw, $status) = @_;
     # A reservation already at $ip means we're EDITING it (e.g. the Edit button in
@@ -2663,6 +2777,16 @@ sub reserve_dialog {
         my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
         $row->Label(-text => 'pool:', -width => 7, -anchor => 'w')->pack(-side => 'left');
         $row->Label(-text => pool_desc($S->{model}, $ip), -anchor => 'w')->pack(-side => 'left');
+    }
+    # Say when the address belongs to an AP we can log into. Reserving or
+    # moving one is not like moving a laptop: a statically-addressed AP ignores
+    # the reservation entirely, so the operator needs to know that the real
+    # change is on the device.
+    if (my $ap = ap_at($S->{model}, $ip)) {
+        my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
+        $row->Label(-text => 'AP:', -width => 7, -anchor => 'w')->pack(-side => 'left');
+        $row->Label(-text => ap_label($ap) . '  — reachable over ssh',
+                    -anchor => 'w')->pack(-side => 'left');
     }
     # Cross-ref: if this MAC already has a reservation at a DIFFERENT IP, or is
     # currently live at a different IP, surface it BEFORE the user commits, with
@@ -2905,7 +3029,9 @@ sub release_dialog {
     # Loop so 'Probe' can pop the read-only detail dialog and return here.
     while (1) {
         my $dlg = ($S->{anchor} // $status)->DialogBox(-title => "Reservation $ip",
-            -buttons => ['Edit', 'Probe', 'Push', 'Move', 'Release', 'Cancel']);
+            -buttons => [ 'Edit', 'Probe', 'Push', 'Move',
+                          (ap_at($S->{model}, $ip) ? ('AP') : ()),
+                          'Release', 'Cancel' ]);
         my $seen = last_seen_str($S->{model}, $ip);
         $dlg->add('Label', -text =>
             sprintf("%s\nMAC:  %s\nName: %s\nGroup: %s\nLast seen: %s",
@@ -2931,6 +3057,12 @@ sub release_dialog {
         if (!defined $resp || $resp =~ /^ERR/) { $status->configure(-text => " $resp"); return }
         $S->{model} = gather($cli); $redraw->();
         $status->configure(-text => " released $ip");
+    } elsif ($ans eq 'AP') {
+        # A branch of the dispatch chain, not nested inside Release — placed
+        # there first time round it was unreachable dead code that still
+        # compiled, because $ans is 'Release' throughout that block.
+        my $ap = ap_at($S->{model}, $ip);
+        ap_dialog($cli, $S, $ip, $ap, $redraw, $status) if $ap;
     } elsif ($ans eq 'Move') {
         move_dialog($cli, $S, $ip, $r, $redraw, $status);
     } elsif ($ans eq 'Push') {
