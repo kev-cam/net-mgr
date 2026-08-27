@@ -619,12 +619,20 @@ sub _is_live_source {
 # reservation is real and the operator's likeliest intent on seeing a squatter
 # is to move or release it, so dropping through to the "reserve this address"
 # arm would offer to create a reservation that already exists.
-# 'orphan_resv' is deliberately NOT listed - that is pre-existing behaviour and
-# whether a drifted cell should offer release is a separate question from this
-# fix, so it is left exactly as it was rather than changed in passing.
+# 'orphan_resv' IS listed now. It was left out as a deliberately deferred
+# question, and the answer turned out to be a bug: a drifted cell fell through
+# to the "reserve this address" arm, which prefills the MAC from leased or
+# observed data. A drifted reservation has neither at that address — the device
+# is elsewhere, which is what drifted means — so the edit dialog opened on an
+# existing reservation with an EMPTY MAC field, and saving it failed with "bad
+# MAC". Moving wndr6400-up to .10 and then trying to edit it hit exactly this.
+#
+# A drifted row is still a reservation, and the useful actions on it (move,
+# release, edit) are the same as for any other.
 sub _state_offers_release {
     my ($st) = @_;
-    return ($st eq 'reserved' || $st eq 'active' || $st eq 'conflict') ? 1 : 0;
+    return ($st eq 'reserved' || $st eq 'active' || $st eq 'conflict'
+         || $st eq 'orphan_resv') ? 1 : 0;
 }
 
 # Which MAC is actually on $ip right now, per the model. The lease wins over an
@@ -2582,7 +2590,14 @@ sub reserve_dialog {
     # or the DHCP hostname — so reserving uses its own name when none is given.
     my $known = $S->{model}{mac_name}{ lc($mac // '') };
     $known //= $S->{model}{leased}{$ip}{hostname} if $S->{model}{leased}{$ip};
-    my %v = (ip => $ip, mac => $mac,
+    # Fall back to the reservation's OWN mac. The caller prefills from leased /
+    # observed data, which is empty for a reservation whose device has drifted
+    # elsewhere — and an edit dialog that silently drops the row's MAC is worse
+    # than one that refuses to open: the operator sees a blank field and cannot
+    # tell whether the record lost it or the form did.
+    my %v = (ip => $ip,
+        mac => ((defined $mac && length $mac) ? $mac
+                : ($existing && defined $existing->{mac}) ? $existing->{mac} : ''),
         # Both branches go through bare_name: the stored value may be
         # qualified, and so may a DHCP-supplied hostname.
         name  => bare_name(($existing && defined $existing->{name} && length $existing->{name})
