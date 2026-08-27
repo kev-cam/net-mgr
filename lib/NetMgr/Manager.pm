@@ -5262,8 +5262,44 @@ sub _obs_sms_contact_delete {
 # tells this node to regenerate its own dnsmasq config from its DB replica and
 # reload. Honoured only if [dnsmasq] mode isn't 'off' (i.e. this node manages a
 # local dnsmasq). Forked + reaped like any trigger; a single regen at a time.
+# A push from the master arrives here as OBSERVE kind=regen_dnsmasq. On a
+# FOLLOWER the relay is a separate process writing replicated rows straight to
+# the DB, so _emit_change never runs and the dnsmasq client's doorbell
+# (SUBSCRIBE sub=1 mode=stream FROM dhcp_reservations) never rings. It would
+# then sit until its own refresh timer expired - or forever, on a build with no
+# such timer. Ringing it here turns the master's push into an immediate local
+# re-POLL, which is what puts a reservation into the running server.
+#
+# The row carried is a live, unmodified reservation sent as an 'update', so any
+# other consumer that actually applies rows treats it as an idempotent no-op;
+# only the dnsmasq client, which reads every streamed ROW as "something
+# changed" and re-POLLs for the rendered config, acts on it.
+sub _ring_dnsmasq_doorbell {
+    my ($self) = @_;
+    my $listeners = 0;
+    for my $cli (values %{ $self->{clients} }) {
+        my $subs = $cli->{subs} or next;
+        for my $sub (values %$subs) {
+            next unless ($sub->{table} // '') eq 'dhcp_reservations';
+            next unless ($sub->{mode}  // '') eq 'stream'
+                     || ($sub->{mode}  // '') eq 'snapshot+stream';
+            $listeners++;
+        }
+    }
+    return 0 unless $listeners;
+    my $rows = eval { $self->{db}->query_table('dhcp_reservations') } || [];
+    my $row  = $rows->[0] or return 0;
+    $self->_emit_change(table => 'dhcp_reservations', op => 'update', row => $row);
+    $self->_log("regen_dnsmasq: rang dhcp_reservations doorbell for $listeners consumer(s)");
+    return $listeners;
+}
+
 sub _obs_regen_dnsmasq {
     my ($self, $cli, $kv) = @_;
+    # Ring first: a netmgr-fed dnsmasq pulls its whole config over the socket
+    # and needs no generated file, so the doorbell must not sit behind
+    # [dnsmasq] mode=off the way the file regeneration below does.
+    $self->_ring_dnsmasq_doorbell();
     my $mode = $self->{config}{dnsmasq}{mode} // 'off';
     if ($mode eq 'off') { $self->_log("regen_dnsmasq: ignored ([dnsmasq] mode=off)"); return () }
     my $bin = $self->_producer_path('net-gen-dnsmasq');
