@@ -2533,6 +2533,42 @@ sub _resv_index {
     }
 }
 
+# Strip the fleet's own domain off a name for display/editing.
+#
+# Names reach the reservation table both bare (wc11) and qualified
+# (wc12.grfx.com) depending on which producer wrote them — a DHCP hostname
+# arrives qualified, a hand-typed one does not. Showing the qualified form in
+# the edit box means the operator either keeps re-saving it or trims it by
+# hand, and the inconsistency then leaks into everything that matches on names:
+# it is exactly what stopped sequence_hint recognising wc12.grfx.com as part of
+# the wc series.
+#
+# Only the CONFIGURED domain is removed, not any dot-suffix, so a name that
+# legitimately contains a dot is left alone.
+{
+    my $_dom;                       # cached; the config does not change mid-run
+    sub _fleet_domain {
+        return $_dom if defined $_dom;
+        $_dom = '';
+        for my $p ($ENV{NET_MGR_CONF} // '/etc/net-mgr/config') {
+            next unless -r $p;
+            my $cfg = eval { NetMgr::Config->load($p) } or next;
+            $_dom = $cfg->{dns}{domain} // '';
+            last;
+        }
+        return $_dom;
+    }
+}
+
+sub bare_name {
+    my ($n) = @_;
+    return $n unless defined $n && length $n;
+    my $dom = _fleet_domain();
+    return $n unless length $dom;
+    $n =~ s/\.\Q$dom\E\.?\z//i;
+    return $n;
+}
+
 sub reserve_dialog {
     my ($cli, $S, $ip, $mac, $redraw, $status) = @_;
     # A reservation already at $ip means we're EDITING it (e.g. the Edit button in
@@ -2547,8 +2583,10 @@ sub reserve_dialog {
     my $known = $S->{model}{mac_name}{ lc($mac // '') };
     $known //= $S->{model}{leased}{$ip}{hostname} if $S->{model}{leased}{$ip};
     my %v = (ip => $ip, mac => $mac,
-        name  => ($existing && defined $existing->{name} && length $existing->{name})
-                   ? $existing->{name} : ($known // ''),
+        # Both branches go through bare_name: the stored value may be
+        # qualified, and so may a DHCP-supplied hostname.
+        name  => bare_name(($existing && defined $existing->{name} && length $existing->{name})
+                   ? $existing->{name} : ($known // '')),
         group => ($existing && defined $existing->{grp}) ? $existing->{grp} : '');
     # known groups for convenience
     my %groups; $groups{ $_->{grp} } = 1 for grep { $_->{grp} } values %{ $S->{model}{resv} };
