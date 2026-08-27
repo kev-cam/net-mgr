@@ -417,6 +417,11 @@ install: .version
 #             (e.g. SUDO=sudo for hosts where you don't ssh as root)
 #   KEEP      set to 1 to leave /tmp/<user>/net-mgr in place
 #   MAKEARGS  extra args appended to the remote 'make install'
+# Public half of the identity this host presents to a deployed dnsmasq's
+# event socket. Pushed to each target as /etc/net-mgr/event-allowed_signers
+# by install-on; set EVENT_KEY_PUB= empty to skip pushing it entirely.
+EVENT_KEY_PUB ?= /etc/ssh/ssh_host_ed25519_key.pub
+
 REMOTE_TMP ?= /tmp/$(USER)/net-mgr
 SUDO       ?=
 SSHOPTS    ?=
@@ -465,6 +470,23 @@ install-on: .version
 	  rsync -az -e "ssh $(SSHOPTS)" --rsync-path="$(SUDO) rsync" \
 	    "$$overlay/" $(SSHTGT):/etc/net-mgr/ \
 	    || echo "  *** overlay rsync failed (continuing)"; \
+	fi
+	@# Our dnsmasq refuses to serve lease state until the consumer proves who
+	@# it is, and THIS FILE IS THE GATE: with no allowed-signers file the socket
+	@# stays open exactly as before, so a gateway must be given the key before
+	@# it will accept anyone. Deploying it here means the gate closes at the same
+	@# moment the binary that honours it arrives - no ordering to get right, and
+	@# no window where a freshly rebuilt gateway goes deaf. One line, this host
+	@# only: the master is the sole permitted consumer of a gateway's leases.
+	pub=$(EVENT_KEY_PUB); \
+	if [ -n "$$pub" ] && [ -r "$$pub" ]; then \
+	  who=$$(hostname -s); \
+	  echo "==> $(TARGET): event-socket signer -> /etc/net-mgr/event-allowed_signers ($$who)"; \
+	  awk -v w="$$who" '{print w, $$1, $$2}' "$$pub" \
+	    | ssh $(SSHOPTS) $(SSHTGT) "$(SUDO) sh -c 'mkdir -p /etc/net-mgr && cat > /etc/net-mgr/event-allowed_signers && chmod 0644 /etc/net-mgr/event-allowed_signers'" \
+	    || echo "  *** event signer push failed (continuing)"; \
+	else \
+	  echo "==> $(TARGET): no readable $$pub - event socket left ungated"; \
 	fi
 	@echo "==> $(TARGET): $(SUDO) make -C $(REMOTE_TMP) install $(MAKEARGS)"
 	@ssh $(RUNOPTS) $(SSHTGT) "$(SUDO) make -C $(REMOTE_TMP) install $(MAKEARGS)"

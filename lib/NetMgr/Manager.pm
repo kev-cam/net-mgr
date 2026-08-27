@@ -6714,8 +6714,117 @@ sub _handle_dnsmasq_data {
     }
     $L->{buffer} .= $buf;
     while ($L->{buffer} =~ s/^([^\n]*)\n//) {
-        $self->_process_dnsmasq_event($1, $key);
+        $self->_dnsmasq_line($1, $key);
     }
+}
+
+# ---- event-socket AUTH -------------------------------------------------
+#
+# Our dnsmasq fork will not say anything until the consumer proves who it
+# is: it sends AUTH-REQUIRED with a nonce, we return an SSHSIG over that
+# nonce, and it checks the signature against the allowed-signers file nas3
+# deploys alongside the dnsmasq install. A build without the gate, or a
+# gateway whose key has not landed yet, never sends the challenge, so none
+# of this costs anything there.
+#
+# The namespace is PINNED to netmgr-event rather than taken from the ns= the
+# server advertises. A hostile listener could otherwise nominate 'net-mgr'
+# and collect from us a signature valid for the control plane's own AUTH
+# exchange, turning a lease feed into a credential oracle.
+my $EVENT_SIG_NS = 'netmgr-event';
+
+sub _shq {
+    my ($s) = @_;
+    return "''" unless defined $s && length $s;
+    return $s if $s =~ m{^[A-Za-z0-9_./=,\@:-]+$};
+    (my $q = $s) =~ s/'/'\''/g;
+    return "'$q'";
+}
+
+# The daemon runs as root, so it signs with the node's ssh HOST key and
+# calls itself by its short hostname; that needs no new key material and
+# no agent. Both are overridable for a node whose identity differs.
+sub _dnsmasq_event_identity {
+    my ($self) = @_;
+    my $cfg = $self->{config}{dnsmasq} // {};
+    my $key = $cfg->{event_key} // '/etc/ssh/ssh_host_ed25519_key';
+    my $who = $cfg->{event_principal};
+    unless (defined $who && length $who) {
+        require Sys::Hostname;
+        $who = Sys::Hostname::hostname() // '';
+        $who =~ s/\..*$//;
+    }
+    return ($key, $who);
+}
+
+sub _dnsmasq_event_auth {
+    my ($self, $key, $nonce) = @_;
+    my $L = $self->{dnsmasq_listeners}{$key} or return;
+    my ($key_file, $principal) = $self->_dnsmasq_event_identity;
+
+    unless (-r $key_file) {
+        $self->_log("dnsmasq $key: challenged, but signing key '$key_file' "
+                  . "is unreadable - cannot attach");
+        return $self->_drop_dnsmasq_listener($key);
+    }
+
+    require File::Temp;
+    my $tn = File::Temp->new;
+    binmode $tn; print $tn $nonce; $tn->flush;
+    my $ts = File::Temp->new(SUFFIX => '.sig');
+
+    # setsid/timeout for the same reason NetMgr::Client does it: an
+    # encrypted key makes ssh-keygen block on /dev/tty, which would wedge
+    # the daemon's whole main loop rather than just this connection.
+    my $base = "ssh-keygen -q -Y sign -n $EVENT_SIG_NS -f " . _shq($key_file)
+             . " < " . _shq($tn->filename)
+             . " > " . _shq($ts->filename) . " 2>/dev/null";
+    my $has_timeout = -x '/usr/bin/timeout' || -x '/bin/timeout';
+    my $has_setsid  = -x '/usr/bin/setsid'  || -x '/bin/setsid';
+    my $cmd = ($has_timeout || $has_setsid)
+        ? join(' ', ($has_timeout ? ('timeout', '8') : ()),
+                    ($has_setsid  ? ('setsid')       : ()),
+                    'sh', '-c', _shq($base))
+        : $base;
+
+    if (system($cmd) != 0) {
+        $self->_log("dnsmasq $key: could not sign the challenge with "
+                  . "'$key_file' - cannot attach");
+        return $self->_drop_dnsmasq_listener($key);
+    }
+    open my $sf, '<', $ts->filename
+        or return $self->_drop_dnsmasq_listener($key);
+    my $sig = do { local $/; <$sf> };
+    close $sf;
+    unless (defined $sig && $sig =~ /BEGIN SSH SIGNATURE/) {
+        $self->_log("dnsmasq $key: ssh-keygen produced no signature");
+        return $self->_drop_dnsmasq_listener($key);
+    }
+
+    # Block only for this write: the signature is one small burst and a
+    # partial non-blocking write would desynchronise the handshake.
+    $L->{sock}->blocking(1);
+    my $ok = eval { my $fh = $L->{sock}; print $fh "AUTH principal=$principal\n", $sig; 1 };
+    eval { $L->{sock}->blocking(0) };
+    return $self->_drop_dnsmasq_listener($key) unless $ok;
+    $self->_log("dnsmasq $key: answered challenge as '$principal'");
+}
+
+# Control lines from the event socket; everything else is a lease event.
+sub _dnsmasq_line {
+    my ($self, $line, $key) = @_;
+    if ($line =~ /^AUTH-REQUIRED\b/) {
+        my ($nonce) = $line =~ /\bnonce=([0-9a-f]{8,})/;
+        return $self->_dnsmasq_event_auth($key, $nonce) if defined $nonce;
+        $self->_log("dnsmasq $key: AUTH-REQUIRED without a usable nonce");
+        return $self->_drop_dnsmasq_listener($key);
+    }
+    if ($line =~ /^ERR\b/) {
+        $self->_log("dnsmasq $key: refused our identity ($line)");
+        return $self->_drop_dnsmasq_listener($key);
+    }
+    return if $line =~ /^OK\b/;
+    return $self->_process_dnsmasq_event($line, $key);
 }
 
 # Wire format from src/event-socket.c in our patched dnsmasq:
