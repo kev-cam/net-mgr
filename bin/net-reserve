@@ -2811,6 +2811,34 @@ sub reserve_dialog {
             $row->Button(-text => 'Edit that instead',
                          -command => sub { $v{ip} = $other_resv; $rebuild->() })
                 ->pack(-side => 'left', -padx => 6);
+            # ...and let it be deleted from here. This dialog is reached by
+            # clicking the address where the device actually IS, which has no
+            # reservation of its own and so offers no Release — while the
+            # reservation the operator wants gone sits at another address they
+            # would have to navigate to. Offering only "edit that" made the
+            # stray reservation visible but not removable from the one place
+            # its existence is obvious.
+            $row->Button(-text => 'Release that',
+                -command => sub {
+                    my $nm = (defined $r->{name} && length $r->{name})
+                             ? " ($r->{name})" : '';
+                    my $ok = lc(($S->{anchor} // $status)->messageBox(
+                        -type => 'yesno', -icon => 'warning',
+                        -title => 'Release reservation',
+                        -message => "Release the reservation at $other_resv$nm?\n\n"
+                                  . "The device stays where it is; only the\n"
+                                  . "reservation is removed."));
+                    return unless $ok eq 'yes';
+                    my $resp = $cli->observe(kind => 'dhcp_reservation_delete',
+                                             ip => ($r->{ip} // $other_resv));
+                    if (!defined $resp || $resp =~ /^ERR/) {
+                        $status->configure(-text => " $resp"); return;
+                    }
+                    $S->{model} = gather($cli);
+                    $redraw->();
+                    $status->configure(-text => " released $other_resv");
+                    $rebuild->();
+                })->pack(-side => 'left', -padx => 2);
         }
         if (defined $other_cur && (!defined $other_resv || $other_cur ne $other_resv)) {
             my $row = $dlg->add('Frame')->pack(-fill => 'x', -pady => 1);
