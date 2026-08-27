@@ -418,7 +418,7 @@ install: .version
 #   KEEP      set to 1 to leave /tmp/<user>/net-mgr in place
 #   MAKEARGS  extra args appended to the remote 'make install'
 # Public half of the identity this host presents to a deployed dnsmasq's
-# event socket. Pushed to each target as /etc/net-mgr/event-allowed_signers
+# event socket. Pushed to each target as /etc/net-mgr/allowed_dns
 # by install-on; set EVENT_KEY_PUB= empty to skip pushing it entirely.
 EVENT_KEY_PUB ?= /etc/ssh/ssh_host_ed25519_key.pub
 
@@ -471,20 +471,32 @@ install-on: .version
 	    "$$overlay/" $(SSHTGT):/etc/net-mgr/ \
 	    || echo "  *** overlay rsync failed (continuing)"; \
 	fi
-	@# Our dnsmasq refuses to serve lease state until the consumer proves who
-	@# it is, and THIS FILE IS THE GATE: with no allowed-signers file the socket
-	@# stays open exactly as before, so a gateway must be given the key before
-	@# it will accept anyone. Deploying it here means the gate closes at the same
-	@# moment the binary that honours it arrives - no ordering to get right, and
-	@# no window where a freshly rebuilt gateway goes deaf. One line, this host
-	@# only: the master is the sole permitted consumer of a gateway's leases.
+	@# Our dnsmasq serves no lease state until the consumer proves who it is,
+	@# and THIS FILE IS THE GATE: with no allowed_dns the socket stays open as
+	@# before, so a gateway must be given the file before it will accept anyone.
+	@# Deploying it here means the gate closes at the same moment the binary that
+	@# honours it arrives - no ordering to get right, and no window where a
+	@# freshly rebuilt gateway goes deaf.
+	@#
+	@# [updaters] gets this host's key alone: the master is the authority, and
+	@# every other node receives lease data by replication instead. Anything you
+	@# want ADDED - a [readers] key for a person or a debugging box - belongs in
+	@# /etc/net-mgr/allowed_dns.extra on THIS host, which is appended verbatim
+	@# below. Editing allowed_dns on the target does not survive: this step
+	@# rewrites it on every install, by design, so the fleet has one source.
 	pub=$(EVENT_KEY_PUB); \
 	if [ -n "$$pub" ] && [ -r "$$pub" ]; then \
 	  who=$$(hostname -s); \
-	  echo "==> $(TARGET): event-socket signer -> /etc/net-mgr/event-allowed_signers ($$who)"; \
-	  awk -v w="$$who" '{print w, $$1, $$2}' "$$pub" \
-	    | ssh $(SSHOPTS) $(SSHTGT) "$(SUDO) sh -c 'mkdir -p /etc/net-mgr && cat > /etc/net-mgr/event-allowed_signers && chmod 0644 /etc/net-mgr/event-allowed_signers'" \
-	    || echo "  *** event signer push failed (continuing)"; \
+	  extra=/etc/net-mgr/allowed_dns.extra; \
+	  echo "==> $(TARGET): allowed_dns <- [updaters] $$who$$([ -r $$extra ] && echo ' + allowed_dns.extra')"; \
+	  { echo "# Managed by net-mgr install-on from $$who - local edits here are"; \
+	    echo "# overwritten. Add keys to /etc/net-mgr/allowed_dns.extra on $$who."; \
+	    echo "[updaters]"; \
+	    awk -v w="$$who" '{print w, $$1, $$2}' "$$pub"; \
+	    [ -r "$$extra" ] && { echo; cat "$$extra"; }; \
+	    true; } \
+	  | ssh $(SSHOPTS) $(SSHTGT) "$(SUDO) sh -c 'mkdir -p /etc/net-mgr && cat > /etc/net-mgr/allowed_dns && chmod 0644 /etc/net-mgr/allowed_dns && rm -f /etc/net-mgr/event-allowed_signers'" \
+	    || echo "  *** allowed_dns push failed (continuing)"; \
 	else \
 	  echo "==> $(TARGET): no readable $$pub - event socket left ungated"; \
 	fi
