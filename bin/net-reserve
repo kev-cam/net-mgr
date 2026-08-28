@@ -3019,7 +3019,7 @@ sub reserve_dialog {
         $force = 1;          # 'No' — caller insists on a second reservation
     }
     my $r = $cli->observe(kind => 'dhcp_reservation', ip => $v{ip}, mac => lc $v{mac},
-        ($v{name}  ne '' ? (name => $v{name})  : ()),
+        ($v{name}  ne '' ? (name => bare_name($v{name}))  : ()),
         subnet_cidr => subnet_of($v{ip}),
         ($v{group} ne '' ? (grp  => $v{group}) : ()),
         ($force ? (force => 1) : ()));

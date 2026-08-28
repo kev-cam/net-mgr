@@ -4839,6 +4839,19 @@ sub _obs_dhcp_reservation {
     die "dhcp_reservation: ip required\n"  unless defined $ip  && length $ip;
     die "dhcp_reservation: bad ip '$ip'\n"
         unless $ip =~ /\A\d+\.\d+\.\d+\.\d+\z/;
+    # Reservation names are HOST LABELS, not FQDNs: net-gen-dnsmasq appends the
+    # fleet domain itself when it writes the hosts section, so a stored
+    # "wc13.grfx.com" is emitted as "wc13.grfx.com  wc13.grfx.com.grfx.com" and
+    # the host stops answering to its own short name. The GUI strips the domain
+    # when it PRE-FILLS the field, but not on save, and any other client could
+    # send one too - so enforce it here, where every write lands.
+    if (defined $kv->{name} && length $kv->{name}) {
+        my $dom = $self->{config}{dns}{domain};
+        if (defined $dom) {
+            $dom =~ s/^\s+|\s+$//g;
+            $kv->{name} =~ s/\.\Q$dom\E\.?\z//i if length $dom;
+        }
+    }
     # Single fetch: reused for the duplicate-MAC guard AND the merge below,
     # so we don't hit the DB twice on the edit path.
     my $existing = $self->{db}->get_dhcp_reservation($ip);
