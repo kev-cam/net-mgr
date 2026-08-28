@@ -46,6 +46,9 @@
 
 VARIANT="${1:-custom}"
 FORCE="${FORCE:-0}"
+# Last-resort config clobber. OFF by default: the dnsmasq config files are the
+# fallback and are expected to be good, so a switch back must not replace them.
+RESTORE_DPKG_DIST="${RESTORE_DPKG_DIST:-0}"
 
 STATE_DIR=/var/lib/net-mgr
 STATE_FILE="$STATE_DIR/dnsmasq-variant"
@@ -91,28 +94,30 @@ if [ -r "$STATE_FILE" ]; then
     fi
 fi
 
-# Currently-serving-DHCP check — only interesting when going TO stock, since
-# that path drops sgy include fragments and can take down the subnet.
+# Currently-serving-DHCP check — going to stock restarts the service, and with
+# RESTORE_DPKG_DIST=1 it also replaces the live config, which is far worse.
 if [ "$VARIANT" = "stock" ]; then
     live_dhcp=no
     if systemctl is-active --quiet dnsmasq 2>/dev/null; then
         live_dhcp=yes
     fi
-    if [ "$live_dhcp" = "yes" ]; then
+    if [ "$live_dhcp" = "yes" ] && [ "$RESTORE_DPKG_DIST" = "1" ]; then
         echo "  ****************************************************************"
-        echo "  * WARNING: dnsmasq is ACTIVE on this host. Switching to 'stock' *"
-        echo "  * will overwrite /etc/dnsmasq.conf with the dpkg-dist default,  *"
+        echo "  * WARNING: RESTORE_DPKG_DIST=1 and dnsmasq is ACTIVE. This will *"
+        echo "  * overwrite /etc/dnsmasq.conf with the dpkg-dist default,       *"
         echo "  * dropping any /usr/local/sgy/conf.d/dnsmasq-* include lines    *"
         echo "  * the running config pulls in. DHCP for served subnets will be  *"
         echo "  * DOWN until you flip back with variant=custom.                 *"
-        echo "  * (backup of the live conf is written to $BAK_CONF)"
+        echo "  * (backup of the live conf is written to $BAK_CONF)             *"
         echo "  ****************************************************************"
         if [ "$FORCE" != "1" ]; then
             echo "  (set FORCE=1 in env to acknowledge and proceed non-interactively)"
         fi
+    elif [ "$live_dhcp" = "yes" ]; then
+        echo "  note: dnsmasq is active; it will be restarted. The config files are"
+        echo "        kept as-is, so DHCP comes back on the same configuration."
     fi
 fi
-
 rc_overall=0
 
 case "$VARIANT" in
@@ -134,30 +139,42 @@ custom)
     step "run $IMPL local" "$IMPL" local || rc_overall=$?
     ;;
 stock)
-    # Try the swap script first if present — swap-dnsmasq system cleanly
-    # stops dnsmasq-local and starts dnsmasq.service (same /etc/dnsmasq.conf
-    # on both sides, so no config restore needed). The dpkg-dist restore
-    # below is belt-and-suspenders for a fresh host without the tree yet, or
-    # if swap-dnsmasq itself fails (UNTESTED per user).
+    # swap-dnsmasq system stops dnsmasq-local and starts dnsmasq.service against
+    # the SAME /etc/dnsmasq.conf, so there is nothing to restore: the config
+    # files ARE the fallback and they are good.
+    #
+    # This used to overwrite /etc/dnsmasq.conf from dpkg-dist unconditionally,
+    # turning a clean service flip into config loss - the sgy include fragments
+    # went with it and took DHCP down until someone flipped back. That is now
+    # opt-in via RESTORE_DPKG_DIST=1 and should stay a genuine last resort, for
+    # a host whose config is actually broken rather than merely switched.
     if [ -x "$IMPL" ]; then
         step "run $IMPL system" "$IMPL" system || rc_overall=$?
+    elif [ "$RESTORE_DPKG_DIST" != "1" ]; then
+        echo "  ERROR: switch impl '$IMPL' not found or not executable"
+        echo "  Nothing has been changed; the config files are intact."
+        echo "  TODO: install the tree + binary on this host, then retry:"
+        echo "          net-cluster --peers nas3 --auth observe \\"
+        echo "            kind=deploy_dnsmasq host=$(hostname -s) confirm=1"
+        echo "        or, as a LAST RESORT, re-run with RESTORE_DPKG_DIST=1 to"
+        echo "        overwrite $LIVE_CONF with the packaged default."
+        exit 3
     else
         echo "step: run swap-dnsmasq system ... skip ('$IMPL' not present)"
     fi
-    # Guaranteed fallback: restore /etc/dnsmasq.conf from dpkg-dist and
-    # restart dnsmasq. Idempotent — an unchanged file just gets copied over
-    # itself. Backup the live conf first so the flip is reversible even from
-    # here (variant=custom will invoke the manual script; if that's missing
-    # the operator can `cp $BAK_CONF $LIVE_CONF` by hand).
-    if [ -r "$DPKG_DIST" ]; then
-        if [ -r "$LIVE_CONF" ]; then
-            step "backup $LIVE_CONF -> $BAK_CONF" cp -p "$LIVE_CONF" "$BAK_CONF" \
+    if [ "$RESTORE_DPKG_DIST" = "1" ]; then
+        if [ -r "$DPKG_DIST" ]; then
+            if [ -r "$LIVE_CONF" ]; then
+                step "backup $LIVE_CONF -> $BAK_CONF" cp -p "$LIVE_CONF" "$BAK_CONF" \
+                    || rc_overall=$?
+            fi
+            step "restore $LIVE_CONF from $DPKG_DIST" cp -p "$DPKG_DIST" "$LIVE_CONF" \
                 || rc_overall=$?
+        else
+            echo "step: restore dpkg-dist ... skip ($DPKG_DIST not present)"
         fi
-        step "restore $LIVE_CONF from $DPKG_DIST" cp -p "$DPKG_DIST" "$LIVE_CONF" \
-            || rc_overall=$?
     else
-        echo "step: restore dpkg-dist ... skip ($DPKG_DIST not present)"
+        echo "step: restore dpkg-dist ... skip (config kept; RESTORE_DPKG_DIST=1 forces it)"
     fi
     if systemctl is-enabled dnsmasq >/dev/null 2>&1 \
        || systemctl is-active dnsmasq >/dev/null 2>&1; then
