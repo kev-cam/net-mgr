@@ -339,6 +339,23 @@ sub load {
                 croak "$p:$lineno: bad [uplinks] line: $line";
             }
 
+            # [hosts] keys are TARGET PATHS, not identifiers:
+            #
+            #     [hosts]
+            #     /etc/hosts = /etc/hosts.grfx,/etc/hosts.dhcp
+            #
+            # The key names the file to assemble and the value lists the
+            # fragments to concatenate, in order. The generic key pattern below
+            # only accepts identifier-shaped keys, so a path would be a parse
+            # error - and here the key IS the destination, which is what makes
+            # several targets expressible in one section.
+            if ($section eq 'hosts' && $line =~ m{^(/[^\s=]+)\s*=\s*(.*)$}) {
+                my ($k, $v) = ($1, $2);
+                $v =~ s/^"(.*)"$/$1/;
+                $cfg->{hosts}{$k} = $v;
+                next;
+            }
+
             if ($line =~ /^([A-Za-z_][\w-]*)\s*=\s*(.*)$/) {
                 my ($k, $v) = ($1, $2);
                 $v =~ s/^"(.*)"$/$1/;

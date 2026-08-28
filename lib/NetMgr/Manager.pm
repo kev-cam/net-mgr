@@ -5385,6 +5385,35 @@ sub _ring_dnsmasq_doorbell {
     return $listeners;
 }
 
+# OBSERVE kind=regen_hosts — rebuild the DHCP hosts fragment and reassemble the
+# [hosts] targets on THIS node. A no-op where no [hosts] section exists, which
+# is what makes it safe to fan out to every peer rather than only to DHCP
+# servers: /etc/hosts matters on any machine someone types a name on, and the
+# master is usually not a dnsmasq node at all.
+sub _obs_regen_hosts {
+    my ($self, $cli, $kv) = @_;
+    my $cfg = $self->{config}{hosts};
+    return () unless ref $cfg eq 'HASH' && %$cfg;
+    my $bin = $self->_producer_path('net-gen-hosts');
+    unless ($bin && -x $bin) { $self->_log("regen_hosts: net-gen-hosts missing"); return () }
+    if (grep { ($_->{name} // '') eq 'regen-hosts' } values %{ $self->{triggers} }) {
+        return ();   # one in flight already
+    }
+    my $pid = fork();
+    return () unless defined $pid;
+    if ($pid == 0) {
+        for my $c (values %{ $self->{clients} }) { close $c->{sock} if $c->{sock} }
+        close $self->{listen} if $self->{listen};
+        $ENV{NET_MGR_LISTEN} = $self->_self_connect_addr;
+        exec $bin;
+        exit 127;
+    }
+    $self->_log("regen_hosts: net-gen-hosts pid=$pid (told by "
+              . ($cli->{ident} // '?') . ")");
+    $self->{triggers}{$pid} = { cli_fd => undef, name => 'regen-hosts', started_at => time() };
+    return ();
+}
+
 sub _obs_regen_dnsmasq {
     my ($self, $cli, $kv) = @_;
     # Ring first: a netmgr-fed dnsmasq pulls its whole config over the socket
@@ -5433,6 +5462,11 @@ sub _broadcast_regen_dnsmasq {
     # Always fire locally — _obs_regen_dnsmasq handles mode-off / in-flight.
     eval { $self->_obs_regen_dnsmasq({ ident => 'self' }, {}) };
     $self->_log("regen_dnsmasq self-fire failed: $@") if $@;
+    # /etc/hosts is rebuilt on the same trigger: a DHCP change is exactly when
+    # the hosts fragment goes stale, and a stale line there outranks DNS for
+    # every local tool (ping, ssh, curl) that goes through the system resolver.
+    eval { $self->_obs_regen_hosts({ ident => 'self' }, {}) };
+    $self->_log("regen_hosts self-fire failed: $@") if $@;
     # Debounce network fan-out: a bulk import shouldn't do N_peers * N_rows
     # connect/observe/bye round-trips on the main path.
     my $now = time();
@@ -5456,7 +5490,6 @@ sub _broadcast_regen_dnsmasq {
         my %caps = map { $_ => 1 }
                    grep { length }
                    split /,/, ($r->{capabilities} // '');
-        next unless $caps{dnsmasq};
         my $addr = eval { $self->{mesh}->address_for($member) }
                 || "$member:7531";
         my $ok = eval {
@@ -5464,7 +5497,11 @@ sub _broadcast_regen_dnsmasq {
             my $c = NetMgr::Client->new(listen => $addr, timeout => 6);
             $c->hello(consumer => "regen-dnsmasq-fanout.$$");
             eval { $c->auth };   # tolerate no-key (mirrors _forward_observe_to_master)
-            $c->observe(kind => 'regen_dnsmasq');
+            # Hosts on EVERY node - a machine need not serve DHCP for someone
+            # to type a name at it, and the master usually serves none. A node
+            # with no [hosts] section treats this as a no-op.
+            $c->observe(kind => 'regen_hosts');
+            $c->observe(kind => 'regen_dnsmasq') if $caps{dnsmasq};
             $c->bye;
             1;
         };
@@ -6008,6 +6045,7 @@ sub _handle_observe {
                                        { @events = $self->_obs_sms_contact_delete($cli, $kv) }
         elsif ($kind eq 'ap_exclude')  { @events = $self->_obs_ap_exclude($cli, $kv) }
         elsif ($kind eq 'regen_dnsmasq'){ @events = $self->_obs_regen_dnsmasq($cli, $kv) }
+        elsif ($kind eq 'regen_hosts')   { @events = $self->_obs_regen_hosts($cli, $kv) }
         elsif ($kind eq 'self_update') { @events = $self->_obs_self_update($cli, $kv) }
         elsif ($kind eq 'deploy')      { @events = $self->_obs_deploy($cli, $kv) }
         elsif ($kind eq 'deploy_dnsmasq') { @events = $self->_obs_deploy_dnsmasq($cli, $kv) }
