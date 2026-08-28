@@ -481,10 +481,12 @@ install-on: .version
 	@# [updaters] gets this host's key alone: the master is the authority, and
 	@# every other node receives lease data by replication instead. Keys to ADD
 	@# live on THIS host as /etc/net-mgr/allowed_dns.<pattern>, where <pattern>
-	@# is a target hostname, or a prefix with a trailing '=' for a wildcard:
+	@# is a target hostname in which '=' stands for '.*', the same shorthand
+	@# net-lookup takes on the command line, matched against the whole name:
 	@#
 	@#     allowed_dns.gateway=   every host whose name starts "gateway"
-	@#     allowed_dns.gateway3   that host alone
+	@#     allowed_dns.=gateway=  every host with "gateway" anywhere in it
+	@#     allowed_dns.gateway3   that host alone (no '=', so exact)
 	@#     allowed_dns.=          every target
 	@#
 	@# All files matching the target are appended verbatim, sorted, so a reader
@@ -499,10 +501,8 @@ install-on: .version
 	  for x in /etc/net-mgr/allowed_dns.*; do \
 	    [ -r "$$x" ] || continue; \
 	    pat=$${x##*/allowed_dns.}; \
-	    case "$$pat" in \
-	      *=) case "$$tgt" in $${pat%=}*) : ;; *) continue ;; esac ;; \
-	      *)  [ "$$pat" = "$$tgt" ] || continue ;; \
-	    esac; \
+	    glob=`printf '%s' "$$pat" | tr '=' '*'`; \
+	    case "$$tgt" in $$glob) : ;; *) continue ;; esac; \
 	    extras="$$extras $$x"; \
 	  done; \
 	  echo "==> $(TARGET): allowed_dns <- [updaters] $$who$$([ -n "$$extras" ] && echo " +$$extras")"; \
