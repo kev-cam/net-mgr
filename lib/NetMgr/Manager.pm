@@ -3424,6 +3424,15 @@ sub _obs_deploy_dnsmasq {
 
     my $confirm = (($kv->{confirm} // '') eq '1') ? 1 : 0;
 
+    # host= names ONE target, so a gateway can be done without first adding it
+    # to [deploy] dnsmasq_hosts on the hub. It reaches make as TARGET=, so keep
+    # it to a plain hostname: no spaces, quotes or shell metacharacters.
+    my $host = $kv->{host};
+    if (defined $host && length $host) {
+        $host =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
+            or die "deploy_dnsmasq: refusing suspicious host '$host'\n";
+    }
+
     my $pid = fork();
     die "deploy_dnsmasq: fork failed: $!\n" unless defined $pid;
     if ($pid == 0) {
@@ -3431,6 +3440,7 @@ sub _obs_deploy_dnsmasq {
         for my $l (values %{ $self->{listeners} }) { close $l->{sock} if $l->{sock} }
         $ENV{NET_MGR_REPO} = $repo;
         $ENV{NET_MGR_DNSMASQ_CONFIRM} = $confirm;
+        $ENV{NET_MGR_DNSMASQ_HOST} = $host if defined $host && length $host;
         my $du = $self->{config}{deploy}{user};
         $ENV{NET_MGR_DEPLOY_USER} = $du if defined $du && length $du;
         { no warnings; exec $script; }
@@ -3439,7 +3449,9 @@ sub _obs_deploy_dnsmasq {
     $self->{triggers}{$pid} = { name => 'deploy-dnsmasq', started_at => time(),
                                 cli_fd => undef, who => $who };
     $self->_log("deploy_dnsmasq started pid=$pid by $who "
-              . ($confirm ? "(INSTALLING - DHCP will restart)" : "(dry run, no confirm=1)"));
+              . (defined $host && length $host ? "host=$host " : "all dnsmasq_hosts ")
+              . ($confirm ? "(INSTALLING to /usr/local/sbin; server not switched)"
+                          : "(dry run, no confirm=1)"));
     return ();
 }
 

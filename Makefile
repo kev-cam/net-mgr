@@ -590,15 +590,20 @@ deploy: .version
 DNSMASQ_REPO   ?= /usr/local/src/dnsmasq
 DNSMASQ_TMP    ?= /tmp/dnsmasq-deploy
 DNSMASQ_CFLAGS ?= -O2 -std=gnu17
+DNSMASQ_URL    ?= https://github.com/kev-cam/dnsmasq
+DNSMASQ_BRANCH ?= aws
 
 install-dnsmasq-on:
 	@if [ -z "$(TARGET)" ]; then \
 	  echo "Usage: make install-dnsmasq-on TARGET=host [CONFIRM=1] [SUDO=sudo]"; exit 2; \
 	fi
-	@# Refuse a stock tree: without event-socket.c this is not our fork, and
-	@# installing it would remove the lease feed net-mgr depends on.
-	@[ -f "$(DNSMASQ_REPO)/src/event-socket.c" ] || { \
-	  echo "$(DNSMASQ_REPO) is not our dnsmasq fork (no src/event-socket.c)"; exit 2; }
+	@# A missing repo is not an error: the fork is public, so the hub can fetch
+	@# it itself (see install-dnsmasq-go). An EXISTING tree that is not the fork
+	@# is refused, so a stock checkout can never be pushed over a patched build.
+	@if [ -e "$(DNSMASQ_REPO)" ] && [ ! -f "$(DNSMASQ_REPO)/src/event-socket.c" ]; then \
+	  echo "$(DNSMASQ_REPO) exists but is not our dnsmasq fork (no src/event-socket.c)"; \
+	  exit 2; \
+	fi
 	$(eval SSHTGT := $(shell t='$(TARGET)'; h=$${t##*@}; pre=$${t%$$h}; nl='$(NETLOOKUP)'; [ -n "$$nl" ] && ! command -v "$$nl" >/dev/null 2>&1 && nl=./bin/net-lookup; if [ -z "$$nl" ] || printf '%s' "$$h" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$$|:'; then printf '%s' "$$t"; else ip=$$($$nl "$$h" 2>/dev/null | head -1); [ -z "$$ip" ] && ip=$$($$nl "$${h%-*}" 2>/dev/null | head -1); [ -n "$$ip" ] && printf '%s' "$$pre$$ip" || printf '%s' "$$t"; fi))
 	@echo "==> $(TARGET) ($(SSHTGT)): dnsmasq fork from $(DNSMASQ_REPO)"
 	@# The guard has to switch TARGETS, not just exit: each recipe line runs in
@@ -621,6 +626,22 @@ install-dnsmasq-on:
 # install-dnsmasq-on with CONFIRM=1, which passes SSHTGT down already resolved.
 install-dnsmasq-go:
 	@[ -n "$(SSHTGT)" ] || { echo "install-dnsmasq-go: call install-dnsmasq-on, not this"; exit 2; }
+	@# Fetch the fork if the hub has no copy. kev-cam/dnsmasq is public and its
+	@# default branch IS the fork, so this needs no deploy key - the gateways
+	@# having no checkout was the whole reason the patched build could only ever
+	@# be made by hand. Refreshing an existing tree is opt-in (DNSMASQ_PULL=1)
+	@# so a deploy never silently ships something newer than was reviewed.
+	@if [ ! -d "$(DNSMASQ_REPO)/.git" ]; then \
+	  echo "==> cloning $(DNSMASQ_URL) ($(DNSMASQ_BRANCH)) -> $(DNSMASQ_REPO)"; \
+	  git clone --quiet --branch $(DNSMASQ_BRANCH) $(DNSMASQ_URL) $(DNSMASQ_REPO) \
+	    || { echo "  *** clone failed"; exit 2; }; \
+	elif [ "$(DNSMASQ_PULL)" = "1" ]; then \
+	  echo "==> refreshing $(DNSMASQ_REPO)"; \
+	  git -C $(DNSMASQ_REPO) pull --ff-only --quiet || { echo "  *** pull failed"; exit 2; }; \
+	fi
+	@[ -f "$(DNSMASQ_REPO)/src/event-socket.c" ] || { \
+	  echo "  *** $(DNSMASQ_REPO) is not our dnsmasq fork after preparation"; exit 2; }
+	@echo "==> source: $(DNSMASQ_REPO) @ `git -C $(DNSMASQ_REPO) log --oneline -1 2>/dev/null`"
 	@echo "==> $(TARGET): rsync $(DNSMASQ_REPO) -> $(DNSMASQ_TMP)"
 	@ssh $(SSHOPTS) $(SSHTGT) "mkdir -p $(DNSMASQ_TMP)"
 	@rsync -az --delete --exclude='.git/' --exclude='*.o' --exclude='src/dnsmasq' \

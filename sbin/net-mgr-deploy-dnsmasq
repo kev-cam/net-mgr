@@ -18,9 +18,17 @@ set -e
 repo=${NET_MGR_REPO:?set NET_MGR_REPO to the net-mgr checkout path}
 [ -d "$repo/.git" ] || { echo "net-mgr-deploy-dnsmasq: $repo is not a git checkout" >&2; exit 2; }
 confirm=${NET_MGR_DNSMASQ_CONFIRM:-0}
+host=${NET_MGR_DNSMASQ_HOST:-}
 if [ "$confirm" = "1" ]; then
-    echo "net-mgr-deploy-dnsmasq: repo=$repo — INSTALLING (DHCP will restart)"
+    echo "net-mgr-deploy-dnsmasq: repo=$repo — INSTALLING to /usr/local/sbin (server not switched)"
 else
     echo "net-mgr-deploy-dnsmasq: repo=$repo — dry run (pass confirm=1 to install)"
+fi
+# host= names one target and needs no [deploy] dnsmasq_hosts, so a gateway can
+# be fixed without first editing config on the hub. Without it, every host in
+# [deploy] dnsmasq_hosts is done in turn.
+if [ -n "$host" ]; then
+    echo "net-mgr-deploy-dnsmasq: single target $host"
+    exec make -C "$repo" install-dnsmasq-on TARGET="$host" CONFIRM="$confirm"
 fi
 exec make -C "$repo" deploy-dnsmasq CONFIRM="$confirm"
