@@ -6747,12 +6747,30 @@ sub _shq {
 sub _dnsmasq_event_identity {
     my ($self) = @_;
     my $cfg = $self->{config}{dnsmasq} // {};
-    my $key = $cfg->{event_key} // '/etc/ssh/ssh_host_ed25519_key';
+    # Sign with the same host key install-on published. It writes the RSA one
+    # by default - the fleet's usual choice - so prefer that and fall back,
+    # rather than signing with a key the gateway was never given.
+    my $key = $cfg->{event_key};
+    unless (defined $key && length $key) {
+        for my $cand ('/etc/ssh/ssh_host_rsa_key', '/etc/ssh/ssh_host_ed25519_key') {
+            next unless -r $cand;
+            $key = $cand;
+            last;
+        }
+        $key = '/etc/ssh/ssh_host_rsa_key' unless defined $key;
+    }
+    # install-on stamps the published key with the comment netmgr@<host>, and
+    # the gate derives its principal from that comment then host-wildcards it
+    # to netmgr@*, exactly as NetMgr::Auth does. So present netmgr@<us>: the
+    # host part is ignored on purpose, and the key is what actually proves it.
     my $who = $cfg->{event_principal};
     unless (defined $who && length $who) {
         require Sys::Hostname;
-        $who = Sys::Hostname::hostname() // '';
-        $who =~ s/\..*$//;
+        my $h = Sys::Hostname::hostname();
+        $h = '' unless defined $h;
+        my $dot = index($h, '.');
+        $h = substr($h, 0, $dot) if $dot >= 0;
+        $who = 'netmgr@' . $h;
     }
     return ($key, $who);
 }

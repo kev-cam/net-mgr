@@ -420,7 +420,7 @@ install: .version
 # Public half of the identity this host presents to a deployed dnsmasq's
 # event socket. Pushed to each target as /etc/net-mgr/allowed_dns
 # by install-on; set EVENT_KEY_PUB= empty to skip pushing it entirely.
-EVENT_KEY_PUB ?= /etc/ssh/ssh_host_ed25519_key.pub
+EVENT_KEY_PUB ?= /etc/ssh/ssh_host_rsa_key.pub
 
 REMOTE_TMP ?= /tmp/$(USER)/net-mgr
 SUDO       ?=
@@ -494,6 +494,7 @@ install-on: .version
 	@# whole fleet. Editing allowed_dns ON THE TARGET does not survive: this step
 	@# rewrites it on every install, by design, so the fleet has one source.
 	pub=$(EVENT_KEY_PUB); \
+	[ -r "$$pub" ] || pub=/etc/ssh/ssh_host_ed25519_key.pub; \
 	if [ -n "$$pub" ] && [ -r "$$pub" ]; then \
 	  who=$$(hostname -s); \
 	  tgt='$(TARGET)'; tgt=$${tgt##*@}; \
@@ -507,10 +508,11 @@ install-on: .version
 	  done; \
 	  echo "==> $(TARGET): allowed_dns <- [updaters] $$who$$([ -n "$$extras" ] && echo " +$$extras")"; \
 	  { echo "# Managed by net-mgr install-on from $$who - local edits here are"; \
-	    echo "# overwritten. Add keys on $$who as /etc/net-mgr/allowed_dns.<host>,"; \
+	    echo "# overwritten. authorized_keys format: <type> <key> [principal]."; \
+	    echo "# Add keys on $$who as /etc/net-mgr/allowed_dns.<host>,"; \
 	    echo "# or allowed_dns.<prefix>= to cover several (e.g. allowed_dns.gateway=)."; \
 	    echo "[updaters]"; \
-	    awk -v w="$$who" '{print w, $$1, $$2}' "$$pub"; \
+	    awk -v w="$$who" '{print $$1, $$2, "netmgr@" w}' "$$pub"; \
 	    for x in $$extras; do echo; cat "$$x"; done; \
 	    true; } \
 	  | ssh $(SSHOPTS) $(SSHTGT) "$(SUDO) sh -c 'mkdir -p /etc/net-mgr && cat > /etc/net-mgr/allowed_dns && chmod 0644 /etc/net-mgr/allowed_dns && rm -f /etc/net-mgr/event-allowed_signers'" \
