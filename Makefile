@@ -592,6 +592,7 @@ DNSMASQ_TMP    ?= /tmp/dnsmasq-deploy
 DNSMASQ_CFLAGS ?= -O2 -std=gnu17
 DNSMASQ_URL    ?= https://github.com/kev-cam/dnsmasq
 DNSMASQ_BRANCH ?= aws
+DNSMASQ_BUILD_HOST ?=
 
 install-dnsmasq-on:
 	@if [ -z "$(TARGET)" ]; then \
@@ -642,12 +643,37 @@ install-dnsmasq-go:
 	@[ -f "$(DNSMASQ_REPO)/src/event-socket.c" ] || { \
 	  echo "  *** $(DNSMASQ_REPO) is not our dnsmasq fork after preparation"; exit 2; }
 	@echo "==> source: $(DNSMASQ_REPO) @ `git -C $(DNSMASQ_REPO) log --oneline -1 2>/dev/null`"
-	@echo "==> $(TARGET): rsync $(DNSMASQ_REPO) -> $(DNSMASQ_TMP)"
-	@ssh $(SSHOPTS) $(SSHTGT) "mkdir -p $(DNSMASQ_TMP)"
-	@rsync -az --delete --exclude='.git/' --exclude='*.o' --exclude='src/dnsmasq' \
-	  -e "ssh $(SSHOPTS)" $(DNSMASQ_REPO)/ $(SSHTGT):$(DNSMASQ_TMP)/
-	@echo "==> $(TARGET): building"
-	@ssh $(SSHOPTS) $(SSHTGT) "make -C $(DNSMASQ_TMP) -j4 CFLAGS='$(DNSMASQ_CFLAGS)' >/dev/null"
+	@# Where to compile. Empty (default) = on the target itself, which is always
+	@# ABI-correct. Set DNSMASQ_BUILD_HOST to build elsewhere and copy the binary
+	@# over - for a gateway with no toolchain. Choose that host by GLIBC, not by
+	@# convenience: a dynamically linked binary runs only where the runtime glibc
+	@# is at least the build one, so build on the OLDEST gateway, not on the NAS.
+	@if [ -z "$(DNSMASQ_BUILD_HOST)" ]; then \
+	  echo "==> $(TARGET): rsync source, build on the target"; \
+	  ssh $(SSHOPTS) $(SSHTGT) "mkdir -p $(DNSMASQ_TMP)" || exit 2; \
+	  rsync -az --delete --exclude='.git/' --exclude='*.o' --exclude='src/dnsmasq' \
+	    -e "ssh $(SSHOPTS)" $(DNSMASQ_REPO)/ $(SSHTGT):$(DNSMASQ_TMP)/ || exit 2; \
+	  ssh $(SSHOPTS) $(SSHTGT) "make -C $(DNSMASQ_TMP) -j4 CFLAGS='$(DNSMASQ_CFLAGS)' >/dev/null" \
+	    || { echo "  *** build failed on $(TARGET) (no toolchain? set DNSMASQ_BUILD_HOST=)"; exit 2; }; \
+	else \
+	  echo "==> building on $(DNSMASQ_BUILD_HOST), copying the binary to $(TARGET)"; \
+	  ssh $(SSHOPTS) $(DNSMASQ_BUILD_HOST) "mkdir -p $(DNSMASQ_TMP)" || exit 2; \
+	  rsync -az --delete --exclude='.git/' --exclude='*.o' --exclude='src/dnsmasq' \
+	    -e "ssh $(SSHOPTS)" $(DNSMASQ_REPO)/ $(DNSMASQ_BUILD_HOST):$(DNSMASQ_TMP)/ || exit 2; \
+	  ssh $(SSHOPTS) $(DNSMASQ_BUILD_HOST) "make -C $(DNSMASQ_TMP) -j4 CFLAGS='$(DNSMASQ_CFLAGS)' >/dev/null" \
+	    || { echo "  *** build failed on $(DNSMASQ_BUILD_HOST)"; exit 2; }; \
+	  ssh $(SSHOPTS) $(SSHTGT) "mkdir -p $(DNSMASQ_TMP)/src" || exit 2; \
+	  hop=`mktemp`; \
+	  rsync -az -e "ssh $(SSHOPTS)" $(DNSMASQ_BUILD_HOST):$(DNSMASQ_TMP)/src/dnsmasq "$$hop" || exit 2; \
+	  rsync -az -e "ssh $(SSHOPTS)" "$$hop" $(SSHTGT):$(DNSMASQ_TMP)/src/dnsmasq || exit 2; \
+	  rm -f "$$hop"; \
+	fi
+	@# A binary built elsewhere runs only if the target's glibc is at least the
+	@# build host's. Rather than compare version strings, RUN it: the loader is
+	@# the authority, and a mismatch then fails here, before anything has been
+	@# replaced, instead of leaving a gateway with a binary that cannot start.
+	@ssh $(SSHOPTS) $(SSHTGT) "$(DNSMASQ_TMP)/src/dnsmasq --version >/dev/null 2>&1" \
+	  || { echo "  *** the built binary does not run on $(TARGET) (glibc/arch mismatch?) - refusing"; exit 3; }
 	@# Verify BEFORE replacing anything: a build that silently lost the fork's
 	@# features would take the lease feed down and be hard to attribute later.
 	@echo "==> $(TARGET): verifying the built binary carries the fork"
