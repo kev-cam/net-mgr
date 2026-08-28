@@ -4862,7 +4862,15 @@ sub _obs_dhcp_reservation {
             $dom = $d;
             last;
         }
-        $kv->{name} =~ s/\.\Q$dom\E\.?\z//i if defined $dom && length $dom;
+        # Fall back to the SAME literal net-gen-dnsmasq falls back to
+        # (bin/net-gen-dnsmasq: $domain_opt // $dhcp_cfg{domain} // 'grfx.com').
+        # This fleet has no [dhcp] section at all, so the domain actually
+        # appended to every hosts line comes from that hardcoded default - a
+        # config-only lookup here finds nothing to strip and fails open, which
+        # is precisely how the first two attempts at this silently did nothing.
+        # If the generator's default ever changes, this must change with it.
+        $dom = 'grfx.com' unless defined $dom && length $dom;
+        $kv->{name} =~ s/\.\Q$dom\E\.?\z//i;
     }
     # Single fetch: reused for the duplicate-MAC guard AND the merge below,
     # so we don't hit the DB twice on the edit path.
