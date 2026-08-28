@@ -479,21 +479,39 @@ install-on: .version
 	@# freshly rebuilt gateway goes deaf.
 	@#
 	@# [updaters] gets this host's key alone: the master is the authority, and
-	@# every other node receives lease data by replication instead. Anything you
-	@# want ADDED - a [readers] key for a person or a debugging box - belongs in
-	@# /etc/net-mgr/allowed_dns.extra on THIS host, which is appended verbatim
-	@# below. Editing allowed_dns on the target does not survive: this step
+	@# every other node receives lease data by replication instead. Keys to ADD
+	@# live on THIS host as /etc/net-mgr/allowed_dns.<pattern>, where <pattern>
+	@# is a target hostname, or a prefix with a trailing '=' for a wildcard:
+	@#
+	@#     allowed_dns.gateway=   every host whose name starts "gateway"
+	@#     allowed_dns.gateway3   that host alone
+	@#     allowed_dns.=          every target
+	@#
+	@# All files matching the target are appended verbatim, sorted, so a reader
+	@# key can be scoped to the machines that should honour it instead of the
+	@# whole fleet. Editing allowed_dns ON THE TARGET does not survive: this step
 	@# rewrites it on every install, by design, so the fleet has one source.
 	pub=$(EVENT_KEY_PUB); \
 	if [ -n "$$pub" ] && [ -r "$$pub" ]; then \
 	  who=$$(hostname -s); \
-	  extra=/etc/net-mgr/allowed_dns.extra; \
-	  echo "==> $(TARGET): allowed_dns <- [updaters] $$who$$([ -r $$extra ] && echo ' + allowed_dns.extra')"; \
+	  tgt='$(TARGET)'; tgt=$${tgt##*@}; \
+	  extras=; \
+	  for x in /etc/net-mgr/allowed_dns.*; do \
+	    [ -r "$$x" ] || continue; \
+	    pat=$${x##*/allowed_dns.}; \
+	    case "$$pat" in \
+	      *=) case "$$tgt" in $${pat%=}*) : ;; *) continue ;; esac ;; \
+	      *)  [ "$$pat" = "$$tgt" ] || continue ;; \
+	    esac; \
+	    extras="$$extras $$x"; \
+	  done; \
+	  echo "==> $(TARGET): allowed_dns <- [updaters] $$who$$([ -n "$$extras" ] && echo " +$$extras")"; \
 	  { echo "# Managed by net-mgr install-on from $$who - local edits here are"; \
-	    echo "# overwritten. Add keys to /etc/net-mgr/allowed_dns.extra on $$who."; \
+	    echo "# overwritten. Add keys on $$who as /etc/net-mgr/allowed_dns.<host>,"; \
+	    echo "# or allowed_dns.<prefix>= to cover several (e.g. allowed_dns.gateway=)."; \
 	    echo "[updaters]"; \
 	    awk -v w="$$who" '{print w, $$1, $$2}' "$$pub"; \
-	    [ -r "$$extra" ] && { echo; cat "$$extra"; }; \
+	    for x in $$extras; do echo; cat "$$x"; done; \
 	    true; } \
 	  | ssh $(SSHOPTS) $(SSHTGT) "$(SUDO) sh -c 'mkdir -p /etc/net-mgr && cat > /etc/net-mgr/allowed_dns && chmod 0644 /etc/net-mgr/allowed_dns && rm -f /etc/net-mgr/event-allowed_signers'" \
 	    || echo "  *** allowed_dns push failed (continuing)"; \
