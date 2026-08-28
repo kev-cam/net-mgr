@@ -50,6 +50,7 @@ my $MAP     = undef;        # sync: record->source map (default /etc/net-mgr/ddn
 my $NODE    = undef;        # sync: node to read live tunnel state from via he_diag
 my $HE_NAME = 'he_net';     # sync: tunnel name inside that node
 my $TUNNEL_PREFIX_CACHE;    # memoised: one he_diag per run, not per record
+my $WAN6_CACHE;
 
 GetOptions(
     'account=s'  => \$ACCOUNT,
@@ -341,6 +342,7 @@ exit 1;
 #
 #     # record                source
 #     gateway.grfx.com        wan4          # current public IPv4  -> A
+#     gateway6.grfx.com       wan6          # global IPv6 on the WAN if -> AAAA
 #     gateway3-6.grfx.com     he6:2         # tunnel prefix ::2    -> AAAA
 #     tunnel3-6.grfx.com      he6:1         # tunnel prefix ::1    -> AAAA
 #     net-chat.grfx.com       literal:2001:470:1f05:1f9::ca7
@@ -416,9 +418,55 @@ sub live_tunnel_prefix {
     return ($TUNNEL_PREFIX_CACHE = undef);
 }
 
+# The global IPv6 address on the WAN interface. Unlike wan4 - which is
+# discovered by asking an outside service what it sees, and so works from any
+# box behind the same NAT - this reads a LOCAL interface, so net-ddnx must run
+# ON the WAN host for it to resolve. Elsewhere it returns undef and the record
+# is reported SKIP rather than being published wrong.
+#
+# The interface is the one carrying the default route: wan4 is a public address
+# that may be NAT'd, so it is never a local address to match against.
+sub live_wan6 {
+    return $WAN6_CACHE if defined $WAN6_CACHE;
+    my $dev;
+    for my $fam ('-4', '-6') {
+        last if defined $dev;
+        if (open my $ph, '-|', 'ip', $fam, 'route', 'show', 'default') {
+            while (my $l = <$ph>) {
+                if ($l =~ /\bdev\s+(\S+)/) { $dev = $1; last }
+            }
+            close $ph;
+        }
+    }
+    return ($WAN6_CACHE = undef) unless defined $dev;
+
+    my @cand;
+    if (open my $ph, '-|', 'ip', '-6', '-o', 'addr', 'show', 'dev', $dev, 'scope', 'global') {
+        while (my $l = <$ph>) {
+            next unless $l =~ m{inet6\s+([0-9a-fA-F:]+)/\d+(.*)$};
+            my ($addr, $flags) = ($1, $2);
+            # fc00::/7 is unique-local: globally scoped by ip(8)'s reckoning but
+            # not globally routable, so publishing one in DNS is a black hole.
+            next if $addr =~ /^f[cdCD]/;
+            next if $flags =~ /\bdeprecated\b/;
+            push @cand, { addr => $addr, temp => ($flags =~ /\btemporary\b/ ? 1 : 0) };
+        }
+        close $ph;
+    }
+    return ($WAN6_CACHE = undef) unless @cand;
+
+    # Prefer a permanent address. A privacy/temporary address rotates every few
+    # hours, so a AAAA pointing at one is stale almost immediately - the drift
+    # this tool exists to catch would become permanent noise.
+    my @perm = grep { !$_->{temp} } @cand;
+    my $pick = @perm ? $perm[0] : $cand[0];
+    return ($WAN6_CACHE = $pick->{addr});
+}
+
 sub resolve_source {
     my ($src) = @_;
     if ($src eq 'wan4')                { return (live_wan4(), 'A') }
+    if ($src eq 'wan6')                { return (live_wan6(), 'AAAA') }
     if ($src =~ /^literal:(.+)$/i)     { my $v = $1; return ($v, ($v =~ /:/ ? 'AAAA' : 'A')) }
     if ($src =~ /^he6:([0-9a-f:]+)$/i) {
         my $suffix = $1;
