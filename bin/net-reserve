@@ -516,6 +516,33 @@ sub gather {
         }
     }
 
+    # Duplicate NAMES are a distinct fault from duplicate MACs. Two reservations
+    # sharing a name make that name resolve to BOTH addresses (dnsmasq
+    # round-robins), so the short name stops identifying one host - wc12 pointed
+    # at .132 and .229 here. The usual cause is a device returning with a
+    # RANDOMISED MAC (02/06/0a/0e...) and being re-reserved under the same name,
+    # leaving the old row behind still wearing it. Keyed per subnet and on the
+    # BARE name, matching how the generator writes the hosts section.
+    my %dup_name;
+    {
+        my %by_name;
+        for my $ip (keys %resv) {
+            my $n = bare_name($resv{$ip}{name} // '');
+            next unless length $n;
+            my $sub = $resv{$ip}{subnet_cidr} // subnet_of($ip) // '?';
+            push @{ $by_name{ lc($n) . '|' . $sub } }, $resv{$ip};
+        }
+        for my $k (keys %by_name) {
+            my @r = @{ $by_name{$k} };
+            next unless @r > 1;
+            # Display the name as stored, not the folded key: "Mint" reads as
+            # the thing in the table, "mint" reads as a different record.
+            my $disp = bare_name($r[0]{name} // '');
+            $dup_name{$disp} = [ map { $_->{ip} }
+                sort { (ip2int($a->{ip}) // 0) <=> (ip2int($b->{ip}) // 0) } @r ];
+        }
+    }
+
     my %subnets;
     $subnets{ $_->{subnet_cidr} } = 1 for @$ranges;
     for my $ip (keys %resv, keys %leased, keys %observed) {
@@ -534,6 +561,7 @@ sub gather {
         observed => \%observed, mac_name => \%mac_name,
         mac_cur_ip => \%mac_cur_ip, mac_resv_ip => \%mac_resv_ip,
         dup_resv => \%dup_resv,
+        dup_name => \%dup_name,
         subnets => \@subnets,
         ifaces => $ifaces,   # raw interface rows (mac/first_seen/kind/vendor) for --new
     };
@@ -948,21 +976,44 @@ sub cmd_duplicates {
     my $cli   = connect_client(want_auth => 0);
     my $model = gather($cli);
     my $dup   = $model->{dup_resv} || {};
-    unless (%$dup) { print "no duplicate-MAC reservations\n"; return }
-    printf "%d MAC(s) with more than one reservation:\n\n", scalar keys %$dup;
-    for my $mac (sort keys %$dup) {
-        my @ips = @{ $dup->{$mac} };
-        printf "  %s\n", $mac;
-        for my $ip (@ips) {
-            my $r = $model->{resv}{$ip} || {};
-            printf "    %-16s %-20s %s\n", $ip, ($r->{name} // '-'),
-                   ($ip eq $ips[0] ? 'SERVED' : 'dropped at config generation');
+    my $dupn  = $model->{dup_name} || {};
+    unless (%$dup || %$dupn) { print "no duplicate reservations\n"; return }
+
+    # Names first: a duplicate name is the one an operator is most likely to be
+    # chasing, because the symptom is "the host is not where I put it" rather
+    # than anything that looks like a reservation problem.
+    if (%$dupn) {
+        printf "%d name(s) on more than one reservation:\n\n", scalar keys %$dupn;
+        for my $n (sort keys %$dupn) {
+            my @ips = @{ $dupn->{$n} };
+            printf "  %s\n", $n;
+            for my $ip (@ips) {
+                my $r = $model->{resv}{$ip} || {};
+                printf "    %-16s %s\n", $ip, ($r->{mac} // '-');
+            }
+            print "\n";
         }
-        print "\n";
+        print "The name resolves to EVERY address above (dnsmasq round-robins), so it\n"
+            . "no longer identifies one host. A device returning with a randomised MAC\n"
+            . "and being re-reserved under the same name leaves the old row behind.\n\n";
     }
-    print "dnsmasq honours one address per MAC. The generator keeps the first by\n"
-        . "(name, address) and discards the rest — visible only as a WARN in the\n"
-        . "serving gateway's log. Release the ones you do not want.\n";
+
+    if (%$dup) {
+        printf "%d MAC(s) with more than one reservation:\n\n", scalar keys %$dup;
+        for my $mac (sort keys %$dup) {
+            my @ips = @{ $dup->{$mac} };
+            printf "  %s\n", $mac;
+            for my $ip (@ips) {
+                my $r = $model->{resv}{$ip} || {};
+                printf "    %-16s %-20s %s\n", $ip, ($r->{name} // '-'),
+                       ($ip eq $ips[0] ? 'SERVED' : 'dropped at config generation');
+            }
+            print "\n";
+        }
+        print "dnsmasq honours one address per MAC. The generator keeps the first by\n"
+            . "(name, address) and discards the rest — visible only as a WARN in the\n"
+            . "serving gateway's log. Release the ones you do not want.\n";
+    }
 }
 
 sub cmd_overlaps {
@@ -2401,6 +2452,36 @@ sub cmd_gui {
     # --new: pop the "recent devices without a reservation" chooser on launch,
     # after the window has painted (and after autoname, so names are populated).
     $mw->after(450, sub { $new_devices->() }) if $opt_new;
+    # Flag duplicate reservations on launch. Neither fault is visible from the
+    # grid: a duplicate NAME resolves to every address that carries it, and a
+    # duplicate MAC has all but one address silently discarded at config
+    # generation (a WARN in the gateway's log nobody reads). Both are rare - two
+    # names in 213 reservations here - so a dialog is affordable and does not
+    # become the kind of noise that trains people to dismiss it.
+    my $dup_warn = sub {
+        my $m  = $S{model} or return;
+        my $dn = $m->{dup_name} || {};
+        my $dm = $m->{dup_resv} || {};
+        return unless %$dn || %$dm;
+        my @msg;
+        if (%$dn) {
+            push @msg, 'Duplicate NAMES — each resolves to every address listed:';
+            push @msg, sprintf('  %-16s %s', $_, join(', ', @{ $dn->{$_} }))
+                for sort keys %$dn;
+        }
+        if (%$dm) {
+            push @msg, '' if @msg;
+            push @msg, 'Duplicate MACs — only the first is served, the rest are dropped:';
+            push @msg, sprintf('  %-18s %s', $_, join(', ', @{ $dm->{$_} }))
+                for sort keys %$dm;
+        }
+        push @msg, '', 'Release the entries you do not want, or rename them.';
+        $mw->messageBox(-title => 'net-reserve: duplicate reservations',
+                        -icon  => 'warning', -type => 'OK',
+                        -message => join("\n", @msg));
+    };
+    $mw->after(600, sub { $dup_warn->() });
+
     # periodic refresh: lazy (local DB only) — explicit actions force-sync
     my $tick; $tick = sub {
         $S{model} = gather($cli); $refresh_subnets->(); $redraw->();
