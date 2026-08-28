@@ -53,6 +53,7 @@ my %opt = (timeout => 2, user => 'admin', pass => '');
 GetOptions(\%opt, 'ports=s', 'fast', 'full', 'timeout=i',
            'user=s', 'pass=s', 'pass-file=s', 'ask', 'listen=s',
            'ptz', 'ptz-speed=f', 'ptz-dwell=f',
+           'sample', 'uri=s', 'out=s', 'show!', 'ffmpeg=s',
            'verbose|v', 'help|h')
     or usage(2);
 usage(0) if $opt{help};
@@ -85,13 +86,18 @@ if (!defined $opt{pass} || $opt{pass} eq '') {
         $opt{pass} = $ENV{NET_ONVIF_PASS};
     }
 }
-my $target = shift @ARGV or usage(2);
+# --uri needs no target: the URI already names the host. Everything else
+# does, so the requirement stays for every other mode.
+my $target = shift @ARGV;
+usage(2) unless (defined $target && length $target)
+              || (defined $opt{uri} && length $opt{uri});
 
 # A broad set of ports these cameras are known to wander onto — used for --fast
 # and as the pure-Perl fallback when nmap is absent.
 my @CAMERA_PORTS = (
     21,23,37,80,81,82,83,88,443,554,555,587,700,1024,1025,1935,2000,2020,3702,
-    5000,5353,6036,6668,7001,7080,7443,8000,8001,8008,8009,8010,8080,8081,8082,
+    5000,5353,5540,5541,5542,5543,5544,5545,6036,6668,7001,7080,7443,
+    8000,8001,8008,8009,8010,8080,8081,8082,
     8090,8091,8181,8200,8443,8500,8554,8555,8600,8800,8880,8888,8899,8999,9000,
     9001,9002,9010,9080,9088,9090,9100,9200,9527,9999,10000,10001,10080,10554,
     11554,12345,18080,20000,34567,34599,37777,37778,49152,49153,50000,55555,
@@ -108,6 +114,24 @@ my $ONVIF_SOAP =
 . '<tds:GetSystemDateAndTime/></s:Body></s:Envelope>';
 
 # ---------------------------------------------------------------------------
+# --uri: test one URI directly and stop. Discovery is the slow part of this
+# tool and is pointless when the operator already has the URI in hand - this is
+# the "I have this from VLC, why does my NVR hate it" path.
+if (defined $opt{uri} && length $opt{uri}) {
+    my $ok = report_rtsp('given', $opt{uri}, $opt{user}, $opt{pass});
+    if ($opt{sample}) {
+        my $dest = $opt{out} || (($ENV{TMPDIR} || '/tmp') . "/net-onvif-frame.jpg");
+        my $err  = ffmpeg_grab($opt{uri}, $dest, $opt{ffmpeg});
+        if ($err) {
+            print "  frame: ffmpeg $err\n";
+        } else {
+            printf "  frame: %s\n", $dest;
+            my $v = (defined $opt{show} && !$opt{show}) ? undef : show_file($dest);
+            printf "         opened with %s\n", $v if $v;
+        }
+    }
+    exit($ok ? 0 : 1);
+}
 my $ip = resolve_target($target);
 print "== net-onvif: probing $target ($ip) ==\n";
 
@@ -175,6 +199,46 @@ if (@onvif_hits) {
                 printf "  RTSP [%s]: %s\n", $nm, with_creds($uri, $opt{user}, $opt{pass});
                 printf "        (as published, no credentials: %s)\n", $uri
                     if defined $opt{user} && length $opt{user};
+            }
+            if ($opt{sample}) {
+                my $n = 0;
+                for my $u (@$uris) {
+                    my (undef, undef, $uri) = @$u;
+                    report_rtsp('stream' . $n, $uri, $opt{user}, $opt{pass});
+                    if ($n == 0) {
+                        my $dest = $opt{out} || (($ENV{TMPDIR} || '/tmp') . "/net-onvif-$ip.jpg");
+                        # ffmpeg first: a decoded frame proves transport AND codec.
+                        # The ONVIF snapshot is the fallback because it proves only
+                        # that the camera can render a JPEG - a different service,
+                        # which can work while RTSP does not.
+                        my $err = ffmpeg_grab(with_creds($uri, $opt{user}, $opt{pass}),
+                                              $dest, $opt{ffmpeg});
+                        if (!$err) {
+                            printf "  frame: %s (via ffmpeg, RTSP confirmed end to end)\n", $dest;
+                        } else {
+                            printf "  frame: ffmpeg %s\n", $err;
+                            my ($snaps) = onvif_snapshot_uris($ip, $port, $path,
+                                                              $opt{user}, $opt{pass});
+                            if (@$snaps) {
+                                printf "  snapshot URI: %s
+", $snaps->[0][1];
+                                my $serr = fetch_snapshot($snaps->[0][1], $opt{user},
+                                                          $opt{pass}, $dest);
+                                if ($serr) { printf "  snapshot: %s\n", $serr; $dest = undef }
+                                else       { printf "  frame: %s (via ONVIF snapshot)\n", $dest }
+                            } else {
+                                print "  snapshot: camera offers no GetSnapshotUri\n";
+                                $dest = undef;
+                            }
+                        }
+                        if (defined $dest && -s $dest
+                            && !(defined $opt{show} && !$opt{show})) {
+                            my $v = show_file($dest);
+                            printf "         opened with %s\n", $v if $v;
+                        }
+                    }
+                    $n++;
+                }
             }
         } else {
             printf "  no stream URI: %s\n", $why // 'GetProfiles returned none';
@@ -447,6 +511,197 @@ sub onvif_stream_uris {
         last if @out;
     }
     return (\@out, $why);
+}
+
+# ---- URI testing and frame sampling ---------------------------------------
+#
+# Two separate jobs, because they fail independently and a camera can do one
+# without the other:
+#
+#   1. TEST the RTSP URI - a DESCRIBE handshake, pure Perl, no decoder. It
+#      proves the URI is live, says whether credentials are demanded, and
+#      reports the codec from the SDP. That last one matters more than it
+#      looks: an H.265 stream plays in VLC and defeats plenty of NVR software,
+#      so "VLC works but ZoneMinder does not" is answered here rather than by
+#      guesswork.
+#
+#   2. SAMPLE a frame - via ONVIF GetSnapshotUri, which returns a JPEG over
+#      HTTP. Deliberately NOT by decoding RTSP: that needs ffmpeg, which is not
+#      installed anywhere on this fleet, whereas a JPEG needs nothing at all.
+#      If the camera has no snapshot service we say so rather than pretending.
+sub rtsp_describe {
+    my ($uri, $user, $pass) = @_;
+    my ($host, $port, $path) = $uri =~ m{^rtsp://(?:[^@/]*@)?([^:/]+)(?::(\d+))?(/.*)?$};
+    return { error => "unparseable RTSP URI" } unless defined $host;
+    $port ||= 554;
+    $path = '/' unless defined $path && length $path;
+    my $sock = connect_tcp($host, $port) or return { error => "connect $host:$port failed" };
+    my $req = "DESCRIBE rtsp://$host:$port$path RTSP/1.0\r\nCSeq: 1\r\n"
+            . "Accept: application/sdp\r\nUser-Agent: net-onvif\r\n";
+    if (defined $user && length $user) {
+        require MIME::Base64;
+        $req .= "Authorization: Basic "
+             . MIME::Base64::encode_base64("$user:" . (defined $pass ? $pass : ''), '') . "\r\n";
+    }
+    $req .= "\r\n";
+    print {$sock} $req;
+    my $resp = '';
+    eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm($opt{timeout} || 3);
+        while (my $l = <$sock>) { $resp .= $l; last if length($resp) > 65536 }
+        alarm 0;
+        1;
+    };
+    close $sock;
+    my ($status) = $resp =~ m{^RTSP/1\.0\s+(\d+)\s*([^\r\n]*)};
+    my $reason   = $2 // '';
+    my %r = (status => $status, reason => $reason, raw => $resp);
+    $r{auth} = ($resp =~ /WWW-Authenticate:\s*(\w+)/i) ? $1 : undef;
+    my @codecs = $resp =~ /a=rtpmap:\d+\s+([A-Za-z0-9-]+)/g;
+    $r{codecs} = \@codecs if @codecs;
+    ($r{dimensions}) = $resp =~ /a=x-dimensions:\s*([0-9,\s]+)/i;
+    ($r{framerate})  = $resp =~ /a=framerate:\s*([0-9.]+)/i;
+    return \%r;
+}
+
+# GetSnapshotUri per profile. Same endpoint-guessing as the stream lookup: a
+# firmware that serves media from an unexpected path serves snapshots there too.
+sub onvif_snapshot_uris {
+    my ($host, $port, $path, $user, $pass) = @_;
+    my (@out, $why);
+    for my $mpath ($path, '/onvif/media_service', '/onvif/media', '/onvif/services') {
+        my $resp = soap_post($host, $port, $mpath,
+                             'http://www.onvif.org/ver10/media/wsdl/GetProfiles',
+                             '<trt:GetProfiles/>', $user, $pass);
+        next unless defined $resp && length $resp;
+        if ($resp =~ /<[^>]*Fault>/i) {
+            my ($t) = $resp =~ m{<[^>]*(?:Text|faultstring)[^>]*>([^<]+)}i;
+            $why = 'GetProfiles refused' . ($t ? ": $t" : ' (credentials?)');
+            next;
+        }
+        my @tokens = $resp =~ /<[^>]*Profiles[^>]*\btoken="([^"]+)"/gi;
+        @tokens    = $resp =~ /\btoken="([^"]+)"/gi unless @tokens;
+        next unless @tokens;
+        for my $tok (@tokens) {
+            my $sr = soap_post($host, $port, $mpath,
+                        'http://www.onvif.org/ver10/media/wsdl/GetSnapshotUri',
+                        '<trt:GetSnapshotUri><trt:ProfileToken>' . _xml($tok)
+                      . '</trt:ProfileToken></trt:GetSnapshotUri>', $user, $pass);
+            next unless defined $sr;
+            warn "  [media $port GetSnapshotUri $tok]\n$sr\n" if $opt{verbose};
+            my ($uri) = $sr =~ m{<[^>]*:?Uri>([^<]+)</[^>]*:?Uri>}i;
+            push @out, [ $tok, xml_decode($uri) ] if $uri;
+        }
+        last if @out;
+    }
+    return (\@out, $why);
+}
+
+# Pull one frame off the RTSP stream with ffmpeg. This is the strongest test
+# available: DESCRIBE only proves the server answers, whereas a decoded frame
+# proves transport, negotiation AND codec support end to end - which is exactly
+# the gap between "VLC plays it" and "the NVR shows black".
+#
+# TCP transport by default: UDP loses NAL units on any congested segment and
+# fails in a way that looks like a broken camera rather than a lost packet.
+sub ffmpeg_grab {
+    my ($uri, $dest, $bin) = @_;
+    $bin ||= 'ffmpeg';
+    my $have = `sh -c 'command -v $bin' 2>/dev/null`;
+    return "not found (pass --ffmpeg PATH, or use the ONVIF snapshot instead)"
+        unless $have =~ /\S/;
+    my @cmd = ($bin, '-nostdin', '-loglevel', 'error',
+               '-rtsp_transport', 'tcp', '-i', $uri,
+               '-frames:v', '1', '-y', $dest);
+    # Bound it: a camera that accepts the connection and then never sends media
+    # would otherwise hang here indefinitely.
+    my $to = `sh -c 'command -v timeout' 2>/dev/null`;
+    unshift @cmd, 'timeout', '25' if $to =~ /\S/;
+    my $rc = system(@cmd);
+    return "ffmpeg rc " . ($rc >> 8) if $rc != 0;
+    return "produced no frame" unless -s $dest;
+    return undef;
+}
+
+# Fetch a snapshot to a file. curl rather than a hand-rolled client because
+# cameras habitually demand DIGEST auth, and reimplementing that here to save
+# one dependency would be a poor trade - curl is already relied on by net-ddns.
+sub fetch_snapshot {
+    my ($url, $user, $pass, $dest) = @_;
+    my $curl = `sh -c 'command -v curl' 2>/dev/null`;
+    return "curl not found - cannot fetch the snapshot" unless $curl =~ /\S/;
+    # On Cygwin, `curl` is usually Windows' curl.exe, which cannot write to a
+    # /cygdrive or /tmp path and fails with rc 23 (write error) - a message that
+    # reads like a camera fault. Hand it a native path when cygpath is present.
+    my $out = $dest;
+    if (`sh -c 'command -v cygpath' 2>/dev/null` =~ /\S/) {
+        my $w = `cygpath -w "$dest" 2>/dev/null`;
+        chomp $w;
+        $out = $w if length $w;
+    }
+    my @cmd = ('curl', '-sS', '--max-time', 15, '-o', $out);
+    push @cmd, '--anyauth', '--user', "$user:" . (defined $pass ? $pass : '')
+        if defined $user && length $user;
+    push @cmd, $url;
+    # Capture the HTTP status: a camera whose snapshot service is broken answers
+    # 500 with an empty body, and "no data returned" makes that look like a
+    # network problem rather than the firmware fault it is.
+    push @cmd, '-w', '%{http_code}';
+    my $code = `@{[ join ' ', map { my $x=$_; $x =~ s/'/'\''/g; "'$x'" } @cmd ]} 2>/dev/null`;
+    chomp $code;
+    return "HTTP $code from the snapshot URL (camera-side failure)"
+        if length $code && $code !~ /^2\d\d$/;
+    return "no data returned (HTTP $code)" unless -s $dest;
+    # A camera that wants credentials often answers 401 with an HTML body and
+    # HTTP 200-looking plumbing, so check we actually got an image.
+    open my $fh, '<', $dest or return "cannot read $dest";
+    binmode $fh; read $fh, my $magic, 4; close $fh;
+    return "not a JPEG/PNG (got " . unpack('H*', $magic) . ") - wrong credentials?"
+        unless $magic =~ /^\xFF\xD8/ || $magic =~ /^\x89PNG/;
+    return undef;
+}
+
+# Hand the frame to whatever the desktop uses. Deliberately not a Tk viewer:
+# Tk's core image formats are GIF/PPM, so showing a JPEG would need Tk::JPEG
+# or Img - another dependency, on every box, to display a file the OS already
+# knows how to open.
+sub show_file {
+    my ($path) = @_;
+    for my $c (['cygstart', $path], ['xdg-open', $path], ['open', $path]) {
+        my $bin = `sh -c 'command -v $c->[0]' 2>/dev/null`;
+        next unless $bin =~ /\S/;
+        system(@$c);
+        return $c->[0];
+    }
+    return undef;
+}
+
+# Report on one RTSP URI: is it live, does it want credentials, what codec is
+# it. Printed rather than returned because this is the answer an operator came
+# for - "why does VLC play it and my NVR not".
+sub report_rtsp {
+    my ($label, $uri, $user, $pass) = @_;
+    my $r = rtsp_describe($uri, $user, $pass);
+    if ($r->{error}) { printf "  test %-14s ERROR %s\n", $label, $r->{error}; return 0 }
+    my $st = $r->{status} // '?';
+    printf "  test %-14s RTSP %s %s\n", $label, $st, ($r->{reason} // '');
+    if ($r->{auth} && $st eq '401') {
+        printf "        needs %s auth - supply --user/--pass\n", $r->{auth};
+        return 0;
+    }
+    printf "        codec: %s\n", join(', ', @{ $r->{codecs} }) if $r->{codecs};
+    printf "        dimensions: %s\n", $r->{dimensions} if $r->{dimensions};
+    printf "        framerate: %s\n", $r->{framerate}  if $r->{framerate};
+    # The single most useful thing this tool can say to someone whose NVR is
+    # showing a black frame.
+    if ($r->{codecs} && grep { /^H265$/i } @{ $r->{codecs} }) {
+        print  "        NOTE: H.265. VLC handles it; many NVRs (ZoneMinder among\n"
+             . "              them) need an ffmpeg built with HEVC and often cannot\n"
+             . "              DECODE it for motion analysis. Prefer an H.264\n"
+             . "              substream there, or record with passthrough.\n";
+    }
+    return ($st eq '200') ? 1 : 0;
 }
 
 # ---- PTZ ------------------------------------------------------------------
