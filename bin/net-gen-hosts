@@ -132,6 +132,16 @@ sub write_atomic {
     print {$tmp} $content or die "net-gen-hosts: write $path: $!\n";
     close $tmp;
     chmod 0644, $tmp->filename;
+    # Write-then-swap: the new content lands in a temp file in the SAME
+    # directory (so the rename is atomic; across filesystems it would not
+    # be), the current file becomes <path>-bak, and only then does the new
+    # one take its place. The target is never absent or half-written, which
+    # matters most for the file the resolver reads on every lookup. -bak is
+    # refreshed each update, so it is the immediately previous generation.
+    if (-e $path) {
+        rename $path, "$path-bak"
+            or warn "net-gen-hosts: could not keep $path-bak: $!" . chr(10);
+    }
     rename $tmp->filename, $path or die "net-gen-hosts: rename onto $path: $!\n";
 }
 
@@ -202,12 +212,6 @@ for my $target (sort keys %$targets) {
         printf "net-gen-hosts: would write %s (%d fragment(s), %d missing)\n",
                $target, $used, $missing;
         next;
-    }
-    # Keep one copy of whatever was there before this tool first touched it.
-    my $bak = "$target.netmgr-backup";
-    if (length $cur && !-e $bak) {
-        if (open my $b, '>', $bak) { print {$b} $cur; close $b;
-            print "net-gen-hosts: kept the previous $target as $bak\n" }
     }
     write_atomic($target, $out);
     printf "net-gen-hosts: wrote %s (%d fragment(s)%s)\n",
