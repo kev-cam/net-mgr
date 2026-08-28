@@ -35,7 +35,7 @@ RUN_APP_LINKS = net-ssh net-mosh net-sftp net-scp net-rsync net-vnc
 # backward compat; net-find emits a soft-deprecation warning when
 # invoked via one of these names.
 FIND_LINKS    = net-find-lost net-find-peers net-find-rogue-dhcp
-SBINS = net-mgr net-mgr-setup net-dns net-mgr-relay net-mgr-self-update net-mgr-deploy net-mgr-netif-hook net-mgr-reset-ble net-mgr-dnsmasq-switch
+SBINS = net-mgr net-mgr-setup net-dns net-mgr-relay net-mgr-self-update net-mgr-deploy net-mgr-netif-hook net-mgr-reset-ble net-mgr-dnsmasq-switch net-mgr-dnsmasq-install net-mgr-deploy-dnsmasq
 # Recovery scripts live off PATH so net-find can enumerate them
 # without polluting BINDIR. Each script must support --describe.
 RECOVERYS = net-recover-tlsg2424
@@ -568,6 +568,105 @@ deploy: .version
 	  echo; echo "==> deploy finished with FAILURES:$$failed"; exit 1; \
 	fi; \
 	echo; echo "==> deploy complete"
+
+
+# --- our patched dnsmasq to the DHCP servers -------------------------
+#   make install-dnsmasq-on TARGET=gateway3            # dry run, shows the plan
+#   make install-dnsmasq-on TARGET=gateway3 CONFIRM=1  # actually do it
+#   make deploy-dnsmasq CONFIRM=1                      # every dnsmasq_hosts entry
+#
+# net-mgr's own deploy ships perl and leaves the DHCP server running. This
+# ships the DHCP server binary itself. It installs to /usr/local/sbin/dnsmasq
+# and does NOT touch the running server: that is the convention swap-dnsmasq
+# already set, with the distro binary left at /usr/sbin/dnsmasq. Activation
+# is a separate, reversible step: net-cluster dnsmasq-switch variant=custom
+# (revert with variant=stock). Hosts must still be listed in [deploy]
+# dnsmasq_hosts, never plain 'hosts', and CONFIRM=1 passed.
+#
+# The source is a checkout of our fork on THIS host ([deploy] dnsmasq_repo,
+# default /usr/local/src/dnsmasq). It is rsynced to the target and built
+# THERE, so the binary matches the target's libc and architecture instead of
+# the hub's - the gateways have no checkout of their own and cannot self-build.
+DNSMASQ_REPO   ?= /usr/local/src/dnsmasq
+DNSMASQ_TMP    ?= /tmp/dnsmasq-deploy
+DNSMASQ_CFLAGS ?= -O2 -std=gnu17
+
+install-dnsmasq-on:
+	@if [ -z "$(TARGET)" ]; then \
+	  echo "Usage: make install-dnsmasq-on TARGET=host [CONFIRM=1] [SUDO=sudo]"; exit 2; \
+	fi
+	@# Refuse a stock tree: without event-socket.c this is not our fork, and
+	@# installing it would remove the lease feed net-mgr depends on.
+	@[ -f "$(DNSMASQ_REPO)/src/event-socket.c" ] || { \
+	  echo "$(DNSMASQ_REPO) is not our dnsmasq fork (no src/event-socket.c)"; exit 2; }
+	$(eval SSHTGT := $(shell t='$(TARGET)'; h=$${t##*@}; pre=$${t%$$h}; nl='$(NETLOOKUP)'; [ -n "$$nl" ] && ! command -v "$$nl" >/dev/null 2>&1 && nl=./bin/net-lookup; if [ -z "$$nl" ] || printf '%s' "$$h" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$$|:'; then printf '%s' "$$t"; else ip=$$($$nl "$$h" 2>/dev/null | head -1); [ -z "$$ip" ] && ip=$$($$nl "$${h%-*}" 2>/dev/null | head -1); [ -n "$$ip" ] && printf '%s' "$$pre$$ip" || printf '%s' "$$t"; fi))
+	@echo "==> $(TARGET) ($(SSHTGT)): dnsmasq fork from $(DNSMASQ_REPO)"
+	@# The guard has to switch TARGETS, not just exit: each recipe line runs in
+	@# its own shell, so an `exit 0` here would end only this line and make would
+	@# carry on to the rsync. That is exactly how a dry run reached a live
+	@# gateway during testing.
+	@if [ "$(CONFIRM)" != "1" ]; then \
+	  echo "    DRY RUN. This would rsync the tree, build it on $(TARGET),"; \
+	  echo "    verify it, install to /usr/local/sbin/dnsmasq, and ensure"; \
+	  echo "    netmgr= is set. The RUNNING DHCP server is left alone -"; \
+	  echo "    activate separately with dnsmasq-switch variant=custom."; \
+	  echo "    Re-run with CONFIRM=1 to proceed."; \
+	else \
+	  $(MAKE) --no-print-directory install-dnsmasq-go TARGET="$(TARGET)" \
+	    SSHTGT="$(SSHTGT)" SUDO="$(SUDO)" SSHOPTS="$(SSHOPTS)" \
+	    DNSMASQ_REPO="$(DNSMASQ_REPO)" DNSMASQ_TMP="$(DNSMASQ_TMP)"; \
+	fi
+
+# The steps that actually touch the target. Reachable only through
+# install-dnsmasq-on with CONFIRM=1, which passes SSHTGT down already resolved.
+install-dnsmasq-go:
+	@[ -n "$(SSHTGT)" ] || { echo "install-dnsmasq-go: call install-dnsmasq-on, not this"; exit 2; }
+	@echo "==> $(TARGET): rsync $(DNSMASQ_REPO) -> $(DNSMASQ_TMP)"
+	@ssh $(SSHOPTS) $(SSHTGT) "mkdir -p $(DNSMASQ_TMP)"
+	@rsync -az --delete --exclude='.git/' --exclude='*.o' --exclude='src/dnsmasq' \
+	  -e "ssh $(SSHOPTS)" $(DNSMASQ_REPO)/ $(SSHTGT):$(DNSMASQ_TMP)/
+	@echo "==> $(TARGET): building"
+	@ssh $(SSHOPTS) $(SSHTGT) "make -C $(DNSMASQ_TMP) -j4 CFLAGS='$(DNSMASQ_CFLAGS)' >/dev/null"
+	@# Verify BEFORE replacing anything: a build that silently lost the fork's
+	@# features would take the lease feed down and be hard to attribute later.
+	@echo "==> $(TARGET): verifying the built binary carries the fork"
+	@ssh $(SSHOPTS) $(SSHTGT) "strings $(DNSMASQ_TMP)/src/dnsmasq | grep -q 'AUTH-REQUIRED'" \
+	  || { echo "  *** built binary has no auth gate - refusing to install"; exit 3; }
+	@ssh $(SSHOPTS) $(SSHTGT) "strings $(DNSMASQ_TMP)/src/dnsmasq | grep -q 'netmgr'" \
+	  || { echo "  *** built binary has no netmgr client - refusing to install"; exit 3; }
+	@echo "==> $(TARGET): installing to /usr/local/sbin (running server untouched)"
+	@rsync -az -e "ssh $(SSHOPTS)" sbin/net-mgr-dnsmasq-install $(SSHTGT):$(DNSMASQ_TMP)/
+	@ssh $(SSHOPTS) $(SSHTGT) "$(SUDO) sh $(DNSMASQ_TMP)/net-mgr-dnsmasq-install $(DNSMASQ_TMP)"
+	@echo "==> $(TARGET): dnsmasq install done"
+
+# Every host in [deploy] dnsmasq_hosts. Kept separate from 'hosts' so that a
+# routine `make deploy` can never restart a DHCP server as a side effect.
+deploy-dnsmasq:
+	@command -v perl >/dev/null 2>&1 || { echo "perl required for 'make deploy-dnsmasq'"; exit 1; }
+	@cfg='$(DEPLOY_CONF)'; \
+	[ -f "$$cfg" ] || { echo "config '$$cfg' not found (set DEPLOY_CONF=)"; exit 2; }; \
+	get() { perl -Ilib -MNetMgr::Config -e \
+	  'my $$c=NetMgr::Config->load($$ARGV[0]); my $$v=$$c->{deploy}{$$ARGV[1]}//q(); $$v=~s/^\s+|\s+$$//g; print $$v' \
+	  "$$cfg" "$$1"; }; \
+	hosts=`get dnsmasq_hosts | tr ',' ' '`; \
+	if [ -z "$$hosts" ]; then \
+	  echo "No [deploy] dnsmasq_hosts in $$cfg. Add e.g.:"; \
+	  echo "  [deploy]"; echo "  dnsmasq_hosts = gateway3"; \
+	  echo "(deliberately separate from 'hosts': installing dnsmasq restarts DHCP)"; \
+	  exit 2; \
+	fi; \
+	sudo_v=`get sudo`; sshopts_v=`get ssh_opts`; repo_v=`get dnsmasq_repo`; \
+	[ -n "$$repo_v" ] || repo_v='$(DNSMASQ_REPO)'; \
+	echo "==> deploy-dnsmasq (repo='$$repo_v' confirm='$(CONFIRM)') hosts:$$hosts"; \
+	failed=''; \
+	for h in $$hosts; do \
+	  echo; echo "===== $$h ====="; \
+	  $(MAKE) --no-print-directory install-dnsmasq-on TARGET="$$h" \
+	      SUDO="$$sudo_v" SSHOPTS="$$sshopts_v" DNSMASQ_REPO="$$repo_v" CONFIRM="$(CONFIRM)" \
+	    || { echo "deploy-dnsmasq: $$h FAILED — continuing"; failed="$$failed $$h"; }; \
+	done; \
+	if [ -n "$$failed" ]; then echo; echo "==> deploy-dnsmasq FAILURES:$$failed"; exit 1; fi; \
+	echo; echo "==> deploy-dnsmasq complete"
 
 # --- xpra-pod net-mgr image -----------------------------------------
 #   make pod-image                       # build for the host's flavor

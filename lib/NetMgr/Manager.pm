@@ -3397,6 +3397,52 @@ sub _obs_deploy {
     return ();
 }
 
+# OBSERVE kind=deploy_dnsmasq — push our patched dnsmasq to [deploy]
+# dnsmasq_hosts. Same authorisation as kind=deploy, plus one extra gate:
+# installing RESTARTS the DHCP server for a whole segment, so the caller must
+# say confirm=1. Without it the run is a dry run that reports what it would do
+# on each host - the accidental outcome is the harmless one.
+sub _obs_deploy_dnsmasq {
+    my ($self, $cli, $kv) = @_;
+    my ($who) = $self->_chat_identity($cli, $kv);
+    die "deploy_dnsmasq: not authorized\n" unless defined $who;
+    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_update})) {
+        die "deploy_dnsmasq: '$who' is not an allowed updater "
+          . "(add the key to /etc/net-mgr/allowed_updaters)\n";
+    }
+    my $repo = $self->{config}{manager}{repo};
+    die "deploy_dnsmasq: no repo configured (set [manager] repo = /path/to/checkout)\n"
+        unless defined $repo && length $repo;
+    $repo =~ m{^[\w./-]+$}
+        or die "deploy_dnsmasq: refusing suspicious repo path '$repo'\n";
+    -d "$repo/.git" or die "deploy_dnsmasq: '$repo' is not a git checkout\n";
+    my $script = $self->{config}{manager}{deploy_dnsmasq_script}
+              // '/usr/local/sbin/net-mgr-deploy-dnsmasq';
+    -x $script or die "deploy_dnsmasq: '$script' is not executable\n";
+    die "deploy_dnsmasq: already in progress\n"
+        if grep { $_->{name} eq 'deploy-dnsmasq' } values %{ $self->{triggers} };
+
+    my $confirm = (($kv->{confirm} // '') eq '1') ? 1 : 0;
+
+    my $pid = fork();
+    die "deploy_dnsmasq: fork failed: $!\n" unless defined $pid;
+    if ($pid == 0) {
+        for my $c (values %{ $self->{clients}   }) { close $c->{sock} if $c->{sock} }
+        for my $l (values %{ $self->{listeners} }) { close $l->{sock} if $l->{sock} }
+        $ENV{NET_MGR_REPO} = $repo;
+        $ENV{NET_MGR_DNSMASQ_CONFIRM} = $confirm;
+        my $du = $self->{config}{deploy}{user};
+        $ENV{NET_MGR_DEPLOY_USER} = $du if defined $du && length $du;
+        { no warnings; exec $script; }
+        POSIX::_exit(127);
+    }
+    $self->{triggers}{$pid} = { name => 'deploy-dnsmasq', started_at => time(),
+                                cli_fd => undef, who => $who };
+    $self->_log("deploy_dnsmasq started pid=$pid by $who "
+              . ($confirm ? "(INSTALLING - DHCP will restart)" : "(dry run, no confirm=1)"));
+    return ();
+}
+
 # OBSERVE kind=reset_ble — bounce the local Bluetooth stack + net-bitchat-bridge.
 # Recovery for the "Maximum advertisements reached" wedge that leaves the bridge
 # in activating/auto-restart after bluez holds onto advertising slots across a
@@ -5919,6 +5965,7 @@ sub _handle_observe {
         elsif ($kind eq 'regen_dnsmasq'){ @events = $self->_obs_regen_dnsmasq($cli, $kv) }
         elsif ($kind eq 'self_update') { @events = $self->_obs_self_update($cli, $kv) }
         elsif ($kind eq 'deploy')      { @events = $self->_obs_deploy($cli, $kv) }
+        elsif ($kind eq 'deploy_dnsmasq') { @events = $self->_obs_deploy_dnsmasq($cli, $kv) }
         elsif ($kind eq 'reset_ble')   { @events = $self->_obs_reset_ble($cli, $kv) }
         elsif ($kind eq 'dnsmasq_switch')
                                        { @events = $self->_obs_dnsmasq_switch($cli, $kv) }

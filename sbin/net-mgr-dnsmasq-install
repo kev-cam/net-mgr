@@ -1,0 +1,60 @@
+#!/bin/sh
+# net-mgr-dnsmasq-install — install a freshly built patched dnsmasq on THIS host.
+#
+# Run as root on the target by `make install-dnsmasq-on`, which rsyncs our fork
+# and builds it in $1 first. The gateways have no checkout of their own, so this
+# is how the patched binary gets onto them at all.
+#
+#   net-mgr-dnsmasq-install /tmp/dnsmasq-deploy
+#
+# It installs to /usr/local/sbin/dnsmasq and DOES NOT touch the running server.
+# That is the convention the fork's own swap-dnsmasq already established: the
+# distro binary stays at /usr/sbin/dnsmasq, the patched one lives alongside it,
+# and switching between them is a separate, reversible act:
+#
+#   net-cluster dnsmasq-switch variant=custom   (or: swap-dnsmasq local)
+#   net-cluster dnsmasq-switch variant=stock    (or: swap-dnsmasq system)
+#
+# Keeping install and activation apart means putting the binary in place costs
+# nothing at runtime, and the moment DHCP actually changes hands stays a single
+# deliberate command with an equally simple way back.
+set -e
+build=${1:?usage: net-mgr-dnsmasq-install <build-dir>}
+new="$build/src/dnsmasq"
+[ -x "$new" ] || { echo "no built binary at $new" >&2; exit 2; }
+
+# Belt and braces: the caller checks these too, but this can be run by hand and
+# must never install something lacking the feed net-mgr depends on.
+strings "$new" | grep -q netmgr || { echo "built binary has no netmgr client" >&2; exit 3; }
+
+dest=/usr/local/sbin/dnsmasq
+mkdir -p /usr/local/sbin
+if [ -e "$dest" ]; then
+    cp -a "$dest" "$dest.previous"
+    echo "kept previous local build as $dest.previous"
+fi
+install -m 0755 "$new" "$dest"
+echo "installed $dest"
+
+# The feed only happens if dnsmasq is told where net-mgr is. Without this line
+# the new binary changes nothing: reservations still never reach the running
+# server, which is precisely the gateway3 symptom.
+conf=/etc/net-mgr/dnsmasq.conf
+if [ -f "$conf" ]; then
+    if grep -q "^netmgr=" "$conf"; then
+        echo "netmgr= already configured in $conf"
+    else
+        echo "netmgr=127.0.0.1:7531" >> "$conf"
+        echo "added netmgr=127.0.0.1:7531 to $conf"
+    fi
+else
+    # Deliberately not created: a file nothing includes would look like the
+    # feed was configured while changing nothing at all.
+    echo "WARNING: $conf absent - dnsmasq will NOT pull config from net-mgr" >&2
+fi
+
+echo "NOT ACTIVATED. The running DHCP server is untouched."
+if [ -x /usr/local/src/dnsmasq/swap-dnsmasq ]; then
+    /usr/local/src/dnsmasq/swap-dnsmasq status 2>/dev/null || true
+fi
+echo "To switch: net-cluster dnsmasq-switch variant=custom   (revert: variant=stock)"

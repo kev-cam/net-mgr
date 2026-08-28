@@ -1,0 +1,26 @@
+#!/bin/sh
+# net-mgr-deploy-dnsmasq — push our patched dnsmasq to the [deploy] dnsmasq_hosts.
+#
+# Run by the daemon (as root) on an authenticated `deploy_dnsmasq` OBSERVE, or by
+# hand. Trigger over the mesh with:
+#
+#   net-cluster --peers HUB --auth observe kind=deploy_dnsmasq confirm=1
+#
+# UNLIKE net-mgr-deploy, which ships perl and leaves the DHCP server running,
+# this replaces the DHCP server binary and RESTARTS it on every target. So it
+# does nothing without an explicit confirm: with CONFIRM unset the Makefile
+# prints, per host, exactly what it would do and stops. That default is
+# deliberate - the harmless outcome is the one you get by accident.
+#
+# Targets come from [deploy] dnsmasq_hosts, which is deliberately NOT the same
+# key as [deploy] hosts, so an ordinary `make deploy` can never restart DHCP.
+set -e
+repo=${NET_MGR_REPO:?set NET_MGR_REPO to the net-mgr checkout path}
+[ -d "$repo/.git" ] || { echo "net-mgr-deploy-dnsmasq: $repo is not a git checkout" >&2; exit 2; }
+confirm=${NET_MGR_DNSMASQ_CONFIRM:-0}
+if [ "$confirm" = "1" ]; then
+    echo "net-mgr-deploy-dnsmasq: repo=$repo — INSTALLING (DHCP will restart)"
+else
+    echo "net-mgr-deploy-dnsmasq: repo=$repo — dry run (pass confirm=1 to install)"
+fi
+exec make -C "$repo" deploy-dnsmasq CONFIRM="$confirm"
