@@ -4845,12 +4845,24 @@ sub _obs_dhcp_reservation {
     # the host stops answering to its own short name. The GUI strips the domain
     # when it PRE-FILLS the field, but not on save, and any other client could
     # send one too - so enforce it here, where every write lands.
+    #
+    # The domain is read from [dhcp] FIRST because that is where the generator
+    # reads it (net-gen-dnsmasq: $dhcp_cfg{domain}); [dns] and [cluster] are
+    # checked as fallbacks. Reading only [dns] made this a silent no-op on the
+    # master, which is exactly where it has to work.
     if (defined $kv->{name} && length $kv->{name}) {
-        my $dom = $self->{config}{dns}{domain};
-        if (defined $dom) {
-            $dom =~ s/^\s+|\s+$//g;
-            $kv->{name} =~ s/\.\Q$dom\E\.?\z//i if length $dom;
+        my $c = $self->{config} || {};
+        my $dom;
+        for my $sect (qw(dhcp dns cluster)) {
+            next unless ref $c->{$sect} eq 'HASH';
+            my $d = $c->{$sect}{domain};
+            next unless defined $d;
+            $d =~ s/^\s+|\s+$//g;
+            next unless length $d;
+            $dom = $d;
+            last;
         }
+        $kv->{name} =~ s/\.\Q$dom\E\.?\z//i if defined $dom && length $dom;
     }
     # Single fetch: reused for the duplicate-MAC guard AND the merge below,
     # so we don't hit the DB twice on the edit path.

@@ -2720,7 +2720,17 @@ sub _resv_index {
         for my $p ($ENV{NET_MGR_CONF} // '/etc/net-mgr/config') {
             next unless -r $p;
             my $cfg = eval { NetMgr::Config->load($p) } or next;
-            $_dom = $cfg->{dns}{domain} // '';
+            # [dhcp] first: that is where net-gen-dnsmasq reads it, so agreeing
+            # with the generator matters more than any one section's tidiness.
+            for my $sect (qw(dhcp dns cluster)) {
+                next unless ref $cfg->{$sect} eq 'HASH';
+                my $d = $cfg->{$sect}{domain};
+                next unless defined $d;
+                $d =~ s/^\s+|\s+$//g;
+                next unless length $d;
+                $_dom = $d;
+                last;
+            }
             last;
         }
         return $_dom;
