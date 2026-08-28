@@ -588,11 +588,9 @@ deploy: .version
 # THERE, so the binary matches the target's libc and architecture instead of
 # the hub's - the gateways have no checkout of their own and cannot self-build.
 DNSMASQ_REPO   ?= /usr/local/src/dnsmasq
-DNSMASQ_TMP    ?= /tmp/dnsmasq-deploy
-DNSMASQ_CFLAGS ?= -O2 -std=gnu17
+DNSMASQ_DEST   ?= /usr/local/src/dnsmasq
 DNSMASQ_URL    ?= https://github.com/kev-cam/dnsmasq
 DNSMASQ_BRANCH ?= aws
-DNSMASQ_BUILD_HOST ?=
 
 install-dnsmasq-on:
 	@if [ -z "$(TARGET)" ]; then \
@@ -620,7 +618,7 @@ install-dnsmasq-on:
 	else \
 	  $(MAKE) --no-print-directory install-dnsmasq-go TARGET="$(TARGET)" \
 	    SSHTGT="$(SSHTGT)" SUDO="$(SUDO)" SSHOPTS="$(SSHOPTS)" \
-	    DNSMASQ_REPO="$(DNSMASQ_REPO)" DNSMASQ_TMP="$(DNSMASQ_TMP)"; \
+	    DNSMASQ_REPO="$(DNSMASQ_REPO)" DNSMASQ_DEST="$(DNSMASQ_DEST)"; \
 	fi
 
 # The steps that actually touch the target. Reachable only through
@@ -643,47 +641,37 @@ install-dnsmasq-go:
 	@[ -f "$(DNSMASQ_REPO)/src/event-socket.c" ] || { \
 	  echo "  *** $(DNSMASQ_REPO) is not our dnsmasq fork after preparation"; exit 2; }
 	@echo "==> source: $(DNSMASQ_REPO) @ `git -C $(DNSMASQ_REPO) log --oneline -1 2>/dev/null`"
-	@# Where to compile. Empty (default) = on the target itself, which is always
-	@# ABI-correct. Set DNSMASQ_BUILD_HOST to build elsewhere and copy the binary
-	@# over - for a gateway with no toolchain. Choose that host by GLIBC, not by
-	@# convenience: a dynamically linked binary runs only where the runtime glibc
-	@# is at least the build one, so build on the OLDEST gateway, not on the NAS.
-	@if [ -z "$(DNSMASQ_BUILD_HOST)" ]; then \
-	  echo "==> $(TARGET): rsync source, build on the target"; \
-	  ssh $(SSHOPTS) $(SSHTGT) "mkdir -p $(DNSMASQ_TMP)" || exit 2; \
-	  rsync -az --delete --exclude='.git/' --exclude='*.o' --exclude='src/dnsmasq' \
-	    -e "ssh $(SSHOPTS)" $(DNSMASQ_REPO)/ $(SSHTGT):$(DNSMASQ_TMP)/ || exit 2; \
-	  ssh $(SSHOPTS) $(SSHTGT) "make -C $(DNSMASQ_TMP) -j4 CFLAGS='$(DNSMASQ_CFLAGS)' >/dev/null" \
-	    || { echo "  *** build failed on $(TARGET) (no toolchain? set DNSMASQ_BUILD_HOST=)"; exit 2; }; \
-	else \
-	  echo "==> building on $(DNSMASQ_BUILD_HOST), copying the binary to $(TARGET)"; \
-	  ssh $(SSHOPTS) $(DNSMASQ_BUILD_HOST) "mkdir -p $(DNSMASQ_TMP)" || exit 2; \
-	  rsync -az --delete --exclude='.git/' --exclude='*.o' --exclude='src/dnsmasq' \
-	    -e "ssh $(SSHOPTS)" $(DNSMASQ_REPO)/ $(DNSMASQ_BUILD_HOST):$(DNSMASQ_TMP)/ || exit 2; \
-	  ssh $(SSHOPTS) $(DNSMASQ_BUILD_HOST) "make -C $(DNSMASQ_TMP) -j4 CFLAGS='$(DNSMASQ_CFLAGS)' >/dev/null" \
-	    || { echo "  *** build failed on $(DNSMASQ_BUILD_HOST)"; exit 2; }; \
-	  ssh $(SSHOPTS) $(SSHTGT) "mkdir -p $(DNSMASQ_TMP)/src" || exit 2; \
-	  hop=`mktemp`; \
-	  rsync -az -e "ssh $(SSHOPTS)" $(DNSMASQ_BUILD_HOST):$(DNSMASQ_TMP)/src/dnsmasq "$$hop" || exit 2; \
-	  rsync -az -e "ssh $(SSHOPTS)" "$$hop" $(SSHTGT):$(DNSMASQ_TMP)/src/dnsmasq || exit 2; \
-	  rm -f "$$hop"; \
-	fi
-	@# A binary built elsewhere runs only if the target's glibc is at least the
-	@# build host's. Rather than compare version strings, RUN it: the loader is
-	@# the authority, and a mismatch then fails here, before anything has been
-	@# replaced, instead of leaving a gateway with a binary that cannot start.
-	@ssh $(SSHOPTS) $(SSHTGT) "$(DNSMASQ_TMP)/src/dnsmasq --version >/dev/null 2>&1" \
-	  || { echo "  *** the built binary does not run on $(TARGET) (glibc/arch mismatch?) - refusing"; exit 3; }
-	@# Verify BEFORE replacing anything: a build that silently lost the fork's
-	@# features would take the lease feed down and be hard to attribute later.
-	@echo "==> $(TARGET): verifying the built binary carries the fork"
-	@ssh $(SSHOPTS) $(SSHTGT) "strings $(DNSMASQ_TMP)/src/dnsmasq | grep -q 'AUTH-REQUIRED'" \
-	  || { echo "  *** built binary has no auth gate - refusing to install"; exit 3; }
-	@ssh $(SSHOPTS) $(SSHTGT) "strings $(DNSMASQ_TMP)/src/dnsmasq | grep -q 'netmgr'" \
-	  || { echo "  *** built binary has no netmgr client - refusing to install"; exit 3; }
+	@# The tree goes to /usr/local/src/dnsmasq, not a scratch dir, for two
+	@# reasons: it is where this fleet has always rsynced it (gateway2 still has
+	@# such a tree, .git-less, from 2026-08-17), and net-mgr-dnsmasq-switch looks
+	@# for /usr/local/src/dnsmasq/swap-dnsmasq. Put the source anywhere else and
+	@# the binary installs fine but the SWITCH has nothing to call - gateway2 is
+	@# in exactly that state today, with a tree but no swap-dnsmasq.
+	@echo "==> $(TARGET): rsync $(DNSMASQ_REPO) -> $(DNSMASQ_DEST)"
+	@ssh $(SSHOPTS) $(SSHTGT) "$(SUDO) mkdir -p $(DNSMASQ_DEST)" || exit 2
+	@rsync -az --delete --exclude='.git/' --exclude='*.o' --exclude='src/dnsmasq' \
+	  --rsync-path="$(SUDO) rsync" -e "ssh $(SSHOPTS)" \
+	  $(DNSMASQ_REPO)/ $(SSHTGT):$(DNSMASQ_DEST)/ || exit 2
+	@# Build with the fork's own ./remake, NOT plain make. remake reads the
+	@# compile-time options out of the TARGET's /usr/sbin/dnsmasq --version and
+	@# rebuilds with the same set, so swap-dnsmasq can run the local build with
+	@# the packaged unit's argv (DNSSEC --trust-anchor= and friends) unfiltered.
+	@# That is also why the build cannot be done on another machine and copied:
+	@# the options are a property of the target, not of the builder.
+	@echo "==> $(TARGET): ./remake install (options taken from the target's own dnsmasq)"
+	@ssh $(SSHOPTS) $(SSHTGT) "$(SUDO) sh -c 'cd $(DNSMASQ_DEST) && ./remake install'" \
+	  || { echo "  *** remake failed on $(TARGET) (no toolchain, or no packaged dnsmasq to read options from)"; exit 2; }
+	@# Verify what landed, before anything is switched to it.
+	@echo "==> $(TARGET): verifying /usr/local/sbin/dnsmasq"
+	@ssh $(SSHOPTS) $(SSHTGT) "/usr/local/sbin/dnsmasq --version >/dev/null 2>&1" \
+	  || { echo "  *** installed binary does not run on $(TARGET) - refusing to go further"; exit 3; }
+	@ssh $(SSHOPTS) $(SSHTGT) "strings /usr/local/sbin/dnsmasq | grep -q 'AUTH-REQUIRED'" \
+	  || { echo "  *** installed binary has no auth gate - wrong source?"; exit 3; }
+	@ssh $(SSHOPTS) $(SSHTGT) "test -x $(DNSMASQ_DEST)/swap-dnsmasq" \
+	  || { echo "  *** $(DNSMASQ_DEST)/swap-dnsmasq missing - dnsmasq-switch would fail"; exit 3; }
 	@echo "==> $(TARGET): installing to /usr/local/sbin (running server untouched)"
-	@rsync -az -e "ssh $(SSHOPTS)" sbin/net-mgr-dnsmasq-install $(SSHTGT):$(DNSMASQ_TMP)/
-	@ssh $(SSHOPTS) $(SSHTGT) "$(SUDO) sh $(DNSMASQ_TMP)/net-mgr-dnsmasq-install $(DNSMASQ_TMP)"
+	@rsync -az -e "ssh $(SSHOPTS)" sbin/net-mgr-dnsmasq-install $(SSHTGT):/tmp/
+	@ssh $(SSHOPTS) $(SSHTGT) "$(SUDO) sh /tmp/net-mgr-dnsmasq-install $(DNSMASQ_DEST)"
 	@echo "==> $(TARGET): dnsmasq install done"
 
 # Every host in [deploy] dnsmasq_hosts. Kept separate from 'hosts' so that a

@@ -1,44 +1,29 @@
 #!/bin/sh
-# net-mgr-dnsmasq-install — install a freshly built patched dnsmasq on THIS host.
+# net-mgr-dnsmasq-install — post-build configuration for a patched dnsmasq.
 #
-# Run as root on the target by `make install-dnsmasq-on`, which rsyncs our fork
-# and builds it in $1 first. The gateways have no checkout of their own, so this
-# is how the patched binary gets onto them at all.
+# Run as root on the target by `make install-dnsmasq-on`, AFTER the fork's own
+# ./remake install has put the binary at /usr/local/sbin/dnsmasq. remake does the
+# compiling and installing (with the compile-time options read from the target's
+# packaged dnsmasq, so swap-dnsmasq can run it with the packaged unit's argv);
+# this only does the part remake knows nothing about - pointing dnsmasq at
+# net-mgr - and reports what still has to happen by hand.
 #
-#   net-mgr-dnsmasq-install /tmp/dnsmasq-deploy
+#   net-mgr-dnsmasq-install [/usr/local/src/dnsmasq]
 #
-# It installs to /usr/local/sbin/dnsmasq and DOES NOT touch the running server.
-# That is the convention the fork's own swap-dnsmasq already established: the
-# distro binary stays at /usr/sbin/dnsmasq, the patched one lives alongside it,
-# and switching between them is a separate, reversible act:
-#
-#   net-cluster dnsmasq-switch variant=custom   (or: swap-dnsmasq local)
-#   net-cluster dnsmasq-switch variant=stock    (or: swap-dnsmasq system)
-#
-# Keeping install and activation apart means putting the binary in place costs
-# nothing at runtime, and the moment DHCP actually changes hands stays a single
-# deliberate command with an equally simple way back.
+# It does NOT activate anything. The patched binary sits alongside the distro one
+# until swap-dnsmasq is told to switch, which keeps putting it in place free of
+# runtime consequence and leaves the changeover a single reversible command.
 set -e
-build=${1:?usage: net-mgr-dnsmasq-install <build-dir>}
-new="$build/src/dnsmasq"
-[ -x "$new" ] || { echo "no built binary at $new" >&2; exit 2; }
+tree=${1:-/usr/local/src/dnsmasq}
+bin=/usr/local/sbin/dnsmasq
 
-# Belt and braces: the caller checks these too, but this can be run by hand and
-# must never install something lacking the feed net-mgr depends on.
-strings "$new" | grep -q netmgr || { echo "built binary has no netmgr client" >&2; exit 3; }
+[ -x "$bin" ] || { echo "no patched binary at $bin - did remake install run?" >&2; exit 2; }
+"$bin" --version >/dev/null 2>&1 || { echo "$bin will not execute" >&2; exit 3; }
+strings "$bin" | grep -q netmgr || { echo "$bin has no netmgr client" >&2; exit 3; }
 
-dest=/usr/local/sbin/dnsmasq
-mkdir -p /usr/local/sbin
-if [ -e "$dest" ]; then
-    cp -a "$dest" "$dest.previous"
-    echo "kept previous local build as $dest.previous"
-fi
-install -m 0755 "$new" "$dest"
-echo "installed $dest"
-
-# The feed only happens if dnsmasq is told where net-mgr is. Without this line
-# the new binary changes nothing: reservations still never reach the running
-# server, which is precisely the gateway3 symptom.
+# THE line that matters. Without it the patched binary changes nothing: it never
+# polls net-mgr, so reservations still never reach the running server - which is
+# the entire gateway3 symptom, not the stale build.
 conf=/etc/net-mgr/dnsmasq.conf
 if [ -f "$conf" ]; then
     if grep -q "^netmgr=" "$conf"; then
@@ -48,13 +33,14 @@ if [ -f "$conf" ]; then
         echo "added netmgr=127.0.0.1:7531 to $conf"
     fi
 else
-    # Deliberately not created: a file nothing includes would look like the
-    # feed was configured while changing nothing at all.
+    # Deliberately not created: a file nothing includes would look like the feed
+    # was configured while changing nothing at all.
     echo "WARNING: $conf absent - dnsmasq will NOT pull config from net-mgr" >&2
 fi
 
-echo "NOT ACTIVATED. The running DHCP server is untouched."
-if [ -x /usr/local/src/dnsmasq/swap-dnsmasq ]; then
-    /usr/local/src/dnsmasq/swap-dnsmasq status 2>/dev/null || true
+if [ ! -x "$tree/swap-dnsmasq" ]; then
+    echo "WARNING: $tree/swap-dnsmasq missing - dnsmasq-switch will fail" >&2
 fi
+
+echo "NOT ACTIVATED. The running DHCP server is untouched."
 echo "To switch: net-cluster dnsmasq-switch variant=custom   (revert: variant=stock)"
