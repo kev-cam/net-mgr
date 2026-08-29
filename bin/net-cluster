@@ -349,6 +349,7 @@ sub cmd_selfcheck {
     require MIME::Base64;
     my $res = $m->observe_all(kind => 'selfcheck');
     my $any = 0;
+    my %loaded_hash;   # module => hash => { peer => 1 }
     for my $p ($m->peers) {
         my $r = $res->{ $p->{name} } // ($p->{error} // 'down');
         if ($r !~ /^OK\b/) {
@@ -371,10 +372,21 @@ sub cmd_selfcheck {
         push @flag, "shadowed=$sh"      if $sh;
         push @flag, "schema code=$sc/db=$sd"
             if defined $sc && defined $sd && $sc ne $sd;
+        # A node with no checkout of its own (the gateways) has nothing to
+        # compare against, so 'ok' there means only loaded == installed. Say
+        # so rather than letting it read as 'this node is current'.
+        my $norepo = $report =~ /^repo:\s+\(none configured\)/m;
         printf "%-20s %-40s%s\n", $p->{name},
-               (@flag ? join('  ', @flag) : 'ok'),
+               (@flag ? join('  ', @flag)
+                      : ($norepo ? 'ok (no repo: loaded==installed only)' : 'ok')),
                (defined $hd ? " head=$hd" : '');
         $any = 1 if @flag;
+        # Remember each module's loaded hash so peers can be compared with each
+        # other — that is the only way to catch a lagging repo-less leaf.
+        for my $l (split /\n/, $report) {
+            next unless $l =~ m{^(NetMgr/\S+)\s+(\S+)\s+\S+\s+\S+\s+\S};
+            $loaded_hash{$1}{$2}{ $p->{name} } = 1;
+        }
         if ($full) {
             print map { "    $_\n" } split /\n/, $report;
         } elsif (@flag) {
@@ -386,6 +398,20 @@ sub cmd_selfcheck {
                 push @keep, $l if $on;
             }
             print map { "    $_\n" } @keep;
+        }
+    }
+    # Cross-node comparison. Nodes legitimately differ mid-rollout, so this is
+    # reported rather than treated as a failure — but a leaf quietly left
+    # behind by a cascade looks exactly like this and nothing else shows it.
+    my @div = sort grep { keys %{ $loaded_hash{$_} } > 1 } keys %loaded_hash;
+    if (@div) {
+        print "\nmodules differing across peers:\n";
+        for my $m (@div) {
+            print "  $m\n";
+            for my $h (sort keys %{ $loaded_hash{$m} }) {
+                printf "    %-10s %s\n", $h,
+                       join(', ', sort keys %{ $loaded_hash{$m}{$h} });
+            }
         }
     }
     return $any ? 1 : 0;
