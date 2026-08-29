@@ -46,6 +46,13 @@ use NetMgr::AutoDiscover ();
 # bridge that happened to hear it. Revisit alongside an authenticating relay;
 # until then the protection is that the fleet is private and nas3 is not
 # Internet-reachable (see IPV6-TRANSPORT-SPEC.md, "Exposure model").
+# pending_tasks is the fleet's outstanding-work queue. It is readable here
+# rather than in %SUBSCRIBABLE_AUTH because the AUTH list demands FULL scope,
+# which would put the queue out of reach of exactly the debug-capable operator
+# key that needs to see why a push has not landed. It does not replicate: that
+# is decided by @REPLICATED in Relay.pm, not by membership here, and keeping it
+# out of there also keeps it clear of the relay's DELETE gap (task_done deletes
+# rows, and a table with no _delete_ handler leaves followers holding zombies).
 my %SUBSCRIBABLE = map { $_ => 1 } qw(
     machines hostnames interfaces addresses ports aps
     associations dhcp_leases events aliases dhcp_vars
@@ -60,20 +67,14 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
     bitchat_locations
     wan_services wan_service_candidates wan_service_health
     public_dns_servers sms_contacts sms_services
+    pending_tasks
 );
 
 # Tables whose contents are sensitive (credentials etc.); SUBSCRIBE
 # is allowed only when the calling connection has completed AUTH.
-#
-# pending_tasks is here for the second property rather than the first: an
-# AUTH-gated table has no Relay _apply_ handler and so does not replicate,
-# which is what a per-node work queue wants. Replicating it would also walk
-# straight into the relay's DELETE gap — task_done() deletes rows, and a
-# table with no _delete_ handler leaves followers holding zombies forever.
 my %SUBSCRIBABLE_AUTH = map { $_ => 1 } qw(
     isp_secrets
     chat_authorized_keys
-    pending_tasks
 );
 
 sub new {
@@ -5995,10 +5996,14 @@ sub _obs_selfcheck {
                       ? '  <-- MIGRATION PENDING' : ''));
 
     if ($repo) {
-        chomp(my $head = `git -C $repo rev-parse --short HEAD 2>/dev/null` // '');
-        chomp(my $br   = `git -C $repo rev-parse --abbrev-ref HEAD 2>/dev/null` // '');
+        # The daemon runs as root and the checkout belongs to its owner, so a
+        # bare git here refuses the repo as dubious ownership and every field
+        # comes back empty — which is why this reported 'head: ?' at first.
+        my $git = "git -c safe.directory=$repo -C $repo";
+        chomp(my $head = `$git rev-parse --short HEAD 2>/dev/null` // '');
+        chomp(my $br   = `$git rev-parse --abbrev-ref HEAD 2>/dev/null` // '');
         my @d = grep { /\S/ }
-                split /\n/, (`git -C $repo status --porcelain 2>/dev/null` // '');
+                split /\n/, (`$git status --porcelain 2>/dev/null` // '');
         $f{head} = $head if length $head;
         push @r, sprintf("head:     %s (%s)%s", $head || '?', $br || '?',
                          @d ? sprintf('  %d uncommitted file%s',
