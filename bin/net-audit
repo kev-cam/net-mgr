@@ -439,13 +439,65 @@ sub do_audit {
     }
 }
 
+# fw_state is sectioned (===NAT===, ===FILTER6===, ...) when it comes from the
+# daemon probe, but the ssh fallback returns a bare `iptables-save -t nat` with
+# no markers at all. Scoping blindly by section would silently drop every v4
+# finding on ssh-reached hosts, so callers fall back to the whole blob.
+# Returns undef when the section is absent — an older daemon or a node without
+# ip6tables — which callers must treat as "unknown", never as "wide open".
+sub fw_section {
+    my ($raw, $name) = @_;
+    return undef unless defined $raw && $raw =~ /^===KIND===/m;
+    my ($sec) = $raw =~ /^===\Q$name\E===\r?\n(.*?)^===/ms;
+    return $sec;
+}
+
+# IPv6 posture. Unlike v4 there is no NAT backstop here, so an empty filter
+# table with ACCEPT policies is not "nothing to audit" — it is every service on
+# the host, and every LAN host holding a global v6, reachable from the
+# Internet. Gated on the node actually having v6 connectivity (a v6 default
+# route): a box with no v6 path is not exposed, and flagging it would train
+# people to ignore this finding.
+sub ip6_posture {
+    my ($host, $raw) = @_;
+    my $filt = fw_section($raw, 'FILTER6');
+    return () unless defined $filt && $filt =~ /^\*filter/m;   # absent = unknown
+    my $routes6 = fw_section($raw, 'ROUTES6') // '';
+    return () unless $routes6 =~ /^\s*default\b/m;             # no v6 path out
+    my @out;
+    for my $chain (qw(INPUT FORWARD)) {
+        my ($policy) = $filt =~ /^:\Q$chain\E\s+(\S+)/m;
+        next unless defined $policy && uc($policy) eq 'ACCEPT';
+        next if grep { /^-A\s+\Q$chain\E\b/ } split /\n/, $filt;
+        push @out, {
+            host      => $host,
+            severity  => 'critical',
+            mechanism => 'ip6tables',
+            boundary  => 'Internet>Private',
+            bind_addr => '[::]',
+            bind_port => '*',
+            note      => $chain eq 'FORWARD'
+                ? 'no IPv6 FORWARD filtering (policy ACCEPT, 0 rules) - every '
+                . 'LAN host with a global v6 is directly reachable'
+                : 'no IPv6 INPUT filtering (policy ACCEPT, 0 rules) - every '
+                . 'service bound on this host is reachable from the Internet',
+        };
+    }
+    return @out;
+}
+
 sub audit_host {
     my ($host, $iface_zones, $sink, $intentional) = @_;
     my @out;
 
     # iptables PREROUTING DNAT.
     my $raw = live_iptables_for_host($host);
-    for my $r (parse_dnat($raw)) {
+    # Scope to the v4 NAT section now that the probe also carries ===NAT6===,
+    # or the v6 rules would be parsed as v4. Unsectioned output (ssh fallback)
+    # is the nat table already, so it is used whole.
+    my $nat4 = fw_section($raw, 'NAT');
+    $nat4 = $raw unless defined $nat4;
+    for my $r (parse_dnat($nat4)) {
         my $bind_addr = $r->{dst};
         if (defined $bind_addr && $bind_addr =~ s{/32$}{}) { } # strip /32
         $bind_addr //= '*';
@@ -465,6 +517,31 @@ sub audit_host {
         );
         push @out, $f if $f;
     }
+
+    # ip6tables PREROUTING DNAT — rare, but it is a forward like any other.
+    my $nat6 = fw_section($raw, 'NAT6');
+    if (defined $nat6) {
+        for my $r (parse_dnat($nat6)) {
+            my $bind_addr = $r->{dst};
+            if (defined $bind_addr) { $bind_addr =~ s{/128$}{} }
+            $bind_addr //= '*';
+            my $f = make_finding(
+                host        => $host,
+                mechanism   => 'ip6tables',
+                bind_addr   => $bind_addr,
+                bind_port   => $r->{dport} // '?',
+                target_host => $r->{to_host},
+                target_port => $r->{to_port},
+                iface_zones => $iface_zones,
+                sink        => $sink,
+                intentional => $intentional,
+            );
+            push @out, $f if $f;
+        }
+    }
+
+    # Is anything filtering v6 at all?
+    push @out, ip6_posture($host, $raw);
 
     # ssh -L tunnels (live, via net-import-ssh-forwards --print).
     for my $r (live_tunnels_for_host($host)) {

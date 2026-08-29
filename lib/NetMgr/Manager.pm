@@ -3804,6 +3804,13 @@ sub _reexec {
 # Each value is either a shell-script string (run via /bin/sh -c) or
 # a code-ref that returns a string. The dispatcher in _handle_poll
 # picks the right path.
+# fw_state carries the v6 tables as well as the v4 ones. IPv4 on these gateways
+# is shielded incidentally by MASQUERADE, so an empty filter table there is
+# survivable; IPv6 has no NAT to hide behind, and a host holding a global
+# address is reachable from the Internet the moment nothing filters it. An
+# audit that reads only iptables-save reports such a node clean, which is worse
+# than not auditing it. A node with no ip6tables at all emits an empty section
+# — the consumer must read that as UNKNOWN, not as "no rules".
 my %POLL_SCRIPTS = (
     fw_state => <<'SH',
 echo ===KIND===
@@ -3819,6 +3826,12 @@ echo ===NAT===
 iptables-save -t nat 2>/dev/null
 echo ===FILTER===
 iptables-save -t filter 2>/dev/null
+echo ===ROUTES6===
+ip -6 route show 2>/dev/null
+echo ===NAT6===
+ip6tables-save -t nat 2>/dev/null
+echo ===FILTER6===
+ip6tables-save -t filter 2>/dev/null
 echo ===END===
 SH
     ssh_forwards => 'pgrep -lfa ssh 2>/dev/null',
