@@ -1290,6 +1290,30 @@ sub _push_host {
 # the name shows up (e.g. on the soil dashboard) without falsely marking the
 # device online. Optional SUBNET limits scope; --dry-run prints the
 # observations instead of sending them.
+# The DD-WRT APs serve DHCP from their own NVRAM static_leases, so a reservation
+# that reaches the gateways but never the APs leaves an AP still handing out the
+# address the device was moved OFF. That is how a host ends up answering on two
+# addresses at once and the stale one outlives the change - the conflicting rows
+# net-reserve then has to reconcile were manufactured by the push that did not
+# finish the job.
+#
+# The master holds the AP ssh credentials, so ask it rather than reaching for
+# the APs from here. Never fatal: the reservation itself is already stored, and
+# an unreachable AP must not make a successful reservation look failed. (This
+# fleet's APs drop sshd in and out, so that is a routine outcome, not an
+# exception.)
+sub _push_aps {
+    my ($cli) = @_;
+    return 1 if $opt_dry;
+    my $r = eval { $cli->observe(kind => 'push_aps') };
+    if (!defined $r || $r =~ /^ERR/) {
+        warn "net-reserve: AP push: " . ($r // 'no response')
+           . " (reservation is saved; APs may still serve the old address)\n";
+        return 0;
+    }
+    return 1;
+}
+
 sub cmd_push {
     my ($subnet) = @_;
     my $want = defined $subnet ? normalize_cidr($subnet) : undef;
@@ -1323,6 +1347,11 @@ sub cmd_push {
     return if $opt_dry;
     print "pushed $pushed name(s) into net-lookup as never-seen hosts",
           ($failed ? " ($failed failed)" : ''), "\n";
+    # The APs are the half of "push" that changes what a device is actually
+    # handed the next time it asks.
+    print _push_aps($cli)
+        ? "  APs updated from the reservations" . chr(10)
+        : "  AP push FAILED - APs may still serve old addresses" . chr(10);
 }
 
 sub cmd_add_range {
@@ -3060,6 +3089,10 @@ sub reserve_dialog {
         $status->configure(-text => $ok
             ? " pushed $v{ip} -> $v{mac}" . ($v{name} ne '' ? " ($v{name})" : '')
             : " push $v{ip} failed");
+        # Push means "make this real on the servers that answer DHCP", and
+        # the APs are among them - without this the AP keeps handing out
+        # the address the device was just moved off.
+        _push_aps($cli);
         return;
     }
     return unless $ans eq 'Reserve' || $ans eq 'Reserve+Push';
@@ -3121,6 +3154,7 @@ sub reserve_dialog {
         $msg .= _push_host($cli, ip => $v{ip}, mac => lc $v{mac},
                            ($v{name} ne '' ? (name => $v{name}) : ()))
             ? ' + pushed to net-lookup' : ' (push failed)';
+        $msg .= _push_aps($cli) ? ' + APs' : ' (AP push failed)';
     }
     $S->{model} = gather($cli); $redraw->();
     $status->configure(-text => $msg);

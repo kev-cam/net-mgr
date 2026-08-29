@@ -5390,6 +5390,52 @@ sub _ring_dnsmasq_doorbell {
 # is what makes it safe to fan out to every peer rather than only to DHCP
 # servers: /etc/hosts matters on any machine someone types a name on, and the
 # master is usually not a dnsmasq node at all.
+# OBSERVE kind=push_aps — regenerate the DD-WRT APs' static_leases from the DB
+# and restart their dnsmasq. The APs serve DHCP from their own NVRAM, so a
+# reservation that reaches the gateways but not the APs leaves an AP handing out
+# the address the operator just moved a device OFF - which is how a machine ends
+# up answering on two addresses at once and the stale one outlives the change.
+#
+# _sync_dnsmasq already does this, but passively: only on the master, only when
+# [dnsmasq] push_aps is set, and only when its polling signature notices. An
+# explicit Push is a direct instruction and should not be conditional on a
+# passive-mode flag, so this runs whenever asked - the operator pressing Push has
+# said what they want. Still master-only, because the AP ssh credentials live
+# there, and still one-at-a-time.
+sub _obs_push_aps {
+    my ($self, $cli, $kv) = @_;
+    my ($who) = $self->_chat_identity($cli, $kv);
+    die "push_aps: not authorized\n" unless defined $who;
+    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_update})) {
+        die "push_aps: '$who' is not an allowed updater\n";
+    }
+    my $is_master = (($self->{cluster_runtime}{role} // $self->{cluster}{role} // '') eq 'master');
+    unless ($is_master) {
+        # Not an error: a follower forwards nothing and simply has no APs to
+        # push. Saying so beats a silent no-op that looks like success.
+        $self->_log("push_aps: ignored — this node is not the master");
+        return ();
+    }
+    my $bin = $self->_producer_path('net-push-ap');
+    unless ($bin && -x $bin) { $self->_log("push_aps: net-push-ap missing"); return () }
+    if (grep { ($_->{name} // '') eq 'push-aps' } values %{ $self->{triggers} }) {
+        return ();   # one in flight already
+    }
+    my $pid = fork();
+    return () unless defined $pid;
+    if ($pid == 0) {
+        for my $c (values %{ $self->{clients} }) { close $c->{sock} if $c->{sock} }
+        close $self->{listen} if $self->{listen};
+        $ENV{NET_MGR_LISTEN} = $self->_self_connect_addr;
+        exec $bin, '--apply', '--auto';
+        exit 127;
+    }
+    $self->_log("push_aps: net-push-ap --apply --auto pid=$pid (told by "
+              . ($cli->{ident} // '?') . ")");
+    $self->{triggers}{$pid} = { cli_fd => undef, name => 'push-aps', started_at => time() };
+    return ();
+}
+
 sub _obs_regen_hosts {
     my ($self, $cli, $kv) = @_;
     my $cfg = $self->{config}{hosts};
@@ -6046,6 +6092,7 @@ sub _handle_observe {
         elsif ($kind eq 'ap_exclude')  { @events = $self->_obs_ap_exclude($cli, $kv) }
         elsif ($kind eq 'regen_dnsmasq'){ @events = $self->_obs_regen_dnsmasq($cli, $kv) }
         elsif ($kind eq 'regen_hosts')   { @events = $self->_obs_regen_hosts($cli, $kv) }
+        elsif ($kind eq 'push_aps')     { @events = $self->_obs_push_aps($cli, $kv) }
         elsif ($kind eq 'self_update') { @events = $self->_obs_self_update($cli, $kv) }
         elsif ($kind eq 'deploy')      { @events = $self->_obs_deploy($cli, $kv) }
         elsif ($kind eq 'deploy_dnsmasq') { @events = $self->_obs_deploy_dnsmasq($cli, $kv) }
