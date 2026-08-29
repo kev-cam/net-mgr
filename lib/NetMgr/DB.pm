@@ -11,7 +11,7 @@ use Carp qw(croak);
 use DBI;
 use FindBin;
 
-our $SCHEMA_VERSION = 41;
+our $SCHEMA_VERSION = 42;
 
 sub new {
     my ($class, %args) = @_;
@@ -1036,6 +1036,48 @@ CREATE TABLE IF NOT EXISTS sms_services (
 SQL
         return;
     }
+    if ($v == 42) {
+        # pending_tasks — durable record of work that was ASKED FOR but has not
+        # landed yet.
+        #
+        # Until now a push that could not reach its target was a warning in
+        # whoever's terminal ran it, and nothing else: not recorded, not retried,
+        # gone when the window closed. That is how a half-finished push becomes
+        # the stale data someone reconciles days later - an AP kept handing out
+        # an address the operator had already moved a device off, because the
+        # one attempt to tell it failed while sshd was between moods.
+        #
+        # UNIQUE (kind, target) so re-asking for work already queued updates the
+        # row instead of stacking duplicates: ten edits in a minute are one
+        # outstanding push per AP, not ten.
+        #
+        # next_attempt drives the backoff and is what the worker selects on.
+        # attempts/last_error are kept AFTER success is impossible to tell apart
+        # from never-tried, so an operator can see "3 failures, sshd refused"
+        # rather than an empty queue that looks healthy.
+        #
+        # A pure CREATE TABLE IF NOT EXISTS, for the reason migration 38 gives:
+        # it touches no existing table, transforms no data, and re-running is a
+        # no-op, so it cannot fail against live data the way an ALTER can.
+        $self->{dbh}->do(<<'SQL');
+CREATE TABLE IF NOT EXISTS pending_tasks (
+    id           INT           NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    kind         VARCHAR(64)   NOT NULL,
+    target       VARCHAR(128)  NOT NULL DEFAULT '',
+    payload      TEXT          NULL,
+    attempts     INT           NOT NULL DEFAULT 0,
+    first_seen   DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_attempt DATETIME      NULL,
+    next_attempt DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_error   TEXT          NULL,
+    notified_at  DATETIME      NULL,
+    escalated_at DATETIME      NULL,
+    UNIQUE KEY uq_pending (kind, target),
+    KEY idx_pending_due (next_attempt)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+SQL
+        return;
+    }
     if ($v == 41) {
         # dhcp_ranges.status — is this pool's server actually answering?
         #
@@ -1232,6 +1274,89 @@ sub upsert_interface {
         "SELECT * FROM interfaces WHERE mac = ?", undef, $f{mac});
     return { op => 'insert', changed_fields => [keys %$now], was => undef, now => $now };
 }
+
+# ---- pending_tasks --------------------------------------------------------
+#
+# Work that was asked for and has not landed yet. See migration 42 for why it
+# is durable rather than a warning on someone's terminal.
+
+# Queue, or refresh, a task. Idempotent on (kind, target): asking again for work
+# already outstanding updates the payload and deliberately leaves attempts and
+# next_attempt alone, so an operator repeating themselves does not reset a
+# backoff and turn a broken target into a hot loop.
+sub task_enqueue {
+    my ($self, %f) = @_;
+    croak "task_enqueue: kind required" unless defined $f{kind} && length $f{kind};
+    my $target = defined $f{target} ? $f{target} : '';
+    $self->{dbh}->do(
+        "INSERT INTO pending_tasks (kind, target, payload, next_attempt)
+              VALUES (?, ?, ?, NOW())
+         ON DUPLICATE KEY UPDATE payload = VALUES(payload)",
+        undef, $f{kind}, $target, $f{payload}
+    );
+    return $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM pending_tasks WHERE kind = ? AND target = ?",
+        undef, $f{kind}, $target
+    );
+}
+
+# Everything whose next_attempt has arrived, oldest first.
+sub tasks_due {
+    my ($self, $limit) = @_;
+    $limit = (defined $limit && $limit =~ /\A\d+\z/ && $limit > 0) ? 0 + $limit : 20;
+    return $self->{dbh}->selectall_arrayref(
+        "SELECT * FROM pending_tasks WHERE next_attempt <= NOW()
+          ORDER BY next_attempt LIMIT $limit", { Slice => {} }
+    ) || [];
+}
+
+# Everything outstanding, for reporting - net-reserve wants to say "2 APs still
+# owe you this push" rather than leaving the operator to guess.
+sub tasks_outstanding {
+    my ($self) = @_;
+    return $self->{dbh}->selectall_arrayref(
+        "SELECT * FROM pending_tasks ORDER BY first_seen", { Slice => {} }
+    ) || [];
+}
+
+# The work landed. The row goes; the narrative stays in the log.
+sub task_done {
+    my ($self, $id) = @_;
+    $self->{dbh}->do("DELETE FROM pending_tasks WHERE id = ?", undef, $id);
+}
+
+# It failed again: count it, keep the reason, and push the next attempt out with
+# exponential backoff, capped so a long-dead target is retried hourly forever
+# rather than drifting out to never. Returns the new attempt count so the caller
+# can decide about notifying or escalating.
+sub task_failed {
+    my ($self, $id, $err, %opt) = @_;
+    my $base = $opt{base} || 60;
+    my $cap  = $opt{cap}  || 3600;
+    my $row  = $self->{dbh}->selectrow_hashref(
+        "SELECT attempts FROM pending_tasks WHERE id = ?", undef, $id) or return;
+    my $n = ($row->{attempts} // 0) + 1;
+    my $delay = $base * (2 ** ($n - 1));
+    $delay = $cap if $delay > $cap;
+    $self->{dbh}->do(
+        "UPDATE pending_tasks
+            SET attempts = ?, last_error = ?, last_attempt = NOW(),
+                next_attempt = DATE_ADD(NOW(), INTERVAL ? SECOND)
+          WHERE id = ?",
+        undef, $n, $err, $delay, $id
+    );
+    return $n;
+}
+
+# Stamp notified_at / escalated_at so each happens once per outstanding task,
+# not once per retry - an AP that is down for a day must not send a mail an hour.
+sub task_mark {
+    my ($self, $id, $col) = @_;
+    return unless defined $col && $col =~ /\A(?:notified_at|escalated_at)\z/;
+    $self->{dbh}->do("UPDATE pending_tasks SET $col = NOW() WHERE id = ?", undef, $id);
+    return 1;
+}
+
 
 # Delete the rows a MAC has moved off. Separate from _supersede_addresses,
 # which removes OTHER MACs from one address; this removes one MAC from its
@@ -3220,6 +3345,7 @@ sub query_table {
         chat_authorized_keys
         host_keys dhcp_ranges dhcp_reservations
         mesh_tunnels node_capabilities bitchat_peers bitchat_locations
+        pending_tasks
         wan_services wan_service_candidates wan_service_health
         public_dns_servers sms_contacts sms_services
     );

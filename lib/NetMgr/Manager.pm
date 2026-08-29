@@ -3050,7 +3050,7 @@ sub _check_periodic_triggers {
     my $now   = time();
     $self->{periodic_last} //= {};
 
-    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq ddns he-dns ipv6_vlan netif register-self bitchat-sweep)) {
+    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq ddns he-dns ipv6_vlan netif register-self bitchat-sweep pending-tasks)) {
         my $interval = $sched->{$name} // 0;
         # netif: track interface changes (WiFi/USB up/down) and rebind the
         # 'all'/'auto' listeners. Auto-enable at 30s for those specs (an explicit
@@ -3065,6 +3065,10 @@ sub _check_periodic_triggers {
         # this on interface change, but on nodes with a fixed listen= (no netif)
         # it would otherwise only run at daemon start.
         $interval ||= 300 if $name eq 'register-self';
+        # pending-tasks: drain outstanding work. Self-enabling, because a queue
+        # nobody drains is worse than no queue - it would collect failures and
+        # look like a record of them rather than a plan to fix them.
+        $interval ||= 120 if $name eq 'pending-tasks';
         # ipv6_vlan keep-up: re-establish a managed IPv6 net that's down. Auto-
         # enable at 60s when there's one to keep up (the control VLAN has an id,
         # or an he6in4 network is mode=on).
@@ -3145,6 +3149,7 @@ sub _check_periodic_triggers {
 sub _fire_periodic {
     my ($self, $name) = @_;
     if ($name eq 'push-dnsmasq') { $self->_sync_dnsmasq; return }
+    if ($name eq 'pending-tasks') { $self->_run_pending_tasks; return }
     if ($name eq 'register-self') { $self->_register_self_interfaces; return }
     if ($name eq 'bitchat-sweep') {
         # Two-stage sweep: peers with is_connected=1 that haven't been
@@ -3222,6 +3227,149 @@ sub _fire_periodic {
     };
 }
 
+# ---- pending_tasks worker -------------------------------------------------
+#
+# Drains work that was asked for and has not landed. The point is that a push to
+# an unreachable target stops being a warning nobody keeps and becomes a row
+# that survives until the target answers - an AP that was between sshd moods
+# gets the reservation when it comes back, instead of serving the old address
+# indefinitely while the DB says the move was done.
+#
+# Attempts run as forked producers like every other job here; the OUTCOME is
+# recorded in _reap_triggers, which is the only place the exit status exists.
+sub _run_pending_tasks {
+    my ($self) = @_;
+    my $is_master = (($self->{cluster_runtime}{role} // $self->{cluster}{role} // '') eq 'master');
+    return unless $is_master;          # AP credentials and the queue live here
+    my $due = eval { $self->{db}->tasks_due(10) } || [];
+    return unless @$due;
+    for my $t (@$due) {
+        # One attempt per task in flight: a slow ssh must not have three copies
+        # of itself queued behind it.
+        next if grep { ($_->{task_id} // 0) == $t->{id} } values %{ $self->{triggers} };
+        $self->_attempt_task($t);
+    }
+}
+
+sub _attempt_task {
+    my ($self, $t) = @_;
+    my ($bin, @args);
+    if ($t->{kind} eq 'push_aps') {
+        $bin = $self->_producer_path('net-push-ap');
+        @args = ('--apply', length($t->{target} // '') ? $t->{target} : '--auto');
+    } else {
+        # An unknown kind is a bug, not a transient: retrying it forever would
+        # hide that. Drop it and say so.
+        $self->_log("pending task $t->{id}: unknown kind '$t->{kind}' — discarding");
+        eval { $self->{db}->task_done($t->{id}) };
+        return;
+    }
+    unless ($bin && -x $bin) {
+        eval { $self->{db}->task_failed($t->{id}, "producer missing") };
+        return;
+    }
+    my $pid = fork();
+    return unless defined $pid;
+    if ($pid == 0) {
+        for my $c (values %{ $self->{clients} }) { close $c->{sock} if $c->{sock} }
+        close $self->{listen} if $self->{listen};
+        $ENV{NET_MGR_LISTEN} = $self->_self_connect_addr;
+        exec $bin, @args;
+        exit 127;
+    }
+    $self->{triggers}{$pid} = { cli_fd => undef, name => "task-$t->{kind}",
+                                started_at => time(), task_id => $t->{id},
+                                task_kind => $t->{kind}, task_target => $t->{target} };
+    $self->_log("pending task $t->{id} ($t->{kind}"
+              . (length($t->{target} // '') ? " -> $t->{target}" : '')
+              . ") attempt " . (($t->{attempts} // 0) + 1) . " pid=$pid");
+}
+
+# Record the outcome of a task attempt. Called from _reap_triggers, which owns
+# the exit status.
+sub _task_outcome {
+    my ($self, $t, $exit) = @_;
+    my $id = $t->{task_id} or return;
+    if ($exit == 0) {
+        eval { $self->{db}->task_done($id) };
+        $self->_log("pending task $id ($t->{task_kind}) done");
+        return;
+    }
+    my $n = eval { $self->{db}->task_failed($id, "exit $exit") } // 0;
+    $self->_log("pending task $id ($t->{task_kind}) failed exit=$exit attempt=$n");
+
+    my $cfg      = $self->{config}{alerts} || {};
+    my $notify   = $cfg->{notify_after}   // 2;   # "more than a couple of tries"
+    my $escalate = $cfg->{escalate_after} // 4;
+
+    my $row = eval { $self->{db}->dbh->selectrow_hashref(
+        "SELECT * FROM pending_tasks WHERE id = ?", undef, $id) } or return;
+
+    if ($n >= $notify && !$row->{notified_at}) {
+        my $what = $row->{kind} . (length($row->{target}) ? " -> $row->{target}" : '');
+        $self->_notify_admin(
+            "net-mgr: $what still outstanding after $n attempts",
+            "Task $id ($what) has failed $n times.\n"
+          . "First queued: $row->{first_seen}\n"
+          . "Last error:   " . ($row->{last_error} // '?') . "\n\n"
+          . "It stays queued and will keep retrying with backoff.\n"
+          . "Until it lands, the target may still be serving stale data.\n");
+        eval { $self->{db}->task_mark($id, 'notified_at') };
+    }
+
+    # Escalation needs a NAMED target: "reboot the AP" is only meaningful when we
+    # know which one. A fleet-wide push that fails is reported, not escalated -
+    # rebooting every AP because one is unreachable would be a worse outage than
+    # the stale lease it is trying to fix.
+    if ($n >= $escalate && !$row->{escalated_at}
+        && $row->{kind} eq 'push_aps' && length $row->{target}
+        && ($cfg->{escalate_ap_reboot} // 0)) {
+        $self->_log("pending task $id: escalating — rebooting AP $row->{target}");
+        eval { $self->_reboot_ap($row->{target}) };
+        eval { $self->{db}->task_mark($id, 'escalated_at') };
+    }
+}
+
+# Mail the admin. Recipient from [alerts] email, default root - a local mailbox
+# that exists on every node, so the default cannot silently go nowhere the way
+# an unset address would.
+sub _notify_admin {
+    my ($self, $subject, $body) = @_;
+    my $to = ($self->{config}{alerts} || {})->{email} || 'root';
+    my $ok = eval {
+        open my $mh, '|-', 'sendmail', '-t' or die "no sendmail\n";
+        print {$mh} "To: $to\nSubject: $subject\n\n$body";
+        close $mh;
+        1;
+    };
+    unless ($ok) {
+        # Never let a missing MTA lose the alert: the log is the fallback and is
+        # what an operator reads when the mail never arrives.
+        $self->_log("ALERT (mail to $to failed: " . ($@ || 'unknown') . ") $subject");
+        return 0;
+    }
+    $self->_log("alerted $to: $subject");
+    return 1;
+}
+
+sub _reboot_ap {
+    my ($self, $ap) = @_;
+    my $bin = $self->_producer_path('net-poll-ap');
+    return unless $bin && -x $bin;
+    my $pid = fork();
+    return unless defined $pid;
+    if ($pid == 0) {
+        for my $c (values %{ $self->{clients} }) { close $c->{sock} if $c->{sock} }
+        close $self->{listen} if $self->{listen};
+        $ENV{NET_MGR_LISTEN} = $self->_self_connect_addr;
+        exec $bin, '--reboot', $ap;
+        exit 127;
+    }
+    $self->{triggers}{$pid} = { cli_fd => undef, name => 'ap-reboot',
+                                started_at => time() };
+}
+
+
 # Regenerate / push dnsmasq config when dhcp_reservations has changed. Gated by
 # [dnsmasq] mode = auto (this node regenerates its OWN dnsmasq from the local DB
 # replica + reload — the gateway "do it automatically on reservation updates"
@@ -3285,6 +3433,7 @@ sub _reap_triggers {
         next unless $t;
         $self->_log("trigger $t->{name} pid=$pid done exit=$exit"
                   . " elapsed=" . (time() - $t->{started_at}) . "s");
+        if ($t->{task_id}) { $self->_task_outcome($t, $exit); next }
         if ($t->{name} eq 'self-update') {
             if ($exit == 0) {
                 $self->_log("self-update OK — re-execing into the new code");
@@ -5421,18 +5570,18 @@ sub _obs_push_aps {
     if (grep { ($_->{name} // '') eq 'push-aps' } values %{ $self->{triggers} }) {
         return ();   # one in flight already
     }
-    my $pid = fork();
-    return () unless defined $pid;
-    if ($pid == 0) {
-        for my $c (values %{ $self->{clients} }) { close $c->{sock} if $c->{sock} }
-        close $self->{listen} if $self->{listen};
-        $ENV{NET_MGR_LISTEN} = $self->_self_connect_addr;
-        exec $bin, '--apply', '--auto';
-        exit 127;
+    # Queue it FIRST, then attempt it. The queue is what makes an unreachable
+    # AP survive: if this attempt fails, the row stays and the pending-tasks
+    # worker keeps retrying with backoff instead of the push being lost with
+    # the terminal that asked for it. On success the row is removed by
+    # _task_outcome, so a working push leaves nothing behind.
+    my $t = eval { $self->{db}->task_enqueue(kind => "push_aps", target => "",
+                                             payload => ($cli->{ident} // "?")) };
+    unless ($t) {
+        $self->_log("push_aps: could not queue the task: $@");
+        return ();
     }
-    $self->_log("push_aps: net-push-ap --apply --auto pid=$pid (told by "
-              . ($cli->{ident} // '?') . ")");
-    $self->{triggers}{$pid} = { cli_fd => undef, name => 'push-aps', started_at => time() };
+    $self->_attempt_task($t);
     return ();
 }
 
