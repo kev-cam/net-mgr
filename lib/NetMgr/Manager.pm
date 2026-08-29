@@ -5905,6 +5905,155 @@ sub _obs_he_diag {
     ));
     return ();
 }
+# OBSERVE kind=selfcheck — report what code this daemon is ACTUALLY running.
+#
+# A self-update can log exit=0, install cleanly, re-exec — and the daemon can
+# still be answering out of stale modules: a copy earlier in @INC shadowing the
+# installed one, an install that wrote sbin/ but not lib/, or a re-exec that
+# never took. From outside all of those look identical — the node is healthy,
+# it authenticates, and it quietly lacks the code you just shipped. Unpicking
+# that used to need a shell on the box. This reports the three-way comparison
+# instead: what each NetMgr module is LOADED from, what is INSTALLED, what is
+# in the REPO, and every shadowing copy sitting in @INC.
+#
+# Read-only — it stats and hashes files the daemon already reads and runs no
+# command beyond `git rev-parse` in the configured checkout. Gated exactly like
+# POLL: [debug] enabled, then /etc/net-mgr/allowed_debug if that file exists.
+sub _obs_selfcheck {
+    my ($self, $cli, $kv) = @_;
+    # The same gate POLL uses: [debug] enabled is the master switch, and the
+    # allowlist only RESTRICTS when it exists (absent file = open). Matching it
+    # matters — a stricter gate here would refuse exactly when you need this
+    # most, on a node you cannot get a shell on to add the key.
+    my $en = lc($self->{config}{debug}{enabled} // 'on');
+    die "selfcheck disabled ([debug] enabled=off)\n"
+        if $en =~ /^(off|no|0|false|disabled)$/;
+    if (NetMgr::Auth::principals('/etc/net-mgr/allowed_debug')) {
+        unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_debug})) {
+            die "selfcheck: not authorized (add the key to /etc/net-mgr/allowed_debug)\n";
+        }
+    }
+    require Digest::MD5;
+    require MIME::Base64;
+
+    # Short content hash — enough to tell two copies of a .pm apart.
+    my $sum = sub {
+        my ($p) = @_;
+        return undef unless defined $p && -f $p;
+        open my $fh, '<', $p or return undef;
+        binmode $fh;
+        my $h = eval { Digest::MD5->new->addfile($fh)->hexdigest };
+        close $fh;
+        return defined $h ? substr($h, 0, 8) : undef;
+    };
+    my $ago = sub {
+        my ($d) = @_;
+        return $d < 5400   ? int($d/60)    . 'm'
+             : $d < 172800 ? int($d/3600)  . 'h'
+             :               int($d/86400) . 'd';
+    };
+    my $when = sub {
+        my ($p) = @_;
+        return '-' unless defined $p && -e $p;
+        my $t = (stat $p)[9];
+        return POSIX::strftime('%m-%d %H:%M', localtime $t)
+             . ' (' . $ago->(time() - $t) . ' ago)';
+    };
+
+    my $host = `hostname 2>/dev/null`; chomp $host;
+    my $repo = $self->{config}{manager}{repo};
+    $repo = undef unless defined $repo && $repo =~ m{^[\w./-]+$} && -d "$repo/.git";
+    # Where `make install` puts modules (the Makefile's PERL5DIR).
+    my $p5dir = $self->{config}{manager}{perl5dir} // '/usr/local/share/perl5';
+
+    my (@r, %f);
+    push @r, "== selfcheck on $host ==";
+    push @r, sprintf("daemon:   pid=%d up=%s version=%s", $$,
+                     $ago->(time() - ($self->{started_at} // time())),
+                     _read_version());
+    push @r, "perl:     $^X";
+    push @r, "argv0:    $0";
+    push @r, "repo:     " . ($repo // '(none configured)');
+    push @r, "perl5dir: $p5dir";
+    push @r, "PERL5LIB: " . ($ENV{PERL5LIB} // '(unset)');
+
+    # Schema: what the loaded code believes, against what the database is.
+    my $code_schema = do { no warnings 'once'; $NetMgr::DB::SCHEMA_VERSION };
+    my $db_schema   = eval { $self->{db}->current_schema_version };
+    $f{schema_code} = $code_schema // '?';
+    $f{schema_db}   = $db_schema   // '?';
+    push @r, sprintf("schema:   code=%s db=%s%s", $f{schema_code}, $f{schema_db},
+                     ((defined $code_schema && defined $db_schema
+                       && $code_schema != $db_schema)
+                      ? '  <-- MIGRATION PENDING' : ''));
+
+    if ($repo) {
+        chomp(my $head = `git -C $repo rev-parse --short HEAD 2>/dev/null` // '');
+        chomp(my $br   = `git -C $repo rev-parse --abbrev-ref HEAD 2>/dev/null` // '');
+        my @d = grep { /\S/ }
+                split /\n/, (`git -C $repo status --porcelain 2>/dev/null` // '');
+        $f{head} = $head if length $head;
+        push @r, sprintf("head:     %s (%s)%s", $head || '?', $br || '?',
+                         @d ? sprintf('  %d uncommitted file%s',
+                                      scalar @d, @d == 1 ? '' : 's') : '');
+    }
+
+    # The three-way comparison, per loaded NetMgr module.
+    my @mods = sort grep { m{^NetMgr/} } keys %INC;
+    my ($stale, $uninstalled, $shadowed) = (0, 0, 0);
+    my @rows;
+    for my $m (@mods) {
+        my $loaded = $INC{$m};
+        my $inst   = "$p5dir/$m";
+        my $rp     = $repo ? "$repo/lib/$m" : undef;
+        my ($lh, $ih, $rh) = ($sum->($loaded), $sum->($inst), $sum->($rp));
+        my @st;
+        # Loaded differs from the repo — this daemon has not picked the code up.
+        push @st, 'STALE'         if defined $rh && defined $lh && $rh ne $lh;
+        # Repo differs from installed — `make install` did not land the file.
+        push @st, 'NOT-INSTALLED' if defined $rh && (!defined $ih || $rh ne $ih);
+        # More than one copy in @INC — whichever comes first wins, silently.
+        my @copies = grep { -f $_ } map { "$_/$m" } @INC;
+        push @st, 'SHADOWED(' . scalar(@copies) . ')' if @copies > 1;
+        $stale++       if grep { $_ eq 'STALE' } @st;
+        $uninstalled++ if grep { $_ eq 'NOT-INSTALLED' } @st;
+        $shadowed++    if grep { /^SHADOWED/ } @st;
+        push @rows, [ $m, $lh, $ih, $rh, (join(',', @st) || 'ok'), $loaded, \@copies ];
+    }
+    $f{modules}     = scalar @mods;
+    $f{stale}       = $stale;
+    $f{uninstalled} = $uninstalled;
+    $f{shadowed}    = $shadowed;
+
+    push @r, '', sprintf('%-26s %-9s %-9s %-9s %s',
+                         'module', 'loaded', 'installed', 'repo', 'state');
+    for my $row (@rows) {
+        push @r, sprintf('%-26s %-9s %-9s %-9s %s', $row->[0],
+                         $row->[1] // '-', $row->[2] // '-', $row->[3] // '-',
+                         $row->[4]);
+    }
+    # Spell out the interesting ones — the table above is for scanning, these
+    # are the paths you would otherwise have to go and look at by hand.
+    for my $row (@rows) {
+        my ($m, $lh, $ih, $rh, $st, $loaded, $copies) = @$row;
+        next if $st eq 'ok';
+        push @r, '', "$m: $st";
+        push @r, '  loaded   ' . $loaded . '  ' . $when->($loaded);
+        push @r, '  install  ' . "$p5dir/$m" . '  ' . $when->("$p5dir/$m");
+        push @r, '  repo     ' . "$repo/lib/$m" . '  ' . $when->("$repo/lib/$m")
+            if $repo;
+        push @r, '  shadowed by: ' . $_ for grep { $_ ne $loaded } @$copies;
+    }
+    push @r, '', '@INC:';
+    push @r, "  $_" for @INC;
+
+    $self->_send($cli, format_ok(
+        %f,
+        report_b64 => MIME::Base64::encode_base64(join("\n", @r) . "\n", ''),
+    ));
+    return ();
+}
+
 
 # OBSERVE kind=mesh_tunnel — write/delete a row of the cluster-replicated
 # mesh_tunnels table (tunnel topology — server/prefixes/provider_id per owner).
@@ -6252,6 +6401,7 @@ sub _handle_observe {
         elsif ($kind eq 'he_net')      { @events = $self->_obs_he_net($cli, $kv) }
         elsif ($kind eq 'he_update')   { @events = $self->_obs_he_update($cli, $kv) }
         elsif ($kind eq 'he_diag')     { @events = $self->_obs_he_diag($cli, $kv) }
+        elsif ($kind eq 'selfcheck')   { @events = $self->_obs_selfcheck($cli, $kv) }
         elsif ($kind eq 'write_config'){ @events = $self->_obs_write_config($cli, $kv) }
         elsif ($kind eq 'mesh_tunnel') { @events = $self->_obs_mesh_tunnel($cli, $kv) }
         elsif ($kind eq 'publish_self'){ @events = $self->_obs_publish_self($cli, $kv) }

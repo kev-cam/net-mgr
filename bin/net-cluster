@@ -12,6 +12,8 @@
 #   net-cluster snapshot <table> [--where=…]    — dump rows per peer
 #   net-cluster diff <table> [--key=col,…]      — show only divergent rows
 #   net-cluster observe kind=K k=v ...          — fan out one OBSERVE
+#   net-cluster selfcheck [--full]              — is each node RUNNING the
+#                                                 code it was shipped?
 #   net-cluster master kind=K k=v ...           — OBSERVE on master only
 #   net-cluster repair action=A k=v ...         — fan out one REPAIR
 #                                                 (loopback or may_repair)
@@ -86,6 +88,7 @@ $peers_opt = '127.0.0.1' if $cmd eq 'deploy' && !$peers_opt;
 $auth = 1 if $cmd eq 'repair' && !$auth;
 # `add_public_dns` rides the REPAIR verb — same auth model.
 $auth = 1 if ($cmd eq 'add_public_dns' || $cmd eq 'add-public-dns') && !$auth;
+$auth = 1 if $cmd eq 'selfcheck' && !$auth;
 
 # Build the Multi. Auth is wired as an empty hash so NetMgr::Client
 # falls back to its default key_id / key_file detection.
@@ -152,6 +155,7 @@ elsif ($cmd eq 'dnsmasq-switch')
                            { unshift @ARGV, 'kind=dnsmasq_switch'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'dhcp-cycle'){ unshift @ARGV, 'kind=dhcp_cycle'; $rc = cmd_observe($multi) }
 elsif ($cmd eq 'poll')     { $rc = cmd_poll($multi) }
+elsif ($cmd eq 'selfcheck'){ $rc = cmd_selfcheck($multi) }
 elsif ($cmd eq 'put')      { $rc = cmd_put($multi) }
 elsif ($cmd eq 'master')   { $rc = cmd_master($multi) }
 elsif ($cmd eq 'repair')   { $rc = cmd_repair($multi) }
@@ -329,6 +333,61 @@ sub cmd_observe {
         }
     }
     return $any_err ? 1 : 0;
+}
+
+# Ask every peer what code it is ACTUALLY running, and say so in one line
+# each. The failure this exists for is silent: a node pulls, installs, logs
+# exit=0, re-execs — and still answers out of stale modules, because a copy
+# earlier in @INC shadows the installed one or the install never wrote lib/.
+# Nothing about a healthy STATUS line reveals that. Summary per peer by
+# default with the flagged modules spelled out; --full prints each report
+# whole (@INC included).
+sub cmd_selfcheck {
+    my ($m) = @_;
+    my $full = grep { $_ eq '--full' } @ARGV;
+    require MIME::Base64;
+    my $res = $m->observe_all(kind => 'selfcheck');
+    my $any = 0;
+    for my $p ($m->peers) {
+        my $r = $res->{ $p->{name} } // ($p->{error} // 'down');
+        if ($r !~ /^OK\b/) {
+            printf "%-20s %s\n", $p->{name}, $r;
+            $any = 1;
+            next;
+        }
+        my $report = '';
+        if    ($r =~ /report_b64="([^"]*)"/)          { $report = MIME::Base64::decode_base64($1) }
+        elsif ($r =~ m{report_b64=([A-Za-z0-9+/=]+)}) { $report = MIME::Base64::decode_base64($1) }
+        my ($sc) = $r =~ /\bschema_code=(\S+)/;
+        my ($sd) = $r =~ /\bschema_db=(\S+)/;
+        my ($st) = $r =~ /\bstale=(\d+)/;
+        my ($ui) = $r =~ /\buninstalled=(\d+)/;
+        my ($sh) = $r =~ /\bshadowed=(\d+)/;
+        my ($hd) = $r =~ /\bhead=(\w+)/;
+        my @flag;
+        push @flag, "stale=$st"         if $st;
+        push @flag, "not-installed=$ui" if $ui;
+        push @flag, "shadowed=$sh"      if $sh;
+        push @flag, "schema code=$sc/db=$sd"
+            if defined $sc && defined $sd && $sc ne $sd;
+        printf "%-20s %-40s%s\n", $p->{name},
+               (@flag ? join('  ', @flag) : 'ok'),
+               (defined $hd ? " head=$hd" : '');
+        $any = 1 if @flag;
+        if ($full) {
+            print map { "    $_\n" } split /\n/, $report;
+        } elsif (@flag) {
+            # Just the per-module detail blocks — skip the header and @INC.
+            my ($on, @keep) = (0);
+            for my $l (split /\n/, $report) {
+                last if $l eq '@INC:';
+                $on = 1 if $l =~ m{^NetMgr/\S+: };
+                push @keep, $l if $on;
+            }
+            print map { "    $_\n" } @keep;
+        }
+    }
+    return $any ? 1 : 0;
 }
 
 sub cmd_poll {
