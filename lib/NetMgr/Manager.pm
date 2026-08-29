@@ -5996,18 +5996,31 @@ sub _obs_selfcheck {
                       ? '  <-- MIGRATION PENDING' : ''));
 
     if ($repo) {
-        # The daemon runs as root and the checkout belongs to its owner, so a
-        # bare git here refuses the repo as dubious ownership and every field
-        # comes back empty — which is why this reported 'head: ?' at first.
+        # The daemon runs as root while the checkout belongs to its owner, so
+        # git can refuse the repo as dubious ownership — hence safe.directory.
+        # Keep stderr: swallowing it is what left this reporting a bare '?',
+        # which says nothing about WHY. If git will not answer, say what it
+        # said instead of making the reader guess.
         my $git = "git -c safe.directory=$repo -C $repo";
-        chomp(my $head = `$git rev-parse --short HEAD 2>/dev/null` // '');
-        chomp(my $br   = `$git rev-parse --abbrev-ref HEAD 2>/dev/null` // '');
-        my @d = grep { /\S/ }
-                split /\n/, (`$git status --porcelain 2>/dev/null` // '');
-        $f{head} = $head if length $head;
-        push @r, sprintf("head:     %s (%s)%s", $head || '?', $br || '?',
-                         @d ? sprintf('  %d uncommitted file%s',
-                                      scalar @d, @d == 1 ? '' : 's') : '');
+        chomp(my $out = (`$git rev-parse --short HEAD 2>&1` // ''));
+        my ($head, $gerr);
+        if ($out =~ /\A[0-9a-f]{7,40}\z/) { $head = $out }
+        else                              { $gerr = $out }
+        if (defined $head) {
+            chomp(my $br = (`$git rev-parse --abbrev-ref HEAD 2>/dev/null` // ''));
+            my @d = grep { /\S/ }
+                    split /\n/, (`$git status --porcelain 2>/dev/null` // '');
+            $f{head} = $head;
+            push @r, sprintf("head:     %s (%s)%s", $head, $br || '?',
+                             @d ? sprintf('  %d uncommitted file%s',
+                                          scalar @d, @d == 1 ? '' : 's') : '');
+        }
+        else {
+            $gerr = '(no output — is git on the daemon PATH?)'
+                unless defined $gerr && length $gerr;
+            $gerr =~ s/\s+/ /g;
+            push @r, "head:     unavailable — git: " . substr($gerr, 0, 160);
+        }
     }
 
     # The three-way comparison, per loaded NetMgr module.
