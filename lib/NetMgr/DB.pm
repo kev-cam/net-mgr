@@ -1233,6 +1233,21 @@ sub upsert_interface {
     return { op => 'insert', changed_fields => [keys %$now], was => undef, now => $now };
 }
 
+# Delete the rows a MAC has moved off. Separate from _supersede_addresses,
+# which removes OTHER MACs from one address; this removes one MAC from its
+# previous addresses. Deleting rather than flagging keeps every reader honest
+# without each having to learn an "inactive" concept - and the lease and
+# reservation tables still hold the history if it is wanted.
+sub _retire_moved_addresses {
+    my ($self, $mac, $family, $addrs) = @_;
+    return unless $addrs && @$addrs;
+    my $ph = join ',', ('?') x @$addrs;
+    $self->{dbh}->do(
+        "DELETE FROM addresses WHERE mac = ? AND family = ? AND addr IN ($ph)",
+        undef, $mac, $family, @$addrs
+    );
+}
+
 sub upsert_address {
     my ($self, %f) = @_;
     croak "mac required"    unless $f{mac};
@@ -1272,6 +1287,38 @@ sub upsert_address {
         }
     }
 
+    # Same-MAC movement. The block above resolves one ADDRESS moving between
+    # MACs; this resolves one MAC moving between ADDRESSES, which is what
+    # happens every time a device is re-reserved onto a new IP. Without it both
+    # rows stay live and anything that expands a name through the MAC offers the
+    # abandoned address alongside the current one - net-ping answered a moved
+    # camera with the address it had just left, while DNS answered correctly.
+    #
+    # Scoped to the SAME SUBNET, because a MAC legitimately holds addresses in
+    # several: this fleet has 24 multi-homed hosts (opti03 at .223.219 and
+    # .15.219 among them) and a roaming interface can wander between segments.
+    # Only a second address in the SAME subnet is a contradiction.
+    #
+    # v4 only. Multiple v6 addresses inside one /64 are normal and expected -
+    # SLAAC plus privacy/temporary addresses - so superseding there would delete
+    # addresses that are all genuinely live.
+    my @moved_from;
+    if (($f{family} // '') eq 'v4' && $f{addr} =~ /\A\d+\.\d+\.\d+\.\d+\z/) {
+        my ($net) = $f{addr} =~ /\A(\d+\.\d+\.\d+)\./;
+        my $rows = $self->{dbh}->selectall_arrayref(
+            "SELECT addr, source FROM addresses
+              WHERE mac = ? AND family = ? AND addr != ? AND addr LIKE ?",
+            { Slice => {} }, $f{mac}, $f{family}, $f{addr}, "$net.%"
+        );
+        for my $r (@$rows) {
+            # Same priority discipline as the cross-MAC case: a lower-priority
+            # observation must not evict what an authoritative source recorded.
+            next if defined $f{source}
+                 && _source_priority($f{source}) < _source_priority($r->{source});
+            push @moved_from, $r->{addr};
+        }
+    }
+
     my $was = $self->{dbh}->selectrow_hashref(
         "SELECT * FROM addresses WHERE mac = ? AND family = ? AND addr = ?",
         undef, $f{mac}, $f{family}, $f{addr}
@@ -1304,6 +1351,8 @@ sub upsert_address {
         );
         $self->_supersede_addresses($f{family}, $f{addr}, \@to_supersede)
             if @to_supersede;
+        $self->_retire_moved_addresses($f{mac}, $f{family}, \@moved_from)
+            if @moved_from;
         return { op => @changed ? 'update' : 'noop',
                  changed_fields => \@changed, was => $was, now => $now,
                  superseded => [@to_supersede] };
@@ -1322,6 +1371,8 @@ sub upsert_address {
     );
     $self->_supersede_addresses($f{family}, $f{addr}, \@to_supersede)
         if @to_supersede;
+    $self->_retire_moved_addresses($f{mac}, $f{family}, \@moved_from)
+        if @moved_from;
     return { op => 'insert', changed_fields => [qw(mac family addr source)],
              was => undef, now => $now, superseded => [@to_supersede] };
 }
