@@ -203,8 +203,12 @@ if (@onvif_hits) {
             if ($opt{sample}) {
                 my $n = 0;
                 for my $u (@$uris) {
-                    my (undef, undef, $uri) = @$u;
-                    report_rtsp('stream' . $n, $uri, $opt{user}, $opt{pass});
+                    my ($nm, undef, $uri) = @$u;
+                    # Label with the PROFILE name rather than stream0/stream1: the
+                    # profiles are listed just above with their URIs, so naming them
+                    # here is what lets a reader tie a result to a URL instead of
+                    # counting lines.
+                    report_rtsp($nm, $uri, $opt{user}, $opt{pass});
                     if ($n == 0) {
                         my $dest = $opt{out} || (($ENV{TMPDIR} || '/tmp') . "/net-onvif-$ip.jpg");
                         # ffmpeg first: a decoded frame proves transport AND codec.
@@ -214,7 +218,7 @@ if (@onvif_hits) {
                         my $err = ffmpeg_grab(with_creds($uri, $opt{user}, $opt{pass}),
                                               $dest, $opt{ffmpeg});
                         if (!$err) {
-                            printf "  frame: %s (via ffmpeg, RTSP confirmed end to end)\n", $dest;
+                            printf "  frame: %s" . chr(10) . "         from %s (ffmpeg: RTSP confirmed end to end)" . chr(10), $dest, $uri;
                         } else {
                             printf "  frame: ffmpeg %s\n", $err;
                             my ($snaps) = onvif_snapshot_uris($ip, $port, $path,
@@ -225,7 +229,7 @@ if (@onvif_hits) {
                                 my $serr = fetch_snapshot($snaps->[0][1], $opt{user},
                                                           $opt{pass}, $dest);
                                 if ($serr) { printf "  snapshot: %s\n", $serr; $dest = undef }
-                                else       { printf "  frame: %s (via ONVIF snapshot)\n", $dest }
+                                else       { printf "  frame: %s" . chr(10) . "         from %s (ONVIF snapshot, NOT the RTSP stream)" . chr(10), $dest, $snaps->[0][1] }
                             } else {
                                 print "  snapshot: camera offers no GetSnapshotUri\n";
                                 $dest = undef;
