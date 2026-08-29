@@ -64,9 +64,16 @@ my %SUBSCRIBABLE = map { $_ => 1 } qw(
 
 # Tables whose contents are sensitive (credentials etc.); SUBSCRIBE
 # is allowed only when the calling connection has completed AUTH.
+#
+# pending_tasks is here for the second property rather than the first: an
+# AUTH-gated table has no Relay _apply_ handler and so does not replicate,
+# which is what a per-node work queue wants. Replicating it would also walk
+# straight into the relay's DELETE gap — task_done() deletes rows, and a
+# table with no _delete_ handler leaves followers holding zombies forever.
 my %SUBSCRIBABLE_AUTH = map { $_ => 1 } qw(
     isp_secrets
     chat_authorized_keys
+    pending_tasks
 );
 
 sub new {
