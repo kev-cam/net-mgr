@@ -92,6 +92,16 @@ my ($gui, $describe, $opt_name, $opt_group, $opt_notes, $opt_zone, $limit, $opt_
 my ($opt_start, $opt_end);          # trim-range boundaries
 my ($opt_dnsmasq, $opt_no_dnsmasq);
 my ($opt_push, $opt_dry, $opt_new);
+
+# Reservation edits that the APs have not been told about yet.
+#
+# A reservation lives in two places: this DB, and the DHCP server on each AP.
+# The reserve dialog pushes as part of saving, but a MOVE only wrote the DB —
+# so the operator saw "moved .233 -> .11", the table agreed, and the APs went
+# on handing out the old address until someone happened to run a push. Nothing
+# in the UI said so. Counting the unpushed edits lets the GUI offer to flush
+# them before it closes, which is the last moment anyone can notice.
+my $ap_dirty = 0;
 GetOptions(
     'listen=s'   => \$listen,
     'server=s'   => \$server,
@@ -1217,6 +1227,9 @@ sub cmd_move {
     # and say how to proceed, rather than making the operator go and look.
     die "net-reserve: $r\n" if !defined $r || $r =~ /^ERR/;
     print "moved $old -> $new" . ($opt_force ? " (replaced any existing reservation)" : '') . "\n";
+    # The DB now says one thing and the APs still say another. Saying so beats
+    # letting it surface later as a device that keeps its old address.
+    print "note: the APs have not been updated - run 'net-reserve push' to send it\n";
 }
 
 # Backfill host names on reservations that lack one: re-observe each nameless
@@ -1311,6 +1324,7 @@ sub _push_aps {
            . " (reservation is saved; APs may still serve the old address)\n";
         return 0;
     }
+    $ap_dirty = 0;
     return 1;
 }
 
@@ -1810,6 +1824,38 @@ sub cmd_gui {
 
     my $mw = Tk::MainWindow->new(-title => "net-reserve — $listen");
     $S{anchor} = $mw;             # dialogs parent off the main window
+
+    # Closing with edits the APs have not been told about is the failure this
+    # catches: the DB and the UI agree, the APs quietly disagree, and the
+    # symptom turns up later as a device that still gets its old address. Ask
+    # on the way out rather than pushing silently — a push touches every AP,
+    # and an operator part-way through a batch of moves may not want that yet.
+    $mw->protocol('WM_DELETE_WINDOW', sub {
+        if ($ap_dirty) {
+            my $ans = lc($mw->messageBox(
+                -type => 'yesnocancel', -icon => 'question',
+                -title => 'net-reserve: unpushed changes',
+                -message => "$ap_dirty change"
+                    . ($ap_dirty == 1 ? '' : 's')
+                    . " have not been pushed to the APs.\n\n"
+                    . "Until they are, the APs keep serving the old addresses.\n\n"
+                    . "Push now before closing?"));
+            return if $ans eq 'cancel';
+            if ($ans eq 'yes') {
+                # A failure here is not silent and not lost: push_aps queues the
+                # work in pending_tasks, which retries with backoff.
+                unless (_push_aps($cli)) {
+                    $mw->messageBox(
+                        -type => 'ok', -icon => 'warning',
+                        -title => 'net-reserve: AP push failed',
+                        -message => "The push did not complete.\n\n"
+                            . "It has been queued and will be retried; the "
+                            . "reservations themselves are saved.");
+                }
+            }
+        }
+        $mw->destroy;
+    });
     # One Balloon serves every widget that wants hover-help; attach below.
     my $balloon = $mw->Balloon(-state => 'balloon', -initwait => 600);
     my $fs = 10;
@@ -3344,7 +3390,8 @@ sub move_dialog {
     }
     if (!defined $resp || $resp =~ /^ERR/) { $status->configure(-text => " $resp"); return }
     $S->{model} = gather($cli); $redraw->();
-    $status->configure(-text => " moved $ip -> $newip");
+    $ap_dirty++;
+    $status->configure(-text => " moved $ip -> $newip (not yet pushed to APs)");
 }
 
 # Where a NAMED device belongs, if its siblings already imply a pattern.
