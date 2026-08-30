@@ -3979,6 +3979,13 @@ my %POLL_METHODS = (
         # the fleet can tell "deliberately dormant" from "dead", which it
         # cannot when the service is stopped.
         my $standby = ($self->{config}{dnsmasq}{standby} // 0) ? 1 : 0;
+        # Mirror the role into a marker file the patched dnsmasq reads at
+        # startup. Without it the role is only ever learned from THIS payload,
+        # so a restarted standby answers until it arrives — and if this daemon
+        # is unreachable it never arrives, leaving the standby serving a pool
+        # that overlaps the active server's. Local state is what lets a node
+        # be correct with no upstream at all.
+        $self->_write_standby_marker($standby);
         return "#=== control ===
 standby $standby
 " .          "#=== dhcp ===
@@ -4061,6 +4068,48 @@ standby $standby
         return "(no journald entries for $unit)\n";
     },
 );
+
+# Keep /etc/net-mgr/standby in step with [dnsmasq] standby.
+#
+# The patched dnsmasq reads this file at startup to settle its role before it
+# serves anything. Presence means standby; absence on a net-mgr-configured node
+# means active. That is deliberately a FILE and not just the payload directive:
+# a role that only travels over the wire is unknown for the whole window
+# between exec and the first fetch, and unknown forever if this daemon is down
+# — which is precisely when a standby must not start answering.
+#
+# Write-then-rename so a reader never sees a half-written file, and touch the
+# disk only on an actual change: this runs on every payload render.
+sub _write_standby_marker {
+    my ($self, $standby) = @_;
+    my $path = '/etc/net-mgr/standby';
+    my $have = -e $path ? 1 : 0;
+    return if $have == $standby;          # already correct — leave it alone
+    if ($standby) {
+        my $tmp = "$path.new.$$";
+        if (open my $fh, '>', $tmp) {
+            print $fh "# written by net-mgr: this node is a dnsmasq standby.
+"
+                    . "# Presence of this file makes the patched dnsmasq start
+"
+                    . "# dormant, before it has spoken to net-mgr at all.
+";
+            close $fh;
+            unless (rename $tmp, $path) {
+                unlink $tmp;
+                $self->_log("standby marker: rename to $path failed: $!");
+                return;
+            }
+            $self->_log("standby marker: $path created (this node is a standby)");
+        }
+        else { $self->_log("standby marker: cannot write $tmp: $!") }
+    }
+    else {
+        unlink $path
+            ? $self->_log("standby marker: $path removed (this node is active)")
+            : $self->_log("standby marker: cannot remove $path: $!");
+    }
+}
 
 sub _handle_poll {
     my ($self, $cli, $cmd) = @_;
