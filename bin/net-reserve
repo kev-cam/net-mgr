@@ -2201,11 +2201,40 @@ sub cmd_gui {
         ->pack(-side => 'left', -fill => 'both', -expand => 1, -padx => 4, -pady => 4);
     my $side = $body->Frame->pack(-side => 'right', -fill => 'y');
     $S{side_title} = 'Reservations';
-    $side->Label(-textvariable => \$S{side_title})->pack(-side => 'top', -anchor => 'w');
+    my $side_hdr = $side->Frame->pack(-side => 'top', -fill => 'x');
+    $side_hdr->Label(-textvariable => \$S{side_title})->pack(-side => 'left', -anchor => 'w');
+
+    # Lock: hold the list still.
+    #
+    # The pane is rebuilt from scratch every five seconds, which is fine when you
+    # are watching it and maddening when you are working in it — the scroll
+    # position is restored but a row you were reading can move under the pointer
+    # as leases come and go. Locking stops the rescan without stopping the GUI:
+    # explicit actions still refresh, so a reserve or move you make yourself is
+    # shown immediately.
+    $S{scan_lock} = 0;
+    my $lock_btn = $side_hdr->Checkbutton(
+        -text => 'lock', -variable => \$S{scan_lock}, -padx => 2,
+        -command => sub {
+            # $status is declared above and assigned below; the closure captures
+            # the variable, so by click time it is a live widget.
+            $status->configure(-text => $S{scan_lock}
+                ? ' list locked — periodic rescan paused'
+                : ' list unlocked — rescanning every 5s') if $status;
+        })->pack(-side => 'right');
+    $S{lock_btn} = $lock_btn;
+    $balloon->attach($lock_btn,
+        -msg => "Hold this list still.
+"
+              . "The pane is rebuilt every 5s, so rows can move under the
+"
+              . "pointer as leases come and go. Locking pauses that rescan;
+"
+              . "your own reserves and moves still refresh it.");
     # Vertical scrollbar always present ('e', not optional 'oe'): otherwise it
     # appears/disappears with the row count — e.g. when toggling to the DHCP-range
     # view, which has fewer rows — and the pane visibly resizes each time.
-    $resv_text = $side->Scrolled('ROText', -width => 38, -height => 24,
+    $resv_text = $side->Scrolled('ROText', -width => 58, -height => 24,
         -font => 'nrmono', -scrollbars => 'e')->pack(-side => 'top', -fill => 'y', -expand => 1);
     $S{resv_text} = $resv_text;     # so a cell click can centre this pane on its IP
 
@@ -2452,8 +2481,12 @@ sub cmd_gui {
             for my $g (sort keys %by_grp) {
                 $resv_text->insert('end', "[$g]\n");
                 for my $rr (@{ $by_grp{$g} }) {
+                    # MAC gets its own column: it used to stand in for a missing
+                    # name, so a nameless reservation and a named one showed
+                    # different KINDS of thing in the same place.
                     $resv_text->insert('end',
-                        sprintf("  %-15s %s\n", $rr->{ip}, ($rr->{name} // $rr->{mac})));
+                        sprintf("  %-15s %-17s %s\n", $rr->{ip},
+                                ($rr->{mac} // ''), ($rr->{name} // '')));
                 }
             }
             # Active addresses: leased/observed but not reserved (e.g. the KP200,
@@ -2474,8 +2507,9 @@ sub cmd_gui {
                     my $mac  = $active{$aip};
                     my $name = $model->{mac_name}{ lc $mac }
                             // ($model->{leased}{$aip} ? $model->{leased}{$aip}{hostname} : undef)
-                            // $mac;
-                    $resv_text->insert('end', sprintf("  %-15s %s\n", $aip, $name));
+                            // '';
+                    $resv_text->insert('end',
+                        sprintf("  %-15s %-17s %s\n", $aip, $mac, $name));
                 }
             }
         }
@@ -2558,8 +2592,12 @@ sub cmd_gui {
     $mw->after(600, sub { $dup_warn->() });
 
     # periodic refresh: lazy (local DB only) — explicit actions force-sync
+    # Reschedule even while locked, so unlocking resumes on its own rather than
+    # needing the window reopened.
     my $tick; $tick = sub {
-        $S{model} = gather($cli); $refresh_subnets->(); $redraw->();
+        unless ($S{scan_lock}) {
+            $S{model} = gather($cli); $refresh_subnets->(); $redraw->();
+        }
         $mw->after(5000, $tick);
     };
     $mw->after(5000, $tick);
