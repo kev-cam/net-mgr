@@ -3430,112 +3430,81 @@ sub purge_stale_hostnames {
     return ($n && $n > 0) ? $n + 0 : 0;
 }
 
+# Which machine keeps a contested hostname.
+#
+# Extracted because the preview and the delete each had their own idea of the
+# answer, and they drifted: the count reported LOSING MACHINES while the delete
+# removed LOSING ROWS, and a machine holds one row per source (dhcp,
+# reservation, dhcp_reservation). A dry run therefore under-reported — it said
+# 30 where the purge removed 41 — which is precisely the wrong direction for a
+# preview whose job is to tell you what you are about to lose.
+#
+# The rule: a machine with something ONLINE keeps the name whatever the
+# timestamps say. Replication stamps every binding at the same instant, so
+# last_seen ties constantly; only when nothing is online does freshness decide,
+# and a remaining tie goes to the NEWER record.
+sub _hostname_conflict_keeper {
+    my ($self, $name) = @_;
+    my ($keep) = $self->{dbh}->selectrow_array(
+        "SELECT h.machine_id
+           FROM hostnames h
+           LEFT JOIN (SELECT machine_id,
+                             MAX(online)        AS on_any,
+                             MAX(last_observed) AS seen
+                        FROM interfaces GROUP BY machine_id) i
+             ON i.machine_id = h.machine_id
+          WHERE h.name = ?
+          ORDER BY COALESCE(i.on_any, 0) DESC,
+                   h.last_seen           DESC,
+                   i.seen                DESC,
+                   h.machine_id          DESC
+          LIMIT 1",
+        undef, $name);
+    return $keep;
+}
+
+# Names bound to more than one machine.
+sub _conflicting_hostnames {
+    my ($self) = @_;
+    my $rows = $self->{dbh}->selectall_arrayref(
+        "SELECT name FROM hostnames
+          GROUP BY name HAVING COUNT(DISTINCT machine_id) > 1",
+        { Slice => {} });
+    return map { $_->{name} } @{ $rows || [] };
+}
+
 # Resolve hostname conflicts: when the SAME name is bound to multiple
 # machine_ids, keep the row with the most recent last_seen and drop the rest.
 # Exactly the clevo-lx/machine_75 situation. Returns the count of losers
 # dropped (zero when there are no conflicts).
 sub purge_conflicting_hostnames {
     my ($self) = @_;
-    my $rows = $self->{dbh}->selectall_arrayref(
-        "SELECT name FROM hostnames
-          GROUP BY name HAVING COUNT(DISTINCT machine_id) > 1",
-        { Slice => {} });
-    return 0 unless $rows && @$rows;
     my $dropped = 0;
-    for my $r (@$rows) {
-        my $name = $r->{name};
-        # Which machine keeps the name.
-        #
-        # last_seen alone is not enough: replication touches every binding at
-        # the same instant, so these timestamps TIE routinely - and the old
-        # tie-break (machine_id ASC) then handed the name to the LOWEST id,
-        # which is the OLDEST record, because ids ascend. wc13 was the case in
-        # point: a live camera and a polluted grouping of three long-dead MACs
-        # both claimed the name, and the dead grouping won every tie.
-        #
-        # So ask the interfaces first. A machine with something ONLINE is the
-        # one the name should resolve to, whatever the timestamps say. Only if
-        # nothing is online do we fall back to freshness, and a remaining tie
-        # now goes to the NEWER record rather than the older.
-        my ($keep_mid) = $self->{dbh}->selectrow_array(
-            "SELECT h.machine_id
-               FROM hostnames h
-               LEFT JOIN (SELECT machine_id,
-                                 MAX(online)        AS on_any,
-                                 MAX(last_observed) AS seen
-                            FROM interfaces GROUP BY machine_id) i
-                 ON i.machine_id = h.machine_id
-              WHERE h.name = ?
-              ORDER BY COALESCE(i.on_any, 0) DESC,
-                       h.last_seen           DESC,
-                       i.seen                DESC,
-                       h.machine_id          DESC
-              LIMIT 1",
-            undef, $name);
-        next unless defined $keep_mid;
+    for my $name ($self->_conflicting_hostnames) {
+        my $keep = $self->_hostname_conflict_keeper($name);
+        next unless defined $keep;
         my $n = $self->{dbh}->do(
             "DELETE FROM hostnames WHERE name = ? AND machine_id <> ?",
-            undef, $name, $keep_mid);
+            undef, $name, $keep);
         $dropped += $n if $n && $n > 0;
     }
     return $dropped;
 }
 
-# Drop address rows that haven't been seen in $days days. Requires BOTH
-# last_seen old AND (last_observed older or NULL) — last_observed is the
-# "live" timestamp; if a producer just touched the row by writing the same
-# data, last_seen may bump even though last_observed is months old. Sticky
-# manual rows (source='manual') are kept regardless.
-sub purge_stale_addresses {
-    my ($self, %f) = @_;
-    my $days = $f{days} // 30;
-    my $n = $self->{dbh}->do(
-        "DELETE FROM addresses
-          WHERE last_seen < DATE_SUB(NOW(), INTERVAL ? DAY)
-            AND (last_observed IS NULL
-                 OR last_observed < DATE_SUB(NOW(), INTERVAL ? DAY))
-            AND (source IS NULL OR source <> 'manual')",
-        undef, $days, $days);
-    return ($n && $n > 0) ? $n + 0 : 0;
-}
-
-# Dry-run variants: same predicates as the purge_* above, but return a count
-# without deleting. Used by net-purge to preview impact before --commit.
-sub count_expired_leases {
-    my ($self, %f) = @_;
-    my $days = $f{days};
-    my ($n) = $self->{dbh}->selectrow_array(
-        "SELECT COUNT(*) FROM dhcp_leases
-          WHERE expires IS NOT NULL AND expires < NOW()");
-    $n //= 0;
-    if (defined $days && $days > 0) {
-        my ($m) = $self->{dbh}->selectrow_array(
-            "SELECT COUNT(*) FROM dhcp_leases
-              WHERE expires IS NULL
-                AND last_seen IS NOT NULL
-                AND last_seen < (NOW() - INTERVAL ? DAY)",
-            undef, $days);
-        $n += $m // 0;
+sub count_conflicting_hostnames {
+    my ($self) = @_;
+    my $n = 0;
+    for my $name ($self->_conflicting_hostnames) {
+        my $keep = $self->_hostname_conflict_keeper($name);
+        next unless defined $keep;
+        my ($c) = $self->{dbh}->selectrow_array(
+            "SELECT COUNT(*) FROM hostnames WHERE name = ? AND machine_id <> ?",
+            undef, $name, $keep);
+        $n += $c if $c;
     }
     return $n;
 }
-sub count_stale_hostnames {
-    my ($self, %f) = @_;
-    my $days = $f{days} // 30;
-    my ($n) = $self->{dbh}->selectrow_array(
-        "SELECT COUNT(*) FROM hostnames
-          WHERE last_seen < DATE_SUB(NOW(), INTERVAL ? DAY)", undef, $days);
-    return $n // 0;
-}
-sub count_conflicting_hostnames {
-    my ($self) = @_;
-    my $rows = $self->{dbh}->selectall_arrayref(
-        "SELECT name, COUNT(DISTINCT machine_id) c FROM hostnames
-          GROUP BY name HAVING c > 1", { Slice => {} });
-    return 0 unless $rows && @$rows;
-    my $n = 0; $n += ($_->{c} - 1) for @$rows;       # losers per name
-    return $n;
-}
+
 sub count_stale_addresses {
     my ($self, %f) = @_;
     my $days = $f{days} // 30;
