@@ -3444,11 +3444,33 @@ sub purge_conflicting_hostnames {
     my $dropped = 0;
     for my $r (@$rows) {
         my $name = $r->{name};
-        # Find the latest last_seen for this name.
+        # Which machine keeps the name.
+        #
+        # last_seen alone is not enough: replication touches every binding at
+        # the same instant, so these timestamps TIE routinely - and the old
+        # tie-break (machine_id ASC) then handed the name to the LOWEST id,
+        # which is the OLDEST record, because ids ascend. wc13 was the case in
+        # point: a live camera and a polluted grouping of three long-dead MACs
+        # both claimed the name, and the dead grouping won every tie.
+        #
+        # So ask the interfaces first. A machine with something ONLINE is the
+        # one the name should resolve to, whatever the timestamps say. Only if
+        # nothing is online do we fall back to freshness, and a remaining tie
+        # now goes to the NEWER record rather than the older.
         my ($keep_mid) = $self->{dbh}->selectrow_array(
-            "SELECT machine_id FROM hostnames
-              WHERE name = ?
-              ORDER BY last_seen DESC, machine_id ASC LIMIT 1",
+            "SELECT h.machine_id
+               FROM hostnames h
+               LEFT JOIN (SELECT machine_id,
+                                 MAX(online)        AS on_any,
+                                 MAX(last_observed) AS seen
+                            FROM interfaces GROUP BY machine_id) i
+                 ON i.machine_id = h.machine_id
+              WHERE h.name = ?
+              ORDER BY COALESCE(i.on_any, 0) DESC,
+                       h.last_seen           DESC,
+                       i.seen                DESC,
+                       h.machine_id          DESC
+              LIMIT 1",
             undef, $name);
         next unless defined $keep_mid;
         my $n = $self->{dbh}->do(
