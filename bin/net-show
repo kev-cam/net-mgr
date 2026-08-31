@@ -35,35 +35,56 @@ sub zone_of {
     return $rec->{zone};
 }
 
+# Interface-qualified names: wndr6400-up and wndr6400-down are two sides of
+# ONE access point, not two devices. Same convention as nas3-up / nas3-air.
+my @IFACE_SUFFIXES = qw(up down dmz home air);
+
+sub base_name {
+    my ($n) = @_;
+    return undef unless defined $n && length $n;
+    for my $sfx (@IFACE_SUFFIXES) {
+        return $1 if $n =~ /^(.+)-\Q$sfx\E$/i;
+    }
+    return $n;
+}
+
 # What is wrong with this AP's addressing, if anything.
 #
-# Two different mistakes, and they need separate wording because they have
-# separate fixes: an AP in the wrong ZONE is plugged into or configured for
-# the wrong network, whereas an AP in the right zone at the wrong ADDRESS
-# has drifted from its reservation - usually because it was hard-set locally
-# and never took the lease. Silence about which one you have is what makes
-# these take an afternoon.
+# An AP serving the home network also has an upstream leg into the DMZ, so
+# there are TWO addresses to be right about and they fail differently. The
+# DMZ side is the one that must exist and be correct; the home side is
+# checked against its own reservation but is not expected to be in the DMZ,
+# and complaining that it isn't would bury the real faults.
+#
+# Sides are paired by base name rather than by MAC: the two legs have
+# different MACs (adjacent, but that is a coincidence of manufacture, not a
+# rule worth trusting), while the -up/-down naming is the site's own and is
+# what the reservations are keyed on.
 sub ap_problems {
-    my ($ips, $resv) = @_;
-    my @why;
-    unless (@$ips) {
-        push @why, 'no address seen';
-        return @why;
-    }
-    if (defined $want_zone) {
-        for my $ip (@$ips) {
-            my $z = zone_of($ip);
-            next if defined $z && lc $z eq lc $want_zone;
-            push @why, sprintf('%s is in %s, expected %s',
-                               $ip, (defined $z ? $z : 'no mapped zone'), $want_zone);
+    my ($sides, $ip_for) = @_;
+    my (@why, $have_dmz);
+
+    for my $r (@$sides) {
+        my @ips  = sort @{ $ip_for->{ lc $r->{mac} } || [] };
+        my $zone = zone_of($r->{ip});
+        my $is_dmz = defined $want_zone && defined $zone && lc $zone eq lc $want_zone;
+        $have_dmz = 1 if $is_dmz;
+
+        if (!@ips) {
+            push @why, sprintf('%s (%s) not seen at all', $r->{name}, $r->{ip});
+        }
+        elsif (!grep { $_ eq $r->{ip} } @ips) {
+            push @why, sprintf('%s reserved %s but answering on %s',
+                               $r->{name}, $r->{ip}, join(', ', @ips));
+        }
+        # A side whose reserved address sits in no mapped zone is only worth
+        # mentioning when we HAVE a map to judge it against.
+        if (defined $want_zone && !defined $zone) {
+            push @why, sprintf('%s (%s) is in no mapped subnet', $r->{name}, $r->{ip});
         }
     }
-    if (!$resv) {
-        push @why, 'no reservation, so no address to hold it to';
-    }
-    elsif (!grep { $_ eq $resv->{ip} } @$ips) {
-        push @why, sprintf('reserved %s but answering on %s',
-                           $resv->{ip}, join(', ', @$ips));
+    if (defined $want_zone && !$have_dmz) {
+        push @why, "no $want_zone-side address found";
     }
     return @why;
 }
@@ -150,6 +171,13 @@ if (defined $find) {
     }
     my %resv_for;
     $resv_for{ lc $_->{mac} } = $_ for grep { $_->{mac} } @$resvs;
+    # Group reservations by base name so both legs of an AP travel together.
+    my %sides_of;
+    for my $r (@$resvs) {
+        next unless $r->{mac} && $r->{name};
+        my $b = base_name($r->{name}) // next;
+        push @{ $sides_of{lc $b} }, $r;
+    }
 
     NetMgr::Subnets::load();
     # The subnet->zone map comes from LOCAL files (dhcp.master's `# zone=`
@@ -164,16 +192,25 @@ if (defined $find) {
         $want_zone = undef;
     }
     my $bad = 0;
+    my %ip_lc;
+    $ip_lc{lc $_} = $ip_for{$_} for keys %ip_for;
     for my $ap (sort { ($a->{ssid}//'') cmp ($b->{ssid}//'') } @$aps) {
-        my @ips  = sort @{ $ip_for{$ap->{mac}} || [] };
-        my $resv = $resv_for{ lc($ap->{mac} // '') };
-        my @why  = ap_problems(\@ips, $resv);
+        my $resv  = $resv_for{ lc($ap->{mac} // '') };
+        my $base  = $resv ? base_name($resv->{name}) : undef;
+        my $sides = ($base && $sides_of{lc $base}) ? $sides_of{lc $base}
+                  : ($resv ? [$resv] : []);
+        my @why;
+        if (!@$sides) {
+            @why = ('no reservation, so no address to hold it to');
+        } else {
+            @why = ap_problems($sides, \%ip_lc);
+        }
         $bad++ if @why;
         next if $check_only && !@why;
-        my $ip = $ips[0] // '?';
-        printf "%-15s %-17s %-28s %s\n", $ip, $ap->{mac},
-               ($ap->{ssid} // ''),
-               (@why ? '** ' . join('; ', @why) : 'ok');
+        my @ips = sort @{ $ip_for{$ap->{mac}} || [] };
+        my $ip  = $ips[0] // '?';
+        printf "%-15s %-17s %-28s%s\n", $ip, $ap->{mac}, ($ap->{ssid} // ''),
+               (@why ? ' ** ' . join('; ', @why) : '');
     }
     if ($check_only) {
         printf("all APs are where they should be%s\n",
