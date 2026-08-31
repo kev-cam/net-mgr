@@ -456,6 +456,13 @@ sub _delete_dhcp_ranges {
 # different device is two events, and matching the mac as well would make the
 # delete miss whenever the follower's copy had already taken the new mac,
 # leaving the old row behind for good.
+sub _delete_addresses {
+    my ($db, $row) = @_;
+    return unless $row->{mac} && $row->{addr};
+    $db->forget_address(mac => $row->{mac}, addr => $row->{addr},
+                        family => $row->{family});
+}
+
 sub _delete_dhcp_reservations {
     my ($db, $row) = @_;
     return unless $row->{ip};

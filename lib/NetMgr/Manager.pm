@@ -6160,6 +6160,38 @@ sub _obs_selfcheck {
 # trust as code/config writes — this IS a config write, just routed via DB
 # instead of a file). Loopback exempt. Emits a row event so replication picks
 # it up; followers get the change automatically.
+# OBSERVE kind=address_forget mac=… addr=… — retire ONE address row.
+#
+# The gap this fills: purge_stale is age-based and wholesale, and a row for an
+# address nothing occupies can never be superseded, because superseding needs
+# an observation AT that address. Such a row is otherwise permanent. Three
+# turned up in one afternoon chasing wc12/wc13.
+#
+# Narrow on purpose: both fields required, matched exactly, no patterns, and
+# gated on may_update — it deletes evidence, so it sits at the same tier as a
+# config write rather than with the read-only probes.
+sub _obs_address_forget {
+    my ($self, $cli, $kv) = @_;
+    unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_update})) {
+        die "address_forget: not authorized (add the key to /etc/net-mgr/allowed_updaters)\n";
+    }
+    my $mac  = $kv->{mac}  or die "address_forget: mac= required\n";
+    my $addr = $kv->{addr} or die "address_forget: addr= required\n";
+    $mac  =~ /\A[0-9a-fA-F:]{17}\z/     or die "address_forget: bad mac '$mac'\n";
+    $addr =~ /\A[0-9a-fA-F.:]{3,45}\z/  or die "address_forget: bad addr '$addr'\n";
+    my $row = $self->{db}->forget_address(mac => $mac, addr => $addr);
+    unless ($row) {
+        # Not an error: saying so beats reporting success for a no-op.
+        $self->_log("address_forget: no row for $mac at $addr");
+        return ();
+    }
+    $self->_log("address_forget: dropped $addr from $mac"
+              . " (source=" . ($row->{source} // '-') . ")"
+              . " at the request of " . ($cli->{ident} // '?'));
+    $self->_emit_change(table => 'addresses', op => 'delete', row => $row);
+    return ();
+}
+
 sub _obs_purge_stale {
     my ($self, $cli, $kv) = @_;
     unless (_peer_is_loopback($cli) || ($cli->{auth} && $cli->{auth}{may_update})) {
@@ -6503,6 +6535,8 @@ sub _handle_observe {
         elsif ($kind eq 'mesh_tunnel') { @events = $self->_obs_mesh_tunnel($cli, $kv) }
         elsif ($kind eq 'publish_self'){ @events = $self->_obs_publish_self($cli, $kv) }
         elsif ($kind eq 'purge_stale') { @events = $self->_obs_purge_stale($cli, $kv) }
+        elsif ($kind eq 'address_forget')
+                                       { @events = $self->_obs_address_forget($cli, $kv) }
         elsif ($kind eq 'relay')       { @events = $self->_obs_relay($cli, $kv) }
         else {
             die "unknown observation kind '$kind'\n";

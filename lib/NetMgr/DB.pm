@@ -3516,16 +3516,96 @@ sub count_conflicting_hostnames {
     return $n;
 }
 
+# Drop address rows nothing has actually SEEN in $days days.
+#
+# This used to require last_seen AND last_observed both old. The intent was
+# not to delete a row some producer is still refreshing — but replication
+# touches last_seen across the whole table at once, so in practice the two
+# conditions could not both be satisfied until the threshold crossed the last
+# replication sweep, at which point everything qualified at once. Measured on
+# 2026-08-30: 0 rows at days=30/14/7, then 346 of 442 at days=3. There was no
+# useful setting in between, which makes a destructive tool untrustworthy.
+#
+# last_observed is the only timestamp that means "we saw something here", so
+# that is what decides. Rows never observed fall back to last_seen, so a
+# freshly imported entry is not deleted before anything has had a chance to
+# confirm it. Sticky manual rows are kept regardless.
+sub purge_stale_addresses {
+    my ($self, %f) = @_;
+    my $days = $f{days} // 30;
+    my $n = $self->{dbh}->do(
+        "DELETE FROM addresses
+          WHERE COALESCE(last_observed, last_seen)
+                    < DATE_SUB(NOW(), INTERVAL ? DAY)
+            AND (source IS NULL OR source <> 'manual')",
+        undef, $days);
+    return ($n && $n > 0) ? $n + 0 : 0;
+}
+
+# Forget ONE address, named exactly.
+#
+# Everything else here is age-based or wholesale, which leaves no way to
+# retire a single ghost: a row for an address nothing occupies can never be
+# superseded, because superseding requires an observation AT that address.
+# wc12's .229 is the example — a dead MAC's old lease that no scan can
+# contradict and no safe --days can reach.
+#
+# Deliberately narrow: both mac and addr are required and matched exactly,
+# there is no pattern form, and it returns the row so the caller can
+# broadcast the delete (addresses replicate, so a silent local delete would
+# simply diverge from the followers).
+sub forget_address {
+    my ($self, %f) = @_;
+    my ($mac, $addr) = (lc($f{mac} // ''), $f{addr} // '');
+    return undef unless length $mac && length $addr;
+    my $family = $f{family} || ($addr =~ /:/ ? 'v6' : 'v4');
+    my $row = $self->{dbh}->selectrow_hashref(
+        "SELECT * FROM addresses WHERE mac = ? AND family = ? AND addr = ?",
+        undef, $mac, $family, $addr);
+    return undef unless $row;
+    $self->{dbh}->do(
+        "DELETE FROM addresses WHERE mac = ? AND family = ? AND addr = ?",
+        undef, $mac, $family, $addr);
+    return $row;
+}
+
+sub count_expired_leases {
+    my ($self, %f) = @_;
+    my $days = $f{days};
+    my ($n) = $self->{dbh}->selectrow_array(
+        "SELECT COUNT(*) FROM dhcp_leases
+          WHERE expires IS NOT NULL AND expires < NOW()");
+    $n //= 0;
+    if (defined $days && $days > 0) {
+        my ($m) = $self->{dbh}->selectrow_array(
+            "SELECT COUNT(*) FROM dhcp_leases
+              WHERE expires IS NULL
+                AND last_seen IS NOT NULL
+                AND last_seen < (NOW() - INTERVAL ? DAY)",
+            undef, $days);
+        $n += $m // 0;
+    }
+    return $n;
+}
+
+sub count_stale_hostnames {
+    my ($self, %f) = @_;
+    my $days = $f{days} // 30;
+    my ($n) = $self->{dbh}->selectrow_array(
+        "SELECT COUNT(*) FROM hostnames
+          WHERE last_seen < DATE_SUB(NOW(), INTERVAL ? DAY)", undef, $days);
+    return $n // 0;
+}
+
 sub count_stale_addresses {
     my ($self, %f) = @_;
     my $days = $f{days} // 30;
     my ($n) = $self->{dbh}->selectrow_array(
         "SELECT COUNT(*) FROM addresses
-          WHERE last_seen < DATE_SUB(NOW(), INTERVAL ? DAY)
-            AND (last_observed IS NULL
-                 OR last_observed < DATE_SUB(NOW(), INTERVAL ? DAY))
+          WHERE COALESCE(last_observed, last_seen)
+                    < DATE_SUB(NOW(), INTERVAL ? DAY)
             AND (source IS NULL OR source <> 'manual')",
-        undef, $days, $days);
+        undef, $days);
     return $n // 0;
 }
 
