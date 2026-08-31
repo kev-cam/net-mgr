@@ -1622,7 +1622,18 @@ sub reset_rtt {
 sub _source_priority {
     my ($s) = @_;
     return 0 unless defined $s;
-    return 5 if $s =~ /:dhcp\.master$/;
+    # dhcp.master is NOT listed here, deliberately.
+    #
+    # It used to score 5 - above a live DHCP lease (3) and an ARP sighting (1)
+    # - so that an AP-lease observation could not downgrade a hand-curated
+    # entry. That was right while the file was being maintained. It is dead
+    # now, kept only from the transition, and the ranking outlived its reason:
+    # 204 of 442 address rows still carried that source, and every one of them
+    # was immune to correction. Any observation of where a device ACTUALLY was
+    # came back skipped_lower_priority and was discarded, so the table drifted
+    # from reality and no amount of scanning could pull it back. Falling
+    # through to the default (1) means an equal-priority sighting supersedes
+    # it, and the stale rows heal as their devices are next seen.
     return 4 if $s =~ /:dhcp\.extra$/;
     return 3 if $s =~ /:DHCP$/i;       # leased from a DHCP server
     return 3 if $s =~ /:ssh$/i;        # direct probe of host (e.g. AP self-report)
