@@ -61,14 +61,24 @@ sub load {
         $line =~ s/[\r\n]+\z//;
         $line =~ s/^\s+|\s+$//g;
         next if $line eq '' || $line =~ /^#/;
-        my ($cidr, $name, @rest) = split /\s+/, $line, 3;
+        my ($cidr, $name, $rest) = split /\s+/, $line, 3;
         next unless $cidr && $name;
-        my $notes = @rest ? join(' ', @rest) : undef;
+        # Third column is the ZONE TAG, as this file's own format comment says
+        # ("Columns: CIDR, name, [zone-tag]"). It used to land in notes with
+        # zone left undef, so an override file could name a subnet but never
+        # place it in a zone - every address in it answered "no mapped zone",
+        # which is indistinguishable from having no map at all. Anything after
+        # the tag is still kept as notes.
+        my ($zone, $notes);
+        if (defined $rest && length $rest) {
+            ($zone, $notes) = split /\s+/, $rest, 2;
+            $zone = lc $zone if defined $zone;
+        }
         my ($net, $bits) = $cidr =~ m{^(\d+\.\d+\.\d+\.\d+)/(\d+)$}
                          ? ($1, $2) : ($cidr, 24);
         $BY_CIDR{$cidr} = {
             cidr => $cidr, net => $net, mask => _mask_from_bits($bits),
-            name => $name, zone => undef, notes => $notes,
+            name => $name, zone => $zone, notes => $notes,
         };
     }
     close $fh;
