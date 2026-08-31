@@ -2,7 +2,9 @@
 # net-show — list access points and look up which AP saw a given IP.
 # (Replaces the legacy /usr/local/bin/show-ap.)
 #
-# Bare:           list APs and their SSIDs
+# Bare:           list APs and their SSIDs, flagging any that are not on the
+#                 address they should be
+# --check:        only the problems, exit 1 if there are any
 # -find=<ip>:     show which AP/lease saw the given IP
 # --listen H:P:   override manager address
 # --no-scan:      skip the TRIGGER scan-ap (use cached DB only)
@@ -13,6 +15,58 @@ use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case no_bundling);   # support old `-find=ip`
 use NetMgr::Client;
+use NetMgr::Subnets ();
+
+# Which zone an AP's address ought to sit in. A name, not a subnet: the
+# subnet->zone map lives in dhcp.master's `# zone=` comments (and
+# /etc/net-mgr/subnets), so the answer follows the site's own definition
+# rather than a CIDR hard-coded here.
+my $want_zone = 'dmz';
+my $check_only = 0;
+
+# The zone tag for an address, or undef when the site's map says nothing
+# about it. cidr_for() invents a /24 when it has no entry, so an unmapped
+# address yields a lookup miss rather than a wrong answer.
+sub zone_of {
+    my ($ip) = @_;
+    return undef unless defined $ip && $ip =~ /^\d+\.\d+\.\d+\.\d+$/;
+    my $cidr = NetMgr::Subnets::cidr_for($ip) or return undef;
+    my $rec  = NetMgr::Subnets::lookup($cidr) or return undef;
+    return $rec->{zone};
+}
+
+# What is wrong with this AP's addressing, if anything.
+#
+# Two different mistakes, and they need separate wording because they have
+# separate fixes: an AP in the wrong ZONE is plugged into or configured for
+# the wrong network, whereas an AP in the right zone at the wrong ADDRESS
+# has drifted from its reservation - usually because it was hard-set locally
+# and never took the lease. Silence about which one you have is what makes
+# these take an afternoon.
+sub ap_problems {
+    my ($ips, $resv) = @_;
+    my @why;
+    unless (@$ips) {
+        push @why, 'no address seen';
+        return @why;
+    }
+    if (defined $want_zone) {
+        for my $ip (@$ips) {
+            my $z = zone_of($ip);
+            next if defined $z && lc $z eq lc $want_zone;
+            push @why, sprintf('%s is in %s, expected %s',
+                               $ip, (defined $z ? $z : 'no mapped zone'), $want_zone);
+        }
+    }
+    if (!$resv) {
+        push @why, 'no reservation, so no address to hold it to';
+    }
+    elsif (!grep { $_ eq $resv->{ip} } @$ips) {
+        push @why, sprintf('reserved %s but answering on %s',
+                           $resv->{ip}, join(', ', @$ips));
+    }
+    return @why;
+}
 
 sub usage {
     return <<'EOF';
@@ -20,6 +74,9 @@ usage:
   net-show                       # list access points and their SSIDs
   net-show --no-scan             # same, but skip the TRIGGER scan-ap
   net-show -find=<ip>            # show which AP saw the given IP
+  net-show --check               # only report APs that are NOT where they
+                                 # should be; exit 1 if any (for cron)
+  net-show --zone NAME           # expected zone for APs (default: dmz)
   net-show --listen HOST:PORT    # override manager address (else 127.0.0.1:7531
                                  # or $NET_MGR_LISTEN)
   net-show -h | --help           # this message
@@ -36,6 +93,8 @@ my $find;
 my $no_scan;
 my $help;
 GetOptions(
+    'check'   => \$check_only,
+    'zone=s'  => \$want_zone,
     'listen=s' => \$listen,
     'find=s'   => \$find,
     'no-scan'  => \$no_scan,
@@ -83,14 +142,45 @@ if (defined $find) {
     # Bare: list APs with their addresses and SSIDs.
     my $aps  = $cli->snapshot(1, 'aps');
     my $addrs = $cli->snapshot(2, 'addresses');
+    my $resvs = $cli->snapshot(3, 'dhcp_reservations') || [];
     my %ip_for;
     for my $a (@$addrs) {
         next unless $a->{family} eq 'v4';
         push @{ $ip_for{$a->{mac}} }, $a->{addr};
     }
+    my %resv_for;
+    $resv_for{ lc $_->{mac} } = $_ for grep { $_->{mac} } @$resvs;
+
+    NetMgr::Subnets::load();
+    # The subnet->zone map comes from LOCAL files (dhcp.master's `# zone=`
+    # comments, /etc/net-mgr/subnets). net-show is a mesh client and runs
+    # happily from a workstation that has neither, where every address would
+    # look unmapped and every AP would be reported wrong. Say so once and drop
+    # the zone half of the check instead; the reservation half is DB-driven
+    # and still means something from anywhere.
+    unless (scalar NetMgr::Subnets::all()) {
+        print "note: no subnet->zone map here (needs /etc/net-mgr/dhcp.master\n"
+            . "      or /etc/net-mgr/subnets) - checking reservations only\n";
+        $want_zone = undef;
+    }
+    my $bad = 0;
     for my $ap (sort { ($a->{ssid}//'') cmp ($b->{ssid}//'') } @$aps) {
-        my $ip = (sort @{ $ip_for{$ap->{mac}} || [] })[0] // '?';
-        printf "%-15s %-17s %s\n", $ip, $ap->{mac}, $ap->{ssid} // '';
+        my @ips  = sort @{ $ip_for{$ap->{mac}} || [] };
+        my $resv = $resv_for{ lc($ap->{mac} // '') };
+        my @why  = ap_problems(\@ips, $resv);
+        $bad++ if @why;
+        next if $check_only && !@why;
+        my $ip = $ips[0] // '?';
+        printf "%-15s %-17s %-28s %s\n", $ip, $ap->{mac},
+               ($ap->{ssid} // ''),
+               (@why ? '** ' . join('; ', @why) : 'ok');
+    }
+    if ($check_only) {
+        printf("all APs are where they should be%s\n",
+               defined $want_zone ? " (zone $want_zone)" : " (reservations only)")
+            unless $bad;
+        $cli->bye;
+        exit($bad ? 1 : 0);
     }
 }
 
