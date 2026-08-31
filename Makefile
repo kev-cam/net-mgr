@@ -14,6 +14,14 @@ PREFIX     ?= /usr/local
 BINDIR     ?= $(PREFIX)/bin
 SBINDIR    ?= $(PREFIX)/sbin
 PERL5DIR   ?= $(PREFIX)/share/perl5
+
+# Interface-qualified host names: gateway3-down is an ADDRESS for gateway3, not
+# a different machine. Deploy targets are written that way ([deploy] hosts uses
+# gateway2-down/gateway3-down), but the per-host config overlay belongs to the
+# HOST, so these suffixes are stripped when looking one up. A list, not "any
+# trailing -word": clevo-lx and workhorse are whole names, and collapsing them
+# would hand a machine another machine's allowed_updaters.
+OVERLAY_IFACE_SUFFIXES ?= down up dmz home air
 SHAREDIR   ?= $(PREFIX)/share/net-mgr
 RECOVERYDIR?= $(PREFIX)/lib/net-mgr/recovery
 MANDIR     ?= $(PREFIX)/share/man
@@ -469,19 +477,24 @@ install-on: .version
 	@# whose DNS went stale), and the allowed_dns matcher below already strips
 	@# the login, so match that here too.
 	@#
-	@# A trailing -<iface> is deliberately NOT stripped: it cannot be told apart
-	@# from a hostname that simply contains a dash, so gateway2-down would fall
-	@# back to gateway2 but clevo-lx would silently pick up clevo's overlay -
-	@# a DIFFERENT machine, handed another host's allowed_updaters. Say what was
-	@# looked for instead: a silent skip is why a name mismatch here reads as
+	@# A KNOWN interface suffix is stripped too (OVERLAY_IFACE_SUFFIXES), because
+	@# gateway3-down is an address for gateway3 rather than a machine of its own,
+	@# so the overlay belongs under the host name. Only listed suffixes: matching
+	@# any trailing -word would send clevo-lx to clevo's overlay - a DIFFERENT
+	@# machine, handed another host's allowed_updaters. A miss now says what it
+	@# looked for; skipping in silence is why a name mismatch here reads as
 	@# nothing happening at all.
-	@raw='$(TARGET)'; nouser=$${raw##*@}; \
+	@raw='$(TARGET)'; nouser=$${raw##*@}; base="$$nouser"; \
+	for sfx in $(OVERLAY_IFACE_SUFFIXES); do \
+	  case "$$nouser" in *-$$sfx) base=$${nouser%-$$sfx}; break ;; esac; \
+	done; \
 	overlay=; \
-	for cand in "/etc/net-mgr/deploy/$$raw" "/etc/net-mgr/deploy/$$nouser"; do \
+	for cand in "/etc/net-mgr/deploy/$$raw" "/etc/net-mgr/deploy/$$nouser" \
+	            "/etc/net-mgr/deploy/$$base"; do \
 	  [ -d "$$cand" ] || continue; overlay="$$cand"; break; \
 	done; \
 	if [ -z "$$overlay" ] && [ -d /etc/net-mgr/deploy ]; then \
-	  echo "==> $(TARGET): no overlay (looked for /etc/net-mgr/deploy/$$raw, $$nouser)"; \
+	  echo "==> $(TARGET): no overlay (looked for $$raw, $$nouser, $$base under /etc/net-mgr/deploy)"; \
 	fi; \
 	if [ -n "$$overlay" ]; then \
 	  echo "==> $(TARGET): overlay $$overlay -> /etc/net-mgr/"; \
