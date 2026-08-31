@@ -464,8 +464,26 @@ install-on: .version
 	@# allowed_updaters/write_config trust. The overlay path is fixed —
 	@# files under /etc/net-mgr/deploy/<host>/X.conf land at /etc/net-mgr/X.conf.
 	@# Skipped silently when the overlay dir doesn't exist (normal case).
-	@overlay=/etc/net-mgr/deploy/$(TARGET); \
-	if [ -d "$$overlay" ]; then \
+	@# Find the overlay dir. TARGET can carry a login (installer@gateway3) and
+	@# an interface suffix (gateway2-down is how [deploy] hosts names a node
+	@# whose DNS went stale), and the allowed_dns matcher below already strips
+	@# the login, so match that here too.
+	@#
+	@# A trailing -<iface> is deliberately NOT stripped: it cannot be told apart
+	@# from a hostname that simply contains a dash, so gateway2-down would fall
+	@# back to gateway2 but clevo-lx would silently pick up clevo's overlay -
+	@# a DIFFERENT machine, handed another host's allowed_updaters. Say what was
+	@# looked for instead: a silent skip is why a name mismatch here reads as
+	@# nothing happening at all.
+	@raw='$(TARGET)'; nouser=$${raw##*@}; \
+	overlay=; \
+	for cand in "/etc/net-mgr/deploy/$$raw" "/etc/net-mgr/deploy/$$nouser"; do \
+	  [ -d "$$cand" ] || continue; overlay="$$cand"; break; \
+	done; \
+	if [ -z "$$overlay" ] && [ -d /etc/net-mgr/deploy ]; then \
+	  echo "==> $(TARGET): no overlay (looked for /etc/net-mgr/deploy/$$raw, $$nouser)"; \
+	fi; \
+	if [ -n "$$overlay" ]; then \
 	  echo "==> $(TARGET): overlay $$overlay -> /etc/net-mgr/"; \
 	  rsync -az -e "ssh $(SSHOPTS)" --rsync-path="$(SUDO) rsync" \
 	    "$$overlay/" $(SSHTGT):/etc/net-mgr/ \
