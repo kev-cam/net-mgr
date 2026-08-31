@@ -4,7 +4,9 @@
 #
 # Bare:           list APs and their SSIDs, flagging any that are not on the
 #                 address they should be
-# --check:        only the problems, exit 1 if there are any
+# --check:        re-observe first (TRIGGER discover), then report only the
+#                 problems; exit 1 if there are any. Refreshing matters: a
+#                 check against a stale table reports faults you already fixed.
 # -find=<ip>:     show which AP/lease saw the given IP
 # --listen H:P:   override manager address
 # --no-scan:      skip the TRIGGER scan-ap (use cached DB only)
@@ -95,8 +97,8 @@ usage:
   net-show                       # list access points and their SSIDs
   net-show --no-scan             # same, but skip the TRIGGER scan-ap
   net-show -find=<ip>            # show which AP saw the given IP
-  net-show --check               # only report APs that are NOT where they
-                                 # should be; exit 1 if any (for cron)
+  net-show --check               # re-observe, then report only APs that are
+                                 # NOT where they should be; exit 1 if any
   net-show --zone NAME           # expected zone for APs (default: dmz)
   net-show --listen HOST:PORT    # override manager address (else 127.0.0.1:7531
                                  # or $NET_MGR_LISTEN)
@@ -131,6 +133,22 @@ unless ($no_scan) {
     my $r = $cli->trigger("scan-ap", wait => 1);
     if (defined $r && $r =~ /^ERR/) {
         warn "TRIGGER scan-ap: $r\n";
+    }
+    # --check judges addresses, so it has to look before it speaks. scan-ap
+    # refreshes the AP/SSID side but leaves the addresses table alone, and a
+    # check that reads only cache keeps reporting a fault after you have fixed
+    # it: an AP moved to its reserved address was still flagged for a stale row
+    # three days old, which teaches people to ignore the output. discover
+    # re-observes and upsert_address retires whatever the device moved off.
+    #
+    # No reply is not a failure here: the trigger runs a producer and returns
+    # nothing on success in the observed case, so only an explicit ERR is worth
+    # reporting.
+    if ($check_only) {
+        my $d = $cli->trigger("discover", wait => 1);
+        if (defined $d && $d =~ /^ERR/) {
+            warn "TRIGGER discover: $d (addresses may be stale)\n";
+        }
     }
 }
 
