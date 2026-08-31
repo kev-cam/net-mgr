@@ -6433,6 +6433,11 @@ sub _validate_write_config_path {
 
     return (1, undef, 0644) if $path eq '/etc/net-mgr/config';
     return (1, undef, 0644) if $path eq '/etc/net-mgr/bitchat-bridge.conf';
+    # The subnet -> zone map (CIDR name [zone-tag]). NetMgr::Subnets reads it
+    # alongside dhcp.master's `# zone=` comments, and it is the survivor of the
+    # two: dhcp.master is being retired, so anything asking 'is this address in
+    # the DMZ' ends up here. Writable for the same reason [config] is.
+    return (1, undef, 0644) if $path eq '/etc/net-mgr/subnets';
     return (1, undef, 0644) if $path =~ m{^/etc/net-mgr/config\.d/[A-Za-z0-9._-]+\.conf$};
     return (1, undef, 0600) if $path =~ m{^/etc/net-mgr/secrets/[A-Za-z0-9._-]+$};
     return (1, undef, 0644) if $path =~ m{^/etc/net-mgr/allowed_[a-z_]+$};
@@ -6447,6 +6452,7 @@ sub _validate_write_config_path {
                        (?: config
                          | config\.d/[A-Za-z0-9._-]+\.conf
                          | allowed_[a-z_]+
+                         | subnets
                        )$}x;
     return (1, undef, 0600)
         if $path =~ m{^/etc/net-mgr/deploy/[A-Za-z0-9][A-Za-z0-9.-]*/
