@@ -144,15 +144,30 @@ exit 0;
 # the display name).  No live ssh-fingerprinting here — that's what the
 # dump itself does.
 sub candidate_hosts {
+    # One row per machine. a.addr cannot be selected bare alongside GROUP BY:
+    # a machine with several v4 addresses makes it nonaggregated under
+    # sql_mode=only_full_group_by (the default since MySQL 5.7), which is a
+    # hard error, not a warning -- so this path died the moment it ran without
+    # an explicit host list, and only the named-host form was ever exercised.
+    #
+    # Pick the freshest address rather than whichever row the server happened
+    # to return: it becomes the ssh target when primary_name is NULL, and the
+    # most recently observed leg is the one most likely to answer. addr breaks
+    # ties so repeated runs agree.
     my $rows = $db->dbh->selectall_arrayref(<<'SQL', { Slice => {} });
-SELECT m.id, m.primary_name, a.addr
+SELECT m.id, m.primary_name,
+       SUBSTRING_INDEX(
+           GROUP_CONCAT(a.addr
+                        ORDER BY COALESCE(a.last_observed, a.last_seen) DESC,
+                                 a.addr ASC),
+           ',', 1) AS addr
   FROM machines m
   JOIN interfaces i ON i.machine_id = m.id
   JOIN ports     p ON p.mac = i.mac AND p.port = 22 AND p.proto = 'tcp'
   JOIN addresses a ON a.mac = i.mac AND a.family = 'v4'
  WHERE m.online = 1
- GROUP BY m.id
- ORDER BY m.primary_name, a.addr
+ GROUP BY m.id, m.primary_name
+ ORDER BY m.primary_name, addr
 SQL
     my @out;
     for my $r (@$rows) {
