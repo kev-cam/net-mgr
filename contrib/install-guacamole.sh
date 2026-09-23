@@ -268,12 +268,25 @@ fi
 say "configuration"
 mkdir -p "$GUAC_HOME/extensions" "$GUAC_HOME/lib"
 
+# Set modes EXPLICITLY. Everything below is created with cat/install and so
+# inherits root's umask, and on a box with umask 077 that produced a 0700
+# /etc/guacamole containing a 0600 guacamole.properties. Tomcat runs as
+# $TOMCAT_USER, not root, so it could not read its own configuration -- the
+# webapp still answered 200 on :8080 (that only proves the WAR deployed),
+# and the breakage would not have shown up until the first login attempt.
+# 0750 root:tomcat: tomcat reads, nobody else gets in, and user-mapping.xml
+# holds a password hash so nothing here should be world-readable.
+chown -R "root:$TOMCAT_USER" "$GUAC_HOME"
+chmod 750 "$GUAC_HOME" "$GUAC_HOME/extensions" "$GUAC_HOME/lib"
+
 cat > "$GUAC_HOME/guacamole.properties" <<PROPS
 # Managed by net-mgr contrib/install-guacamole.sh
 guacd-hostname: 127.0.0.1
 guacd-port:     4822
 user-mapping:   $GUAC_HOME/user-mapping.xml
 PROPS
+chown "root:$TOMCAT_USER" "$GUAC_HOME/guacamole.properties"
+chmod 640 "$GUAC_HOME/guacamole.properties"
 info "wrote $GUAC_HOME/guacamole.properties"
 
 # quickconnect: lets you type ssh://host in the UI instead of needing a
@@ -287,7 +300,8 @@ if [ ! -f "$GUAC_HOME/extensions/$QC.jar" ]; then
              "$root/$GUAC_VER/binary/$QC.tar.gz" 2>/dev/null; then
             tar -xzf "$tmp/qc.tgz" -C "$tmp"
             f=$(find "$tmp" -name "$QC.jar" | head -1)
-            [ -n "$f" ] && install -m 644 "$f" "$GUAC_HOME/extensions/$QC.jar" \
+            [ -n "$f" ] && install -o root -g "$TOMCAT_USER" -m 640 \
+                              "$f" "$GUAC_HOME/extensions/$QC.jar" \
                         && info "installed quickconnect extension"
             break
         fi
@@ -317,13 +331,23 @@ if [ ! -f "$GUAC_HOME/user-mapping.xml" ]; then
     </authorize>
 </user-mapping>
 MAP
-    chmod 600 "$GUAC_HOME/user-mapping.xml"
+    # 640 root:tomcat, NOT 600 root: this file IS the login database, so
+    # tomcat has to read it or every authentication fails.
+    chown "root:$TOMCAT_USER" "$GUAC_HOME/user-mapping.xml"
+    chmod 640 "$GUAC_HOME/user-mapping.xml"
     printf 'guacamole web login\nuser: netmgr\npass: %s\n' "$GPASS" > "$SECRET"
     chmod 600 "$SECRET"
     info "created guacamole login 'netmgr' — password in $SECRET"
 else
     info "$GUAC_HOME/user-mapping.xml exists — leaving credentials alone"
 fi
+
+# Re-assert after everything exists, so re-running this repairs an install
+# made before the modes were set explicitly rather than needing an uninstall.
+chown -R "root:$TOMCAT_USER" "$GUAC_HOME"
+find "$GUAC_HOME" -type d -exec chmod 750 {} +
+find "$GUAC_HOME" -type f -exec chmod 640 {} +
+info "permissions: $GUAC_HOME is root:$TOMCAT_USER, dirs 750, files 640"
 
 # --- 5. apache front end ----------------------------------------------------
 say "apache reverse proxy"

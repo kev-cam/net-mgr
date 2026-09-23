@@ -235,10 +235,19 @@ sub tier {
 # this report, point them at it instead: it renders the terminal or
 # desktop in the browser, with no client-side setup.
 #
-# Detected rather than configured. guacamole.properties exists only on the
-# host where install-guacamole.sh has run, so every other node in the
-# fleet keeps the old scheme URLs and nothing needs a config flag.
-my $GUAC = -r '/etc/guacamole/guacamole.properties' ? '/guacamole' : undef;
+# Detected rather than configured: this file exists only on the host where
+# install-guacamole.sh has run, so every other node in the fleet keeps the
+# old scheme URLs and there is no config flag to set.
+#
+# Deliberately NOT /etc/guacamole/guacamole.properties, which was the first
+# attempt. That directory also holds user-mapping.xml with the login hash
+# in it, so it belongs to tomcat and is closed to everyone else: www-data
+# could not read it, the test came back false, and the page kept emitting
+# ssh:// links with nothing to say why. conf-enabled/ is Apache's own tree,
+# readable by the process doing the asking, and its presence means the
+# proxy is actually ENABLED -- which is the real precondition for one of
+# these links resolving. Tests the right thing and can be read.
+my $GUAC = -e '/etc/apache2/conf-enabled/guacamole.conf' ? '/guacamole' : undef;
 
 # The client URL is base64("<id>\0<type>\0<dataSource>"), read out of
 # ClientIdentifier.js in the WAR rather than guessed: type 'c' is
