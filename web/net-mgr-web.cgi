@@ -239,7 +239,11 @@ sub port_badge {
         my ($scheme, $default_port) = @$scheme_def;
         my $url = "$scheme://$first_addr"
                 . ($default_port ? '' : ":$port");
-        return sprintf '<a class=port href="%s" title="%s">%s</a>',
+        # rel/referrerpolicy as well as the page-wide meta: these are the
+        # links that actually leave for a device, and stating it here keeps
+        # the reason next to the code that depends on it.
+        return sprintf '<a class=port href="%s" title="%s"'
+                     . ' rel="noreferrer" referrerpolicy="no-referrer">%s</a>',
             escapeHTML($url), escapeHTML($title), escapeHTML($label);
     }
     return sprintf '<span class=port title="%s">%s</span>',
@@ -2234,6 +2238,16 @@ sub wrap_page {
 <!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
+<!-- Send no Referer anywhere. DD-WRT's httpd rejects any request whose
+     Referer names a host other than itself -- "400 Cross Site Action
+     detected" -- so every click-through from this page to an AP admin
+     UI failed while pasting the same URL by hand worked, because typing
+     it sends no Referer at all. Measured: no-referer 200, foreign
+     referer 400, own referer 200. Page-wide rather than per-link so
+     links added later cannot reintroduce it; nothing here needs a
+     Referer, and not leaking this page's address to every device on the
+     fleet is the better default regardless. -->
+<meta name="referrer" content="no-referrer">
 <title>@{[escapeHTML($title)]}</title>
 <style>
 body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
