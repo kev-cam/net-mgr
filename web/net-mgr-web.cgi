@@ -22,6 +22,7 @@ use warnings;
 use lib '/usr/local/share/perl5';
 use CGI qw(escapeHTML);
 use Time::Local qw(timelocal);
+use MIME::Base64 qw(encode_base64);
 use NetMgr::Client;
 
 print "Content-Type: text/html; charset=utf-8\n\n";
@@ -226,8 +227,44 @@ sub tier {
     return $any_clickable ? 1 : 2;
 }
 
+# Guacamole click-through -------------------------------------------
+#
+# ssh/rdp/vnc badges used to emit ssh:// and vnc:// URLs, which only work
+# if the VIEWING machine has a handler registered for them -- so they did
+# nothing at all in most browsers. Where Guacamole is installed beside
+# this report, point them at it instead: it renders the terminal or
+# desktop in the browser, with no client-side setup.
+#
+# Detected rather than configured. guacamole.properties exists only on the
+# host where install-guacamole.sh has run, so every other node in the
+# fleet keeps the old scheme URLs and nothing needs a config flag.
+my $GUAC = -r '/etc/guacamole/guacamole.properties' ? '/guacamole' : undef;
+
+# The client URL is base64("<id>\0<type>\0<dataSource>"), read out of
+# ClientIdentifier.js in the WAR rather than guessed: type 'c' is
+# CONNECTION, and 'default' is the data source for user-mapping.xml file
+# auth (it is also what the client falls back to). No padding is stripped
+# -- Guacamole decodes with atob(), which wants the '=' kept.
+sub guac_url {
+    my ($name) = @_;
+    return undef unless $GUAC;
+    my $id = encode_base64(join("\0", $name, 'c', 'default'), '');
+    return "$GUAC/#/client/$id";
+}
+
+# The naming rule, shared with net-gen-guacamole. Both sides derive the
+# name independently -- the report never asks Guacamole what exists -- so
+# these two MUST stay in step or links land on "connection not found".
+sub guac_name {
+    my ($label, $scheme) = @_;
+    my $n = lc $label;
+    $n =~ s/[^a-z0-9._-]+/-/g;
+    $n =~ s/^-+|-+$//g;
+    return "$n-$scheme";
+}
+
 sub port_badge {
-    my ($port_row, $first_addr) = @_;
+    my ($port_row, $first_addr, $host_label) = @_;
     my $port  = $port_row->{port};
     my $proto = $port_row->{proto} // 'tcp';
     my $svc   = $port_row->{service} // '';
@@ -237,6 +274,19 @@ sub port_badge {
     my $scheme_def = $SCHEME{$port};
     if ($first_addr && $scheme_def && $proto eq 'tcp') {
         my ($scheme, $default_port) = @$scheme_def;
+
+        # ssh/rdp/vnc through Guacamole when it is here. http/https stay as
+        # ordinary links -- a browser already speaks those, and routing them
+        # through a remote-desktop gateway would be absurd.
+        if ($GUAC && defined $host_label && length $host_label
+                  && $scheme =~ /^(ssh|rdp|vnc)$/) {
+            my $u = guac_url(guac_name($host_label, $scheme));
+            return sprintf '<a class="port guac" href="%s" title="%s">%s</a>',
+                escapeHTML($u),
+                escapeHTML("$title — via guacamole"),
+                escapeHTML($label);
+        }
+
         my $url = "$scheme://$first_addr"
                 . ($default_port ? '' : ":$port");
         # rel/referrerpolicy as well as the page-wide meta: these are the
@@ -443,7 +493,7 @@ sub render_list {
         my $online = machine_online($mid) ? 'online' : 'offline';
         my @ports = aggregate_ports(@macs);
         next unless $keep->($label, \@ports);
-        my @port_html = map { port_badge($_, $first_addr) } @ports;
+        my @port_html = map { port_badge($_, $first_addr, $label) } @ports;
         my $link = sprintf '<a class=hostlink href="?m=%d">%s</a>',
             $mid, escapeHTML($label);
         my $html = sprintf
@@ -458,7 +508,7 @@ sub render_list {
         my $label = $first_addr // $mac;
         my @ports = aggregate_ports($mac);
         next unless $keep->($label, \@ports);
-        my @port_html = map { port_badge($_, $first_addr) } @ports;
+        my @port_html = map { port_badge($_, $first_addr, $label) } @ports;
         my $online = $iface->{online} ? 'online' : 'offline';
         my $link = sprintf '<a class=hostlink href="?i=%s">%s</a>',
             escapeHTML($mac), escapeHTML($label);
@@ -2272,6 +2322,10 @@ code { color: #888; font-size: 0.9em; }
 }
 a.port { color: #6cf; }
 a.port:hover { background: #2a4060; }
+/* Guacamole-backed badges open in the browser rather than handing off to a
+   local client, so they are worth telling apart at a glance. */
+a.port.guac { background: #24331d; color: #9d6; }
+a.port.guac:hover { background: #354a2a; }
 form.filter { margin: 0.6em 0 1em; font-size: 0.9em; color: #888; }
 form.filter input[type=text] {
     background: #1a1a1a; color: #ccc; border: 1px solid #444;

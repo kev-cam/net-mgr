@@ -1,0 +1,226 @@
+#!/usr/bin/perl
+#
+# net-gen-guacamole — build Guacamole's user-mapping.xml from net-mgr's own
+# view of the fleet, so every host with an ssh/rdp/vnc port becomes a
+# connection the report can link straight into.
+#
+#   net-gen-guacamole              # print what it would write, change nothing
+#   net-gen-guacamole --write      # write /etc/guacamole/user-mapping.xml
+#   net-gen-guacamole --write --restart   # ... and restart tomcat
+#
+# Run it on the host serving the report (nas3): it talks to the local
+# net-mgr daemon on 127.0.0.1:7531, exactly as the web CGI does.
+#
+# ---------------------------------------------------------------------------
+# Connection NAMES are an interface, not a detail.
+#
+# The report builds its links without asking Guacamole anything — it encodes
+# base64("<name>\0c\0default") and points at /guacamole/#/client/<that>. So
+# the name this script emits and the name net-mgr-web.cgi computes have to
+# agree exactly, or the link lands on "connection not found".
+#
+# The rule, in one place, mirrored by guac_name() in the CGI:
+#
+#       <display label lowercased, [^a-z0-9._-] -> '-'> . '-' . <scheme>
+#
+# e.g. lenny-ssh, wndr8k2-down-vnc, opti7050-rdp.
+#
+# The credentials in <authorize> are NOT generated here: they are read back
+# out of the existing file and preserved. install-guacamole.sh created them
+# and put a copy in /etc/net-mgr/secrets/guacamole; regenerating them on
+# every run would lock you out every time the fleet changed.
+# ---------------------------------------------------------------------------
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Long;
+use MIME::Base64 qw(encode_base64);
+use NetMgr::Client;
+
+my $MAP     = '/etc/guacamole/user-mapping.xml';
+my ($write, $restart, $help);
+GetOptions('write' => \$write, 'restart' => \$restart, 'help|h' => \$help)
+    or usage(2);
+usage(0) if $help;
+
+sub usage {
+    my ($rc) = @_;
+    print <<'EOT';
+net-gen-guacamole — generate Guacamole connections from net-mgr's DB.
+
+  net-gen-guacamole                 dry run: print the XML, write nothing
+  net-gen-guacamole --write         write /etc/guacamole/user-mapping.xml
+  net-gen-guacamole --write --restart   ... then restart tomcat9
+
+One connection per (host, protocol) for every host whose ports table shows
+ssh (22), rdp (3389) or vnc (5900-5910). Addresses are written as IPs, not
+names, so guacd does not depend on DNS being healthy at connect time.
+
+The <authorize> block (username/password) is preserved from the existing
+file — this only ever rewrites the connection list.
+EOT
+    exit $rc;
+}
+
+# Ports -> protocol. Deliberately narrow: these are the three guacd speaks
+# that we have client libraries for. Telnet is installed but not offered —
+# nothing on this fleet should be using it.
+my %PROTO = (
+    22   => 'ssh',
+    3389 => 'rdp',
+);
+$PROTO{$_} = 'vnc' for 5900 .. 5910;
+
+# ---------------------------------------------------------------------------
+my $cli = NetMgr::Client->new(listen => '127.0.0.1:7531')
+    or die "net-gen-guacamole: cannot reach the net-mgr daemon on 127.0.0.1:7531\n";
+$cli->hello(consumer => "net-gen-guacamole.$$");
+
+my $machines  = $cli->snapshot(1, 'machines');
+my $hostnames = $cli->snapshot(2, 'hostnames');
+my $ifaces    = $cli->snapshot(3, 'interfaces');
+my $addresses = $cli->snapshot(4, 'addresses', where => "family = 'v4'");
+my $ports     = $cli->snapshot(5, 'ports');
+my $friendly  = $cli->snapshot(6, 'friendly_names');
+$cli->bye;
+
+my %machine_by_id = map { $_->{id} => $_ } @$machines;
+my %friendly_by_machine = map { $_->{machine_id} => $_->{name} } @$friendly;
+my %hostnames_by_machine;
+push @{ $hostnames_by_machine{ $_->{machine_id} } }, $_->{name} for @$hostnames;
+my %addrs_by_mac;
+push @{ $addrs_by_mac{ $_->{mac} } }, $_ for @$addresses;
+my %ports_by_mac;
+push @{ $ports_by_mac{ $_->{mac} } }, $_ for @$ports;
+my %iface_by_machine;
+push @{ $iface_by_machine{ $_->{machine_id} // 0 } }, $_ for @$ifaces;
+
+# Same ordering the report uses, so the address in a link matches the address
+# shown beside it in the table.
+sub ip_sort_key {
+    my ($a) = @_;
+    return '' unless defined $a;
+    return join '.', map { sprintf '%03d', $_ } split /\./, $a;
+}
+sub primary_addr {
+    my @all = map { @{ $addrs_by_mac{$_} || [] } } @_;
+    return undef unless @all;
+    @all = sort { ip_sort_key($a->{addr}) cmp ip_sort_key($b->{addr}) } @all;
+    return $all[0]{addr};
+}
+sub display_label {
+    my ($mid, $addr) = @_;
+    return $friendly_by_machine{$mid}                  if $friendly_by_machine{$mid};
+    return $machine_by_id{$mid}{primary_name}          if $machine_by_id{$mid}
+                                                       && $machine_by_id{$mid}{primary_name};
+    my $h = $hostnames_by_machine{$mid};
+    return $h->[0] if $h && @$h;
+    return $addr;
+}
+
+# The shared naming rule. Keep in step with guac_name() in net-mgr-web.cgi.
+sub guac_name {
+    my ($label, $scheme) = @_;
+    my $n = lc $label;
+    $n =~ s/[^a-z0-9._-]+/-/g;
+    $n =~ s/^-+|-+$//g;
+    return "$n-$scheme";
+}
+
+sub xml { my $s = shift // ''; $s =~ s/&/&amp;/g; $s =~ s/</&lt;/g;
+          $s =~ s/>/&gt;/g; $s =~ s/"/&quot;/g; return $s }
+
+# --- build the connection list ---------------------------------------------
+my (%seen, @conns);
+for my $mid (sort { $a <=> $b } keys %iface_by_machine) {
+    next unless $mid;                       # skip the unowned-interface bucket
+    my @macs = map { $_->{mac} } @{ $iface_by_machine{$mid} };
+    my $addr = primary_addr(@macs) or next;
+    my $label = display_label($mid, $addr);
+    next unless defined $label && length $label;
+
+    # One connection per protocol, not per port: a host listening on 5901 and
+    # 5902 is one VNC target as far as clicking through is concerned, and the
+    # lowest port is the one that answers.
+    my %best;
+    for my $m (@macs) {
+        for my $p (@{ $ports_by_mac{$m} || [] }) {
+            next unless ($p->{proto} // 'tcp') eq 'tcp';
+            my $proto = $PROTO{ $p->{port} } or next;
+            $best{$proto} = $p->{port}
+                if !defined $best{$proto} || $p->{port} < $best{$proto};
+        }
+    }
+    for my $proto (sort keys %best) {
+        my $name = guac_name($label, $proto);
+        next if $seen{$name}++;             # two machines, one label: first wins
+        push @conns, { name => $name, proto => $proto,
+                       host => $addr, port => $best{$proto}, label => $label };
+    }
+}
+
+# --- preserve the existing credentials -------------------------------------
+my $authorize;
+if (-r $MAP) {
+    open my $fh, '<', $MAP or die "net-gen-guacamole: $MAP: $!\n";
+    local $/; my $cur = <$fh>; close $fh;
+    ($authorize) = $cur =~ m{(<authorize\b[^>]*>)}s;
+}
+unless ($authorize) {
+    die "net-gen-guacamole: no <authorize> block found in $MAP.\n"
+      . "  Run contrib/install-guacamole.sh first — it creates the login and\n"
+      . "  records it in /etc/net-mgr/secrets/guacamole. This script will not\n"
+      . "  invent credentials, because doing so on every run would silently\n"
+      . "  change the password behind you.\n";
+}
+
+# --- emit -------------------------------------------------------------------
+my $out = "<user-mapping>\n"
+        . "    <!-- GENERATED by net-gen-guacamole. Edits are lost on the next\n"
+        . "         run; change the generator, not this file. The <authorize>\n"
+        . "         line is carried over from the previous version. -->\n"
+        . "    $authorize\n";
+for my $c (@conns) {
+    $out .= sprintf qq{        <connection name="%s">\n}, xml($c->{name});
+    $out .= sprintf qq{            <protocol>%s</protocol>\n}, $c->{proto};
+    $out .= sprintf qq{            <param name="hostname">%s</param>\n}, xml($c->{host});
+    $out .= sprintf qq{            <param name="port">%d</param>\n}, $c->{port};
+    # Self-signed certificates are the norm on this fleet; without this RDP
+    # fails at the handshake with a message that reads like a network fault.
+    $out .= qq{            <param name="ignore-cert">true</param>\n} if $c->{proto} eq 'rdp';
+    $out .= "        </connection>\n";
+}
+$out .= "    </authorize>\n</user-mapping>\n";
+
+printf STDERR "%d connection(s) from %d machine(s)\n",
+    scalar @conns, scalar keys %iface_by_machine;
+for my $proto (qw(ssh rdp vnc)) {
+    my $n = grep { $_->{proto} eq $proto } @conns;
+    printf STDERR "  %-4s %d\n", $proto, $n;
+}
+
+if (!$write) {
+    print $out;
+    print STDERR "\n(dry run — pass --write to install this as $MAP)\n";
+    exit 0;
+}
+
+# Atomic, and keep one generation back: a bad regeneration should not be the
+# thing that stops you reaching a machine.
+my $tmp = "$MAP.new.$$";
+open my $o, '>', $tmp or die "net-gen-guacamole: $tmp: $!\n";
+print $o $out; close $o;
+chmod 0600, $tmp;
+if (-e $MAP) { rename $MAP, "$MAP.prev" or die "net-gen-guacamole: backup failed: $!\n" }
+rename $tmp, $MAP or die "net-gen-guacamole: install failed: $!\n";
+print STDERR "wrote $MAP (previous kept as $MAP.prev)\n";
+
+if ($restart) {
+    system('systemctl', 'restart', 'tomcat9') == 0
+        or die "net-gen-guacamole: tomcat9 restart failed\n";
+    print STDERR "restarted tomcat9\n";
+} else {
+    print STDERR "user-mapping.xml is re-read on change; restart tomcat9 if it does not take\n";
+}
