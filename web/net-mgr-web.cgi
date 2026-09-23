@@ -28,12 +28,18 @@ print "Content-Type: text/html; charset=utf-8\n\n";
 
 # Query parsing first so views can decide which snapshots they need.
 my %q;
+my %qm;                  # same params, every value kept (repeated keys)
 for my $kv (split /&/, $ENV{QUERY_STRING} // '') {
     my ($k, $v) = split /=/, $kv, 2;
     next unless defined $k;
     $v //= '';
+    $v =~ tr/+/ /;       # form-encoded spaces, before %XX
     $v =~ s/%([0-9A-Fa-f]{2})/chr hex $1/ge;
     $q{$k} = $v;
+    # Checkboxes sharing a name arrive as s=http&s=https. The line above
+    # keeps only the last, so collect repeats alongside it rather than
+    # changing %q -- every other view reads %q and expects last-wins.
+    push @{ $qm{$k} }, $v;
 }
 
 my $cli = eval { NetMgr::Client->new(listen => '127.0.0.1:7531') };
@@ -336,9 +342,95 @@ sub sibling_machines {
 
 # Compact list ------------------------------------------------------
 
+# Filtering ----------------------------------------------------------
+#
+# The name box takes a regexp, but a plain glob is what fingers type:
+# "w*" as a regexp means "zero or more w" and so matches every row,
+# which reads as the filter being broken rather than as the pattern
+# meaning something else. A pattern that is ONLY glob syntax is
+# therefore converted and anchored; anything carrying real regexp
+# metacharacters is left alone and matched unanchored.
+sub _name_matcher {
+    my ($pat) = @_;
+    return (undef, undef) unless defined $pat && length $pat;
+    my $re = $pat;
+    if ($pat =~ /[*?]/ && $pat !~ /[\^\$\[\]()|+{}\\]/) {
+        $re = join '', map { $_ eq '*' ? '.*'
+                           : $_ eq '?' ? '.'
+                           : quotemeta $_ } split //, $pat;
+        $re = '^' . $re . '$';
+    }
+    # qr// on user input is safe by default here: (?{...}) is a compile
+    # error unless `use re 'eval'` is in scope, and it is not.
+    my $qr = eval { qr/$re/i };
+    if (!$qr) { my $e = $@ || 'invalid'; $e =~ s/\s+at\s+.*//s; return (undef, "bad pattern: $e") }
+    return ($qr, undef);
+}
+
+# Which schemes a row offers, via %SCHEME - so ticking "http" also finds
+# 8080/8000/631, which is the point of filtering by service rather than
+# by port number.
+sub port_schemes {
+    my (@ports) = @_;
+    my %seen;
+    for my $p (@ports) {
+        next unless ($p->{proto} // 'tcp') eq 'tcp';
+        my $sd = $SCHEME{ $p->{port} } or next;
+        $seen{ $sd->[0] } = 1;
+    }
+    return \%seen;
+}
+
+sub render_filter_form {
+    my ($name, $ticked, $shown, $total, $err) = @_;
+    my %t = map { $_ => 1 } @$ticked;
+    # Offer every scheme the table can actually link to, in a stable order.
+    my (@schemes, %seen);
+    for my $p (sort { $a <=> $b } keys %SCHEME) {
+        my $sc = $SCHEME{$p}[0];
+        push @schemes, $sc unless $seen{$sc}++;
+    }
+    my $boxes = join '', map {
+        sprintf '<label><input type=checkbox name=s value="%s"%s> %s</label>',
+            escapeHTML($_), ($t{$_} ? ' checked' : ''), escapeHTML($_)
+    } @schemes;
+    my $note = defined $err
+             ? sprintf('<span class=ferr>%s</span>', escapeHTML($err))
+             : ((defined $name && length $name) || @$ticked)
+               ? sprintf('<span class=fnote>%d of %d</span>', $shown, $total)
+               : '';
+    my $nval = escapeHTML(defined $name ? $name : '');
+    return <<HTML;
+<form class=filter method=get action="">
+  <label>name <input type=text name=n value="$nval" size=16
+         placeholder="w* or ^w" title="glob (w*) or regexp (^w)"></label>
+  <span class=svcbox>$boxes</span>
+  <button type=submit>filter</button>
+  <a class=clear href="?">clear</a>
+  $note
+</form>
+HTML
+}
+
 sub render_list {
     # Build (tier, label, html) tuples and sort. Tier 0 = has http/https,
     # 1 = has other clickable service, 2 = no clickable ports.
+    my ($name_re, $re_err) = _name_matcher($q{n});
+    my @want = grep { length } @{ $qm{s} || [] };
+    my %want = map { $_ => 1 } @want;
+    my $total = 0;
+    # Ticked services are OR-ed: "http https" means a web UI of either
+    # kind, which is what clicking through to a box's admin page wants.
+    my $keep = sub {
+        my ($label, $ports) = @_;
+        $total++;
+        return 0 if $name_re && $label !~ $name_re;
+        if (%want) {
+            my $have = port_schemes(@$ports);
+            return 0 unless grep { $have->{$_} } keys %want;
+        }
+        return 1;
+    };
     my @entries;
     for my $mid (grep { $_ } keys %iface_by_machine) {
         my @macs = map { $_->{mac} } @{ $iface_by_machine{$mid} };
@@ -346,6 +438,7 @@ sub render_list {
         my $label = display_label($mid, $first_addr);
         my $online = machine_online($mid) ? 'online' : 'offline';
         my @ports = aggregate_ports(@macs);
+        next unless $keep->($label, \@ports);
         my @port_html = map { port_badge($_, $first_addr) } @ports;
         my $link = sprintf '<a class=hostlink href="?m=%d">%s</a>',
             $mid, escapeHTML($label);
@@ -360,6 +453,7 @@ sub render_list {
         my $first_addr = primary_addr($mac);
         my $label = $first_addr // $mac;
         my @ports = aggregate_ports($mac);
+        next unless $keep->($label, \@ports);
         my @port_html = map { port_badge($_, $first_addr) } @ports;
         my $online = $iface->{online} ? 'online' : 'offline';
         my $link = sprintf '<a class=hostlink href="?i=%s">%s</a>',
@@ -375,8 +469,10 @@ sub render_list {
     my $body  = join("\n", @rows);
     my $count = scalar @$machines;
     my $now   = scalar localtime;
+    my $form  = render_filter_form($q{n}, \@want, scalar @rows, $total, $re_err);
     return wrap_page("net-mgr", <<HTML);
 <div class="meta">$count machines · $now</div>
+$form
 <table>
 <tr><th>host</th><th>ip</th><th>services</th></tr>
 $body
@@ -2162,6 +2258,21 @@ code { color: #888; font-size: 0.9em; }
 }
 a.port { color: #6cf; }
 a.port:hover { background: #2a4060; }
+form.filter { margin: 0.6em 0 1em; font-size: 0.9em; color: #888; }
+form.filter input[type=text] {
+    background: #1a1a1a; color: #ccc; border: 1px solid #444;
+    border-radius: 3px; padding: 2px 6px; font: inherit;
+}
+form.filter .svcbox { margin-left: 0.6em; }
+form.filter .svcbox label { margin-right: 0.6em; white-space: nowrap; }
+form.filter button {
+    background: #1d2a3a; color: #6cf; border: 1px solid #2a4060;
+    border-radius: 3px; padding: 2px 10px; font: inherit; cursor: pointer;
+}
+form.filter button:hover { background: #2a4060; }
+form.filter a.clear { color: #888; margin-left: 0.6em; }
+form.filter .fnote { color: #666; margin-left: 0.6em; }
+form.filter .ferr  { color: #e66; margin-left: 0.6em; }
 a.hostlink { color: #eee; text-decoration: none; }
 a.hostlink:hover { color: #6cf; text-decoration: underline; }
 tr.offline td.name { color: #555; }
