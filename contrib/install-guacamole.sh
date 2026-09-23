@@ -85,6 +85,39 @@ info "$PRETTY_NAME  ($(uname -r))"
 
 command -v apache2ctl >/dev/null || die "apache2 not installed — this is meant for the box serving the net-mgr report"
 
+# --- 0a. is apt healthy? ----------------------------------------------------
+# Check BEFORE installing anything. `apt-get install -y` on a system with
+# half-configured packages tries to repair everything first, so an unrelated
+# pre-existing mess surfaces as a dpkg error in the middle of this script and
+# reads as though Guacamole caused it. nas3 hit exactly that: a stalled
+# nvidia 535->580 transition, 117 packages unconfigured, and a file conflict
+# over /usr/bin/nvidia-bug-report.sh. Say so plainly and stop instead.
+say "apt health"
+# dpkg's status field is desired-action + current-state. Only the current
+# state matters here, and only these values mean "not fully installed or
+# removed": U unpacked, F half-configured, H half-installed, W trigger-await,
+# t trigger-pending. Do NOT count on the second char being != 'i' -- 'rc'
+# (removed, config files kept) is an ordinary, healthy state and there are
+# typically over a hundred of them.
+broken=$(dpkg -l 2>/dev/null |
+         awk 'substr($1,2,1) ~ /[UFHWt]/ {n++} END {print n+0}')
+if ! apt-get check -qq >/dev/null 2>&1 || [ "${broken:-0}" -gt 0 ]; then
+    warn "this system has $broken package(s) not fully installed/configured"
+    warn "and apt-get check reports unmet dependencies."
+    echo
+    info "That is PRE-EXISTING and nothing to do with Guacamole, but every"
+    info "apt-get install below would try to repair it first and fail there."
+    info "Resolve it deliberately (it may need a reboot), then re-run this:"
+    info "    apt-get check;  dpkg --configure -a;  apt --fix-broken install"
+    echo
+    info "Re-run with --skip-apt-check only if you know the breakage cannot"
+    info "affect guacd/tomcat, and expect apt to disagree."
+    [ "${1:-}" = "--skip-apt-check" ] || die "stopping before touching anything"
+    warn "--skip-apt-check given, continuing anyway"
+else
+    info "apt is consistent"
+fi
+
 # --- 1. guacd + protocol support -------------------------------------------
 say "guacd and protocol libraries"
 export DEBIAN_FRONTEND=noninteractive
