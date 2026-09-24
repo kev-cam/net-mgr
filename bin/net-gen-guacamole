@@ -21,9 +21,9 @@
 #
 # The rule, in one place, mirrored by guac_name() in the CGI:
 #
-#       <display label lowercased, [^a-z0-9._-] -> '-'> . '-' . <scheme>
+#       <display label lowercased, [^a-z0-9._-] -> '-'> . '-' . <scheme> . '-' . <port>
 #
-# e.g. lenny-ssh, wndr8k2-down-vnc, opti7050-rdp.
+# e.g. lenny-ssh-22, lenny-vnc-5902, opti7050-rdp-3389.
 #
 # The credentials in <authorize> are NOT generated here: they are read back
 # out of the existing file and preserved. install-guacamole.sh created them
@@ -121,12 +121,14 @@ sub display_label {
 }
 
 # The shared naming rule. Keep in step with guac_name() in net-mgr-web.cgi.
+# The port is part of it: two VNC displays on one host must not collapse to
+# a single connection, and they did.
 sub guac_name {
-    my ($label, $scheme) = @_;
+    my ($label, $scheme, $port) = @_;
     my $n = lc $label;
     $n =~ s/[^a-z0-9._-]+/-/g;
     $n =~ s/^-+|-+$//g;
-    return "$n-$scheme";
+    return "$n-$scheme-$port";
 }
 
 sub xml { my $s = shift // ''; $s =~ s/&/&amp;/g; $s =~ s/</&lt;/g;
@@ -141,23 +143,26 @@ for my $mid (sort { $a <=> $b } keys %iface_by_machine) {
     my $label = display_label($mid, $addr);
     next unless defined $label && length $label;
 
-    # One connection per protocol, not per port: a host listening on 5901 and
-    # 5902 is one VNC target as far as clicking through is concerned, and the
-    # lowest port is the one that answers.
-    my %best;
+    # One connection per PORT, not per protocol. An earlier version kept only
+    # the lowest port per protocol on the theory that a host listening on 5901
+    # and 5902 was one VNC target -- it is not: those are displays :1 and :2,
+    # different desktops, and everything above the first was unreachable. The
+    # same collapse would hide ssh on a second port.
+    my (%seen_port, @hostports);
     for my $m (@macs) {
         for my $p (@{ $ports_by_mac{$m} || [] }) {
             next unless ($p->{proto} // 'tcp') eq 'tcp';
             my $proto = $PROTO{ $p->{port} } or next;
-            $best{$proto} = $p->{port}
-                if !defined $best{$proto} || $p->{port} < $best{$proto};
+            next if $seen_port{"$proto/$p->{port}"}++;   # same port, two MACs
+            push @hostports, [ $proto, $p->{port} ];
         }
     }
-    for my $proto (sort keys %best) {
-        my $name = guac_name($label, $proto);
+    for my $hp (sort { $a->[0] cmp $b->[0] || $a->[1] <=> $b->[1] } @hostports) {
+        my ($proto, $port) = @$hp;
+        my $name = guac_name($label, $proto, $port);
         next if $seen{$name}++;             # two machines, one label: first wins
         push @conns, { name => $name, proto => $proto,
-                       host => $addr, port => $best{$proto}, label => $label };
+                       host => $addr, port => $port, label => $label };
     }
 }
 

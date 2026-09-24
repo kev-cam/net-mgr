@@ -180,6 +180,13 @@ my %SCHEME = (
     631  => ['http',  0],   # CUPS
 );
 
+# Every VNC port is a SEPARATE display -- 5901 is :1, 5902 is :2, 5904 is
+# :4 -- not another route to the same desktop. Listing only 5900/5901 meant
+# the rest rendered as dead text, and their IANA names give no clue what
+# they are ("ag-swim" for 5904, "cm" for 5910), so nobody would think to
+# add them by hand. 5800 stays http above: that one really is a web UI.
+$SCHEME{$_} = ['vnc', 0] for 5900 .. 5910;
+
 # Detected rather than configured: this file exists only on the host where
 # install-guacamole.sh has run, so every other node in the fleet keeps the
 # old scheme URLs and there is no config flag to set.
@@ -271,12 +278,15 @@ sub guac_url {
 # The naming rule, shared with net-gen-guacamole. Both sides derive the
 # name independently -- the report never asks Guacamole what exists -- so
 # these two MUST stay in step or links land on "connection not found".
+# The port is part of the name. Without it a host with two displays, or
+# ssh on both 22 and 2222, collapses to one connection and every badge
+# links to the same place -- silently, since the link still resolves.
 sub guac_name {
-    my ($label, $scheme) = @_;
+    my ($label, $scheme, $port) = @_;
     my $n = lc $label;
     $n =~ s/[^a-z0-9._-]+/-/g;
     $n =~ s/^-+|-+$//g;
-    return "$n-$scheme";
+    return "$n-$scheme-$port";
 }
 
 sub port_badge {
@@ -296,7 +306,7 @@ sub port_badge {
         # through a remote-desktop gateway would be absurd.
         if ($GUAC && defined $host_label && length $host_label
                   && $scheme =~ /^(ssh|rdp|vnc)$/) {
-            my $u = guac_url(guac_name($host_label, $scheme));
+            my $u = guac_url(guac_name($host_label, $scheme, $port));
             return sprintf '<a class="port guac" href="%s" title="%s">%s</a>',
                 escapeHTML($u),
                 escapeHTML("$title — via guacamole"),
