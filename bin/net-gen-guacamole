@@ -205,7 +205,7 @@ if (!$authorize) {
         }
         close $sf;
         if (defined $pass) {
-            $user = 'netmgr' unless defined $user && length $user;
+            $user = 'n-guac' unless defined $user && length $user;
             require Digest::MD5;
             my $h = Digest::MD5::md5_hex($pass);
             my $u = $user;

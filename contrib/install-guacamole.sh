@@ -50,6 +50,13 @@ APACHE_CONF=/etc/apache2/conf-available/guacamole.conf
 HTPASSWD=/etc/apache2/guacamole.htpasswd
 SECRET_DIR=/etc/net-mgr/secrets
 SECRET=$SECRET_DIR/guacamole
+
+# Two prompts stand in front of a session and they are SEPARATE logins with
+# separate passwords. Giving both the same username was needlessly confusing
+# -- a rejected login gave no clue which of the two had rejected it. Named
+# for the thing doing the asking instead.
+APACHE_USER=n-apache        # the browser pop-up (basic auth), comes first
+GUAC_USER=n-guac            # the form inside the page (guacamole itself)
 DL=https://downloads.apache.org/guacamole
 ARCHIVE=https://archive.apache.org/dist/guacamole
 
@@ -353,7 +360,7 @@ if [ ! -f "$GUAC_HOME/user-mapping.xml" ]; then
          Connections are not enumerated here: use the quickconnect box
          (ssh://host, rdp://host, vnc://host) or let net-mgr generate
          entries from the ports it already knows about. -->
-    <authorize username="netmgr" password="$GHASH" encoding="md5">
+    <authorize username="$GUAC_USER" password="$GHASH" encoding="md5">
     </authorize>
 </user-mapping>
 MAP
@@ -361,9 +368,13 @@ MAP
     # tomcat has to read it or every authentication fails.
     chown "root:$TOMCAT_USER" "$GUAC_HOME/user-mapping.xml"
     chmod 640 "$GUAC_HOME/user-mapping.xml"
-    printf 'guacamole web login\nuser: netmgr\npass: %s\n' "$GPASS" > "$SECRET"
+    # The marker words 'guacamole web login' and 'apache basic-auth' are
+    # parsed by net-gen-guacamole to find the right block -- do not repeat
+    # either phrase in a comment here, or the parser will match that instead.
+    printf 'guacamole web login  (the form inside the page)\nuser: %s\npass: %s\n' \
+           "$GUAC_USER" "$GPASS" > "$SECRET"
     chmod 600 "$SECRET"
-    info "created guacamole login 'netmgr' — password in $SECRET"
+    info "created guacamole login '$GUAC_USER' — password in $SECRET"
 else
     info "$GUAC_HOME/user-mapping.xml exists — leaving credentials alone"
 fi
@@ -403,10 +414,11 @@ command -v htpasswd >/dev/null || apt-get install -y -qq apache2-utils >/dev/nul
 
 if [ ! -f "$HTPASSWD" ]; then
     APASS=$(head -c 18 /dev/urandom | base64 | tr -d '/+=' | head -c 20)
-    htpasswd -bc "$HTPASSWD" netmgr "$APASS" >/dev/null 2>&1
+    htpasswd -bc "$HTPASSWD" "$APACHE_USER" "$APASS" >/dev/null 2>&1
     chown root:www-data "$HTPASSWD"; chmod 640 "$HTPASSWD"
-    printf 'apache basic-auth in front of /guacamole\nuser: netmgr\npass: %s\n' "$APASS" >> "$SECRET"
-    info "created apache basic-auth user 'netmgr' — password appended to $SECRET"
+    printf 'apache basic-auth in front of /guacamole  (the browser pop-up)\nuser: %s\npass: %s\n' \
+           "$APACHE_USER" "$APASS" >> "$SECRET"
+    info "created apache basic-auth user '$APACHE_USER' — password appended to $SECRET"
 else
     info "$HTPASSWD exists — leaving it"
 fi
@@ -476,7 +488,9 @@ info "via apache without credentials: HTTP $front (401 is correct — it means a
 say "done"
 cat <<DONE
    URL:         http://nas3/guacamole/
-   credentials: $SECRET   (two logins: apache basic-auth, then guacamole)
+   credentials: $SECRET
+                $APACHE_USER  — the browser pop-up you meet first
+                $GUAC_USER    — the form inside the page, DIFFERENT password
    connect to a host by typing  ssh://lenny  (or rdp://, vnc://) in the UI
 
    guacd $GUAC_VER, tomcat on 127.0.0.1:8080 only, apache requires a password
