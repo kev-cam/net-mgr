@@ -603,8 +603,24 @@ sub _apply_self_inventory {
                 );
             };
             $self->_log("register_self: anchor upsert_interface $anchor failed: $@") if $@;
+            # ports.service holds the service NAME (ssh, domain, smtp). It is
+            # NOT a provenance field, and writing 'self' into it here was a
+            # double fault: every self-registered port rendered as "self" in
+            # the report instead of its service, and upsert_port overwrites
+            # service whenever it differs — so a port a scan had correctly
+            # identified as ssh got clobbered to 'self' the next time its own
+            # node registered. Provenance already lives in the source column.
+            #
+            # getservbyport gives the same name a scanner would. Where
+            # /etc/services has no entry (7531, 14500) the column is left
+            # NULL and the report falls back to showing the port number,
+            # which is honest rather than wrong.
             for my $p (@{ $inv->{ports} }) {
                 next unless defined $p->{port} && $p->{port} =~ /^\d+$/;
+                my $proto = $p->{proto} // 'tcp';
+                my $svc   = $p->{service};
+                $svc = getservbyport($p->{port} + 0, $proto)
+                    unless defined $svc && length $svc;
                 # Guarded for the same reason the interface loop below is: a
                 # self-inventory row is a convenience and is never worth
                 # aborting startup over.
@@ -612,11 +628,27 @@ sub _apply_self_inventory {
                     $self->_upsert('ports', 'upsert_port',
                         mac     => $anchor,
                         port    => $p->{port} + 0,
-                        proto   => ($p->{proto} // 'tcp'),
-                        service => 'self');
+                        proto   => $proto,
+                        service => $svc);
                 };
                 $self->_log("register_self: upsert_port $anchor/$p->{port} failed: $@") if $@;
             }
+
+            # Repair what the old code wrote. The loop above only revisits
+            # ports that are still open, so anything since closed would keep
+            # the bogus value for ever. Scoped to this node's own anchor MAC:
+            # every node clears its own on restart, and replication carries
+            # the correction to the master.
+            eval {
+                my $n = $db->dbh->do(
+                    "UPDATE ports SET service = NULL
+                      WHERE mac = ? AND service = 'self'",
+                    undef, $anchor);
+                $self->_log("register_self: cleared bogus service='self' on "
+                          . ($n + 0) . " port row(s) for $anchor")
+                    if $n && $n ne '0E0';
+            };
+            $self->_log("register_self: service='self' cleanup failed: $@") if $@;
         }
     }
     # Local dedup: a self-registration is authoritative for this machine's
