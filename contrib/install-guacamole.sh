@@ -290,16 +290,20 @@ fi
 say "configuration"
 mkdir -p "$GUAC_HOME/extensions" "$GUAC_HOME/lib"
 
-# Set modes EXPLICITLY. Everything below is created with cat/install and so
-# inherits root's umask, and on a box with umask 077 that produced a 0700
-# /etc/guacamole containing a 0600 guacamole.properties. Tomcat runs as
-# $TOMCAT_USER, not root, so it could not read its own configuration -- the
-# webapp still answered 200 on :8080 (that only proves the WAR deployed),
-# and the breakage would not have shown up until the first login attempt.
-# 0750 root:tomcat: tomcat reads, nobody else gets in, and user-mapping.xml
-# holds a password hash so nothing here should be world-readable.
-chown -R "root:$TOMCAT_USER" "$GUAC_HOME"
-chmod 750 "$GUAC_HOME" "$GUAC_HOME/extensions" "$GUAC_HOME/lib"
+# Set modes EXPLICITLY: everything here is created with cat/install and so
+# inherits root's umask, and on a box with umask 077 that gave a 0700
+# /etc/guacamole holding a 0600 guacamole.properties, which tomcat (not
+# root) could not read.
+#
+# But protect the FILE that holds the password, not the directory. TWO
+# daemons read things in here and they run as different users: tomcat wants
+# guacamole.properties, user-mapping.xml and extensions; guacd wants
+# guacd.conf. Closing the directory to 0750 root:tomcat locked guacd out
+# and it died on restart with
+#     Unable to open "/etc/guacamole/guacd.conf": Permission denied
+# which reads as a guacd fault rather than a permissions one.
+chown root:root "$GUAC_HOME"
+chmod 755 "$GUAC_HOME" "$GUAC_HOME/extensions" "$GUAC_HOME/lib"
 
 cat > "$GUAC_HOME/guacamole.properties" <<PROPS
 # Managed by net-mgr contrib/install-guacamole.sh
@@ -364,12 +368,30 @@ else
     info "$GUAC_HOME/user-mapping.xml exists — leaving credentials alone"
 fi
 
-# Re-assert after everything exists, so re-running this repairs an install
-# made before the modes were set explicitly rather than needing an uninstall.
-chown -R "root:$TOMCAT_USER" "$GUAC_HOME"
-find "$GUAC_HOME" -type d -exec chmod 750 {} +
-find "$GUAC_HOME" -type f -exec chmod 640 {} +
-info "permissions: $GUAC_HOME is root:$TOMCAT_USER, dirs 750, files 640"
+# Re-assert after everything exists, so re-running repairs an earlier
+# install rather than needing an uninstall first. Per-file, NOT a blanket
+# chown -R: a recursive sweep here is what locked guacd out of guacd.conf.
+chmod 755 "$GUAC_HOME" "$GUAC_HOME/extensions" "$GUAC_HOME/lib"
+chown root:root "$GUAC_HOME"
+
+# guacd's own config: read by guacd, which is neither root nor tomcat.
+if [ -f "$GUAC_HOME/guacd.conf" ]; then
+    chown root:root "$GUAC_HOME/guacd.conf"
+    chmod 644 "$GUAC_HOME/guacd.conf"
+fi
+
+# Extensions are jars, no secrets in them, and tomcat has to load them.
+find "$GUAC_HOME/extensions" -type f -name '*.jar' -exec chmod 644 {} + 2>/dev/null || true
+
+# The two files tomcat reads. user-mapping.xml carries the password hash,
+# so this pair is the part that actually needs closing down.
+for c in guacamole.properties user-mapping.xml; do
+    if [ -f "$GUAC_HOME/$c" ]; then
+        chown "root:$TOMCAT_USER" "$GUAC_HOME/$c"
+        chmod 640 "$GUAC_HOME/$c"
+    fi
+done
+info "permissions: dir 755, credentials 640 root:$TOMCAT_USER, guacd.conf 644"
 
 # --- 5. apache front end ----------------------------------------------------
 say "apache reverse proxy"
@@ -426,6 +448,13 @@ info "wrote $APACHE_CONF and reloaded apache"
 
 # --- 6. start and prove -----------------------------------------------------
 say "starting"
+# Restart guacd as well: the permission changes above affect it, and a
+# re-run that leaves it dead would look like a working install.
+systemctl restart guacd 2>/dev/null || true
+if ! systemctl is-active --quiet guacd; then
+    die "guacd failed to restart — journalctl -u guacd (permissions on $GUAC_HOME?)"
+fi
+info "guacd restarted cleanly"
 systemctl enable "$TOMCAT_UNIT" >/dev/null 2>&1 || true
 systemctl restart "$TOMCAT_UNIT"
 
