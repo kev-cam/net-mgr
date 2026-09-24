@@ -468,15 +468,22 @@ sub port_schemes {
     return \%seen;
 }
 
+# The schemes the table can link to, in a stable order. Used for the filter
+# checkboxes and for the column order in narrow mode, so the boxes read
+# left-to-right in the same order as the columns they produce.
+sub scheme_order {
+    my (@out, %seen);
+    for my $p (sort { $a <=> $b } keys %SCHEME) {
+        my $sc = $SCHEME{$p}[0];
+        push @out, $sc unless $seen{$sc}++;
+    }
+    return @out;
+}
+
 sub render_filter_form {
     my ($name, $ticked, $shown, $total, $err) = @_;
     my %t = map { $_ => 1 } @$ticked;
-    # Offer every scheme the table can actually link to, in a stable order.
-    my (@schemes, %seen);
-    for my $p (sort { $a <=> $b } keys %SCHEME) {
-        my $sc = $SCHEME{$p}[0];
-        push @schemes, $sc unless $seen{$sc}++;
-    }
+    my @schemes = scheme_order();
     my $boxes = join '', map {
         sprintf '<label><input type=checkbox name=s value="%s"%s> %s</label>',
             escapeHTML($_), ($t{$_} ? ' checked' : ''), escapeHTML($_)
@@ -493,6 +500,7 @@ sub render_filter_form {
          placeholder="w* or ^w" title="glob (w*) or regexp (^w)"></label>
   <span class=svcbox>$boxes</span>
   <button type=submit>filter</button>
+  <button type=submit name=narrow value=1 title="one column per ticked service">narrow</button>
   <a class=clear href="?">clear</a>
   $note
 </form>
@@ -518,6 +526,48 @@ sub render_list {
         }
         return 1;
     };
+    # Narrow mode: one COLUMN per ticked service instead of one cell holding
+    # everything a host runs. Alignment is the whole point -- scanning "which
+    # of these boxes has vnc" down a ragged list of badges does not work -- so
+    # it is real table columns, and a host missing a service gets a dimmed
+    # placeholder rather than an empty cell, which would let the next badge
+    # slide left and break the column it was meant to line up with.
+    #
+    # Needs something to narrow TO: with no services ticked it would be a
+    # table with no columns, so fall back to the normal view and say why.
+    my @cols = grep { $want{$_} } scheme_order();
+    my $narrow = ($q{narrow} && @cols) ? 1 : 0;
+    my $narrow_ignored = ($q{narrow} && !@cols) ? 1 : 0;
+
+    my $cells = sub {
+        my ($ports, $first_addr, $label) = @_;
+        return sprintf '<td class=ports>%s</td>',
+            join ' ', map { port_badge($_, $first_addr, $label) } @$ports
+            unless $narrow;
+
+        my %by;
+        for my $p (@$ports) {
+            next unless ($p->{proto} // 'tcp') eq 'tcp';
+            my $sd = $SCHEME{ $p->{port} } or next;
+            push @{ $by{ $sd->[0] } }, $p;
+        }
+        my $out = '';
+        for my $sc (@cols) {
+            my $ps = $by{$sc};
+            if ($ps && @$ps) {
+                # Several ports can share a scheme (vnc :1 :2 :4) -- they all
+                # belong in that scheme's column, still aligned with its peers.
+                $out .= sprintf '<td class=ports>%s</td>',
+                    join ' ', map { port_badge($_, $first_addr, $label) } @$ps;
+            } else {
+                $out .= sprintf
+                    '<td class=ports><span class="port off" title="no %s here">%s</span></td>',
+                    escapeHTML($sc), escapeHTML($sc);
+            }
+        }
+        return $out;
+    };
+
     my @entries;
     for my $mid (grep { $_ } keys %iface_by_machine) {
         my @macs = map { $_->{mac} } @{ $iface_by_machine{$mid} };
@@ -526,13 +576,12 @@ sub render_list {
         my $online = machine_online($mid) ? 'online' : 'offline';
         my @ports = aggregate_ports(@macs);
         next unless $keep->($label, \@ports);
-        my @port_html = map { port_badge($_, $first_addr, $label) } @ports;
         my $link = sprintf '<a class=hostlink href="?m=%d">%s</a>',
             $mid, escapeHTML($label);
         my $html = sprintf
-            '<tr class="%s"><td class=name>%s</td><td>%s</td><td class=ports>%s</td></tr>',
+            '<tr class="%s"><td class=name>%s</td><td>%s</td>%s</tr>',
             $online, $link, escapeHTML($first_addr // ''),
-            join(' ', @port_html);
+            $cells->(\@ports, $first_addr, $label);
         push @entries, [ tier(\@ports), lc $label, $html ];
     }
     for my $iface (@{ $iface_by_machine{0} || [] }) {
@@ -541,13 +590,12 @@ sub render_list {
         my $label = $first_addr // $mac;
         my @ports = aggregate_ports($mac);
         next unless $keep->($label, \@ports);
-        my @port_html = map { port_badge($_, $first_addr, $label) } @ports;
         my $online = $iface->{online} ? 'online' : 'offline';
         my $link = sprintf '<a class=hostlink href="?i=%s">%s</a>',
             escapeHTML($mac), escapeHTML($label);
         my $html = sprintf
-            '<tr class="%s unknown"><td class=name>%s</td><td></td><td class=ports>%s</td></tr>',
-            $online, $link, join(' ', @port_html);
+            '<tr class="%s unknown"><td class=name>%s</td><td></td>%s</tr>',
+            $online, $link, $cells->(\@ports, $first_addr, $label);
         push @entries, [ tier(\@ports), lc $label, $html ];
     }
     @entries = sort { $a->[0] <=> $b->[0] || $a->[1] cmp $b->[1] } @entries;
@@ -556,12 +604,17 @@ sub render_list {
     my $body  = join("\n", @rows);
     my $count = scalar @$machines;
     my $now   = scalar localtime;
-    my $form  = render_filter_form($q{n}, \@want, scalar @rows, $total, $re_err);
+    my $err2 = $re_err;
+    $err2 = 'tick a service first — nothing to narrow to' if $narrow_ignored;
+    my $form  = render_filter_form($q{n}, \@want, scalar @rows, $total, $err2);
+    my $head  = $narrow
+        ? join('', map { '<th>' . escapeHTML($_) . '</th>' } @cols)
+        : '<th>services</th>';
     return wrap_page("net-mgr", <<HTML);
 <div class="meta">$count machines · $now</div>
 $form
 <table>
-<tr><th>host</th><th>ip</th><th>services</th></tr>
+<tr><th>host</th><th>ip</th>$head</tr>
 $body
 </table>
 HTML
@@ -2359,6 +2412,13 @@ a.port:hover { background: #2a4060; }
    local client, so they are worth telling apart at a glance. */
 a.port.guac { background: #24331d; color: #9d6; }
 a.port.guac:hover { background: #354a2a; }
+/* Narrow-mode placeholder: holds the column open for a host that does not
+   run this service. Muted and not a link, so it reads as "absent" rather
+   than as something that failed to work. */
+span.port.off {
+    background: #181818; color: #4a4a4a; border: 1px dashed #333;
+    padding: 0 5px;
+}
 form.filter { margin: 0.6em 0 1em; font-size: 0.9em; color: #888; }
 form.filter input[type=text] {
     background: #1a1a1a; color: #ccc; border: 1px solid #444;
