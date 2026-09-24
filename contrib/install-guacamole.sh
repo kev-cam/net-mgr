@@ -141,17 +141,30 @@ for proto in ssh rdp vnc telnet; do
         fi
     done
 done
-# guacd on its own is useless: it will accept a connection and then fail to
+# guacd on its own is useless: it accepts a connection and then fails to
 # speak any protocol, which surfaces as "fails to connect" in the browser
-# with the real reason only in catalina.out. An earlier run here selected
-# nothing but guacd and said so in one easily-missed line, so make it fatal.
+# with the real reason only in catalina.out. So this is fatal -- but the
+# question is whether guacd CAN speak them, not whether the archive is
+# currently offering the packages.
+#
+# Those are different. On nas3 the archive advertises no candidate for any
+# libguac-client-*, yet all three were installed, having arrived as
+# Recommends when guacd itself went in. An earlier version of this check
+# looked only at availability and refused to run on a box where Guacamole
+# was already working.
+have_libs=$(ls /usr/lib/*/libguac-client-*.so* 2>/dev/null | wc -l)
 if [ "${#want[@]}" -le 1 ]; then
-    warn "no libguac-client-* packages found in this archive."
-    info "guacd without them cannot speak ssh, rdp or vnc at all."
-    info "Checked, for each of ssh/rdp/vnc:  libguac-client-<p>0t64, libguac-client-<p>0"
-    info "Look for what this archive actually calls them:"
-    info "    apt-cache search --names-only libguac"
-    die "refusing to install a guacd that cannot do anything"
+    if [ "$have_libs" -gt 0 ]; then
+        warn "archive offers no libguac-client-* packages, but $have_libs library"
+        warn "file(s) are already installed — continuing with those."
+    else
+        warn "no libguac-client-* packages in this archive, and none installed."
+        info "guacd without them cannot speak ssh, rdp or vnc at all."
+        info "Checked, for each of ssh/rdp/vnc:  libguac-client-<p>0t64, libguac-client-<p>0"
+        info "Look for what this archive actually calls them:"
+        info "    apt-cache search --names-only libguac"
+        die "refusing to install a guacd that cannot do anything"
+    fi
 fi
 info "installing: ${want[*]}"
 apt-get install -y -qq "${want[@]}" >/dev/null
