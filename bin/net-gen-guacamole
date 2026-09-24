@@ -209,13 +209,43 @@ if (!$write) {
 
 # Atomic, and keep one generation back: a bad regeneration should not be the
 # thing that stops you reaching a machine.
+# 0640 root:tomcat, NOT 0600 root. This file IS the login database and the
+# servlet container reads it as its own user, so an owner-only file makes
+# EVERY authentication fail -- with nothing in the browser beyond a rejected
+# login, and the real reason only in catalina.out:
+#
+#   WARN o.a.g.a.f.FileAuthenticationProvider - Unable to read user mapping
+#   file "/etc/guacamole/user-mapping.xml": (Permission denied)
+#
+# This is set here rather than inherited, because writing a fresh temp file
+# and renaming it over the target DISCARDS whatever ownership the target
+# had: regenerating silently undid the modes install-guacamole.sh applied.
+my $GROUP = 'tomcat';
+my $gid   = getgrnam($GROUP);
+
 my $tmp = "$MAP.new.$$";
 open my $o, '>', $tmp or die "net-gen-guacamole: $tmp: $!\n";
 print $o $out; close $o;
-chmod 0600, $tmp;
+if (defined $gid) {
+    chown 0, $gid, $tmp
+        or warn "net-gen-guacamole: cannot chown $tmp to root:$GROUP: $!\n";
+    chmod 0640, $tmp;
+} else {
+    # No such group: keep it private rather than widening it, and say why
+    # the result will not work instead of leaving it to be discovered later.
+    chmod 0600, $tmp;
+    warn "net-gen-guacamole: no '$GROUP' group on this host — leaving $MAP\n"
+       . "  owner-only. The servlet container will NOT be able to read it;\n"
+       . "  chown it to whichever user runs tomcat and chmod 640.\n";
+}
 if (-e $MAP) { rename $MAP, "$MAP.prev" or die "net-gen-guacamole: backup failed: $!\n" }
 rename $tmp, $MAP or die "net-gen-guacamole: install failed: $!\n";
-print STDERR "wrote $MAP (previous kept as $MAP.prev)\n";
+my @st = stat $MAP;
+printf STDERR "wrote %s (previous kept as %s.prev) — mode %04o, gid %s\n",
+    $MAP, $MAP, $st[2] & 07777, $st[5];
+if (defined $gid && $st[5] != $gid) {
+    warn "net-gen-guacamole: WARNING: $MAP is not group '$GROUP' — logins will fail\n";
+}
 
 if ($restart) {
     system('systemctl', 'restart', 'tomcat9') == 0
