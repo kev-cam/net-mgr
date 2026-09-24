@@ -190,19 +190,29 @@ if (-r $MAP) {
 if (!$authorize) {
     my $secret = '/etc/net-mgr/secrets/guacamole';
     if (open my $sf, '<', $secret) {
-        my ($pass, $in_guac);
+        # Take the USERNAME from the file too, not just the password. It was
+        # hardcoded to netmgr, so renaming the login (e.g. to tell the two
+        # prompts apart) survived until the day this path ran and silently
+        # put the old name back — at which point nothing works and the file
+        # on disk says it should.
+        my ($user, $pass, $in_guac);
         while (my $l = <$sf>) {
             $in_guac = 1 if $l =~ /guacamole web login/;
             $in_guac = 0 if $l =~ /apache basic-auth/;
-            if ($in_guac && $l =~ /^pass:\s*(\S+)/) { $pass = $1; last }
+            next unless $in_guac;
+            $user = $1 if !defined $user && $l =~ /^user:\s*(\S+)/;
+            if ($l =~ /^pass:\s*(\S+)/) { $pass = $1; last }
         }
         close $sf;
         if (defined $pass) {
+            $user = 'netmgr' unless defined $user && length $user;
             require Digest::MD5;
             my $h = Digest::MD5::md5_hex($pass);
-            $authorize = qq{<authorize username="netmgr" password="$h" encoding="md5">};
+            my $u = $user;
+            $u =~ s/&/&amp;/g; $u =~ s/</&lt;/g; $u =~ s/"/&quot;/g;
+            $authorize = qq{<authorize username="$u" password="$h" encoding="md5">};
             warn "net-gen-guacamole: $MAP had no usable credentials — rebuilt\n"
-               . "  the login from $secret (user netmgr).\n";
+               . "  the login from $secret (user $user).\n";
         }
     }
 }
