@@ -513,14 +513,22 @@ sub split_cmd {
 
 # ---- x11vnc mode ---------------------------------------------------
 #
-# net-vnc --x11vnc [user@]host:display [ssh-opts...]
+# net-vnc --x11vnc [--scale F] [user@]host:display [ssh-opts...]
 #
 # SSH to the host, start x11vnc on the given display with -autoport so
 # it picks a free rfb port, read that port from x11vnc's output, set up
-# an SSH tunnel, and launch the local viewer.
+# an SSH tunnel, and launch the local viewer.  --scale is handed to
+# x11vnc's -scale, so the framebuffer is shrunk on the remote before it
+# crosses the tunnel (a 4K screen at 0.5 ships a quarter of the pixels).
 
 sub _x11vnc_connect {
     my @args = @_;
+    my $scale;
+    if (@args >= 2 && $args[0] eq '--scale') {
+        (undef, $scale) = splice @args, 0, 2;
+        die "net-vnc --x11vnc: bad --scale '$scale' (expected e.g. 0.5)\n"
+            unless $scale =~ /^\d*\.?\d+$/ && $scale > 0;
+    }
     my ($dest, @ssh_extra) = @args;
     die "net-vnc --x11vnc: need [user\@]host:display\n" unless defined $dest;
     my ($user_at, $host, $disp_n) = $dest =~ /^((?:[^\@]+\@)?)([^:]+):(\d+)$/
@@ -542,6 +550,7 @@ sub _x11vnc_connect {
     # so a viewer that never connects can't strand x11vnc/the tunnel.
     my $remote = 'pkill -x x11vnc 2>/dev/null || true; sleep 0.3; '
                . "x11vnc -display :$disp_n -autoport 5900 -nopw "
+               . (defined $scale ? "-scale $scale " : '')
                . "-once -timeout 60 2>&1";
     # x11vnc with -autoport: it prints "PORT=NNNN" to stderr.
     # Run via SSH, merge stderr into stdout so we can read the port.
