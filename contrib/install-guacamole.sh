@@ -134,8 +134,30 @@ for proto in ssh rdp vnc telnet; do
         fi
     done
 done
+# guacd on its own is useless: it will accept a connection and then fail to
+# speak any protocol, which surfaces as "fails to connect" in the browser
+# with the real reason only in catalina.out. An earlier run here selected
+# nothing but guacd and said so in one easily-missed line, so make it fatal.
+if [ "${#want[@]}" -le 1 ]; then
+    warn "no libguac-client-* packages found in this archive."
+    info "guacd without them cannot speak ssh, rdp or vnc at all."
+    info "Checked, for each of ssh/rdp/vnc:  libguac-client-<p>0t64, libguac-client-<p>0"
+    info "Look for what this archive actually calls them:"
+    info "    apt-cache search --names-only libguac"
+    die "refusing to install a guacd that cannot do anything"
+fi
 info "installing: ${want[*]}"
 apt-get install -y -qq "${want[@]}" >/dev/null
+
+# Prove the protocols are actually there rather than trusting the install:
+# the packages ship the .so files guacd dlopen()s at connect time, and a
+# missing one is not detectable until someone clicks a link.
+libs=$(ls /usr/lib/*/libguac-client-*.so* 2>/dev/null | wc -l)
+if [ "$libs" -eq 0 ]; then
+    die "no libguac-client-*.so installed — guacd cannot speak any protocol"
+fi
+info "protocol libraries present: $(ls /usr/lib/*/libguac-client-*.so 2>/dev/null |
+        sed 's|.*/libguac-client-||; s|\.so.*||' | sort -u | tr '\n' ' ')"
 
 # Read the version back out of what apt actually installed — this is what
 # the WAR must match. Ask the binary first, fall back to the package version
