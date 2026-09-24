@@ -306,10 +306,17 @@ sub port_badge {
         # through a remote-desktop gateway would be absurd.
         if ($GUAC && defined $host_label && length $host_label
                   && $scheme =~ /^(ssh|rdp|vnc)$/) {
-            my $u = guac_url(guac_name($host_label, $scheme, $port));
-            return sprintf '<a class="port guac" href="%s" title="%s">%s</a>',
+            my $cname = guac_name($host_label, $scheme, $port);
+            my $u     = guac_url($cname);
+            # data-scheme drives the window geometry, data-guac names the
+            # window so re-clicking a host reuses its own rather than
+            # stacking duplicates. Both are read by the opener in wrap_page.
+            return sprintf '<a class="port guac" href="%s" title="%s"'
+                         . ' data-scheme="%s" data-guac="%s">%s</a>',
                 escapeHTML($u),
                 escapeHTML("$title — via guacamole"),
+                escapeHTML($scheme),
+                escapeHTML($cname),
                 escapeHTML($label);
         }
 
@@ -2495,6 +2502,52 @@ p.reco a:hover, table.reco-summary a:hover, p.meta a:hover {
 <nav><a href="?">&larr; hosts</a><a href="?view=chat">chat</a><a href="?view=tools">tools</a></nav>
 <h1>@{[escapeHTML($h1)]}</h1>
 $body
+<script>
+(function () {
+  // Open a session in its own window. A remote desktop inside an ordinary
+  // tab fights the surrounding chrome for both screen space and keystrokes:
+  // ctrl-W, ctrl-T, F11 and the rest are eaten by the browser before the
+  // guest ever sees them. A window.open with explicit geometry is treated as
+  // a popup -- no tab strip, no bookmarks bar, no menu.
+  //
+  // The address bar cannot be removed; browsers have refused that for twenty
+  // years because hiding it is how phishing works. This is as bare as a page
+  // is allowed to ask for.
+  function openSession(a) {
+    var scheme = a.getAttribute('data-scheme') || '';
+    var full   = (scheme === 'vnc' || scheme === 'rdp');   // desktops: fill the screen
+    var w = full ? screen.availWidth  : Math.min(1100, screen.availWidth);
+    var h = full ? screen.availHeight : Math.min(760,  screen.availHeight);
+    var x = full ? 0 : Math.max(0, Math.floor((screen.availWidth  - w) / 2));
+    var y = full ? 0 : Math.max(0, Math.floor((screen.availHeight - h) / 2));
+    var features = 'popup=yes,menubar=no,toolbar=no,location=no,status=no'
+                 + ',directories=no,resizable=yes'
+                 + ',scrollbars=' + (full ? 'no' : 'yes')
+                 + ',width=' + w + ',height=' + h + ',left=' + x + ',top=' + y;
+    var name = 'guac_' + (a.getAttribute('data-guac') || 'session').replace(/\W/g, '_');
+    var win;
+    try { win = window.open(a.href, name, features); } catch (e) { return false; }
+    if (!win || win.closed) return false;   // blocked: fall through to the plain link
+    // Chromium ignores width/height when the named window already exists, so
+    // re-assert the geometry; harmless on a fresh one. Wrapped because a
+    // cross-origin window can refuse moveTo/resizeTo.
+    try { win.moveTo(x, y); win.resizeTo(w, h); } catch (e) {}
+    try { win.focus(); } catch (e) {}
+    return true;
+  }
+
+  // Delegated, so it keeps working when the table is re-rendered by a filter.
+  document.addEventListener('click', function (ev) {
+    // Leave the modified clicks alone: ctrl/cmd-click for a tab and
+    // shift-click for a window are the user overriding this on purpose.
+    if (ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return;
+    var t = ev.target;
+    var a = (t && t.closest) ? t.closest('a.guac') : null;
+    if (!a) return;
+    if (openSession(a)) ev.preventDefault();
+  }, false);
+})();
+</script>
 </body></html>
 HTML
 }
