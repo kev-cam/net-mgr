@@ -21,6 +21,20 @@ use warnings;
 use Carp qw(croak);
 
 my %DEFAULTS = (
+    # Automatic DB tidying. Deliberately NOT under [scheduling]: that registry
+    # requires a task name in three separate lists which are already out of
+    # step, and a key absent from its duration table is never parsed -- so
+    # `scrub = 24h` would arrive as the string "24h" and numify to 24 SECONDS.
+    # It is also inert on any node whose [scheduling] block is commented out.
+    scrub => {
+        mode                     => 'enforce',  # off | report | enforce
+        interval                 => 3600,       # seconds between ticks
+        chat_markers             => 'keep-newest',
+        chat_marker_min_age      => 86400,      # never touch anything newer
+        chat_marker_batch        => 5000,       # rows per DELETE
+        chat_marker_max_per_run  => 20000,      # ceiling per tick
+        chat_marker_alarm_per_hour => 10,       # above this, refuse to clean
+    },
     manager => {
         # 'all' (default) = bind every LAN-facing address on this host — any
         # interface, present or future (a periodic + SIGHUP rescan tracks WiFi/USB

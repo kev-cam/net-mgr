@@ -1514,6 +1514,7 @@ sub run {
         $self->_check_periodic_triggers;
         $self->_age_out_offline;
         $self->_purge_old_events;
+        $self->_scrub_tick;
         $self->_check_dnsmasq_listeners;
     }
     $self->_log("shutting down");
@@ -3053,6 +3054,75 @@ sub _purge_old_events {
     return unless $days > 0;
     my $n = $self->{db}->purge_events(days => $days);
     $self->_log("purged $n event row(s) older than ${days}d") if $n && $n > 0;
+}
+
+# Keep chat_messages from filling with bridge startup markers.
+#
+# Called from the main loop beside _purge_old_events, which is the one
+# automatic purge in this codebase provably running in production, needs no
+# config to work, and needs no cross-file registration. See the [scrub]
+# comment in Config.pm for why the [scheduling] registry is not used.
+#
+# Runs on EVERY node, with no master check. chat_messages is absent from
+# @REPLICATED and has no _apply_/_delete_ handler, so the rows are
+# per-node-local in both directions: gateway2 holds 111k, zmc1 79k and nas3
+# 26k in three independent id spaces, and a master-only scrub would clean one
+# node and leave the others dirty for ever. It could not run on gateway2
+# regardless -- with no [cluster] section its role is never set, so the usual
+# `eq 'master'` test is false there permanently.
+sub _scrub_tick {
+    my ($self) = @_;
+    my $cfg  = $self->{config}{scrub} || {};
+    my $mode = $cfg->{mode} // 'enforce';
+    return if $mode eq 'off';
+
+    my $now = time();
+    my $iv  = $cfg->{interval} // 3600;
+    return if ($now - ($self->{_last_scrub} // 0)) < $iv;
+    $self->{_last_scrub} = $now;
+
+    eval {
+        my $c = $self->{db}->count_bridge_markers(
+            min_age     => ($cfg->{chat_marker_min_age} // 86400),
+            recent_secs => $iv,
+        );
+        return unless $c->{total};
+
+        # If markers are still ARRIVING, some bridge is crash-looping again.
+        # Cleaning up after a live producer keeps the table tidy, makes the
+        # row count look healthy, and hides the fault -- which is precisely
+        # how this went unnoticed for a month. Refuse, and say so loudly.
+        my $alarm = $cfg->{chat_marker_alarm_per_hour} // 10;
+        if ($c->{recent} > $alarm) {
+            $self->_log("scrub: SOURCE STILL ACTIVE — $c->{recent} bridge marker(s) "
+                      . "arrived in the last ${iv}s (threshold $alarm). NOT deleting "
+                      . "$c->{deletable} row(s): a bitchat bridge is looping, fix that "
+                      . "first or the scrub will mask it.");
+            eval { $self->_log_event(type => 'scrub_blocked',
+                                     detail => "markers_recent=$c->{recent} "
+                                             . "deletable=$c->{deletable}") };
+            return;
+        }
+
+        if ($mode ne 'enforce') {
+            $self->_log("scrub (report): $c->{deletable} bridge marker row(s) "
+                      . "removable, $c->{kept} kept, $c->{total} total");
+            return;
+        }
+
+        my $removed = $self->{db}->purge_bridge_markers(
+            min_age => ($cfg->{chat_marker_min_age}     // 86400),
+            batch   => ($cfg->{chat_marker_batch}       // 5000),
+            max     => ($cfg->{chat_marker_max_per_run} // 20000),
+        );
+        return unless $removed;
+        my $left = $c->{deletable} - $removed;
+        $self->_log("scrub: removed $removed bridge marker row(s)"
+                  . ($left > 0 ? ", $left still to go (capped per run)" : '')
+                  . "; $c->{kept} kept");
+        eval { $self->_log_event(type => 'scrub', detail => "chat_markers=$removed") };
+    };
+    $self->_log("scrub failed: $@") if $@;
 }
 
 sub _age_out_offline {
@@ -6267,6 +6337,16 @@ sub _obs_purge_stale {
         if ($want{conflicts}) {
             $got{conflicts} = $dry ? $db->count_conflicting_hostnames
                                    : $db->purge_conflicting_hostnames;
+        }
+        # Deliberately NOT in the 'all' expansion above: an operator running
+        # the documented `net-purge --commit` habit should not silently
+        # acquire a new destructive effect on the chat archive. Ask for it:
+        #   net-purge --tables chat --commit
+        if ($want{chat}) {
+            my $c = $db->count_bridge_markers;
+            $got{chat_markers} = $dry ? $c->{deletable}
+                                      : $db->purge_bridge_markers(max => 10_000_000);
+            $got{chat_markers_kept} = $c->{kept};
         }
         if ($want{addresses}) {
             $got{addresses} = $dry ? $db->count_stale_addresses(days => $days)

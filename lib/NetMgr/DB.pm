@@ -3609,6 +3609,104 @@ sub count_stale_addresses {
     return $n // 0;
 }
 
+# ---- chat_messages scrub: bridge startup markers ------------------------
+#
+# A crash-looping bridge supervisor posted its startup marker once per HELPER
+# GENERATION instead of once per process: ~115k rows on nas3, ~111k on
+# gateway2, ~79k on zmc1, against ~26k, 121 and ~140 real messages. The
+# supervisor is fixed (965d843); this keeps the table from filling again and
+# clears what is already there.
+#
+# The predicate is CONTENT, not age, and that is not a style preference: the
+# junk is NEWER than the history it buries. nas3's real messages end
+# 2026-07-30 while its markers run to 2026-09-25, so a `days =>` cut of the
+# kind purge_stale_hostnames uses would delete the archive and keep the junk.
+sub _chat_marker_where {
+    # Anchored at character 1. An unanchored '%[bridge] online%' also matches
+    # genuine BLE-relayed records, which arrive prefixed '[<nick>@bitchat] '.
+    # Matching the PREFIX and never the nickname matters too: the markers read
+    # 'nick=(compiled-default)' on one node and 'nick=zmc1-bridge' on another,
+    # so a literal match would miss entire hosts.
+    #
+    # Nothing here keys on sender or sender_kind. Every junk row carries
+    # sender_kind='human' because the daemon stamps that on any loopback post,
+    # and since the marker fix they also carry sender='bitchat-relay' -- the
+    # same sender as genuine relayed human messages. Neither field separates
+    # them; the body prefix does.
+    return "(body LIKE '[bridge] online nick=%' OR body LIKE '[bridge] offline nick=%')";
+}
+
+# Keep the newest marker per session. net-chat uses it as the bridge liveness
+# signal, so deleting every one leaves the GUI's indicator grey after a
+# reconnect. Returns an arrayref of ids to spare.
+sub _chat_marker_keep_ids {
+    my ($self) = @_;
+    my $w = _chat_marker_where();
+    my $r = $self->{dbh}->selectcol_arrayref(
+        "SELECT MAX(id) FROM chat_messages WHERE $w GROUP BY session");
+    return $r || [];
+}
+
+# What a scrub WOULD do. Mirrors the count_*/purge_* pairing the rest of the
+# purge family uses for dry-run: both sides must share one WHERE, which is
+# why _chat_marker_where exists rather than the clause being written twice.
+sub count_bridge_markers {
+    my ($self, %f) = @_;
+    my $min_age = $f{min_age}     // 86400;
+    my $recent  = $f{recent_secs} // 3600;
+    my $w = _chat_marker_where();
+
+    my ($total) = $self->{dbh}->selectrow_array(
+        "SELECT COUNT(*) FROM chat_messages WHERE $w");
+    my ($recent_n) = $self->{dbh}->selectrow_array(
+        "SELECT COUNT(*) FROM chat_messages
+          WHERE $w AND ts > DATE_SUB(NOW(), INTERVAL ? SECOND)",
+        undef, $recent);
+
+    my $keep  = $self->_chat_marker_keep_ids;
+    my $notin = @$keep ? 'AND id NOT IN (' . join(',', ('?') x @$keep) . ')' : '';
+    my ($deletable) = $self->{dbh}->selectrow_array(
+        "SELECT COUNT(*) FROM chat_messages
+          WHERE $w AND ts < DATE_SUB(NOW(), INTERVAL ? SECOND) $notin",
+        undef, $min_age, @$keep);
+
+    $total     //= 0; $deletable //= 0;
+    return { total     => $total,
+             deletable => $deletable,
+             kept      => $total - $deletable,
+             recent    => $recent_n // 0 };
+}
+
+# Delete them, bounded. Returns the row count actually removed.
+sub purge_bridge_markers {
+    my ($self, %f) = @_;
+    my $min_age = $f{min_age} // 86400;
+    my $batch   = int($f{batch} // 5000);
+    my $max     = int($f{max}   // 20000);
+    $batch = 1 if $batch < 1;
+    my $w     = _chat_marker_where();
+    my $keep  = $self->_chat_marker_keep_ids;
+    my $notin = @$keep ? 'AND id NOT IN (' . join(',', ('?') x @$keep) . ')' : '';
+
+    my $done = 0;
+    while ($done < $max) {
+        my $lim = ($max - $done) < $batch ? ($max - $done) : $batch;
+        # Single-table DELETE, because MySQL accepts LIMIT on those and NOT on
+        # a multi-table DELETE -- which is why the keep-set is resolved to ids
+        # above rather than joined in here. Batched because one unbounded
+        # DELETE over ~115k rows holds locks long enough to stall the daemon
+        # writing to the same table, and this runs inside its event loop.
+        my $rows = $self->{dbh}->do(
+            "DELETE FROM chat_messages
+              WHERE $w AND ts < DATE_SUB(NOW(), INTERVAL ? SECOND) $notin
+              LIMIT " . int($lim),
+            undef, $min_age, @$keep);
+        last unless $rows && $rows > 0;
+        $done += $rows;
+    }
+    return $done;
+}
+
 # ---- bitchat_peers (schema v33) ----------------------------------------
 
 # Upsert one BitChat peer row (per-bridge-site view of the BLE mesh).
