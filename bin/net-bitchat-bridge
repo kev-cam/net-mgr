@@ -132,13 +132,19 @@ if (lc($helper_path) eq 'auto') {
 # startup as defense-in-depth for operators running by hand without
 # ExecCondition.
 sub preflight {
+    # $quiet suppresses the reason line. The supervisor loop re-checks this
+    # every 60s while dormant (see below); without a quiet mode that is a
+    # journal line a minute, for ever, saying the same thing.
+    my ($quiet) = @_;
     if ($mode eq 'off') {
-        warn "[bridge/preflight] skip: [bitchat_bridge] mode = off in /etc/net-mgr/config\n";
+        warn "[bridge/preflight] skip: [bitchat_bridge] mode = off in /etc/net-mgr/config\n"
+            unless $quiet;
         return 1;
     }
     if (!_bt_controller_present()) {
         warn "[bridge/preflight] skip: no Bluetooth controller "
-           . "(/sys/class/bluetooth is empty)\n";
+           . "(/sys/class/bluetooth is empty)\n"
+            unless $quiet;
         return 1;
     }
     if (!defined $helper_path || !length $helper_path || !-x $helper_path) {
@@ -151,7 +157,8 @@ sub preflight {
            . "net-mgr-shipped delegate, builds, and — if it has sudo — "
            . "restarts this service. Or install any bitchat-jsonl "
            . "manually and set [bitchat_bridge] helper_path = /full/path "
-           . "in /etc/net-mgr/config.\n";
+           . "in /etc/net-mgr/config.\n"
+            unless $quiet;
         return 1;
     }
     return 0;
@@ -170,8 +177,41 @@ my $backoff = 1;
 my $adv_wedge_seen;         # set by run_once when helper stderr shows the
                             # leaked-advertising-slot signature
 my $last_ble_reset = 0;
+my $bridge_state     = '';  # '' | 'online' | 'dormant'; read by run_once
+my $started_once     = 0;
+my $dormant_since;
+my $last_dormant_log = 0;
 while (1) {
+    # Re-check the precondition INSIDE the loop.
+    #
+    # preflight() had exactly two callers, both ABOVE this loop, and
+    # systemd's ExecCondition is start-only by definition — so once the
+    # supervisor was running, a Bluetooth controller disappearing at RUNTIME
+    # was invisible to both layers. The helper then failed instantly and was
+    # relaunched for ever. On P620A one supervisor ran 6d7h and issued 3,743
+    # launch cycles, 3,638 of them exiting code=1.
+    #
+    # Go dormant instead of exiting: exiting would just hand it back to
+    # systemd's Restart=, and staying alive means the bridge recovers by
+    # itself when the adapter returns, with no operator.
+    if ($started_once && preflight(1)) {
+        $dormant_since ||= time;
+        if ($bridge_state ne 'dormant') {
+            warn "[bridge] precondition lost — going dormant, re-checking every 60s\n";
+            $bridge_state = 'dormant';
+            $last_dormant_log = time;
+        } elsif (time - $last_dormant_log > 600) {
+            warn "[bridge] still dormant after " . (time - $dormant_since) . "s\n";
+            $last_dormant_log = time;
+        }
+        sleep 60;
+        next;
+    }
+    $started_once  = 1;
+    $dormant_since = undef;
+
     $adv_wedge_seen = 0;
+    my $t0   = time;
     my $exit = eval { run_once() };
     my $err  = $@;
     if ($err) {
@@ -216,12 +256,24 @@ while (1) {
     while ((my $reaped = waitpid(-1, WNOHANG)) > 0) {
         warn "[bridge] reaped stray child pid=$reaped exit=" . ($? >> 8) . "\n";
     }
+    # Reset the ladder on a generation that actually RAN, measured by the
+    # clock rather than inferred from the exit code.
+    #
+    # The old test reset on exit 0 or 143 — but 143 is 128+SIGTERM, i.e.
+    # THIS supervisor's own watchdog kick. A helper that wedged, got kicked,
+    # and wedged again therefore reset the ladder to 1s every single time and
+    # never backed off at all. Duration cannot be gamed that way and needs
+    # nothing threaded out of run_once().
+    my $ran_for = time - $t0;
     sleep $backoff;
-    $backoff = $backoff >= 30 ? 30 : $backoff * 2;
-    # Successful run resets backoff (we only get here if helper actually
-    # produced output for a while — a quick crash should keep backing off).
-    # 143 = SIGTERM, i.e. our own watchdog kick — deliberate, not a crash.
-    $backoff = 1 if defined $exit && ($exit == 0 || $exit == 143);
+    if ($ran_for >= 300) {
+        $backoff = 1;
+    } else {
+        $backoff *= 2;
+        # Was `$backoff >= 30 ? 30 : $backoff * 2` — testing the cap BEFORE
+        # doubling, so the ladder overshot to 32s before settling at 30.
+        $backoff = 300 if $backoff > 300;
+    }
 }
 
 # ---- supervisor inner loop ----
@@ -268,13 +320,27 @@ sub run_once {
         # returns op=exists if the session is already there.
         eval { $cli->chat_open(name => $session); };
         warn "[bridge] chat_open($session) failed: $@" if $@;
-        # Startup marker doubles as an operator-visible "bridge came
-        # up" beacon and validates the write channel is healthy. Safe
-        # to run against the just-opened session.
-        my $marker = "[bridge] online nick="
-                   . (length($nickname) ? $nickname : "(compiled-default)");
-        eval { $cli->chat_post(session => $session, body => $marker); };
-        warn "[bridge] session marker post failed: $@" if $@;
+        # Operator-visible "bridge came up" beacon — on a STATE CHANGE only.
+        #
+        # This sits inside run_once(), which the supervisor calls once per
+        # helper generation, so posting unconditionally wrote one chat row
+        # per relaunch. With the helper crash-looping that is a row every
+        # ~45-66s for ever: 115,523 of nas3's 141,466 chat_messages rows were
+        # this one line. The journal ("launching helper", above) remains the
+        # per-cycle record; chat is for things a human should read.
+        #
+        # as => $as is not cosmetic. Without it the daemon stamps
+        # sender='local', the echo guard below (`next if $row_sender eq $as`)
+        # cannot match, and every marker is fed back to the helper's stdin
+        # and re-broadcast over BLE — which is the "forwarded 1 outbound to
+        # BLE" that accompanied each cycle.
+        if ($bridge_state ne 'online') {
+            my $marker = "[bridge] online nick="
+                       . (length($nickname) ? $nickname : "(compiled-default)");
+            eval { $cli->chat_post(session => $session, body => $marker, as => $as); };
+            warn "[bridge] session marker post failed: $@" if $@;
+            $bridge_state = 'online';
+        }
         # Cross-site mesh binding (Option B step 2): stream inserts on the
         # in-memory bitchat_relay_packets table so we get a ROW event
         # whenever another bridge site fanned out a packet_rx to us.
