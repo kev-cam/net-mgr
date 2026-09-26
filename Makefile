@@ -553,6 +553,30 @@ install-on: .version
 	fi
 	@echo "==> $(TARGET): $(SUDO) make -C $(REMOTE_TMP) install $(MAKEARGS)"
 	@ssh $(RUNOPTS) $(SSHTGT) "$(SUDO) make -C $(REMOTE_TMP) install $(MAKEARGS)"
+	@# swap-dnsmasq - ship the fork's swap tool if THIS host has it.
+	@# net-mgr-dnsmasq-switch calls $(DNSMASQ_DEST)/swap-dnsmasq, and that shim is
+	@# what OBSERVE kind=dnsmasq_switch drives - the only remote lever for
+	@# restarting dnsmasq on a gateway with no ssh. The BINARY has to be built on
+	@# the target (remake reads its compile options from the target's own packaged
+	@# dnsmasq, so it cannot be built here and copied), but the swap script is
+	@# plain host-agnostic shell, so it can and should ride along with every
+	@# deployment. gateway3 sat with /usr/local/sbin/dnsmasq present and no
+	@# swap-dnsmasq, which turned the switch into a no-op that printed a TODO
+	@# nobody was reading - the binary being there is what made it look fine.
+	@# Best-effort: a net-mgr upgrade must not fail because this extra did not
+	@# land, but it must not skip in silence either.
+	@if [ -x "$(DNSMASQ_REPO)/swap-dnsmasq" ]; then \
+	  echo "==> $(TARGET): swap-dnsmasq -> $(DNSMASQ_DEST)/"; \
+	  ssh $(SSHOPTS) $(SSHTGT) "$(SUDO) mkdir -p $(DNSMASQ_DEST)" \
+	    && rsync -az --rsync-path="$(SUDO) rsync" -e "ssh $(SSHOPTS)" \
+	         "$(DNSMASQ_REPO)/swap-dnsmasq" $(SSHTGT):$(DNSMASQ_DEST)/ \
+	    && ssh $(SSHOPTS) $(SSHTGT) "$(SUDO) chmod 755 $(DNSMASQ_DEST)/swap-dnsmasq" \
+	    && ssh $(SSHOPTS) $(SSHTGT) "test -x $(DNSMASQ_DEST)/swap-dnsmasq" \
+	    && echo "==> $(TARGET): swap-dnsmasq installed" \
+	    || echo "  *** $(TARGET): swap-dnsmasq did NOT land - dnsmasq_switch variant=custom will have nothing to call on $(TARGET)"; \
+	else \
+	  echo "==> $(TARGET): no $(DNSMASQ_REPO)/swap-dnsmasq on this host - skipping (dnsmasq_switch variant=custom would have nothing to call)"; \
+	fi
 	@if [ "$(KEEP)" = "1" ]; then \
 	  echo "==> $(TARGET): leaving $(REMOTE_TMP) in place (KEEP=1)"; \
 	else \
