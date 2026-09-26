@@ -153,6 +153,68 @@ my %DEFAULTS = (
         # NB dnsmasq only ADDS from a watched dir; removals still need the SIGHUP
         # that --reload sends, so keep [dnsmasq] mode = auto.
         layout => 'files',
+        # Upstream resolvers for THIS node's dnsmasq, and how it chooses among
+        # them. upstreams empty (the default) generates nothing at all, so a
+        # node nobody has configured is left exactly as it is.
+        #
+        # dnsmasq's DEFAULT is to send a query to ONE upstream and only try
+        # another once that one has timed out, so a single dead resolver costs
+        # every query a timeout. all_servers = 1 sends each query to EVERY
+        # upstream and returns whichever answers first, which makes a dead
+        # resolver free rather than fatal. That only helps with a plural STATIC
+        # list, which is why no_resolv belongs with it: otherwise dnsmasq
+        # inherits /etc/resolv.conf, and on a systemd-resolved box that is
+        # 127.0.0.53 - one upstream, which is resolved itself, and a forwarding
+        # loop straight back if resolved points here in turn.
+        #
+        # What all_servers costs: every upstream sees every query, and query
+        # volume multiplies by the number of upstreams. Do not list a resolver
+        # you would not want handed your entire query stream.
+        #
+        # These become dnsmasq.conf DIRECTIVES. dnsmasq re-reads hosts data and
+        # resolv-file on SIGHUP but NOT its configuration, so changing them
+        # needs a dnsmasq RESTART - net-gen-dnsmasq says so when they change.
+        upstreams       => '',   # space/comma list: IP, IP#port, or /domain/IP
+        all_servers     => 0,    # race every upstream, first answer wins
+        no_resolv       => 0,    # ignore /etc/resolv.conf (pair with upstreams)
+        dns_loop_detect => 0,    # drop an upstream that loops back to us
+        # Which already-included file gets the one-line conf-file= block that
+        # wires dnsmasq-upstream in. dnsmasq reads only what something NAMES,
+        # and which file that is differs per node: gateway3's dnsmasq.conf
+        # names <out_dir>/dnsmasq explicitly, which is why that is the default
+        # (and it is safe to write: the generator's own glob is dnsmasq-*, so
+        # this file is never regenerated). /etc/net-mgr/dnsmasq.conf is NOT a
+        # safe default - it appears once in this repo, in
+        # sbin/net-mgr-dnsmasq-install appending netmgr=, and nothing anywhere
+        # makes dnsmasq read it. Point this at whatever THIS node includes.
+        upstream_include => '',  # default: <out_dir>/dnsmasq
+        # WHICH ADDRESSES THIS dnsmasq ANSWERS ON. Unset (the default) emits
+        # nothing and leaves the node's existing scope alone.
+        #
+        # Set this before restarting a gateway's dnsmasq, because a restart is
+        # when the bound set is recomputed. Without an explicit scope dnsmasq
+        # binds every address of every non-excluded interface -- on a WAN edge
+        # that means the public addresses too -- and --local-service does NOT
+        # save you: the man page says it "only has effect if there are no
+        # --interface, --except-interface, --listen-address or --auth-server
+        # options", so a single except-interface line silently disables it.
+        #
+        # Prefer listen_interfaces over listen_addresses on a DHCP server: DHCP
+        # is interface-oriented, and an address list goes stale when a LAN
+        # address changes. Interface names are VALIDATED against /sys/class/net
+        # and an unknown one is refused, because a name that matches nothing is
+        # exactly how a filter comes to do nothing at all while looking correct.
+        listen_interfaces => '',  # space/comma list, e.g. 'enp1s0 enx00e04c68'
+        listen_addresses  => '',  # optional explicit extras, e.g. '127.0.0.1'
+        # With bind_interfaces dnsmasq binds ONLY the scoped addresses, so
+        # nothing is listening on the WAN at all. Without it, it binds the
+        # wildcard and filters on arrival: queries are still refused, but the
+        # port is open to anyone, which on a firewall-less edge is the whole
+        # problem. On by default whenever a scope is set. The cost: interfaces
+        # that appear LATER are not picked up, so an interface must exist and
+        # have its address at start (use bind-dynamic by hand if that is not
+        # true on this node).
+        bind_interfaces   => 1,
     },
     # BitChat-to-net-chat BLE bridge (bin/net-bitchat-bridge). Default on:
     # the systemd unit is installed enabled, but the supervisor's preflight
@@ -448,7 +510,10 @@ my %ACTIVE = (
                                               # loopback REFRESH socket
     uplinks    => '*',                        # consumed by net-uplink-probe
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
-    dnsmasq    => [qw(mode out_dir push_aps gateways multihomed layout)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
+    dnsmasq    => [qw(mode out_dir push_aps gateways multihomed layout
+                      upstreams all_servers no_resolv dns_loop_detect
+                      upstream_include listen_interfaces listen_addresses
+                      bind_interfaces)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
     bitchat_bridge => [qw(mode helper_path session_name adapter_index diag_journal diag_journal_lines)], # BLE bridge (bin/net-bitchat-bridge)
     'net-chat' => [qw(key_file key_id last_session bitchat_scope bitchat_geohash)], # auth-dialog "Always" + last-open session + bitchat scope/geohash
     ipv6_vlan  => [qw(type name mode server prefix local_suffix forwarding ext_if
