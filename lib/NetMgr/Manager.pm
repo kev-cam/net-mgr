@@ -5334,6 +5334,39 @@ sub _register_reservation_machine {
     # this attestation from 'self', 'dhcp', 'dhcp.master', 'ap', 'ssh-hostkey'.
     $self->_upsert('hostnames', 'upsert_hostname',
         machine_id => $mid, name => $name, source => 'reservation');
+
+    # Retire the names this reservation USED to have.
+    #
+    # Renaming a reservation bound the new name and left every previous one in
+    # place, so a device accumulated every name it had ever been given and all
+    # of them stayed live in DNS. A Tapo strip ended up answering to P316M,
+    # pwrctrl12, pwrctrl13 and pwrstrip9 at once, and `net-lookup pwrctrl13`
+    # still resolved for a reservation that no longer existed — which reads as
+    # "the rename didn't stick".
+    #
+    # Only reservation-sourced rows are touched. 'dhcp', 'self', 'ap' and
+    # 'ssh-hostkey' names are OBSERVATIONS of what the device calls itself and
+    # are not ours to retract; these two sources are assertions made by this
+    # code and by net-reserve's push, so they are exactly what a rename should
+    # supersede. Nothing here can remove a name the device is still announcing.
+    #
+    # delete_hostname returns the rows it removed so the delete reaches
+    # subscribers and follower relays — same reasoning as _merge_machines.
+    if (defined $mac && length $mac) {
+        my $stale = $db->dbh->selectall_arrayref(
+            "SELECT DISTINCT name FROM hostnames
+              WHERE machine_id = ? AND name <> ?
+                AND source IN ('reservation', 'dhcp_reservation')",
+            { Slice => {} }, $mid, $name);
+        for my $row (@{ $stale || [] }) {
+            for my $deleted ($db->delete_hostname($mid, $row->{name})) {
+                $self->_emit_change(table => 'hostnames', op => 'delete',
+                                    row => $deleted);
+            }
+            $self->_log("reservation rename: retired name '$row->{name}'"
+                      . " (superseded by '$name') on machine $mid");
+        }
+    }
     return $mid;
 }
 

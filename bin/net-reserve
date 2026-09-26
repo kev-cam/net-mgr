@@ -2952,6 +2952,21 @@ sub ap_dialog {
         ? " $ip -> $newip (rebooting)" : " failed: $r->{out}");
 }
 
+# Describe a failed observe() so it cannot vanish.
+#
+# NetMgr::Client::observe returns undef on a timeout or a closed socket, and
+# every commit site here did `$status->configure(-text => " $r")` — which
+# painted a SINGLE SPACE into a one-line status bar and nothing else. A write
+# that never reached the daemon was indistinguishable from one that worked,
+# which is most of why "it doesn't appear to have done anything" is so hard to
+# diagnose from the GUI.
+sub _failtext {
+    my ($resp, $what) = @_;
+    return " $what FAILED: no reply from the daemon (timed out or socket closed)"
+        unless defined $resp;
+    return " $what FAILED: $resp";
+}
+
 sub reserve_dialog {
     my ($cli, $S, $ip, $mac, $redraw, $status) = @_;
     # A reservation already at $ip means we're EDITING it (e.g. the Edit button in
@@ -2959,7 +2974,7 @@ sub reserve_dialog {
     my $existing = $S->{model}{resv}{ canon_ip($ip) };
     my $dlg = ($S->{anchor} // $status)->DialogBox(
         -title   => ($existing ? "Edit reservation $ip" : "Reserve $ip"),
-        -buttons => ['Probe', 'Reserve', 'Reserve+Push', 'Push', 'Cancel']);
+        -buttons => ['Probe', 'Reserve', 'Reserve+Push', 'Unreserve', 'Push', 'Cancel']);
     # When editing, default name/group to the reservation's stored values; else
     # default the name to what we already know the device by — its machine name,
     # or the DHCP hostname — so reserving uses its own name when none is given.
@@ -3179,6 +3194,36 @@ sub reserve_dialog {
         _push_aps($cli);
         return;
     }
+    # Unreserve. The verb existed and the CLI used it, but the edit window
+    # offered no way to reach it — so a reservation made by mistake could be
+    # moved or overwritten but never removed, which is what sent someone
+    # looking for an "unreserve" that was not there.
+    if ($ans eq 'Unreserve') {
+        my $ip = canon_ip($v{ip});
+        my $cur = $S->{model}{resv}{$ip};
+        unless ($cur) {
+            $status->configure(-text => " $v{ip} is not reserved — nothing to remove");
+            return;
+        }
+        my $desc = join ' ', grep { defined && length } ($cur->{name}, $cur->{mac});
+        my $ok = lc(($S->{anchor} // $status)->messageBox(
+            -type => 'yesno', -icon => 'warning', -title => 'Remove reservation',
+            -message => "Delete the reservation for $ip"
+                . ($desc ? " ($desc)" : '') . "?\n\n"
+                . "The device keeps its current lease until that expires, then\n"
+                . "falls back to a dynamic address. Names asserted by this\n"
+                . "reservation are retired with it."));
+        return unless $ok eq 'yes';
+        my $resp = $cli->observe(kind => 'dhcp_reservation_delete', ip => $ip);
+        if (!defined $resp || $resp =~ /^ERR/) {
+            $status->configure(-text => _failtext($resp, "unreserve $ip"));
+            return;
+        }
+        $S->{model} = gather($cli); $redraw->();
+        $status->configure(-text => " unreserved $ip"
+            . (_push_aps($cli) ? ' + APs' : ' (AP push failed)'));
+        return;
+    }
     return unless $ans eq 'Reserve' || $ans eq 'Reserve+Push';
     ($v{ip}) = $v{ip} =~ /(\d+\.\d+\.\d+\.\d+)/ ? ($1) : ($v{ip});  # tolerate a label
     unless (defined ip2int($v{ip})) {
@@ -3219,7 +3264,11 @@ sub reserve_dialog {
                 $resp = $cli->observe(kind => 'dhcp_reservation_move',
                     ip => $dup->{ip}, new_ip => $v{ip}, force => 1);
             }
-            if (!defined $resp || $resp =~ /^ERR/) { $status->configure(-text => " $resp"); return }
+            if (!defined $resp || $resp =~ /^ERR/) {
+                $status->configure(-text =>
+                    _failtext($resp, "move $dup->{ip} -> $v{ip}"));
+                return;
+            }
             $S->{model} = gather($cli); $redraw->();
             $status->configure(-text => " moved $dup->{ip} -> $v{ip}");
             return;
@@ -3231,7 +3280,10 @@ sub reserve_dialog {
         subnet_cidr => subnet_of($v{ip}),
         ($v{group} ne '' ? (grp  => $v{group}) : ()),
         ($force ? (force => 1) : ()));
-    if (!defined $r || $r =~ /^ERR/) { $status->configure(-text => " $r"); return }
+    if (!defined $r || $r =~ /^ERR/) {
+        $status->configure(-text => _failtext($r, "reserve $v{ip}"));
+        return;
+    }
     my $msg = " reserved $v{ip} -> $v{mac}";
     if ($ans eq 'Reserve+Push') {
         # Also surface this one reservation as a never-seen net-lookup name.
