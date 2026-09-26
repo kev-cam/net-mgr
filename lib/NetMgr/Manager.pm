@@ -7725,6 +7725,32 @@ sub _dnsmasq_line {
         return $self->_drop_dnsmasq_listener($key);
     }
     return if $line =~ /^OK\b/;
+    # The build announces itself the moment it starts sending state. Record it
+    # against the attachment so the fleet knows WHICH dnsmasq each node runs -
+    # previously unanswerable over the mesh, because no probe reads a remote
+    # file and the socket's mere existence only proved "some build with
+    # --event-listen". A change in the string is worth an event: it means the
+    # binary underneath a node moved, which is exactly the class of thing that
+    # went unnoticed before.
+    if ($line =~ /^VERSION\s/) {
+        my %v;
+        while ($line =~ /\b([\w-]+)=(\S+)/g) { $v{$1} = $2 }
+        my $st  = $self->{dnsmasq_attach}{$key} ||= {};
+        my $was = $st->{version};
+        $st->{version}    = $v{dnsmasq} // '?';
+        $st->{proto}      = $v{proto};
+        $st->{event_auth} = $v{auth};
+        $self->_log("dnsmasq at $key is version $st->{version}"
+                  . " (proto=" . ($v{proto} // '-')
+                  . " auth=" . ($v{auth} // '-') . ")");
+        if (defined $was && $was ne $st->{version}) {
+            eval { $self->_log_event(
+                type   => 'dnsmasq_version_changed',
+                addr   => $st->{host} // ($key =~ /^([^:]+)/ ? $1 : $key),
+                detail => "dnsmasq on this node changed from $was to $st->{version}") };
+        }
+        return;
+    }
     return $self->_process_dnsmasq_event($line, $key);
 }
 
