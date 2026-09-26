@@ -656,11 +656,19 @@ Usage:
                                          every peer — recovery for BLE wedges
                                          like "Maximum advertisements reached";
                                          auth-gated same as update)
-  net-cluster dnsmasq-switch [variant=custom|stock]
+  net-cluster dnsmasq-switch [variant=custom|stock] [force=1]
                                         (flip each gateway between the user's
                                          custom dnsmasq and the distro stock;
-                                         default variant=custom; stock has a
-                                         guaranteed dpkg-dist restore fallback
+                                         default variant=custom. force=1
+                                         re-applies the variant a node is
+                                         ALREADY on, which is how you restart
+                                         dnsmasq remotely: it re-reads hosts and
+                                         resolv-file on SIGHUP but never its
+                                         config, so a config change needs a
+                                         restart. variant=custom also points
+                                         systemd-resolved at the patched dnsmasq
+                                         and stock puts resolved back. stock has
+                                         a guaranteed dpkg-dist restore fallback
                                          so you can always flip back;
                                          auth-gated same as update)
   net-cluster --peers X dhcp-cycle iface=Y [count=N] [gap=SECS]

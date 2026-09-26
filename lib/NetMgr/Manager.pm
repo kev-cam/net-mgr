@@ -3771,6 +3771,11 @@ sub _obs_dnsmasq_switch {
     my $variant = $kv->{variant} // 'custom';
     $variant =~ /^(?:custom|stock)$/
         or die "dnsmasq_switch: variant must be 'custom' or 'stock' (got '$variant')\n";
+    # force=1 re-applies the variant the node is already on. That is what makes
+    # this a dnsmasq RESTART lever, which matters because dnsmasq re-reads hosts
+    # and resolv-file on SIGHUP but never its configuration — and on a gateway
+    # with no ssh there is no other way to make a config change take effect.
+    my $force = ($kv->{force} // '') =~ /^(?:1|y|yes|true|on)$/i ? 1 : 0;
     my $script = $self->{config}{manager}{dnsmasq_switch_script}
               // '/usr/local/sbin/net-mgr-dnsmasq-switch';
     -x $script or die "dnsmasq_switch: script '$script' is not executable\n";
@@ -3788,6 +3793,7 @@ sub _obs_dnsmasq_switch {
         for my $c (values %{ $self->{clients}   }) { close $c->{sock} if $c->{sock} }
         for my $l (values %{ $self->{listeners} }) { close $l->{sock} if $l->{sock} }
         $ENV{NET_MGR_DNSMASQ_SWITCH_IMPL} = $impl if defined $impl && length $impl;
+        $ENV{FORCE} = 1 if $force;
         { no warnings; exec $script, $variant; }
         POSIX::_exit(127);
     }
@@ -3795,6 +3801,7 @@ sub _obs_dnsmasq_switch {
                                 cli_fd => undef, who => $who };
     $self->_log("dnsmasq-switch started pid=$pid by $who "
               . "(script=$script variant=$variant"
+              . ($force ? " force=1" : '')
               . (defined $impl && length $impl ? " impl=$impl" : '')
               . ")");
     return ();

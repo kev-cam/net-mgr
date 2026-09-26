@@ -85,12 +85,20 @@ step() {
     fi
 }
 
-# Idempotency check — running switch-to-X while already on X is a no-op.
+# Idempotency check — running switch-to-X while already on X is a no-op,
+# UNLESS forced. FORCE=1 makes a same-direction run mean "re-apply", which is
+# the only way to restart dnsmasq through this path: dnsmasq re-reads hosts and
+# resolv-file on SIGHUP but never its configuration, so a config change needs a
+# restart, and on a gateway with no ssh this shim is the only lever there is.
 if [ -r "$STATE_FILE" ]; then
     current=$(cat "$STATE_FILE" 2>/dev/null | tr -d '[:space:]')
-    if [ "$current" = "$VARIANT" ]; then
+    if [ "$current" = "$VARIANT" ] && [ "$FORCE" != 1 ]; then
         echo "  already on $VARIANT (per $STATE_FILE) — nothing to do"
+        echo "  (pass force=1 / FORCE=1 to re-apply, e.g. to restart dnsmasq)"
         exit 0
+    fi
+    if [ "$current" = "$VARIANT" ]; then
+        echo "  already on $VARIANT — re-applying because FORCE=1"
     fi
 fi
 
