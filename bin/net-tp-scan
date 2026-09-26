@@ -19,8 +19,14 @@
 #                                  3: Patio Computer        [0]
 #                                  ...
 #
-# Probes via hsx(1): without -tapo it execs hs100 (legacy abyss for
-# HS100/HS110/HS300); with -tapo it runs the kasa Python CLI.
+# Two protocols, probed in order:
+#   * legacy Kasa "abyss" (HS100/HS110/HS300/KP303) via hsx(1) -> hs100:
+#     TCP 9999, XOR-obfuscated JSON, no authentication.
+#   * Tapo (P300/P316-class) via a python-kasa CLI, asked for the
+#     device's raw reply with --json. Authenticated: needs the TP-Link
+#     account as 'email:password' in /etc/net-mgr/secrets/tapo. The CLI
+#     is found via [tp_scan] kasa, else /opt/kasa-venv/bin/kasa, else
+#     $PATH -- deliberately nothing under a home directory.
 
 use strict;
 use warnings;
@@ -28,7 +34,9 @@ use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Getopt::Long qw(:config no_ignore_case bundling);
 use JSON::PP qw(decode_json);
+use MIME::Base64 qw(decode_base64);
 use NetMgr::Config;
+use NetMgr::Secret;
 use NetMgr::DB;
 use NetMgr::Client;
 
@@ -202,6 +210,42 @@ printf "\n%d device(s), %d outlet(s) recorded, %d no-response\n",
 # Returns either:
 #   { type => 'plug',  model, alias, state }
 #   { type => 'strip', model, alias, outlets => [{outlet, name, state}, ...] }
+# Find a python-kasa CLI.
+#
+# This used to go through `hsx -tapo`, which did
+#   chdir "$kdir/py-env/kasa" or die      # $kdir = /home/dkc
+# — a venv inside one person's home directory. That directory no longer exists
+# on any node, so the Tapo branch had been dead for as long as anyone had a
+# Tapo device, failing silently into "no response". Nothing here depends on a
+# home directory now: a system venv, an explicit config path, or $PATH.
+#
+# Order: [tp_scan] kasa in /etc/net-mgr/config wins, then the conventional
+# system venv, then whatever is on $PATH.
+my $_kasa;
+sub kasa_bin {
+    return $_kasa if defined $_kasa;
+    my $cfg = eval { NetMgr::Config->load } || {};
+    my @cand = grep { defined && length }
+        ($cfg->{tp_scan}{kasa}, '/opt/kasa-venv/bin/kasa', '/usr/local/bin/kasa');
+    for my $c (@cand) { return $_kasa = $c if -x $c }
+    my $p = `sh -c 'command -v kasa' 2>/dev/null`;
+    chomp $p;
+    return $_kasa = (length $p ? $p : '');
+}
+
+# Tapo credentials. Unlike the legacy abyss protocol, which is unauthenticated,
+# every Tapo device requires the TP-Link account email and password — they are
+# never sent in clear, but they are what the KLAP auth hash is derived from.
+# Stored as 'email:password' in /etc/net-mgr/secrets/tapo (mode 0600);
+# NetMgr::Secret warns if the mode is looser than that.
+my @_tapo_cred;
+sub tapo_cred {
+    return @_tapo_cred if @_tapo_cred;
+    my ($u, $p, $err) = NetMgr::Secret::get_userpass('tapo');
+    return @_tapo_cred = (undef, undef) if defined $err;
+    return @_tapo_cred = ($u, $p);
+}
+
 # or undef on failure.
 sub probe {
     my ($ip) = @_;
@@ -241,36 +285,51 @@ sub probe {
         }
     }
 
-    # Fall back to tapo (kasa-python via hsx -tapo). Output is text
-    # rather than JSON; keep it best-effort.
-    $out = `timeout 8 hsx -tapo \Q$ip\E discover 2>/dev/null` // '';
+    # Tapo (KLAP / securePassthrough). Asks python-kasa for the device's RAW
+    # response with --json and reads that, rather than scraping the CLI's
+    # human output as the old hsx path did — the text layout is presentation
+    # and changes between releases; the JSON is the device's own reply.
+    my $bin = kasa_bin();
+    return undef unless length $bin;
+    my ($user, $pass) = tapo_cred();
+    return undef unless defined $user;
+
+    $out = `timeout 20 \Q$bin\E --host \Q$ip\E --username \Q$user\E --password \Q$pass\E --json state 2>/dev/null` // '';
     return undef unless length $out;
-    my @blocks = split /(?=^==\s)/m, $out;
-    return undef unless @blocks;
-    # First block = device; subsequent ones = outlets if multi.
-    my $first = shift @blocks;
-    return undef unless $first =~ /==\s+(.+?)\s+(?:-\s+(\S+)\s+)?==/;
-    my ($d_alias, $d_model) = ($1, $2 // '');
-    if (!@blocks) {
-        # Single device, parse Device state
-        my $state;
-        $state = 1 if $first =~ /Device state:\s+True/i;
-        $state = 0 if $first =~ /Device state:\s+False/i;
-        return { type => 'plug', model => $d_model,
-                 alias => $d_alias, state => $state };
+    my $j = eval { decode_json($out) } or return undef;
+
+    my $info  = $j->{get_device_info} || {};
+    my $model = $info->{model} // '';
+    # Nicknames are base64 on the wire.
+    my $b64 = sub {
+        my ($v) = @_;
+        return '' unless defined $v && length $v;
+        my $d = eval { decode_base64($v) };
+        return (defined $d && length $d) ? $d : $v;
+    };
+    my $alias = $b64->($info->{nickname});
+
+    my $kids = $j->{get_child_device_list}{child_device_list};
+    if (!$kids || !@$kids) {
+        # Single plug: device_on is the whole story.
+        my $state = defined $info->{device_on} ? ($info->{device_on} ? 1 : 0) : undef;
+        return { type => 'plug', model => $model, alias => $alias, state => $state };
     }
+
+    # Multi-outlet strip. 'position' is the device's own 1-based slot number
+    # and matches the numbering this tool already stores in wifi_sockets, so
+    # use it rather than the array index — a strip that reports its children
+    # out of order would otherwise be silently renumbered.
     my @outlets;
-    my $i = 1;
-    for my $b (@blocks) {
-        my ($alias) = $b =~ /==\s+(.+?)\s+(?:\(.*?\)\s+)?==/;
-        next unless $alias;
-        my $state;
-        $state = 1 if $b =~ /State \(state\)[^:]*:\s+True/i
-                   || $b =~ /Device state:\s+True/i;
-        $state = 0 if $b =~ /State \(state\)[^:]*:\s+False/i
-                   || $b =~ /Device state:\s+False/i;
-        push @outlets, { outlet => $i++, name => $alias, state => $state };
+    for my $c (@$kids) {
+        my $pos = $c->{position};
+        $pos = scalar(@outlets) + 1 unless defined $pos && $pos =~ /^\d+$/;
+        push @outlets, {
+            outlet => $pos + 0,
+            name   => $b64->($c->{nickname}),
+            state  => (defined $c->{device_on} ? ($c->{device_on} ? 1 : 0) : undef),
+        };
     }
-    return { type => 'strip', model => $d_model,
-             alias => $d_alias, outlets => \@outlets };
+    @outlets = sort { $a->{outlet} <=> $b->{outlet} } @outlets;
+    return { type => 'strip', model => $model, alias => $alias, outlets => \@outlets };
 }
