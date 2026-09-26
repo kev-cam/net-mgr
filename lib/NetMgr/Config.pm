@@ -188,6 +188,27 @@ my %DEFAULTS = (
         # sbin/net-mgr-dnsmasq-install appending netmgr=, and nothing anywhere
         # makes dnsmasq read it. Point this at whatever THIS node includes.
         upstream_include => '',  # default: <out_dir>/dnsmasq
+        # WATCHING THE EVENT SOCKET. This daemon keeps a persistent TCP
+        # connection to every reachable dnsmasq that was started with
+        # --event-listen, and that connection is a live health signal for the
+        # patched build: the distro dnsmasq has no --event-listen at all, so
+        # "reverted to stock" and "killed" both present as the socket going away
+        # and not coming back. A brief absence is just a restart; what matters is
+        # absence that persists.
+        #
+        # Only nodes we have SEEN attached are judged, so a node that legitimately
+        # runs stock is never nagged about it. That knowledge is per-process, so
+        # it is lost across a daemon restart - event_expect names the nodes whose
+        # patched dnsmasq must always be there, which survives one.
+        event_watch       => 1,     # track attachment and log loss/recovery
+        event_expect      => '',    # space/comma addresses that MUST stay attached
+        event_lost_after  => 300,   # seconds of continuous absence before alarming
+        # Re-applying means restarting dnsmasq on that node. OFF by default: on a
+        # WAN edge that is a DNS and DHCP blip, and the alarm above already makes
+        # it a one-command fix. Turn it on where unattended recovery is worth more
+        # than the blip.
+        event_reapply     => 0,     # fire dnsmasq_switch variant=custom force=1
+        event_reapply_max => 3,     # ceiling per daemon lifetime, so it cannot flap
         # WHICH ADDRESSES THIS dnsmasq ANSWERS ON. Unset (the default) emits
         # nothing and leaves the node's existing scope alone.
         #
@@ -513,7 +534,9 @@ my %ACTIVE = (
     dnsmasq    => [qw(mode out_dir push_aps gateways multihomed layout
                       upstreams all_servers no_resolv dns_loop_detect
                       upstream_include listen_interfaces listen_addresses
-                      bind_interfaces)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
+                      bind_interfaces
+                      event_watch event_expect event_lost_after
+                      event_reapply event_reapply_max)], # per-node dnsmasq sync (net-gen-dnsmasq --from-db)
     bitchat_bridge => [qw(mode helper_path session_name adapter_index diag_journal diag_journal_lines)], # BLE bridge (bin/net-bitchat-bridge)
     'net-chat' => [qw(key_file key_id last_session bitchat_scope bitchat_geohash)], # auth-dialog "Always" + last-open session + bitchat scope/geohash
     ipv6_vlan  => [qw(type name mode server prefix local_suffix forwarding ext_if

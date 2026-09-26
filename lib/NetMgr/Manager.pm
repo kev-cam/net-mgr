@@ -7442,22 +7442,135 @@ SQL
         next if $self->{dnsmasq_listeners}{$key};
         $self->_try_connect_dnsmasq($r->{addr}, $port);
     }
+
+    # Nodes named in event_expect are judged even if this process has never
+    # seen them attached - that is the point of naming them, since the
+    # "ever attached" knowledge does not survive a daemon restart. Attempt
+    # them too, so an expected-but-absent node accrues a loss time.
+    for my $h (grep { length } split /[\s,]+/,
+               ($self->{config}{dnsmasq}{event_expect} // '')) {
+        my $key = "$h:$port";
+        next if $self->{dnsmasq_listeners}{$key};
+        ($self->{dnsmasq_attach}{$key} ||= { host => $h, port => $port })
+            ->{expected} = 1;
+        $self->_try_connect_dnsmasq($h, $port);
+    }
+
+    $self->_dnsmasq_attach_audit($port);
+}
+
+# A dnsmasq that has stopped answering on its event port has either been killed
+# or replaced by the distro build (which has no --event-listen), and until now
+# that was entirely silent: the socket simply stopped producing events. Judge
+# only nodes we have seen attached, or that event_expect names, so a node
+# legitimately running stock is never nagged.
+sub _dnsmasq_attach_audit {
+    my ($self, $port) = @_;
+    my $cfg = $self->{config}{dnsmasq} || {};
+    return unless ($cfg->{event_watch} // 1);
+    my $after = $cfg->{event_lost_after} // 300;
+    my $now   = time();
+
+    for my $key (sort keys %{ $self->{dnsmasq_attach} || {} }) {
+        my $st = $self->{dnsmasq_attach}{$key};
+        next if $self->{dnsmasq_listeners}{$key};          # attached: nothing to say
+        next unless $st->{ever_attached} || $st->{expected};
+        next unless $st->{lost_at};
+        next if $st->{alarmed};
+        my $down = $now - $st->{lost_at};
+        next if $down < $after;
+
+        $st->{alarmed} = 1;
+        my $how = $st->{ever_attached} ? 'was attached earlier this run'
+                                       : 'named in [dnsmasq] event_expect';
+        eval {
+            $self->_log_event(
+                type   => 'dnsmasq_event_lost',
+                addr   => $st->{host},
+                detail => sprintf(
+                    "no event socket for %ds (%s; %s). The patched dnsmasq is "
+                  . "gone or replaced by stock, which has no --event-listen. "
+                  . "Fix: net-cluster --peers %s --auth dnsmasq-switch "
+                  . "variant=custom force=1",
+                    $down, $how, $st->{last_err} // 'refused', $st->{host}),
+            );
+        };
+        $self->_log("dnsmasq event socket LOST on $key for ${down}s — "
+                  . ($cfg->{event_reapply} ? "re-applying" : "not re-applying "
+                     . "([dnsmasq] event_reapply = 0)"));
+
+        next unless $cfg->{event_reapply};
+        my $cap = $cfg->{event_reapply_max} // 3;
+        if (($st->{reapplies} // 0) >= $cap) {
+            $self->_log("dnsmasq reapply for $key suppressed: hit "
+                      . "event_reapply_max=$cap this run");
+            next;
+        }
+        $st->{reapplies} = ($st->{reapplies} // 0) + 1;
+        $self->_dnsmasq_reapply_custom($st->{host});
+    }
+}
+
+# Ask the node to re-apply variant=custom. force=1 is what makes this work at
+# all: without it the shim sees the node is already 'custom' per its state file
+# and exits 0 having done nothing. Forked, because the main loop must not block
+# on a peer that is by definition in a bad way.
+sub _dnsmasq_reapply_custom {
+    my ($self, $host) = @_;
+    my $pid = fork();
+    if (!defined $pid) { $self->_log("dnsmasq reapply: fork failed: $!"); return }
+    if ($pid) { $self->{triggers}{$pid} = { name => 'dnsmasq-reapply',
+                                            started_at => time() }; return }
+    # child
+    for my $c (values %{ $self->{clients}   }) { close $c->{sock} if $c->{sock} }
+    for my $l (values %{ $self->{listeners} }) { close $l->{sock} if $l->{sock} }
+    my $ok = eval {
+        require NetMgr::Client;
+        my $c = NetMgr::Client->new(listen => "$host:7531", timeout => 8);
+        $c->hello(consumer => "dnsmasq-reapply.$$");
+        $c->auth;    # must be signed: dnsmasq_switch is may_update-gated
+        $c->observe(kind => 'dnsmasq_switch', variant => 'custom', force => 1);
+        $c->bye;
+        1;
+    };
+    $self->_log("dnsmasq reapply to $host " . ($ok ? "sent" : "FAILED: $@"));
+    POSIX::_exit($ok ? 0 : 1);
 }
 
 sub _try_connect_dnsmasq {
     my ($self, $host, $port) = @_;
+    my $key = "$host:$port";
+    my $st  = $self->{dnsmasq_attach}{$key} ||= { host => $host, port => $port };
     my $sock = IO::Socket::INET->new(
         PeerAddr => $host, PeerPort => $port,
         Proto    => 'tcp', Timeout => 1,
     );
-    return unless $sock;
+    if (!$sock) {
+        # Only interesting once we know this node HAD the patched build; a plain
+        # refusal from a stock dnsmasq is normal and must stay silent.
+        $st->{fails}++;
+        $st->{last_err} = $! // 'connect failed';
+        $st->{lost_at} //= time() if $st->{ever_attached};
+        return;
+    }
     $sock->blocking(0);
-    my $key = "$host:$port";
     $self->{dnsmasq_listeners}{$key} = {
         sock => $sock, host => $host, port => $port, buffer => '',
     };
     $self->{select}->add($sock);
+    my $was_alarmed = $st->{alarmed};
+    $st->{ever_attached}  = 1;
+    $st->{attached_since} = time();
+    $st->{fails}          = 0;
+    delete $st->{lost_at};
+    delete $st->{alarmed};
     $self->_log("dnsmasq listener attached to $key");
+    # Only announce recovery if we announced the loss, or every restart of a
+    # healthy dnsmasq would produce a pair of events nobody asked for.
+    if ($was_alarmed) {
+        eval { $self->_log_event(type => 'dnsmasq_event_recovered', addr => $host,
+                                 detail => "event socket back on port $port") };
+    }
 }
 
 sub _drop_dnsmasq_listener {
@@ -7465,6 +7578,11 @@ sub _drop_dnsmasq_listener {
     my $L = delete $self->{dnsmasq_listeners}{$key} // return;
     $self->{select}->remove($L->{sock});
     eval { $L->{sock}->close };
+    # Timestamp the loss but do NOT alarm here: a dnsmasq restart drops the
+    # socket for a second or two, and an event per restart is noise. The audit
+    # decides, once the absence has lasted.
+    my $st = $self->{dnsmasq_attach}{$key} ||= {};
+    $st->{lost_at} //= time();
     $self->_log("dnsmasq listener dropped from $key");
 }
 
