@@ -1,0 +1,175 @@
+#!/usr/bin/perl
+# net-wifi — list this host's known WiFi profiles and, for each, whether it comes
+# up on its own.
+#
+# "Automatic" is the column that matters operationally. A profile with
+# connection.autoconnect = yes is re-raised by NetworkManager after a reboot, an
+# NM restart, or the device merely reappearing — so a link that has deliberately
+# been put down (say a backup ISP radio that should only carry traffic when the
+# primary has failed) comes back without anyone asking. `nmcli device disconnect`
+# marks the device manually-disconnected and holds for the current NM session
+# only; autoconnect outlives it. [uplink_failover] lowering a radio therefore
+# means very little if that radio's profile is automatic.
+#
+# It also answers a question that had no answer over the mesh at all: which
+# profile name belongs to a given interface. No POLL probe returned nmcli output,
+# so on a node reached only over net-mgr the name had to be guessed — and
+# `nmcli connection up <name>` with a guessed name either does nothing or acts on
+# the wrong interface.
+#
+# Usage:
+#   net-wifi                     table of every WiFi profile
+#   net-wifi --brief             one colon-separated line each (for probes/scripts)
+#   net-wifi --device DEV        only profiles bound to, or active on, DEV
+#   net-wifi --active            only what is currently up
+#   net-wifi --auto              only profiles that come up on their own
+#
+# Read-only: it runs nmcli queries and nothing else.
+
+use strict;
+use warnings;
+use Getopt::Long;
+
+my ($brief, $device, $only_active, $only_auto, $help);
+GetOptions(
+    'brief'     => \$brief,
+    'device=s'  => \$device,
+    'active'    => \$only_active,
+    'auto'      => \$only_auto,
+    'help|h'    => \$help,
+) or do { print STDERR usage(); exit 2 };
+if ($help) { print usage(); exit 0 }
+
+sub usage {
+    return <<'EOT';
+net-wifi — list known WiFi profiles and whether they come up on their own.
+
+Usage:
+  net-wifi                  table of every WiFi profile
+  net-wifi --brief          one colon-separated line each
+  net-wifi --device DEV     only profiles bound to / active on DEV
+  net-wifi --active         only what is currently up
+  net-wifi --auto           only profiles that come up on their own
+
+Columns: NAME, DEVICE, SSID, AUTO (autoconnect), PRIO (autoconnect-priority),
+STATE (active/—), LINK (the interface's own operstate).
+EOT
+}
+
+# No NetworkManager is a normal answer on plenty of nodes, not an error: say so
+# and exit 0 so a caller polling several hosts is not derailed by one of them.
+my $nmcli = `sh -c 'command -v nmcli' 2>/dev/null`;
+chomp $nmcli;
+unless (length $nmcli) {
+    print "net-wifi: no nmcli on this host (NetworkManager not installed?)\n";
+    exit 0;
+}
+
+# -t -f gives stable colon-separated output. Escaped colons can appear inside a
+# profile NAME, so split on unescaped colons only and then unescape.
+sub nm_split {
+    my ($line) = @_;
+    my @f;
+    my $cur = '';
+    my @c = split //, $line;
+    for (my $i = 0; $i <= $#c; $i++) {
+        if ($c[$i] eq '\\' && $i < $#c) { $cur .= $c[++$i]; next }
+        if ($c[$i] eq ':') { push @f, $cur; $cur = ''; next }
+        $cur .= $c[$i];
+    }
+    push @f, $cur;
+    return @f;
+}
+
+my @rows;
+my @out = `$nmcli -t -f NAME,UUID,TYPE,DEVICE,ACTIVE,AUTOCONNECT,AUTOCONNECT-PRIORITY connection show 2>/dev/null`;
+for my $l (@out) {
+    chomp $l;
+    next unless length $l;
+    my ($name, $uuid, $type, $dev, $active, $auto, $prio) = nm_split($l);
+    next unless ($type // '') eq '802-11-wireless';
+    push @rows, {
+        name   => $name   // '',
+        uuid   => $uuid   // '',
+        device => $dev    // '',
+        active => (($active // '') eq 'yes') ? 1 : 0,
+        auto   => (($auto   // '') eq 'yes') ? 1 : 0,
+        prio   => $prio   // '0',
+    };
+}
+
+# SSID is a per-profile property, not a `connection show` column, so it costs one
+# query each. Worth it: the SSID is how a human recognises the link, and a profile
+# NAME is free-form and frequently is not the SSID.
+for my $r (@rows) {
+    my $id = $r->{uuid} ne '' ? $r->{uuid} : $r->{name};
+    my $s = `$nmcli -t -f 802-11-wireless.ssid connection show @{[ shq($id) ]} 2>/dev/null`;
+    chomp $s;
+    $s =~ s/^802-11-wireless\.ssid:\s*//;
+    $r->{ssid} = length $s ? $s : '-';
+}
+
+# The interface's own operstate, which is what [uplink_failover] reads when it
+# decides whether a backup is carrying. A profile can be 'active' in NM's view
+# while the link is not up, so show both rather than trusting either alone.
+for my $r (@rows) {
+    $r->{link} = '-';
+    next unless length $r->{device};
+    if (open my $fh, '<', "/sys/class/net/$r->{device}/operstate") {
+        chomp(my $st = <$fh> // '');
+        close $fh;
+        $r->{link} = length $st ? $st : '-';
+    }
+}
+
+sub shq {
+    my ($s) = @_;
+    return "''" unless defined $s && length $s;
+    return $s if $s =~ m{^[A-Za-z0-9_./=,\@:-]+$};
+    (my $q = $s) =~ s/'/'\\''/g;
+    return "'$q'";
+}
+
+@rows = grep { $_->{active} } @rows if $only_active;
+@rows = grep { $_->{auto}   } @rows if $only_auto;
+if (defined $device) {
+    @rows = grep { $_->{device} eq $device } @rows;
+}
+
+unless (@rows) {
+    print "net-wifi: no matching WiFi profiles\n" unless $brief;
+    exit 0;
+}
+
+if ($brief) {
+    # name:device:ssid:auto:prio:state:link
+    for my $r (sort { $a->{name} cmp $b->{name} } @rows) {
+        printf "%s:%s:%s:%s:%s:%s:%s\n", $r->{name}, $r->{device}, $r->{ssid},
+            ($r->{auto} ? 'auto' : 'manual'), $r->{prio},
+            ($r->{active} ? 'active' : 'down'), $r->{link};
+    }
+    exit 0;
+}
+
+my $w = 4;
+for my $r (@rows) { $w = length $r->{name} if length $r->{name} > $w }
+printf "%-*s  %-14s  %-20s  %-6s  %-4s  %-7s  %s\n",
+    $w, 'NAME', 'DEVICE', 'SSID', 'AUTO', 'PRIO', 'STATE', 'LINK';
+for my $r (sort { $b->{active} <=> $a->{active} || $a->{name} cmp $b->{name} } @rows) {
+    printf "%-*s  %-14s  %-20s  %-6s  %-4s  %-7s  %s\n",
+        $w, $r->{name}, ($r->{device} ne '' ? $r->{device} : '-'),
+        $r->{ssid}, ($r->{auto} ? 'yes' : 'no'), $r->{prio},
+        ($r->{active} ? 'active' : '-'), $r->{link};
+}
+
+# A profile that is automatic AND not the one you want carrying traffic is the
+# thing that silently undoes a deliberate disconnect, so name it explicitly
+# rather than leaving it to be spotted in the table.
+my @auto_down = grep { $_->{auto} && !$_->{active} } @rows;
+if (@auto_down) {
+    print "\nautomatic but not currently up — NetworkManager will raise these on"
+        . " its own (reboot, NM restart, device reappearing):\n";
+    printf "  %s%s\n", $_->{name},
+        (length $_->{device} ? " (on $_->{device})" : '') for @auto_down;
+    print "  to stop one coming back: nmcli con mod <NAME> connection.autoconnect no\n";
+}

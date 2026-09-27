@@ -3922,6 +3922,26 @@ sub _reexec {
 # than not auditing it. A node with no ip6tables at all emits an empty section
 # — the consumer must read that as UNKNOWN, not as "no rules".
 my %POLL_SCRIPTS = (
+    # Which WiFi profiles this node knows, and which come up on their own. The
+    # profile NAME for a given interface had no remote answer before this: no
+    # probe returned nmcli output, so `nmcli connection up <name>` driven over
+    # the mesh meant guessing a name, which either does nothing or acts on the
+    # wrong interface. AUTOCONNECT matters as much as the name - an automatic
+    # profile is re-raised by NetworkManager after a reboot or an NM restart,
+    # silently undoing a deliberate disconnect such as [uplink_failover]
+    # lowering a backup radio.
+    # Falls back to raw nmcli on a node where net-wifi has not landed yet.
+    wifi => <<'SH',
+if command -v net-wifi >/dev/null 2>&1; then
+  net-wifi --brief
+elif command -v nmcli >/dev/null 2>&1; then
+  echo "# net-wifi absent; raw nmcli (name:type:device:active:autoconnect)"
+  nmcli -t -f NAME,TYPE,DEVICE,ACTIVE,AUTOCONNECT connection show 2>/dev/null |
+    awk -F: '$2 == "802-11-wireless"'
+else
+  echo "no nmcli on this host"
+fi
+SH
     fw_state => <<'SH',
 echo ===KIND===
 if [ -f /tmp/.rc_started ] || [ -e /jffs ]; then echo dd-wrt
