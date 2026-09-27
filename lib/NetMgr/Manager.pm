@@ -3160,7 +3160,11 @@ sub _check_periodic_triggers {
     my $now   = time();
     $self->{periodic_last} //= {};
 
-    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq ddns he-dns ipv6_vlan netif register-self bitchat-sweep pending-tasks)) {
+    # NB this list is the gate: a name absent here is never considered, no
+    # matter what [scheduling] says, and _fire_periodic's branch for it is
+    # then dead code. 'uplink' was added to both the config defaults and the
+    # dispatch and still never ran, for exactly that reason.
+    for my $name (qw(scan-ap presence discover find-peers import-leases push-dnsmasq ddns he-dns ipv6_vlan netif register-self bitchat-sweep pending-tasks uplink)) {
         my $interval = $sched->{$name} // 0;
         # netif: track interface changes (WiFi/USB up/down) and rebind the
         # 'all'/'auto' listeners. Auto-enable at 30s for those specs (an explicit
