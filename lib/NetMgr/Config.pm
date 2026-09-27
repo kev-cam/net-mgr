@@ -232,7 +232,15 @@ my %DEFAULTS = (
         mode        => 'off',   # off | on
         primary     => '',      # [uplinks] label that should normally carry traffic
         backup      => '',      # [uplinks] label to raise when the primary fails
-        backup_conn => '',      # nmcli connection name for the backup (REQUIRED to act)
+        backup_conn => '',      # nmcli CONNECTION name for the backup
+        # ...or name the DEVICE instead, which is usually what you actually know.
+        # `nmcli device connect <dev>` raises the device with whichever profile
+        # matches, so the profile's name never has to be discovered - and a
+        # profile name is exactly the thing that cannot be read remotely, since no
+        # poll probe returns nmcli output. One of backup_conn or backup_dev is
+        # required to act; backup_dev wins if both are set, because a device is
+        # the less ambiguous of the two.
+        backup_dev  => '',      # e.g. wlp0s12f0
         down_after  => 3,       # consecutive primary probe failures before raising
         up_after    => 3,       # consecutive primary successes before lowering again
         min_gap     => 120,     # seconds between actions, so it cannot oscillate
@@ -557,7 +565,7 @@ my %ACTIVE = (
                                               # proxy_listen: net-mgr-relay's
                                               # loopback REFRESH socket
     uplinks    => '*',                        # consumed by net-uplink-probe
-    uplink_failover => [qw(mode primary backup backup_conn
+    uplink_failover => [qw(mode primary backup backup_conn backup_dev
                            down_after up_after min_gap)],
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
     dnsmasq    => [qw(mode out_dir push_aps gateways multihomed layout

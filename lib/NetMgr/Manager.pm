@@ -7463,33 +7463,47 @@ sub _uplink_failover_eval {
     my $now  = time();
     my $gap  = $cfg->{min_gap} // 120;
     my $conn = $cfg->{backup_conn} // '';
+    my $dev  = $cfg->{backup_dev}  // '';
+
+    # A device beats a connection name: `nmcli device connect <dev>` picks the
+    # matching profile itself, so the profile never has to be known - and on a
+    # node reachable only over the mesh it CANNOT be known, because no poll probe
+    # returns nmcli output. nmcli's verbs differ between the two forms
+    # (device connect/disconnect vs connection up/down), hence the mapping.
+    my @cmd_up   = length $dev  ? ('nmcli','device','connect',$dev)
+                 : length $conn ? ('nmcli','connection','up',$conn) : ();
+    my @cmd_down = length $dev  ? ('nmcli','device','disconnect',$dev)
+                 : length $conn ? ('nmcli','connection','down',$conn) : ();
+    my $target   = length $dev ? "device '$dev'" : "connection '$conn'";
 
     my $act = sub {
         my ($what, $why) = @_;           # $what is 'up' or 'down'
-        if (!length $conn) {
+        my @cmd = $what eq 'up' ? @cmd_up : @cmd_down;
+        if (!@cmd) {
             return if $st->{warned_no_conn};
             $st->{warned_no_conn} = 1;
             $self->_log("uplink_failover: would bring the backup $what ($why) but "
-                      . "[uplink_failover] backup_conn is unset - set it to the "
-                      . "NetworkManager connection name to act");
+                      . "neither [uplink_failover] backup_dev nor backup_conn is "
+                      . "set - name the interface (simplest) or the NM profile");
             return;
         }
         if (($now - ($st->{last_action} // 0)) < $gap) {
-            $self->_log("uplink_failover: holding off '$what' ($why) - last action "
-                      . ($now - ($st->{last_action} // 0)) . "s ago, min_gap=${gap}s");
+            $self->_log("uplink_failover: holding off '$what' on $target ($why) - "
+                      . "last action " . ($now - ($st->{last_action} // 0))
+                      . "s ago, min_gap=${gap}s");
             return;
         }
         $st->{last_action} = $now;
         $st->{backup_up}   = ($what eq 'up') ? 1 : 0;
         eval { $self->_log_event(type => "uplink_backup_$what",
-                                 detail => "$why; nmcli connection $what '$conn'") };
+                                 detail => "$why; " . join(' ', @cmd)) };
         my $pid = fork();
         if (!defined $pid) { $self->_log("uplink_failover: fork failed: $!"); return }
         if ($pid) { $self->{triggers}{$pid} = { name => "uplink-$what",
                                                 started_at => $now }; return }
         for my $c (values %{ $self->{clients}   }) { close $c->{sock} if $c->{sock} }
         for my $l (values %{ $self->{listeners} }) { close $l->{sock} if $l->{sock} }
-        { no warnings; exec 'nmcli', 'connection', $what, $conn }
+        { no warnings; exec @cmd }
         POSIX::_exit(127);
     };
 
