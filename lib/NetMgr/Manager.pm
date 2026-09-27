@@ -3274,6 +3274,7 @@ sub _fire_periodic {
     }
     if ($name eq 'ddns')         { $self->_check_ddns;   return }
     if ($name eq 'he-dns')       { $self->_check_he_dns; return }
+    if ($name eq 'uplink')       { $self->_uplink_tick;     return }
     if ($name eq 'ipv6_vlan')    { $self->_check_ipv6_vlans; return }
     if ($name eq 'netif')        { $self->_recheck_listeners; return }
     if ($name eq 'register-self'){ $self->_register_self_interfaces; return }
@@ -7420,6 +7421,100 @@ use IO::Socket::INET ();
 # 53 or 67 known open) and try to connect to their event-listen port,
 # default 7533. Re-attempt every minute by default; once attached the
 # socket stays in select() forever.
+# ---- uplink probe + failover ------------------------------------------
+#
+# net-uplink-probe owns probing and the DB row; this owns deciding. Keeping them
+# apart matters: two implementations of "is this uplink up" would drift, and the
+# probe already maintains consecutive_failures, which is the hysteresis counter.
+#
+# Evaluate BEFORE probing, so a tick acts on the rows the previous probe wrote
+# rather than on rows a child process has not finished updating yet.
+sub _uplink_tick {
+    my ($self) = @_;
+    $self->_uplink_failover_eval;
+
+    return unless %{ $self->{config}{uplinks} || {} };
+    my $pid = fork();
+    if (!defined $pid) { $self->_log("uplink: fork failed: $!"); return }
+    if ($pid) { $self->{triggers}{$pid} = { name => 'uplink', started_at => time() }; return }
+    for my $c (values %{ $self->{clients}   }) { close $c->{sock} if $c->{sock} }
+    for my $l (values %{ $self->{listeners} }) { close $l->{sock} if $l->{sock} }
+    { no warnings; exec '/usr/local/bin/net-uplink-probe', '--quiet' }
+    POSIX::_exit(127);
+}
+
+# Raise the backup when the primary has failed enough times; lower it once the
+# primary is convincingly back. Both edges are latched and rate-limited, because
+# an uplink that flaps would otherwise have us cycling a radio every minute.
+sub _uplink_failover_eval {
+    my ($self) = @_;
+    my $cfg = $self->{config}{uplink_failover} || {};
+    return unless lc($cfg->{mode} // 'off') eq 'on';
+    my ($pri, $bak) = ($cfg->{primary} // '', $cfg->{backup} // '');
+    return unless length $pri && length $bak;
+
+    my $rows = eval {
+        $self->{db}->dbh->selectall_arrayref(
+            "SELECT * FROM uplinks", { Slice => {} }) } || [];
+    my %by = map { ($_->{label} // '') => $_ } @$rows;
+    my $p = $by{$pri} or return;          # nothing probed yet
+
+    my $st   = $self->{uplink_state} ||= {};
+    my $now  = time();
+    my $gap  = $cfg->{min_gap} // 120;
+    my $conn = $cfg->{backup_conn} // '';
+
+    my $act = sub {
+        my ($what, $why) = @_;           # $what is 'up' or 'down'
+        if (!length $conn) {
+            return if $st->{warned_no_conn};
+            $st->{warned_no_conn} = 1;
+            $self->_log("uplink_failover: would bring the backup $what ($why) but "
+                      . "[uplink_failover] backup_conn is unset - set it to the "
+                      . "NetworkManager connection name to act");
+            return;
+        }
+        if (($now - ($st->{last_action} // 0)) < $gap) {
+            $self->_log("uplink_failover: holding off '$what' ($why) - last action "
+                      . ($now - ($st->{last_action} // 0)) . "s ago, min_gap=${gap}s");
+            return;
+        }
+        $st->{last_action} = $now;
+        $st->{backup_up}   = ($what eq 'up') ? 1 : 0;
+        eval { $self->_log_event(type => "uplink_backup_$what",
+                                 detail => "$why; nmcli connection $what '$conn'") };
+        my $pid = fork();
+        if (!defined $pid) { $self->_log("uplink_failover: fork failed: $!"); return }
+        if ($pid) { $self->{triggers}{$pid} = { name => "uplink-$what",
+                                                started_at => $now }; return }
+        for my $c (values %{ $self->{clients}   }) { close $c->{sock} if $c->{sock} }
+        for my $l (values %{ $self->{listeners} }) { close $l->{sock} if $l->{sock} }
+        { no warnings; exec 'nmcli', 'connection', $what, $conn }
+        POSIX::_exit(127);
+    };
+
+    if (($p->{last_status} // '') eq 'fail') {
+        $st->{good} = 0;
+        my $fails = $p->{consecutive_failures} // 0;
+        my $need  = $cfg->{down_after} // 3;
+        return if $fails < $need;
+        return if $st->{backup_up};                    # already raised
+        $act->('up', "primary '$pri' failed $fails consecutive probes (>= $need)");
+        return;
+    }
+
+    if (($p->{last_status} // '') eq 'ok') {
+        $st->{good} = ($st->{good} // 0) + 1;
+        my $need = $cfg->{up_after} // 3;
+        return unless $st->{backup_up};                # nothing to lower
+        return if $st->{good} < $need;
+        $act->('down', "primary '$pri' healthy for $st->{good} consecutive probes "
+                     . "(>= $need)");
+    }
+    # 'unknown' deliberately does nothing: a probe that has not run yet is not
+    # evidence of failure, and acting on it would raise the backup at boot.
+}
+
 sub _check_dnsmasq_listeners {
     my ($self) = @_;
     my $cfg = $self->{config}{scanner} // {};

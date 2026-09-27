@@ -100,6 +100,11 @@ my %DEFAULTS = (
         'scan-ap' => 0,
         presence  => 0,
         discover  => 0,
+        # How often to probe [uplinks] and act on the result. 0 = off, which is
+        # the default because probing is only meaningful where [uplinks] is
+        # configured - a gateway. net-uplink-probe was previously run by nothing
+        # at all, so a configured uplink was never actually checked.
+        uplink    => 0,
     },
     # Output directory for net-gen-dnsmasq. Placeholder values
     # themselves live in the dhcp_vars DB table — manage with net-var(1).
@@ -209,6 +214,28 @@ my %DEFAULTS = (
         # than the blip.
         event_reapply     => 0,     # fire dnsmasq_switch variant=custom force=1
         event_reapply_max => 3,     # ceiling per daemon lifetime, so it cannot flap
+    },
+    # ACTING ON [uplinks]. The probe records health; this decides what to do
+    # about it. The reaction is deliberately one-directional in scope: bring the
+    # BACKUP link up when the primary ISP fails, take it down again when the
+    # primary recovers, so the backup is not carrying an idle association (and
+    # handing out DNS) the rest of the time.
+    #
+    # backup_conn is the NetworkManager connection to raise/lower and there is NO
+    # default: guessing a profile name would either do nothing or act on the wrong
+    # interface. With it unset this logs the action it would have taken and does
+    # nothing, which is the useful half anyway.
+    #
+    # Note the primary need not be NM-managed for this to work - on a host whose
+    # WAN is driven by a bare dhclient, nothing here touches the primary at all.
+    uplink_failover => {
+        mode        => 'off',   # off | on
+        primary     => '',      # [uplinks] label that should normally carry traffic
+        backup      => '',      # [uplinks] label to raise when the primary fails
+        backup_conn => '',      # nmcli connection name for the backup (REQUIRED to act)
+        down_after  => 3,       # consecutive primary probe failures before raising
+        up_after    => 3,       # consecutive primary successes before lowering again
+        min_gap     => 120,     # seconds between actions, so it cannot oscillate
         # WHICH ADDRESSES THIS dnsmasq ANSWERS ON. Unset (the default) emits
         # nothing and leaves the node's existing scope alone.
         #
@@ -337,7 +364,7 @@ my %DURATION_KEYS = (
     ap_poll    => { interval => 1, ssh_timeout => 1 },
     timeouts   => { ap => 1, fping => 1, nmap => 1, dhcp => 1 },
     dns        => { ttl => 1 },
-    scheduling => { 'scan-ap' => 1, presence => 1, discover => 1,
+    scheduling => { 'scan-ap' => 1, presence => 1, discover => 1, uplink => 1,
                     'find-peers' => 1, 'import-leases' => 1, 'push-dnsmasq' => 1,
                     ipv6_vlan => 1, netif => 1, 'he-dns' => 1 },
     ddns       => { interval => 1 },
@@ -530,6 +557,8 @@ my %ACTIVE = (
                                               # proxy_listen: net-mgr-relay's
                                               # loopback REFRESH socket
     uplinks    => '*',                        # consumed by net-uplink-probe
+    uplink_failover => [qw(mode primary backup backup_conn
+                           down_after up_after min_gap)],
     dhcp       => '*',                        # placeholders used by net-gen-dnsmasq
     dnsmasq    => [qw(mode out_dir push_aps gateways multihomed layout
                       upstreams all_servers no_resolv dns_loop_detect
