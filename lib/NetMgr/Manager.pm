@@ -7443,9 +7443,26 @@ sub _uplink_tick {
     POSIX::_exit(127);
 }
 
-# Raise the backup when the primary has failed enough times; lower it once the
-# primary is convincingly back. Both edges are latched and rate-limited, because
-# an uplink that flaps would otherwise have us cycling a radio every minute.
+# Is this interface carrying? operstate is the kernel's own answer, so it costs
+# nothing and cannot disagree with reality the way remembered state can.
+sub _link_is_up {
+    my ($self, $dev) = @_;
+    return 0 unless length($dev // '');
+    open my $fh, '<', "/sys/class/net/$dev/operstate" or return 0;
+    chomp(my $s = <$fh> // '');
+    close $fh;
+    return $s eq 'up' ? 1 : 0;
+}
+
+# Converge the backup to the state the primary's health implies. Deliberately NOT
+# latched on our own past actions: a latch only ever lowers a link it raised
+# itself, so a backup that was already up when the daemon started would stay up
+# for ever - which is the opposite of "the backup should not be active unless the
+# primary has failed". Reading operstate instead means the desired state is
+# enforced no matter who last touched the link, including a human.
+#
+# Rate-limited, because an uplink that flaps would otherwise cycle a radio every
+# minute.
 sub _uplink_failover_eval {
     my ($self) = @_;
     my $cfg = $self->{config}{uplink_failover} || {};
@@ -7507,12 +7524,18 @@ sub _uplink_failover_eval {
         POSIX::_exit(127);
     };
 
+    # What the interface is actually doing right now. With backup_conn (a profile
+    # rather than a device) we have no interface to read, so fall back to the
+    # remembered state for that form only.
+    my $is_up = length $dev ? $self->_link_is_up($dev)
+                            : ($st->{backup_up} ? 1 : 0);
+
     if (($p->{last_status} // '') eq 'fail') {
         $st->{good} = 0;
         my $fails = $p->{consecutive_failures} // 0;
         my $need  = $cfg->{down_after} // 3;
         return if $fails < $need;
-        return if $st->{backup_up};                    # already raised
+        return if $is_up;                              # already carrying
         $act->('up', "primary '$pri' failed $fails consecutive probes (>= $need)");
         return;
     }
@@ -7520,10 +7543,11 @@ sub _uplink_failover_eval {
     if (($p->{last_status} // '') eq 'ok') {
         $st->{good} = ($st->{good} // 0) + 1;
         my $need = $cfg->{up_after} // 3;
-        return unless $st->{backup_up};                # nothing to lower
+        return unless $is_up;                          # already down
         return if $st->{good} < $need;
         $act->('down', "primary '$pri' healthy for $st->{good} consecutive probes "
-                     . "(>= $need)");
+                     . "(>= $need); the backup should not carry an idle "
+                     . "association while the primary is fine");
     }
     # 'unknown' deliberately does nothing: a probe that has not run yet is not
     # evidence of failure, and acting on it would raise the backup at boot.
